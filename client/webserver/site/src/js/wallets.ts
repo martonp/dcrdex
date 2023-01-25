@@ -668,7 +668,8 @@ export default class WalletsPage extends BasePage {
     const { wallet, unitInfo: ui, symbol, id: assetID } = app().assets[this.selectedAssetID]
     const bal = wallet.balance
     Doc.show(page.balanceBox, page.walletDetails)
-    const totalBalance = bal.available + bal.locked + bal.immature
+    const totalLocked = bal.locked + bal.contractlocked + bal.bondlocked
+    const totalBalance = bal.available + totalLocked + bal.immature
     page.balance.textContent = Doc.formatCoinValue(totalBalance, ui)
     Doc.empty(page.balanceUnit)
     page.balanceUnit.appendChild(Doc.symbolize(symbol))
@@ -686,8 +687,8 @@ export default class WalletsPage extends BasePage {
       tmpl.subBalance.textContent = Doc.formatCoinValue(subBalance, ui)
     }
     addSubBalance('Available', bal.available)
-    addSubBalance('Locked', bal.locked) // Hide if zero?
-    addSubBalance('Immature', bal.immature) // Hide if zero?
+    addSubBalance('Locked', totalLocked)
+    addSubBalance('Immature', bal.immature)
     const sortedCats = Object.entries(bal.other || {})
     sortedCats.sort((a: [string, number], b: [string, number]): number => a[0].localeCompare(b[0]))
     for (const [cat, sub] of sortedCats) addSubBalance(cat, sub)
