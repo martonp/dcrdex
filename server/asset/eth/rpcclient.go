@@ -18,6 +18,7 @@ import (
 	dexeth "decred.org/dcrdex/dex/networks/eth"
 	swapv0 "decred.org/dcrdex/dex/networks/eth/contracts/v0"
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -33,13 +34,32 @@ var (
 	headerExpirationTime = time.Minute
 )
 
+// This is returned from bestHeader when the header is outdated. It lets withClient know to
+// not to return an error if all the clients are outdated.
+var outdatedHeaderErr = errors.New("header is outdated")
+
 type ContextCaller interface {
 	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
 }
 
+// ethereumClient is satisfied by the *ethclient.Client type. It is used to be able
+// to test outdated/misbehaving providers.
+type ethereumClient interface {
+	HeaderByNumber(ctx context.Context, number *big.Int) (*types.Header, error)
+	SuggestGasTipCap(ctx context.Context) (*big.Int, error)
+	SyncProgress(ctx context.Context) (*ethereum.SyncProgress, error)
+	BlockNumber(ctx context.Context) (uint64, error)
+	TransactionByHash(ctx context.Context, txHash common.Hash) (*types.Transaction, bool, error)
+	BalanceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (*big.Int, error)
+	Close()
+}
+
+var _ ethereumClient = (*ethclient.Client)(nil)
+
 type ethConn struct {
-	*ethclient.Client
-	endpoint string
+	client          ethereumClient
+	contractBackend bind.ContractBackend
+	endpoint        string
 	// swapContract is the current ETH swapContract.
 	swapContract swapContract
 	// tokens are tokeners for loaded tokens. tokens is not protected by a
@@ -49,16 +69,25 @@ type ethConn struct {
 	// caller is a client for raw calls not implemented by *ethclient.Client.
 	caller          ContextCaller
 	txPoolSupported bool
+
+	outdatedMtx sync.RWMutex
+	outdated    bool
 }
 
 type rpcclient struct {
-	net       dex.Network
-	log       dex.Logger
+	net dex.Network
+	log dex.Logger
+	// endpoints should only be used during connect to know which endpoints
+	// to attempt to connect. If we were unable to connect to some of the
+	// endpoints, they will not be included in the clients slice.
 	endpoints []string
 	clients   []*ethConn
 
 	idxMtx      sync.RWMutex
 	endpointIdx int
+
+	allowOutdatedMtx sync.RWMutex
+	allowOutdated    bool
 }
 
 func newRPCClient(net dex.Network, endpoints []string, log dex.Logger) *rpcclient {
@@ -69,35 +98,130 @@ func newRPCClient(net dex.Network, endpoints []string, log dex.Logger) *rpcclien
 	}
 }
 
-func (c *rpcclient) withClient(f func(ec *ethConn) error, haltOnNotFound ...bool) (err error) {
-	for range c.endpoints {
+// advanceToNextClient will attempt to increment endpointIdx to the next client
+// if it has not already been done so by another thread.
+func (c *rpcclient) advanceToNextClient(currClient int) {
+	c.idxMtx.Lock()
+	defer c.idxMtx.Unlock()
+	if c.endpointIdx == currClient && len(c.clients) > 1 {
+		c.endpointIdx = (c.endpointIdx + 1) % len(c.clients)
+		c.log.Infof("Switching RPC endpoint to %q", c.clients[c.endpointIdx].endpoint)
+	}
+}
+
+// setAllowOutdated returns true if all the clients are outdated. It also sets
+// the allowOutdated flag to true for 2 minutes. This is used to allow outdated
+// clients to be used so that the server does not completely stop serving requests.
+func (c *rpcclient) setAllowOutdated() bool {
+	allOutdated := true
+	for _, ec := range c.clients {
+		ec.outdatedMtx.RLock()
+		if !ec.outdated {
+			allOutdated = false
+			break
+		}
+		ec.outdatedMtx.RUnlock()
+	}
+
+	if !allOutdated {
+		return false
+	}
+
+	c.allowOutdatedMtx.Lock()
+	defer c.allowOutdatedMtx.Unlock()
+	if !c.allowOutdated {
+		c.log.Warn("All RPC clients are outdated. Allowing outdated clients for 2 minutes.")
+		c.allowOutdated = true
+		time.AfterFunc(time.Minute*2, func() {
+			c.allowOutdatedMtx.Lock()
+			c.allowOutdated = false
+			c.allowOutdatedMtx.Unlock()
+		})
+	}
+
+	return true
+}
+
+func (c *rpcclient) withClient(ctx context.Context, f func(ec *ethConn) error, haltOnNotFound ...bool) (functionErr error) {
+	c.allowOutdatedMtx.RLock()
+	allowOutdated := c.allowOutdated
+	c.allowOutdatedMtx.RUnlock()
+
+	for range c.clients {
 		c.idxMtx.RLock()
 		idx := c.endpointIdx
 		ec := c.clients[idx]
 		c.idxMtx.RUnlock()
 
-		err = f(ec)
-		if err == nil {
+		ec.outdatedMtx.RLock()
+		originallyOutdated := ec.outdated
+		ec.outdatedMtx.RUnlock()
+
+		if originallyOutdated && !allowOutdated {
+			stillOutdated, err := c.checkIfConnectionOutdated(ctx, ec)
+			if err != nil {
+				c.log.Errorf("Failed to check if connection is outdated: %v", err)
+			}
+			if err != nil || stillOutdated {
+				c.advanceToNextClient(idx)
+				continue
+			}
+		}
+
+		functionErr = f(ec)
+		if functionErr == nil {
 			return nil
 		}
-		if len(haltOnNotFound) > 0 && haltOnNotFound[0] && (errors.Is(err, ethereum.NotFound) || strings.Contains(err.Error(), "not found")) {
-			return err
+
+		txNotFound := len(haltOnNotFound) > 0 && haltOnNotFound[0] && (errors.Is(functionErr, ethereum.NotFound) || strings.Contains(functionErr.Error(), "not found"))
+
+		if functionErr == outdatedHeaderErr {
+			// bestHeader will return outdatedHeaderErr if the header is outdated.
+			// We still return the outdated header, but we want to advance to the next
+			// client.
+			c.setConnectionOutdated(ec, true)
+			c.advanceToNextClient(idx)
+			return nil
 		}
-		c.log.Errorf("Unpropagated error from %q: %v", c.endpoints[idx], err)
-		// Try the next client.
-		c.idxMtx.Lock()
-		// Only advance it if another thread hasn't.
-		if c.endpointIdx == idx && len(c.endpoints) > 0 {
-			c.endpointIdx = (c.endpointIdx + 1) % len(c.endpoints)
-			c.log.Infof("Switching RPC endpoint to %q", c.endpoints[c.endpointIdx])
+
+		// If the connection was originally outdated, then we just checked that it was not outdated, so
+		// we should return the error.
+		if txNotFound && (allowOutdated || originallyOutdated) {
+			return functionErr
 		}
-		c.idxMtx.Unlock()
+
+		// If the connection was not originally outdated, then we should check to make sure the error is
+		// due to the connection now being outdated.
+		if !allowOutdated && !originallyOutdated {
+			outdated, err := c.checkIfConnectionOutdated(ctx, ec)
+			if err != nil {
+				c.log.Errorf("Failed to check if connection is outdated: %v", err)
+			}
+
+			if txNotFound && !outdated {
+				return functionErr
+			}
+		}
+
+		c.advanceToNextClient(idx)
 	}
-	return fmt.Errorf("all providers failed. last error: %w", err)
+
+	if !allowOutdated && c.setAllowOutdated() {
+		return c.withClient(ctx, f, haltOnNotFound...)
+	}
+
+	return fmt.Errorf("all providers failed. last error: %w", functionErr)
 }
 
-// connect connects to an ipc socket. It then wraps ethclient's client and
-// bundles commands in a form we can easily use.
+// connect will attempt to connect to all the endpoints in the endpoints slice.
+// If at least one of the connections is successful and is not outdated, the
+// function will return without error.
+//
+// Connections with an outdated block will be marked as outdated, but included
+// in the clients slice. If the up-to-date providers start to fail, the outdated
+// ones will be checked to see if they are still outdated.
+//
+// Failed connections will not be included in the clients slice.
 func (c *rpcclient) connect(ctx context.Context) (err error) {
 	netAddrs, found := dexeth.ContractAddresses[ethContractVersion]
 	if !found {
@@ -110,11 +234,12 @@ func (c *rpcclient) connect(ctx context.Context) (err error) {
 
 	var success bool
 
-	c.clients = make([]*ethConn, len(c.endpoints))
-	for i, endpoint := range c.endpoints {
+	c.clients = make([]*ethConn, 0, len(c.endpoints))
+	for _, endpoint := range c.endpoints {
 		client, err := rpc.DialContext(ctx, endpoint)
 		if err != nil {
-			return fmt.Errorf("unable to dial rpc to %q: %v", endpoint, err)
+			c.log.Errorf("Failed to connect to %q: %v", endpoint, err)
+			continue
 		}
 
 		defer func() {
@@ -123,10 +248,12 @@ func (c *rpcclient) connect(ctx context.Context) (err error) {
 			}
 		}()
 
+		ethClient := ethclient.NewClient(client)
 		ec := &ethConn{
-			Client:   ethclient.NewClient(client),
-			endpoint: endpoint,
-			tokens:   make(map[uint32]*tokener),
+			client:          ethClient,
+			contractBackend: ethClient,
+			endpoint:        endpoint,
+			tokens:          make(map[uint32]*tokener),
 		}
 
 		reqModules := []string{"eth", "txpool"}
@@ -138,26 +265,65 @@ func (c *rpcclient) connect(ctx context.Context) (err error) {
 			ec.txPoolSupported = true
 		}
 
-		hdr, err := ec.HeaderByNumber(ctx, nil)
+		hdr, err := ec.client.HeaderByNumber(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("error getting best header from %q: %v", endpoint, err)
-		}
-		if c.headerIsOutdated(hdr) {
-			return fmt.Errorf("initial header fetched from %q appears to be outdated (time %s). If you continue to see this message, you might need to check your system clock",
-				endpoint, time.Unix(int64(hdr.Time), 0))
+			c.log.Errorf("Failed to get header from %q: %v", endpoint, err)
+			continue
 		}
 
-		es, err := swapv0.NewETHSwap(contractAddr, ec.Client)
+		ec.outdated = c.headerIsOutdated(hdr)
+		if ec.outdated {
+			c.log.Warnf("Best header from %q is outdated.", endpoint)
+		} else {
+			success = true
+		}
+
+		// This only returns an error if the abi fails to parse, so if it fails
+		// for one provider, it will fail for all.
+		es, err := swapv0.NewETHSwap(contractAddr, ethClient)
 		if err != nil {
 			return fmt.Errorf("unable to initialize eth contract for %q: %v", endpoint, err)
 		}
+
 		ec.swapContract = &swapSourceV0{es}
 		ec.caller = client
 
-		c.clients[i] = ec
+		// Put outdated clients at the end of the list.
+		if ec.outdated {
+			c.clients = append(c.clients, ec)
+		} else {
+			c.clients = append([]*ethConn{ec}, c.clients...)
+		}
 	}
-	success = true
+
+	c.log.Infof("number of connected ETH providers: %d", len(c.clients))
+
+	if !success {
+		return fmt.Errorf("no connection to an up to date ETH provider available")
+	}
+
 	return nil
+}
+
+func (c *rpcclient) setConnectionOutdated(conn *ethConn, outdated bool) {
+	conn.outdatedMtx.Lock()
+	conn.outdated = outdated
+	conn.outdatedMtx.Unlock()
+}
+
+// checkIfConnectionOutdated checks if the connection is outdated. If it is,
+// the outdated field on the connection is set to true.
+func (c *rpcclient) checkIfConnectionOutdated(ctx context.Context, conn *ethConn) (bool, error) {
+	conn.outdatedMtx.Lock()
+	defer conn.outdatedMtx.Unlock()
+
+	hdr, err := conn.client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("Failed to get header from %q: %v", conn.endpoint, err)
+	}
+
+	conn.outdated = c.headerIsOutdated(hdr)
+	return conn.outdated, nil
 }
 
 func (c *rpcclient) headerIsOutdated(hdr *types.Header) bool {
@@ -167,13 +333,13 @@ func (c *rpcclient) headerIsOutdated(hdr *types.Header) bool {
 // shutdown shuts down the client.
 func (c *rpcclient) shutdown() {
 	for _, ec := range c.clients {
-		ec.Close()
+		ec.client.Close()
 	}
 }
 
 func (c *rpcclient) loadToken(ctx context.Context, assetID uint32) error {
 	for _, cl := range c.clients {
-		tkn, err := newTokener(ctx, assetID, c.net, cl.Client)
+		tkn, err := newTokener(ctx, assetID, c.net, cl.contractBackend)
 		if err != nil {
 			return fmt.Errorf("error constructing ERC20Swap: %w", err)
 		}
@@ -183,8 +349,8 @@ func (c *rpcclient) loadToken(ctx context.Context, assetID uint32) error {
 	return nil
 }
 
-func (c *rpcclient) withTokener(assetID uint32, f func(*tokener) error) error {
-	return c.withClient(func(ec *ethConn) error {
+func (c *rpcclient) withTokener(ctx context.Context, assetID uint32, f func(*tokener) error) error {
+	return c.withClient(ctx, func(ec *ethConn) error {
 		tkn, found := ec.tokens[assetID]
 		if !found {
 			return fmt.Errorf("no swap source for asset %d", assetID)
@@ -196,28 +362,22 @@ func (c *rpcclient) withTokener(assetID uint32, f func(*tokener) error) error {
 
 // bestHeader gets the best header at the time of calling.
 func (c *rpcclient) bestHeader(ctx context.Context) (hdr *types.Header, err error) {
-	return hdr, c.withClient(func(ec *ethConn) error {
-		hdr, err = ec.HeaderByNumber(ctx, nil)
-		if err == nil && c.headerIsOutdated(hdr) {
-			c.log.Errorf("Best header from %q appears to be outdated (time %s). If you continue to see this message, you might need to check your system clock",
-				ec.endpoint, time.Unix(int64(hdr.Time), 0))
-			if len(c.endpoints) > 0 {
-				c.idxMtx.Lock()
-				c.endpointIdx = (c.endpointIdx + 1) % len(c.endpoints)
-				endpoint := c.endpoints[c.endpointIdx]
-				c.idxMtx.Unlock()
-				c.log.Infof("Switching RPC endpoint to %q", endpoint)
-			}
+	return hdr, c.withClient(ctx, func(ec *ethConn) error {
+		hdr, err = ec.client.HeaderByNumber(ctx, nil)
+		if err != nil {
+			return err
 		}
-		return err
+		if c.headerIsOutdated(hdr) {
+			return outdatedHeaderErr
+		}
+		return nil
 	})
-
 }
 
 // headerByHeight gets the best header at height.
 func (c *rpcclient) headerByHeight(ctx context.Context, height uint64) (hdr *types.Header, err error) {
-	return hdr, c.withClient(func(ec *ethConn) error {
-		hdr, err = ec.HeaderByNumber(ctx, big.NewInt(int64(height)))
+	return hdr, c.withClient(ctx, func(ec *ethConn) error {
+		hdr, err = ec.client.HeaderByNumber(ctx, big.NewInt(int64(height)))
 		return err
 	})
 }
@@ -225,24 +385,24 @@ func (c *rpcclient) headerByHeight(ctx context.Context, height uint64) (hdr *typ
 // suggestGasTipCap retrieves the currently suggested priority fee to allow a
 // timely execution of a transaction.
 func (c *rpcclient) suggestGasTipCap(ctx context.Context) (tipCap *big.Int, err error) {
-	return tipCap, c.withClient(func(ec *ethConn) error {
-		tipCap, err = ec.SuggestGasTipCap(ctx)
+	return tipCap, c.withClient(ctx, func(ec *ethConn) error {
+		tipCap, err = ec.client.SuggestGasTipCap(ctx)
 		return err
 	})
 }
 
 // syncProgress return the current sync progress. Returns no error and nil when not syncing.
 func (c *rpcclient) syncProgress(ctx context.Context) (prog *ethereum.SyncProgress, err error) {
-	return prog, c.withClient(func(ec *ethConn) error {
-		prog, err = ec.SyncProgress(ctx)
+	return prog, c.withClient(ctx, func(ec *ethConn) error {
+		prog, err = ec.client.SyncProgress(ctx)
 		return err
 	})
 }
 
 // blockNumber gets the chain length at the time of calling.
 func (c *rpcclient) blockNumber(ctx context.Context) (bn uint64, err error) {
-	return bn, c.withClient(func(ec *ethConn) error {
-		bn, err = ec.BlockNumber(ctx)
+	return bn, c.withClient(ctx, func(ec *ethConn) error {
+		bn, err = ec.client.BlockNumber(ctx)
 		return err
 	})
 }
@@ -250,12 +410,12 @@ func (c *rpcclient) blockNumber(ctx context.Context) (bn uint64, err error) {
 // swap gets a swap keyed by secretHash in the contract.
 func (c *rpcclient) swap(ctx context.Context, assetID uint32, secretHash [32]byte) (state *dexeth.SwapState, err error) {
 	if assetID == BipID {
-		return state, c.withClient(func(ec *ethConn) error {
+		return state, c.withClient(ctx, func(ec *ethConn) error {
 			state, err = ec.swapContract.Swap(ctx, secretHash)
 			return err
 		})
 	}
-	return state, c.withTokener(assetID, func(tkn *tokener) error {
+	return state, c.withTokener(ctx, assetID, func(tkn *tokener) error {
 		state, err = tkn.Swap(ctx, secretHash)
 		return err
 	})
@@ -264,8 +424,8 @@ func (c *rpcclient) swap(ctx context.Context, assetID uint32, secretHash [32]byt
 // transaction gets the transaction that hashes to hash from the chain or
 // mempool. Errors if tx does not exist.
 func (c *rpcclient) transaction(ctx context.Context, hash common.Hash) (tx *types.Transaction, isMempool bool, err error) {
-	return tx, isMempool, c.withClient(func(ec *ethConn) error {
-		tx, isMempool, err = ec.TransactionByHash(ctx, hash)
+	return tx, isMempool, c.withClient(ctx, func(ec *ethConn) error {
+		tx, isMempool, err = ec.client.TransactionByHash(ctx, hash)
 		return err
 	}, true) // stop on first provider with "not found", because this should be an error if tx does not exist
 }
@@ -274,7 +434,7 @@ func (c *rpcclient) transaction(ctx context.Context, hash common.Hash) (tx *type
 // transactions.
 func (c *rpcclient) dumbBalance(ctx context.Context, ec *ethConn, assetID uint32, addr common.Address) (bal *big.Int, err error) {
 	if assetID == BipID {
-		return ec.BalanceAt(ctx, addr, nil)
+		return ec.client.BalanceAt(ctx, addr, nil)
 	}
 	tkn := ec.tokens[assetID]
 	if tkn == nil {
@@ -305,7 +465,7 @@ func (c *rpcclient) smartBalance(ctx context.Context, ec *ethConn, assetID uint3
 	}
 
 	if assetID == BipID {
-		ethBalance, err := ec.BalanceAt(ctx, addr, big.NewInt(int64(tip)))
+		ethBalance, err := ec.client.BalanceAt(ctx, addr, big.NewInt(int64(tip)))
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +519,7 @@ func (c *rpcclient) smartBalance(ctx context.Context, ec *ethConn, assetID uint3
 // accountBalance gets the account balance. If txPool functions are supported by the
 // client, it will include the effects of unmined transactions, otherwise it will not.
 func (c *rpcclient) accountBalance(ctx context.Context, assetID uint32, addr common.Address) (bal *big.Int, err error) {
-	return bal, c.withClient(func(ec *ethConn) error {
+	return bal, c.withClient(ctx, func(ec *ethConn) error {
 		if ec.txPoolSupported {
 			bal, err = c.smartBalance(ctx, ec, assetID, addr)
 		} else {

@@ -187,7 +187,7 @@ func TestRPCRotation(t *testing.T) {
 
 	// Shut down the zeroth client and ensure the endpoint index is advanced.
 	cl := ethClient.clients[idx]
-	cl.Close()
+	cl.client.Close()
 
 	_, err = ethClient.bestHeader(ctx)
 	if err != nil {
