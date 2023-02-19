@@ -4036,6 +4036,10 @@ type compositeUTXO struct {
 	// TODO: consider including isDexChange bool for consumer
 }
 
+func (c *compositeUTXO) String() string {
+	return fmt.Sprintf("%f", c.rpc.Amount)
+}
+
 // parseUTXOs constructs and returns a list of compositeUTXOs from the provided
 // set of RPC utxos, including basic information required to spend each rpc utxo.
 // The returned list is sorted by ascending value.

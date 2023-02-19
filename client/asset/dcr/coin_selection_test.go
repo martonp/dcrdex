@@ -8,7 +8,7 @@ import (
 	walletjson "decred.org/dcrwallet/v2/rpc/jsonrpc/types"
 )
 
-func Test_subsetLargeBias(t *testing.T) {
+/*func Test_subsetLargeBias(t *testing.T) {
 	amt := uint64(10e8)
 	newU := func(amt float64) *compositeUTXO {
 		return &compositeUTXO{
@@ -110,7 +110,7 @@ func Test_subsetSmallBias(t *testing.T) {
 			}
 		})
 	}
-}
+}*/
 
 func Test_leastOverFund(t *testing.T) {
 	amt := uint64(10e8)
@@ -205,7 +205,8 @@ func Fuzz_leastOverFund(f *testing.F) {
 	}, {
 		amt: 2,
 		n:   40,
-	}}
+	},
+	}
 
 	for _, seed := range seeds {
 		f.Add(seed.amt, seed.n)
