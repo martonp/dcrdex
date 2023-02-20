@@ -190,22 +190,18 @@ func Test_leastOverFund(t *testing.T) {
 }
 
 func Fuzz_leastOverFund(f *testing.F) {
-	seeds := []struct {
+	type seed struct {
 		amt uint64
 		n   int
-	}{{
-		amt: 200,
-		n:   2,
-	}, {
-		amt: 20,
-		n:   1,
-	}, {
-		amt: 20,
-		n:   20,
-	}, {
-		amt: 2,
-		n:   40,
-	}}
+	}
+
+	seeds := make([]seed, 0, 40)
+	for i := 0; i < 100; i++ {
+		seeds = append(seeds, seed{
+			amt: uint64(rand.Intn(40)),
+			n:   rand.Intn(1000),
+		})
+	}
 
 	for _, seed := range seeds {
 		f.Add(seed.amt, seed.n)

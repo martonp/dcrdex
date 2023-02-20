@@ -4,6 +4,8 @@
 package dcr
 
 import (
+	"fmt"
+	"math/rand"
 	"sort"
 
 	"decred.org/dcrdex/dex/calc"
@@ -136,6 +138,58 @@ func subsetSmallBias(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
 	return set[idx:]
 }
 
+func subsetRandomSelection(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
+	best := uint64(1 << 62)
+	var bestIncluded *[]bool
+	bestNumIncluded := 0
+
+	iterations := 1000
+	for nRep := 0; nRep < iterations; nRep++ {
+		included := make([]bool, len(utxos))
+
+		var found bool
+		var nTotal uint64
+		var numIncluded int
+		for nPass := 0; nPass < 2 && !found; nPass++ {
+			for i := 0; i < len(utxos); i++ {
+				var use bool
+				if nPass == 0 {
+					use = rand.Uint32()&1 == 1
+				} else {
+					use = !included[i]
+				}
+				if use {
+					included[i] = true
+					numIncluded++
+					nTotal += toAtoms(utxos[i].rpc.Amount)
+					if nTotal >= amt {
+						if nTotal < best || (nTotal == best && numIncluded < bestNumIncluded) {
+							best = nTotal
+							bestIncluded = &included
+							bestNumIncluded = numIncluded
+							found = true
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if bestIncluded == nil {
+		return nil
+	}
+
+	set := make([]*compositeUTXO, 0, len(utxos))
+	for i, inc := range *bestIncluded {
+		if inc {
+			set = append(set, utxos[i])
+		}
+	}
+
+	return set
+}
+
 // leastOverFund attempts to pick a subset of the provided UTXOs to reach the
 // required amount with the objective of minimizing the total amount of the
 // selected UTXOs. This is different from the objective used when funding
@@ -179,6 +233,14 @@ func leastOverFund(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
 		set = subsetLargeBias(amt, small)
 		setX := subsetSmallBias(amt, small)
 		if sumUTXOs(setX) < sumUTXOs(set) {
+			set = setX
+		}
+		setX = subsetRandomSelection(amt, small)
+		nonRandom := sumUTXOs(set)
+		random := sumUTXOs(setX)
+		fmt.Println("nonRandom:", nonRandom, "random:", random)
+		if random < nonRandom {
+			fmt.Println("random selection was less")
 			set = setX
 		}
 	} else if single != nil {
