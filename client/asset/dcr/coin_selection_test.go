@@ -1,9 +1,11 @@
 package dcr
 
 import (
+	"fmt"
 	"math/rand"
 	"reflect"
 	"testing"
+	"time"
 
 	walletjson "decred.org/dcrwallet/v2/rpc/jsonrpc/types"
 )
@@ -95,7 +97,7 @@ func Fuzz_leastOverFund(f *testing.F) {
 	for i := 0; i < 100; i++ {
 		seeds = append(seeds, seed{
 			amt: uint64(rand.Intn(40)),
-			n:   rand.Intn(65000),
+			n:   rand.Intn(20000),
 		})
 	}
 
@@ -128,7 +130,11 @@ func Fuzz_leastOverFund(f *testing.F) {
 			}
 			utxos[i] = newU(v)
 		}
-		leastOverFund(amt*1e8, utxos)
+		startTime := time.Now()
+		shuffleRes := leastOverFundShuffle(amt*1e8, utxos)
+		fmt.Printf("shuffle time: %v with #utxo: %d\n", time.Since(startTime), len(utxos))
+		noShuffleRes := leastOverFundNoShuffle(amt*1e8, utxos)
+		fmt.Printf("shuffle is better: %v -- shuffle: %d, no shuffle %d\n", sumUTXOs(shuffleRes) < sumUTXOs(noShuffleRes), sumUTXOs(shuffleRes), sumUTXOs(noShuffleRes))
 	})
 }
 

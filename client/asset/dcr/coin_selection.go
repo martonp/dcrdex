@@ -72,23 +72,86 @@ func sumUTXOs(set []*compositeUTXO) (tot uint64) {
 	return tot
 }
 
-// subsetWithLeastSumGreaterThan attempts to select the subset of UTXOs with
-// the smallest total value greater than amt. It does this by making
-// 1000 random selections and returning the best one. Each selection
-// involves two passes over the UTXOs. The first pass randomly selects
-// each UTXO with 50% probability. Then, the second pass selects any
-// unused UTXOs until the total value is greater than or equal to amt.
-func subsetWithLeastSumGreaterThan(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
+func subsetWithLeastSumGreaterThanShuffle(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
 	best := uint64(1 << 62)
 	var bestIncluded []bool
 	bestNumIncluded := 0
 
-	rnd := rand.New(rand.NewSource(rand.Int63()))
+	rnd := rand.New(rand.NewSource(12345))
+
+	shuffledUTXOs := make([]*compositeUTXO, len(utxos))
+	copy(shuffledUTXOs, utxos)
+	rnd.Shuffle(len(shuffledUTXOs), func(i, j int) {
+		shuffledUTXOs[i], shuffledUTXOs[j] = shuffledUTXOs[j], shuffledUTXOs[i]
+	})
+
 	included := make([]bool, len(utxos))
 	const iterations = 1000
+
 	for nRep := 0; nRep < iterations; nRep++ {
 		var nTotal uint64
 		var numIncluded int
+
+		for nPass := 0; nPass < 2; nPass++ {
+			for i := 0; i < len(shuffledUTXOs); i++ {
+				var use bool
+				if nPass == 0 {
+					use = rnd.Int63()&1 == 1
+				} else {
+					use = !included[i]
+				}
+				if use {
+					included[i] = true
+					numIncluded++
+					nTotal += toAtoms(shuffledUTXOs[i].rpc.Amount)
+					if nTotal >= amt {
+						if nTotal < best || (nTotal == best && numIncluded < bestNumIncluded) {
+							best = nTotal
+							if bestIncluded == nil {
+								bestIncluded = make([]bool, len(utxos))
+							}
+							copy(bestIncluded, included)
+							bestNumIncluded = numIncluded
+						}
+						included[i] = false
+						nTotal -= toAtoms(shuffledUTXOs[i].rpc.Amount)
+						numIncluded--
+					}
+				}
+			}
+		}
+		for i := 0; i < len(included); i++ {
+			included[i] = false
+		}
+	}
+
+	if bestIncluded == nil {
+		return nil
+	}
+
+	set := make([]*compositeUTXO, 0, len(shuffledUTXOs))
+	for i, inc := range bestIncluded {
+		if inc {
+			set = append(set, shuffledUTXOs[i])
+		}
+	}
+
+	return set
+}
+
+func subsetWithLeastSumGreaterThanNoShuffle(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
+	best := uint64(1 << 62)
+	var bestIncluded []bool
+	bestNumIncluded := 0
+
+	rnd := rand.New(rand.NewSource(12345))
+	included := make([]bool, len(utxos))
+	const iterations = 1000
+
+	for nRep := 0; nRep < iterations; nRep++ {
+		var nTotal uint64
+		var numIncluded int
+
 	passes:
 		for nPass := 0; nPass < 2; nPass++ {
 			for i := 0; i < len(utxos); i++ {
@@ -153,7 +216,7 @@ func subsetWithLeastSumGreaterThan(amt uint64, utxos []*compositeUTXO) []*compos
 //
 // If the provided UTXO set has less combined value than the requested amount a
 // nil slice is returned.
-func leastOverFund(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
+func leastOverFundNoShuffle(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
 	if amt == 0 || sumUTXOs(utxos) < amt {
 		return nil
 	}
@@ -175,7 +238,41 @@ func leastOverFund(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
 	// Find a subset of the small UTXO set with smallest combined amount.
 	var set []*compositeUTXO
 	if sumUTXOs(small) >= amt {
-		set = subsetWithLeastSumGreaterThan(amt, small)
+		set = subsetWithLeastSumGreaterThanNoShuffle(amt, small)
+	} else if single != nil {
+		return []*compositeUTXO{single}
+	}
+
+	// Return the small UTXO subset if it is less than the single big UTXO.
+	if single != nil && toAtoms(single.rpc.Amount) < sumUTXOs(set) {
+		return []*compositeUTXO{single}
+	}
+	return set
+}
+
+func leastOverFundShuffle(amt uint64, utxos []*compositeUTXO) []*compositeUTXO {
+	if amt == 0 || sumUTXOs(utxos) < amt {
+		return nil
+	}
+
+	// Partition - smallest UTXO that is large enough to fully fund, and the set
+	// of smaller ones.
+	idx := sort.Search(len(utxos), func(i int) bool {
+		return toAtoms(utxos[i].rpc.Amount) >= amt
+	})
+	var small []*compositeUTXO
+	var single *compositeUTXO // only return this if smaller ones would use more
+	if idx == len(utxos) {    // no one is enough
+		small = utxos
+	} else {
+		small = utxos[:idx]
+		single = utxos[idx]
+	}
+
+	// Find a subset of the small UTXO set with smallest combined amount.
+	var set []*compositeUTXO
+	if sumUTXOs(small) >= amt {
+		set = subsetWithLeastSumGreaterThanShuffle(amt, small)
 	} else if single != nil {
 		return []*compositeUTXO{single}
 	}
