@@ -2476,10 +2476,22 @@ func (btc *baseWallet) fundsRequiredForMultiOrders(orders []*asset.MultiOrderVal
 // passed in.
 func (btc *baseWallet) fundMultiBestEffort(keep, maxLock uint64, values []*asset.MultiOrderValue,
 	maxFeeRate uint64, splitAllowed bool) ([]asset.Coins, [][]dex.Bytes, map[outPoint]*utxo, []*output, error) {
+
+	/*start := time.Now()
+	defer func() {
+		btc.log.Debugf("fundMultiBestEffort took %v", time.Since(start))
+	}()*/
+
 	utxos, _, avail, err := btc.spendableUTXOs(0)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error getting spendable utxos: %w", err)
 	}
+
+	/*btc.log.Debugf("fundMultiBestEffort: %d orders, %d UTXOs, %s available, keep = %s, maxLock = %s",
+		len(values), len(utxos), amount(avail), amount(keep), amount(maxLock))
+	for _, utxo := range utxos {
+		btc.log.Debugf("fundMultiBestEffort utxo amt %d", utxo.amount)
+	}*/
 
 	fundAllOrders := func() [][]*compositeUTXO {
 		indexToFundingCoins := make(map[int][]*compositeUTXO, len(values))
@@ -2570,6 +2582,15 @@ func (btc *baseWallet) fundMultiBestEffort(keep, maxLock uint64, values []*asset
 				redeemScripts[i][j] = output.redeemScript
 			}
 		}
+
+		/*btc.log.Debugf("fundMultiBestEffort: funded %d orders", len(allFundingUTXOs))
+		for i, fundingUTXOs := range allFundingUTXOs {
+			btc.log.Debugf("fundMultiBestEffort: order amount", values[i].Value)
+			for _, utxo := range fundingUTXOs {
+				btc.log.Debugf("fundMultiBestEffort: utxo amount", utxo.amount)
+			}
+		}*/
+
 		return
 	}
 
@@ -2578,6 +2599,7 @@ func (btc *baseWallet) fundMultiBestEffort(keep, maxLock uint64, values []*asset
 	// and continuing until all orders are funded.
 	allFundingUTXOs := fundAllOrders()
 	if allFundingUTXOs != nil {
+		// btc.log.Debugf("fundMultiBestEffort: able to fund all orders without splitting")
 		return returnValues(allFundingUTXOs)
 	}
 
@@ -2588,6 +2610,7 @@ func (btc *baseWallet) fundMultiBestEffort(keep, maxLock uint64, values []*asset
 	// If could not fully fund, fund as much as possible in the priority
 	// order.
 	allFundingUTXOs = fundInOrder(values)
+	// btc.log.Debugf("fundMultiBestEffort: only funded %d/%d orders", len(allFundingUTXOs), len(values))
 	return returnValues(allFundingUTXOs)
 }
 
@@ -2638,6 +2661,12 @@ func (btc *baseWallet) fundMultiSplitTx(orders []*asset.MultiOrderValue, utxos [
 // one output for each order, and submits it to the network.
 func (btc *baseWallet) submitMultiSplitTx(fundingCoins asset.Coins, spents []*output, orders []*asset.MultiOrderValue,
 	maxFeeRate, splitTxFeeRate, splitBuffer uint64) ([]asset.Coins, uint64, error) {
+
+	start := time.Now()
+	defer func() {
+		btc.log.Debugf("submitMultiSplitTx took %v", time.Since(start))
+	}()
+
 	baseTx, totalIn, _, err := btc.fundedTx(fundingCoins)
 	if err != nil {
 		return nil, 0, err
@@ -2707,6 +2736,11 @@ func (btc *baseWallet) submitMultiSplitTx(fundingCoins asset.Coins, spents []*ou
 // without a split transaction.
 func (btc *baseWallet) fundMultiWithSplit(keep, maxLock uint64, values []*asset.MultiOrderValue,
 	splitTxFeeRate, maxFeeRate, splitBuffer uint64) ([]asset.Coins, [][]dex.Bytes, uint64, error) {
+	start := time.Now()
+	defer func() {
+		btc.log.Debugf("fundMultiWithSplit took %v", time.Since(start))
+	}()
+
 	utxos, _, avail, err := btc.spendableUTXOs(0)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("error getting spendable utxos: %w", err)
@@ -2787,6 +2821,8 @@ func (btc *baseWallet) fundMultiWithSplit(keep, maxLock uint64, values []*asset.
 		}
 	}
 
+	btc.log.Debugf("fundMultiWithSplit: funded %d/%d orders with split transaction", len(remainingOrders), len(values))
+
 	coins := make([]asset.Coins, len(values))
 	redeemScripts := make([][]dex.Bytes, len(values))
 	spents := make([]*output, 0, len(values))
@@ -2795,9 +2831,11 @@ func (btc *baseWallet) fundMultiWithSplit(keep, maxLock uint64, values []*asset.
 
 	for i := range values {
 		if fundingUTXOs, ok := indexToFundingCoins[i]; ok {
+			btc.log.Debugf("fundMultiWithSplit: funded amt %d without split", values[i].Value)
 			coins[i] = make(asset.Coins, len(fundingUTXOs))
 			redeemScripts[i] = make([]dex.Bytes, len(fundingUTXOs))
 			for j, unspent := range fundingUTXOs {
+				btc.log.Debugf("    fundMultiWithSplit: utxo amount", unspent.amount)
 				output := newOutput(unspent.txHash, unspent.vout, unspent.amount)
 				btc.fundingCoins[output.pt] = &utxo{
 					txHash:  unspent.txHash,
@@ -2810,6 +2848,8 @@ func (btc *baseWallet) fundMultiWithSplit(keep, maxLock uint64, values []*asset.
 				redeemScripts[i][j] = unspent.redeemScript
 			}
 		} else {
+			btc.log.Debugf("fundMultiWithSplit: funded amt %d with split", values[i].Value)
+			btc.log.Debugf("	fundMultiWithSplit: split output amt %d", splitOutputCoins[splitIndex][0].Value())
 			coins[i] = splitOutputCoins[splitIndex]
 			redeemScripts[i] = []dex.Bytes{nil}
 			splitIndex++
@@ -2830,6 +2870,11 @@ func (btc *baseWallet) fundMulti(maxLock uint64, values []*asset.MultiOrderValue
 	defer btc.fundingMtx.Unlock()
 
 	reserves := btc.reserves()
+
+	btc.log.Debugf("fundMulti ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+	for _, value := range values {
+		btc.log.Debugf("fundMulti: %d", value.Value)
+	}
 
 	coins, redeemScripts, fundingCoins, spents, err := btc.fundMultiBestEffort(reserves, maxLock, values, maxFeeRate, allowSplit)
 	if err != nil {
@@ -6019,13 +6064,12 @@ func (btc *baseWallet) FundMultiOrder(mo *asset.MultiOrder, maxLock uint64) ([]a
 			bal.Available, totalRequiredForOrders)
 	}
 
+	var useSplit bool
+	var splitBuffer uint64
 	customCfg, err := decodeFundMultiOptions(mo.Options)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("error decoding options: %w", err)
 	}
-
-	var useSplit bool
-	var splitBuffer uint64
 	if customCfg.Split != nil {
 		useSplit = *customCfg.Split
 	}
