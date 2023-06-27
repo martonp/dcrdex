@@ -1292,11 +1292,12 @@ func (w *baseWallet) MaxFundingFees(_ uint32, _ map[string]string) uint64 {
 }
 
 // SingleLotSwapFees returns the fees for a swap transaction for a single lot.
-func (w *assetWallet) SingleLotSwapFees(version uint32, feeSuggestion uint64, _ map[string]string) (fees uint64, err error) {
+func (w *assetWallet) SingleLotSwapFees(version uint32, feeSuggestion uint64, _ bool) (fees uint64, err error) {
 	g := w.gases(version)
 	if g == nil {
 		return 0, fmt.Errorf("no gases known for %d version %d", w.assetID, version)
 	}
+
 	return g.Swap * feeSuggestion, nil
 }
 
@@ -1361,11 +1362,12 @@ func (w *assetWallet) PreRedeem(req *asset.PreRedeemForm) (*asset.PreRedeem, err
 }
 
 // SingleLotRedeemFees returns the fees for a redeem transaction for a single lot.
-func (w *assetWallet) SingleLotRedeemFees(version uint32, feeSuggestion uint64, options map[string]string) (fees uint64, err error) {
+func (w *assetWallet) SingleLotRedeemFees(version uint32, feeSuggestion uint64) (fees uint64, err error) {
 	g := w.gases(version)
 	if g == nil {
 		return 0, fmt.Errorf("no gases known for %d version %d", w.assetID, version)
 	}
+
 	return g.Redeem * feeSuggestion, nil
 }
 
@@ -3373,6 +3375,8 @@ func (eth *baseWallet) FeeRate() uint64 {
 		eth.log.Errorf("Error getting net fee state: %v", err)
 		return 0
 	}
+
+	eth.log.Infof("Got ETH fee rate: %v\n", feeRate)
 
 	feeRateGwei, err := dexeth.WeiToGweiUint64(feeRate)
 	if err != nil {
