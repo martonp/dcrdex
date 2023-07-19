@@ -1561,15 +1561,102 @@ func (s *WebServer) apiMMDecisionInfo(w http.ResponseWriter, r *http.Request) {
 	info, err := s.mm.DecisionInfo(cfg)
 	if err != nil {
 		s.writeAPIError(w, fmt.Errorf("error getting decision info: %w", err))
-		return
 	}
-
 	writeJSON(w, &struct {
 		OK   bool        `json:"ok"`
 		Info interface{} `json:"info"`
 	}{
 		OK:   true,
 		Info: info,
+	}, s.indent)
+}
+
+func (s *WebServer) apiRunOverview(w http.ResponseWriter, r *http.Request) {
+	form := &struct {
+		RunID int64 `json:"runID"`
+	}{}
+	if !readPost(w, r, form) {
+		return
+	}
+	overviews, err := s.mm.RunOverviews(form.RunID)
+	if err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting markets in archived run: %w", err))
+		return
+	}
+	writeJSON(w, &struct {
+		OK      bool                       `json:"ok"`
+		Markets map[string]*mm.RunOverview `json:"markets"`
+	}{
+		OK:      true,
+		Markets: overviews,
+	}, s.indent)
+}
+
+func (s *WebServer) apiArchivedBotCfg(w http.ResponseWriter, r *http.Request) {
+	form := &struct {
+		BaseID    uint32 `json:"baseID"`
+		QuoteID   uint32 `json:"quoteID"`
+		Host      string `json:"host"`
+		StartTime int64  `json:"startTime"`
+	}{}
+	if !readPost(w, r, form) {
+		return
+	}
+	cfg, err := s.mm.RunConfig(form.StartTime, form.Host, form.BaseID, form.QuoteID)
+	if err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting bot logs: %w", err))
+		return
+	}
+
+	writeJSON(w, &struct {
+		OK  bool          `json:"ok"`
+		Cfg *mm.BotConfig `json:"cfg"`
+	}{
+		OK:  true,
+		Cfg: cfg,
+	}, s.indent)
+}
+
+func (s *WebServer) apiArchivedMMRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.mm.AllArchivedRuns()
+	if err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting archived mm runs: %w", err))
+		return
+	}
+
+	writeJSON(w, &struct {
+		OK   bool    `json:"ok"`
+		Runs []int64 `json:"runs"`
+	}{
+		OK:   true,
+		Runs: runs,
+	}, s.indent)
+}
+
+func (s *WebServer) apiBotLogs(w http.ResponseWriter, r *http.Request) {
+	form := &struct {
+		BaseID    uint32 `json:"baseID"`
+		QuoteID   uint32 `json:"quoteID"`
+		Host      string `json:"host"`
+		StartTime *int64 `json:"startTime,omitempty"` // for historical logs
+	}{}
+	if !readPost(w, r, form) {
+		return
+	}
+	events, stats, err := s.mm.BotLogs(form.Host, form.BaseID, form.QuoteID, form.StartTime)
+	if err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting bot logs: %w", err))
+		return
+	}
+
+	writeJSON(w, &struct {
+		OK     bool         `json:"ok"`
+		Events []*mm.Event  `json:"events"`
+		Stats  *mm.RunStats `json:"stats"`
+	}{
+		OK:     true,
+		Events: events,
+		Stats:  stats,
 	}, s.indent)
 }
 
@@ -1824,16 +1911,12 @@ func (s *WebServer) apiRemoveMarketMakingConfig(w http.ResponseWriter, r *http.R
 }
 
 func (s *WebServer) apiMarketMakingStatus(w http.ResponseWriter, r *http.Request) {
-	running := s.mm.Running()
-	runningBots := s.mm.RunningBots()
 	writeJSON(w, &struct {
-		OK          bool                 `json:"ok"`
-		Running     bool                 `json:"running"`
-		RunningBots []*mm.MarketWithHost `json:"runningBots"`
+		OK     bool       `json:"ok"`
+		Status *mm.Status `json:"status"`
 	}{
-		OK:          true,
-		Running:     running,
-		RunningBots: runningBots,
+		OK:     true,
+		Status: s.mm.Status(),
 	}, s.indent)
 }
 

@@ -342,15 +342,74 @@ export interface SpotPriceNote extends CoreNote {
   spots: Record<string, Spot>
 }
 
-export interface BotStartStopNote extends CoreNote {
+export interface MMStatus {
+  running: boolean
+  runStart: number
+  bots?: BotStatus[]
+}
+
+export interface MMStatusNote extends CoreNote {
+  running: boolean
+  runStart: number
+  bots?: BotStatus[]
+}
+
+export interface BotBalance {
+  available: number
+  fundingOrder: number
+  pendingRedeem: number
+  pendingRefund: number
+}
+
+export interface RunStats {
+  baseChange: number
+  quoteChange: number
+  baseFees: number
+  quoteFees: number
+  fiatGainLoss: number
+}
+
+export interface RunOverview {
+  config: BotConfig
+  stats: RunStats
+}
+
+export interface BotEvent {
+  type: string
+  timeStamp: number
+  orderIDs: string[]
+  matchID: string
+  fundingTxID: string
+  baseDelta: number
+  quoteDelta: number
+  baseFees: number
+  quoteFees: number
+}
+
+export interface BotStatus {
   host: string
   base: number
   quote: number
   running: boolean
+  baseChange: number
+  quoteChange: number
+  baseFees: number
+  quoteFees: number
+  fiatGainLoss: number
+  baseBalance: BotBalance
+  quoteBalance: BotBalance
 }
 
-export interface MMStartStopNote extends CoreNote {
-  running: boolean
+export interface BotStatusNote extends CoreNote {
+  status: BotStatus
+}
+
+export interface BotEventNote extends CoreNote {
+  host: string
+  base: number
+  quote: number
+  event: BotEvent
+  stats: RunStats
 }
 
 export interface MakerProgram {
@@ -620,11 +679,6 @@ export interface MarketWithHost {
   quote: number
 }
 
-export interface MarketMakingStatus {
-  running: boolean
-  runningBots: MarketWithHost[]
-}
-
 export interface OracleReport {
   host: string
   usdVol: number
@@ -693,10 +747,11 @@ export interface Application {
   checkResponse (resp: APIResponse): boolean
   signOut (): Promise<void>
   registerNoteFeeder (receivers: Record<string, (n: CoreNote) => void>): void
-  getMarketMakingStatus (): Promise<MarketMakingStatus>
+  getMarketMakingStatus (): Promise<MMStatus>
   startMarketMaking (pw: string): Promise<void>
   stopMarketMaking (): Promise<void>
-  getMarketMakingConfig (): Promise<BotConfig[]>
+  getAllMarketMakingConfig (): Promise<BotConfig[]>
+  getMarketMakingConfig (host: string, baseAsset: number, quoteAsset: number): Promise<BotConfig|undefined>
   updateMarketMakingConfig (cfg: BotConfig): Promise<void>
   removeMarketMakingConfig (cfg: BotConfig): Promise<void>
   setMarketMakingEnabled (host: string, baseAsset: number, quoteAsset: number, enabled: boolean): void

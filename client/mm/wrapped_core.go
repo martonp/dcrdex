@@ -96,6 +96,8 @@ func (c *wrappedCore) Trade(pw []byte, form *core.TradeForm) (*core.Order, error
 		fundingFees = o.FeesPaid.Funding
 	}
 
+	c.mm.logOrdersPlaced(c.botID, []dex.Bytes{orderID[:]}, &core.FundingTx{Fees: fundingFees}, form.Sell)
+
 	balMods := []*balanceMod{
 		{false, fromAsset, balTypeAvailable, o.LockedAmt + fundingFees},
 		{true, fromAsset, balTypeFundingOrder, o.LockedAmt + fundingFees},
@@ -140,12 +142,19 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 		fromAsset = form.Base
 		toAsset = form.Quote
 	}
-	form.MaxLock = c.mm.botBalance(c.botID, fromAsset)
+	form.MaxLock = c.mm.botAvailableBalance(c.botID, fromAsset)
 
 	orders, fundingTx, err := c.core.MultiTrade(pw, form)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	orderIDs := make([]dex.Bytes, 0, len(orders))
+	for _, o := range orders {
+		orderIDs = append(orderIDs, o.ID[:])
+	}
+
+	c.mm.logOrdersPlaced(c.botID, orderIDs, fundingTx, form.Sell)
 
 	var totalFromLocked, totalToLocked, fundingFeesPaid uint64
 	for _, o := range orders {
@@ -188,8 +197,8 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 }
 
 func (c *wrappedCore) maxBuyQty(host string, base, quote uint32, rate uint64, options map[string]string) (uint64, error) {
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
+	baseBalance := c.mm.botAvailableBalance(c.botID, base)
+	quoteBalance := c.mm.botAvailableBalance(c.botID, quote)
 
 	mkt, err := c.core.ExchangeMarket(host, base, quote)
 	if err != nil {
@@ -262,8 +271,8 @@ func (c *wrappedCore) MaxBuy(host string, base, quote uint32, rate uint64) (*cor
 }
 
 func (c *wrappedCore) maxSellQty(host string, base, quote uint32, options map[string]string) (uint64, error) {
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
+	baseBalance := c.mm.botAvailableBalance(c.botID, base)
+	quoteBalance := c.mm.botAvailableBalance(c.botID, quote)
 
 	mkt, err := c.core.ExchangeMarket(host, base, quote)
 	if err != nil {
@@ -329,7 +338,7 @@ func (c *wrappedCore) MaxSell(host string, base, quote uint32) (*core.MaxOrderEs
 
 // AssetBalance returns the bot's balance for a specific asset.
 func (c *wrappedCore) AssetBalance(assetID uint32) (*core.WalletBalance, error) {
-	bal := c.mm.botBalance(c.botID, assetID)
+	bal := c.mm.botAvailableBalance(c.botID, assetID)
 
 	return &core.WalletBalance{
 		Balance: &db.Balance{
@@ -372,8 +381,8 @@ func (c *wrappedCore) sufficientBalanceForTrades(host string, base, quote uint32
 		return maxQty >= totalQty, nil
 	}
 
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
+	baseBalance := c.mm.botAvailableBalance(c.botID, base)
+	quoteBalance := c.mm.botAvailableBalance(c.botID, quote)
 
 	mkt, err := c.core.ExchangeMarket(host, base, quote)
 	if err != nil {

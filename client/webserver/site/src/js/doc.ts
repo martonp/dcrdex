@@ -307,9 +307,22 @@ export default class Doc {
     return fullPrecisionFormatter(prec).format(value)
   }
 
+  static formatFiatValue (value: number): string {
+    return fullPrecisionFormatter(2).format(value)
+  }
+
   static conventionalRateStep (rateStepEnc: number, baseUnitInfo: UnitInfo, quoteUnitInfo: UnitInfo) {
     const [qFactor, bFactor] = [quoteUnitInfo.conventional.conversionFactor, baseUnitInfo.conventional.conversionFactor]
     return rateStepEnc / RateEncodingFactor * (bFactor / qFactor)
+  }
+
+  static parseMarketWithHost (marketWithHost: string): [string, number, number] {
+    const [host, base, quote] = marketWithHost.split('-')
+    return [host, parseInt(base), parseInt(quote)]
+  }
+
+  static marketWithHostID (host: string, base: number, quote: number): string {
+    return `${host}-${base}-${quote}`
   }
 
   /*

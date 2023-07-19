@@ -89,6 +89,7 @@ const (
 	RPCWalletDefinitionError             // 71
 	RPCStartMarketMakingError            // 72
 	RPCStopMarketMakingError             // 73
+	RPCMarketMakingLogError              // 74
 )
 
 // Routes are destinations for a "payload" of data. The type of data being

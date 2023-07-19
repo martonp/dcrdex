@@ -442,6 +442,8 @@ func New(cfg *Config) (*WebServer, error) {
 					webAuth.Get(homeRoute, s.handleHome)
 					webAuth.Get(marketsRoute, s.handleMarkets)
 					webAuth.Get(mmSettingsRoute, s.handleMMSettings)
+					webAuth.Get(mmLogsRoute, s.handleMMLogs)
+					webAuth.Get(mmArchivesRoute, s.handleMMArchives)
 					webAuth.Get(marketMakerRoute, s.handleMarketMaking)
 					webAuth.With(dexHostCtx).Get("/dexsettings/{host}", s.handleDexSettings)
 				})
@@ -532,6 +534,10 @@ func New(cfg *Config) (*WebServer, error) {
 			apiAuth.Get("/marketmakingstatus", s.apiMarketMakingStatus)
 			apiAuth.Post("/marketreport", s.apiMarketReport)
 			apiAuth.Post("/mmdecisioninfo", s.apiMMDecisionInfo)
+			apiAuth.Post("/botlogs", s.apiBotLogs)
+			apiAuth.Post("/archivedbotcfg", s.apiArchivedBotCfg)
+			apiAuth.Get("/archivedmmruns", s.apiArchivedMMRuns)
+			apiAuth.Post("/runoverview", s.apiRunOverview)
 		})
 	})
 
@@ -592,7 +598,9 @@ func (s *WebServer) buildTemplates(lang, siteDir string) error {
 		addTemplate("dexsettings", bb, "forms").
 		addTemplate("init", bb).
 		addTemplate("mm", bb, "forms").
-		addTemplate("mmsettings", bb, "forms")
+		addTemplate("mmsettings", bb, "forms").
+		addTemplate("mmlogs", bb).
+		addTemplate("mmarchives", bb)
 
 	return s.html.buildErr()
 }

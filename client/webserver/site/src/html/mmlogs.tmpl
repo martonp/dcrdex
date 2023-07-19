@@ -1,0 +1,62 @@
+{{define "mmlogs"}}
+{{template "top" .}}
+<div id="main" data-handler="mmlogs" class="main mmlogs w-100 overflow-y-auto">
+  <div class="px-5 py-3 w-100">
+    <div class="flex-center fs28 text-break">[[[market_maker_logs]]]</div>
+    <div class="flex-center fs20 text-break">
+      <img id="baseLogo"><img id="quoteLogo"><span id="baseHeader"></span>-<span id="quoteHeader"></span>  @  <span id="hostHeader"></span>
+    </div>
+    <div id="runTime" class="flex-center fs20 text-break d-hide"></div>
+    <div class="d-flex flex-wrap">
+      <div class="order-datum">
+        <div>[[[base_change]]]</div>
+        <div><span id="baseChange"></span> <img id="baseChangeLogo"></div>
+      </div>
+      <div class="order-datum">
+        <div>[[[quote_change]]]</div>
+        <div><span id="quoteChange"></span> <img id="quoteChangeLogo"></div>
+      </div>
+      <div class="order-datum">
+        <div>[[[base_fees]]]</div>
+        <div><span id="baseFees"></span> <img id="baseFeesLogo"></div>
+      </div>
+      <div class="order-datum">
+        <div>[[[quote_fees]]]</div>
+        <div><span id="quoteFees"></span> <img id="quoteFeesLogo"></div>
+      </div>
+      <div class="order-datum">
+        <div>[[[profit]]]</div>
+        <div id="profit"></div>
+      </div>
+    </div>
+
+    <table id="eventsTable">
+      <thead>
+        <th scope="col">Type</th>
+        <th scope="col">Time</th>
+        <th scope="col">Order ID(s)</th>
+        <th scope="col">Match ID</th>
+        <th scope="col">Funding Tx ID</th>
+        <th scope="col">Base Delta</th>
+        <th scope="col">Quote Delta</th>
+        <th scope="col">Base Fees</th>
+        <th scope="col">Quote Fees</th>
+      </thead>
+      <tbody id="eventsTableBody">
+        <tr id="eventTableRowTmpl">
+          <td data-tmpl="eventType"></td>
+          <td data-tmpl="time"></td>
+          <td data-tmpl="orderIDs"></td>
+          <td data-tmpl="matchID"></td>
+          <td data-tmpl="fundingTxID"></td>
+          <td data-tmpl="baseDelta"></td>
+          <td data-tmpl="quoteDelta"></td>
+          <td data-tmpl="baseFees"></td>
+          <td data-tmpl="quoteFees"></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "bottom"}}
+{{end}}

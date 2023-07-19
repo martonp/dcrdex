@@ -119,6 +119,12 @@ type LogConfig struct {
 	LocalLogs  bool   `long:"loglocal" description:"Use local time zone time stamps in log entries."`
 }
 
+// MMConfig encapsulates the settings related to market making.
+type MMConfig struct {
+	EventLogDBPath string `long:"eventlogdb" description:"Event log database filepath. Database will be created if it does not exist."`
+	MMConfigPath   string `long:"mmconfig" description:"Market making configuration filepath. File will be created if it does not exist."`
+}
+
 // Config is the common application configuration definition. This composite
 // struct captures the configuration needed for core and both web and rpc
 // servers, as well as some application-level directives.
@@ -127,6 +133,7 @@ type Config struct {
 	RPCConfig
 	WebConfig
 	LogConfig
+	MMConfig
 	// AppData and ConfigPath should be parsed from the command-line,
 	// as it makes no sense to set these in the config file itself. If no values
 	// are assigned, defaults will be used.
@@ -164,12 +171,10 @@ func (cfg *Config) Web(c *core.Core, mm *mm.MarketMaker, log dex.Logger, utc boo
 		keyFile = filepath.Join(cfg.AppData, "web.key")
 	}
 
-	_, _, mmCfgPath := setNet(cfg.AppData, cfg.Net.String())
-
 	return &webserver.Config{
 		Core:          c,
 		MarketMaker:   mm,
-		MMCfgPath:     mmCfgPath,
+		MMCfgPath:     cfg.MMConfigPath,
 		Addr:          cfg.WebAddr,
 		CustomSiteDir: cfg.SiteDir,
 		Logger:        log,
@@ -285,17 +290,17 @@ func ResolveConfig(appData string, cfg *Config) error {
 
 	cfg.AppData = appData
 
-	var defaultDBPath, defaultLogPath string
+	var defaultDBPath, defaultLogPath, defaultMMEventLogDBPath, defaultMMCfgFile string
 	switch {
 	case cfg.Testnet:
 		cfg.Net = dex.Testnet
-		defaultDBPath, defaultLogPath, _ = setNet(appData, "testnet")
+		defaultDBPath, defaultLogPath, defaultMMEventLogDBPath, defaultMMCfgFile = setNet(appData, "testnet")
 	case cfg.Simnet:
 		cfg.Net = dex.Simnet
-		defaultDBPath, defaultLogPath, _ = setNet(appData, "simnet")
+		defaultDBPath, defaultLogPath, defaultMMEventLogDBPath, defaultMMCfgFile = setNet(appData, "simnet")
 	default:
 		cfg.Net = dex.Mainnet
-		defaultDBPath, defaultLogPath, _ = setNet(appData, "mainnet")
+		defaultDBPath, defaultLogPath, defaultMMEventLogDBPath, defaultMMCfgFile = setNet(appData, "mainnet")
 	}
 	defaultHost := DefaultHostByNetwork(cfg.Net)
 
@@ -329,6 +334,14 @@ func ResolveConfig(appData string, cfg *Config) error {
 		cfg.NoEmbedSite = cfg.ReloadHTML
 	}
 
+	if cfg.MMConfigPath == "" {
+		cfg.MMConfigPath = defaultMMCfgFile
+	}
+
+	if cfg.EventLogDBPath == "" {
+		cfg.EventLogDBPath = defaultMMEventLogDBPath
+	}
+
 	return nil
 }
 
@@ -336,10 +349,11 @@ func ResolveConfig(appData string, cfg *Config) error {
 // files. It returns a suggested path for the database file and a log file. If
 // using a file rotator, the directory of the log filepath as parsed  by
 // filepath.Dir is suitable for use.
-func setNet(applicationDirectory, net string) (dbPath, logPath, mmCfgPath string) {
+func setNet(applicationDirectory, net string) (dbPath, logPath, mmEventLogDBPath, mmCfgPath string) {
 	netDirectory := filepath.Join(applicationDirectory, net)
 	logDirectory := filepath.Join(netDirectory, "logs")
 	logFilename := filepath.Join(logDirectory, "dexc.log")
+	mmEventLogDBPath = filepath.Join(netDirectory, "mm_eventlog.db")
 	mmCfgFilename := filepath.Join(netDirectory, "mm_cfg.json")
 	err := os.MkdirAll(netDirectory, 0700)
 	if err != nil {
@@ -351,7 +365,7 @@ func setNet(applicationDirectory, net string) (dbPath, logPath, mmCfgPath string
 		fmt.Fprintf(os.Stderr, "failed to create log directory: %v\n", err)
 		os.Exit(1)
 	}
-	return filepath.Join(netDirectory, "dexc.db"), logFilename, mmCfgFilename
+	return filepath.Join(netDirectory, "dexc.db"), logFilename, mmEventLogDBPath, mmCfgFilename
 }
 
 // DefaultHostByNetwork accepts configured network and returns the network

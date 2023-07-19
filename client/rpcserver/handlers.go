@@ -54,6 +54,7 @@ const (
 	notificationsRoute         = "notifications"
 	startMarketMakingRoute     = "startmarketmaking"
 	stopMarketMakingRoute      = "stopmarketmaking"
+	marketMakingStatusRoute    = "marketmakingstatus"
 	multiTradeRoute            = "multitrade"
 )
 
@@ -119,6 +120,7 @@ var routes = map[string]func(s *RPCServer, params *RawParams) *msgjson.ResponseP
 	notificationsRoute:         handleNotificationsRoute,
 	startMarketMakingRoute:     handleStartMarketMakingRoute,
 	stopMarketMakingRoute:      handleStopMarketMakingRoute,
+	marketMakingStatusRoute:    handleMarketMakingStatusRoute,
 	multiTradeRoute:            handleMultiTrade,
 }
 
@@ -952,6 +954,10 @@ func handleStopMarketMakingRoute(s *RPCServer, params *RawParams) *msgjson.Respo
 	}
 	s.mm.Stop()
 	return createResponse(stopMarketMakingRoute, "stopped market making", nil)
+}
+
+func handleMarketMakingStatusRoute(s *RPCServer, params *RawParams) *msgjson.ResponsePayload {
+	return createResponse(marketMakingStatusRoute, s.mm.BotStatuses(), nil)
 }
 
 // format concatenates thing and tail. If thing is empty, returns an empty

@@ -1,4 +1,10 @@
 #main.mm {
+  #ctrlButtons {
+    @extend .d-flex;
+
+    justify-content: space-between;
+  }
+
   .asset-select {
     .asset-row .ico-arrowdown {
       display: inline;
@@ -147,52 +153,26 @@
     }
   }
 
-  #createBox,
-  #programsBox {
-    .edit-show {
-      display: none;
-    }
-
-    .edit-hide {
-      display: block;
-    }
-
-    .edit-hide-flex {
-      display: flex;
-    }
-
-    .orange {
-      color: orange;
-    }
-
-    &.edit {
-      .edit-show {
-        display: block;
-      }
-
-      .edit-hide,
-      .edit-hide-flex {
-        display: none !important;
-      }
-
-      #botCreator {
-        border: 1px solid orange;
-      }
-
-      .running-program {
-        outline: solid 2px orange;
-      }
-    }
-  }
-
-  #startErr,
-  #createErr {
-    max-width: 300px;
-  }
-
   #botTable {
     @extend .table; 
     @extend .table-striped; 
+
+    .balance-layover {
+      background-color: #777;
+      z-index: 99;
+      position: absolute;
+      padding: 4px;
+      border-radius: 3px;
+      border-color: #242424;
+    }
+
+    .profit-color {
+      color: $buycolor_light;
+    }
+
+    .loss-color {
+      color: $sellcolor_light;
+    }
   
     img {
       width: 16px;
@@ -228,5 +208,13 @@ body.dark #main.mm {
 
   #botTable {
     @extend .table-dark;
+
+    .profit-color {
+      color: $buycolor_dark;
+    }
+
+    .loss-color {
+      color: $sellcolor_dark;
+    }
   }
 }

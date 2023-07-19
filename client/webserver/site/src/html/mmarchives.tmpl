@@ -1,0 +1,59 @@
+{{define "mmarchives"}}
+{{template "top" .}}
+<div id="main" data-handler="mmarchives" class="main mmarchives w-100 overflow-y-auto">
+  <div class="px-5 py-3 w-100">
+    <div class="flex-center fs28 text-break">[[[past_mm_runs]]]</div>
+    <div class="d-flex">
+      <select class="form-select" id="runSelect">
+      </select>
+      <button type="button" class="fs20 mx-3 px-2 selected" id="loadRunBtn">[[[load_logs]]]</button>
+    </div>
+    <table id="runTable" class="d-hide my-3">
+      <thead>
+        <th scope="col">[[[Host]]]</th>
+        <th scope="col">[[[Market]]]</th>
+        <th scope="col">[[[bot_type]]]</th>
+        <th scope="col">[[[base_change]]]</th>
+        <th scope="col">[[[quote_change]]]</th>
+        <th scope="col">[[[base_fees]]]</th>
+        <th scope="col">[[[quote_fees]]]</th>
+        <th scope="col">[[[profit]]]</th>
+        <th scope="col">[[[logs]]]</th>
+        <th scope="col">[[[Settings]]]</th>
+      </thead>
+      <tbody id="runTableBody">
+        <tr id="runTableRowTmpl">
+          <td data-tmpl="host"></td>
+          <td>
+            <img data-tmpl="baseMktLogo">
+            <span data-tmpl="baseSymbol"></span> - 
+            <img data-tmpl="quoteMktLogo">
+            <span data-tmpl="quoteSymbol"></span>
+          </td>
+          <td data-tmpl="botType"></td>
+          <td>
+            <img data-tmpl="baseChangeLogo">
+            <span data-tmpl="baseChange"></span>
+          </td>
+          <td>
+            <img data-tmpl="quoteChangeLogo">
+            <span data-tmpl="quoteChange"></span>
+          </td>
+          <td>
+            <img data-tmpl="baseFeesLogo">
+            <span data-tmpl="baseFees"></span>
+          </td>
+          <td>
+            <img data-tmpl="quoteFeesLogo">
+            <span data-tmpl="quoteFees"></span>
+          </td>
+          <td data-tmpl="profit"></td>
+          <td><button data-tmpl="logsBtn">[[[view_logs]]]</button></td>
+          <td><span class="ico-settings fs20 pointer mx-2" data-tmpl="settings"></span></td>        
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{{template "bottom"}}
+{{end}}
