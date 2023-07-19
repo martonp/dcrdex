@@ -109,13 +109,13 @@ func (c *wrappedCore) Trade(pw []byte, form *core.TradeForm) (*core.Order, error
 	return o, nil
 }
 
-func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error) {
+func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, *core.FundingTx, error) {
 	enough, err := c.sufficientBalanceForTrades(form.Host, form.Base, form.Quote, form.Sell, form.Placements, form.Options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !enough {
-		return nil, fmt.Errorf("insufficient balance")
+		return nil, nil, fmt.Errorf("insufficient balance")
 	}
 
 	singleLotSwapFees, singleLotRedeemFees, err := c.core.SingleLotFees(&core.SingleLotFeesForm{
@@ -126,12 +126,12 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 		UseMaxFeeRate: true,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	mkt, err := c.core.ExchangeMarket(form.Host, form.Base, form.Quote)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	fromAsset := form.Quote
@@ -142,9 +142,9 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 	}
 	form.MaxLock = c.mm.botBalance(c.botID, fromAsset)
 
-	orders, err := c.core.MultiTrade(pw, form)
+	orders, fundingTx, err := c.core.MultiTrade(pw, form)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var totalFromLocked, totalToLocked, fundingFeesPaid uint64
@@ -184,7 +184,7 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 	}
 	c.mm.modifyBotBalance(c.botID, balMods)
 
-	return orders, nil
+	return orders, fundingTx, nil
 }
 
 func (c *wrappedCore) maxBuyQty(host string, base, quote uint32, rate uint64, options map[string]string) (uint64, error) {

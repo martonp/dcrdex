@@ -5700,10 +5700,10 @@ func (c *Core) PreOrder(form *TradeForm) (*OrderEstimate, error) {
 
 // MultiTrade is used to place multiple standing limit orders on the same
 // side of the same market simultaneously.
-func (c *Core) MultiTrade(pw []byte, form *MultiTradeForm) ([]*Order, error) {
-	reqs, err := c.prepareMultiTradeRequests(pw, form)
+func (c *Core) MultiTrade(pw []byte, form *MultiTradeForm) ([]*Order, *FundingTx, error) {
+	reqs, fundingTx, err := c.prepareMultiTradeRequests(pw, form)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	orders := make([]*Order, 0, len(reqs))
@@ -5722,10 +5722,10 @@ func (c *Core) MultiTrade(pw []byte, form *MultiTradeForm) ([]*Order, error) {
 		c.log.Errorf("failed to send %d of %d trade requests", len(reqs)-len(orders), len(reqs))
 	}
 	if len(orders) == 0 {
-		return nil, err
+		return nil, nil, err // Return funding tx even if err != nil?
 	}
 
-	return orders, nil
+	return orders, fundingTx, nil
 }
 
 // Trade is used to place a market or limit order.
@@ -6133,7 +6133,7 @@ func (c *Core) prepareTradeRequest(pw []byte, form *TradeForm) (*tradeRequest, e
 			qty, assetConfigs.baseAsset.Symbol, rate, mktConf.LotSize)
 	}
 
-	coins, redeemScripts, fundingFees, err := fromWallet.FundOrder(&asset.Order{
+	coins, redeemScripts, _, fundingFees, err := fromWallet.FundOrder(&asset.Order{
 		Version:       assetConfigs.fromAsset.Version,
 		Value:         fundQty,
 		MaxSwapCount:  lots,
@@ -6180,19 +6180,19 @@ func (c *Core) prepareTradeRequest(pw []byte, form *TradeForm) (*tradeRequest, e
 	return tradeRequest, nil
 }
 
-func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tradeRequest, error) {
+func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tradeRequest, *FundingTx, error) {
 	wallets, assetConfigs, dc, mktConf, err := c.prepareForTradeRequestPrep(pw, form.Base, form.Quote, form.Host, form.Sell)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fromWallet, toWallet := wallets.fromWallet, wallets.toWallet
 
 	for _, trade := range form.Placements {
 		if trade.Rate == 0 {
-			return nil, newError(orderParamsErr, "zero rate is invalid")
+			return nil, nil, newError(orderParamsErr, "zero rate is invalid")
 		}
 		if trade.Qty == 0 {
-			return nil, newError(orderParamsErr, "zero quantity is invalid")
+			return nil, nil, newError(orderParamsErr, "zero quantity is invalid")
 		}
 	}
 
@@ -6200,7 +6200,7 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 	for range form.Placements {
 		redeemAddr, err := toWallet.RedemptionAddress()
 		if err != nil {
-			return nil, codedError(walletErr, fmt.Errorf("%s RedemptionAddress error: %w",
+			return nil, nil, codedError(walletErr, fmt.Errorf("%s RedemptionAddress error: %w",
 				assetConfigs.toAsset.Symbol, err))
 		}
 		redeemAddresses = append(redeemAddresses, redeemAddr)
@@ -6211,7 +6211,7 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 		fundQty := trade.Qty
 		lots := fundQty / mktConf.LotSize
 		if lots == 0 {
-			return nil, newError(orderParamsErr, "order quantity < 1 lot")
+			return nil, nil, newError(orderParamsErr, "order quantity < 1 lot")
 		}
 
 		if !form.Sell {
@@ -6223,7 +6223,7 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 		})
 	}
 
-	allCoins, allRedeemScripts, fundingFees, err := fromWallet.FundMultiOrder(&asset.MultiOrder{
+	allCoins, allRedeemScripts, fundingTxID, fundingFees, err := fromWallet.FundMultiOrder(&asset.MultiOrder{
 		Version:       assetConfigs.fromAsset.Version,
 		Values:        orderValues,
 		MaxFeeRate:    assetConfigs.fromAsset.MaxFeeRate,
@@ -6233,7 +6233,7 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 		RedeemAssetID: assetConfigs.toAsset.ID,
 	}, form.MaxLock)
 	if err != nil {
-		return nil, codedError(walletErr, fmt.Errorf("FundMultiOrder error for %s: %v", assetConfigs.fromAsset.Symbol, err))
+		return nil, nil, codedError(walletErr, fmt.Errorf("FundMultiOrder error for %s: %v", assetConfigs.fromAsset.Symbol, err))
 	}
 
 	if len(allCoins) != len(form.Placements) {
@@ -6283,7 +6283,7 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 		req, err := c.createTradeRequest(wallets, coins, allRedeemScripts[i], dc, redeemAddresses[i], tradeForm,
 			orderValues[i].MaxSwapCount, orderValues[i].MaxSwapCount, fees, assetConfigs, mktConf, errClosers[i])
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tradeRequests = append(tradeRequests, req)
 	}
@@ -6292,7 +6292,15 @@ func (c *Core) prepareMultiTradeRequests(pw []byte, form *MultiTradeForm) ([]*tr
 		errCloser.Success()
 	}
 
-	return tradeRequests, nil
+	var fundingTx *FundingTx
+	if fundingTxID != nil {
+		fundingTx = &FundingTx{
+			ID:   fundingTxID,
+			Fees: fundingFees,
+		}
+	}
+
+	return tradeRequests, fundingTx, nil
 }
 
 // sendTradeRequest sends an order, processes the result, then prepares and

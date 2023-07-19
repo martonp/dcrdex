@@ -201,9 +201,9 @@ func (c *tCore) PreOrder(form *core.TradeForm) (*core.OrderEstimate, error) {
 	c.preOrderParam = form
 	return c.orderEstimate, nil
 }
-func (c *tCore) MultiTrade(pw []byte, forms *core.MultiTradeForm) ([]*core.Order, error) {
+func (c *tCore) MultiTrade(pw []byte, forms *core.MultiTradeForm) ([]*core.Order, *core.FundingTx, error) {
 	c.multiTradesPlaced = append(c.multiTradesPlaced, forms)
-	return c.multiTradeResult, nil
+	return c.multiTradeResult, nil, nil
 }
 
 func (c *tCore) WalletState(assetID uint32) *core.WalletState {
@@ -2581,11 +2581,10 @@ func testSegregatedCoreTrade(t *testing.T, testMultiTrade bool) {
 		segregatedCore := mm.wrappedCoreForBot(dcrBtcID)
 
 		if testMultiTrade {
-
 			if test.multiTradeOnly {
-				_, err = segregatedCore.MultiTrade([]byte{}, test.multiTrade)
+				_, _, err = segregatedCore.MultiTrade([]byte{}, test.multiTrade)
 			} else {
-				_, err = segregatedCore.MultiTrade([]byte{}, &core.MultiTradeForm{
+				_, _, err = segregatedCore.MultiTrade([]byte{}, &core.MultiTradeForm{
 					Host:  test.trade.Host,
 					Sell:  test.trade.Sell,
 					Base:  test.trade.Base,

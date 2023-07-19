@@ -565,7 +565,7 @@ func handleMultiTrade(s *RPCServer, params *RawParams) *msgjson.ResponsePayload 
 		return usage(multiTradeRoute, err)
 	}
 	defer form.appPass.Clear()
-	res, err := s.core.MultiTrade(form.appPass, form.srvForm)
+	res, _, err := s.core.MultiTrade(form.appPass, form.srvForm)
 	if err != nil {
 		errMsg := fmt.Sprintf("unable to multi trade: %v", err)
 		resErr := msgjson.NewError(msgjson.RPCTradeError, errMsg)
