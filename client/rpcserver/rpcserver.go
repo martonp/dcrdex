@@ -84,7 +84,7 @@ type clientCore interface {
 	AddWalletPeer(assetID uint32, host string) error
 	RemoveWalletPeer(assetID uint32, host string) error
 	Notifications(int) ([]*db.Notification, error)
-	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error)
+	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, *core.FundingTx, error)
 }
 
 // RPCServer is a single-client http and websocket server enabling a JSON

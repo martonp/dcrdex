@@ -1408,9 +1408,9 @@ func (eth *TokenWallet) createTokenFundingCoin(amount, fees uint64) *tokenFundin
 }
 
 // FundOrder locks value for use in an order.
-func (w *ETHWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uint64, error) {
+func (w *ETHWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, dex.Bytes, uint64, error) {
 	if w.gasFeeLimit() < ord.MaxFeeRate {
-		return nil, nil, 0, fmt.Errorf(
+		return nil, nil, nil, 0, fmt.Errorf(
 			"%v: server's max fee rate %v higher than configured fee rate limit %v",
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
@@ -1418,7 +1418,7 @@ func (w *ETHWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uint6
 	g, err := w.initGasEstimate(int(ord.MaxSwapCount), ord.Version,
 		ord.RedeemVersion, ord.RedeemAssetID)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
 	}
 
 	ethToLock := ord.MaxFeeRate*g.Swap*ord.MaxSwapCount + ord.Value
@@ -1434,39 +1434,39 @@ func (w *ETHWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uint6
 	coin := w.createFundingCoin(ethToLock)
 
 	if err = w.lockFunds(ethToLock, initiationReserve); err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 
-	return asset.Coins{coin}, []dex.Bytes{nil}, 0, nil
+	return asset.Coins{coin}, []dex.Bytes{nil}, nil, 0, nil
 }
 
 // FundOrder locks value for use in an order.
-func (w *TokenWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uint64, error) {
+func (w *TokenWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, dex.Bytes, uint64, error) {
 	if w.gasFeeLimit() < ord.MaxFeeRate {
-		return nil, nil, 0, fmt.Errorf(
+		return nil, nil, nil, 0, fmt.Errorf(
 			"%v: server's max fee rate %v higher than configured fee rate limit %v",
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
 
 	approvalStatus, err := w.approvalStatus(ord.Version)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
 	}
 	if approvalStatus != asset.Approved {
-		return nil, nil, 0, asset.ErrUnapprovedToken
+		return nil, nil, nil, 0, asset.ErrUnapprovedToken
 	}
 
 	g, err := w.initGasEstimate(int(ord.MaxSwapCount), ord.Version,
 		ord.RedeemVersion, ord.RedeemAssetID)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
 	}
 
 	ethToLock := ord.MaxFeeRate * g.Swap * ord.MaxSwapCount
 
 	var success bool
 	if err = w.lockFunds(ord.Value, initiationReserve); err != nil {
-		return nil, nil, 0, fmt.Errorf("error locking token funds: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error locking token funds: %v", err)
 	}
 	defer func() {
 		if !success {
@@ -1477,27 +1477,27 @@ func (w *TokenWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uin
 	w.log.Debugf("Locking %s to swap %s in up to %d swaps at a fee rate of %d gwei/gas using up to %d gas per swap",
 		w.parent.amtString(ethToLock), w.amtString(ord.Value), ord.MaxSwapCount, ord.MaxFeeRate, g.Swap)
 	if err := w.parent.lockFunds(ethToLock, initiationReserve); err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 
 	coin := w.createTokenFundingCoin(ord.Value, ethToLock)
 
 	success = true
-	return asset.Coins{coin}, []dex.Bytes{nil}, 0, nil
+	return asset.Coins{coin}, []dex.Bytes{nil}, nil, 0, nil
 }
 
 // FundMultiOrder funds multiple orders in one shot. No special handling is
 // required for ETH as ETH does not over-lock during funding.
-func (w *ETHWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]asset.Coins, [][]dex.Bytes, uint64, error) {
+func (w *ETHWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]asset.Coins, [][]dex.Bytes, dex.Bytes, uint64, error) {
 	if w.gasFeeLimit() < ord.MaxFeeRate {
-		return nil, nil, 0, fmt.Errorf(
+		return nil, nil, nil, 0, fmt.Errorf(
 			"%v: server's max fee rate %v higher than configured fee rate limit %v",
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
 
 	g, err := w.initGasEstimate(1, ord.Version, ord.RedeemVersion, ord.RedeemAssetID)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
 	}
 
 	var totalToLock uint64
@@ -1509,11 +1509,11 @@ func (w *ETHWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]ass
 	}
 
 	if maxLock > 0 && maxLock < totalToLock {
-		return nil, nil, 0, fmt.Errorf("insufficient funds to lock %d for %d orders", totalToLock, len(ord.Values))
+		return nil, nil, nil, 0, fmt.Errorf("insufficient funds to lock %d for %d orders", totalToLock, len(ord.Values))
 	}
 
 	if err = w.lockFunds(totalToLock, initiationReserve); err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 
 	redeemScripts := make([][]dex.Bytes, len(ord.Values))
@@ -1521,30 +1521,30 @@ func (w *ETHWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]ass
 		redeemScripts[i] = []dex.Bytes{nil}
 	}
 
-	return allCoins, redeemScripts, 0, nil
+	return allCoins, redeemScripts, nil, 0, nil
 }
 
 // FundMultiOrder funds multiple orders in one shot. No special handling is
 // required for ETH as ETH does not over-lock during funding.
-func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]asset.Coins, [][]dex.Bytes, uint64, error) {
+func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]asset.Coins, [][]dex.Bytes, dex.Bytes, uint64, error) {
 	if w.gasFeeLimit() < ord.MaxFeeRate {
-		return nil, nil, 0, fmt.Errorf(
+		return nil, nil, nil, 0, fmt.Errorf(
 			"%v: server's max fee rate %v higher than configured fee rate limit %v",
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
 
 	approvalStatus, err := w.approvalStatus(ord.Version)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
 	}
 	if approvalStatus != asset.Approved {
-		return nil, nil, 0, asset.ErrUnapprovedToken
+		return nil, nil, nil, 0, asset.ErrUnapprovedToken
 	}
 
 	g, err := w.initGasEstimate(1, ord.Version,
 		ord.RedeemVersion, ord.RedeemAssetID)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error estimating swap gas: %v", err)
 	}
 
 	var totalETHToLock, totalTokenToLock uint64
@@ -1559,7 +1559,7 @@ func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]a
 
 	var success bool
 	if err = w.lockFunds(totalTokenToLock, initiationReserve); err != nil {
-		return nil, nil, 0, fmt.Errorf("error locking token funds: %v", err)
+		return nil, nil, nil, 0, fmt.Errorf("error locking token funds: %v", err)
 	}
 	defer func() {
 		if !success {
@@ -1568,7 +1568,7 @@ func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]a
 	}()
 
 	if err := w.parent.lockFunds(totalETHToLock, initiationReserve); err != nil {
-		return nil, nil, 0, err
+		return nil, nil, nil, 0, err
 	}
 
 	redeemScripts := make([][]dex.Bytes, len(ord.Values))
@@ -1577,7 +1577,7 @@ func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]a
 	}
 
 	success = true
-	return allCoins, redeemScripts, 0, nil
+	return allCoins, redeemScripts, nil, 0, nil
 }
 
 // gasEstimates are estimates of gas required for operations involving a swap

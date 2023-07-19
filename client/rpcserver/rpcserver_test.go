@@ -172,8 +172,8 @@ func (c *TCore) RemoveWalletPeer(assetID uint32, address string) error {
 func (c *TCore) Notifications(n int) ([]*db.Notification, error) {
 	return nil, nil
 }
-func (c *TCore) MultiTrade(appPass []byte, form *core.MultiTradeForm) ([]*core.Order, error) {
-	return nil, nil
+func (c *TCore) MultiTrade(appPass []byte, form *core.MultiTradeForm) ([]*core.Order, *core.FundingTx, error) {
+	return nil, nil, nil
 }
 
 type tBookFeed struct{}

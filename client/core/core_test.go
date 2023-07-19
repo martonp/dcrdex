@@ -786,10 +786,10 @@ func (w *TXCWallet) ConfirmRedemption(coinID dex.Bytes, redemption *asset.Redemp
 	return w.confirmRedemptionResult, w.confirmRedemptionErr
 }
 
-func (w *TXCWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uint64, error) {
+func (w *TXCWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, dex.Bytes, uint64, error) {
 	w.fundedVal = ord.Value
 	w.fundedSwaps = ord.MaxSwapCount
-	return w.fundingCoins, w.fundRedeemScripts, 0, w.fundingCoinErr
+	return w.fundingCoins, w.fundRedeemScripts, nil, 0, w.fundingCoinErr
 }
 
 func (w *TXCWallet) MaxOrder(*asset.MaxOrderForm) (*asset.SwapEstimate, error) {
@@ -1071,8 +1071,8 @@ func (w *TXCWallet) MaxFundingFees(_ uint32, _ map[string]string) uint64 {
 	return 0
 }
 
-func (*TXCWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) (coins []asset.Coins, redeemScripts [][]dex.Bytes, fundingFees uint64, err error) {
-	return nil, nil, 0, nil
+func (*TXCWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) (coins []asset.Coins, redeemScripts [][]dex.Bytes, splitTx dex.Bytes, fundingFees uint64, err error) {
+	return nil, nil, nil, 0, nil
 }
 
 type TAccountLocker struct {

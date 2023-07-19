@@ -388,6 +388,13 @@ type Order struct {
 	ReadyToTick       bool              `json:"readyToTick"`
 }
 
+// FundingTx represents the ID and fees paid for a splitting transaction
+// that was needed to fund an order.
+type FundingTx struct {
+	ID   dex.Bytes `json:"txid"`
+	Fees uint64    `json:"fees"`
+}
+
 // InFlightOrder is an Order that is not stamped yet, but has a temporary ID
 // to match once order submission is complete.
 type InFlightOrder struct {
