@@ -1,5 +1,14 @@
 
 #main.mmsettings {
+  #placementTables {
+    padding-left: 25px;
+    border-left: 1px solid $light_border_color;
+  }
+
+  #decisionInfoTables {
+    padding-right: 25px;
+  }
+
   .bot-settings-container {
     display: flex;
     margin-left: 3%;
@@ -7,9 +16,29 @@
     margin-top: 20px;
   }
 
+  #calcPlacementTablesContainer {
+    display: flex;
+    justify-content: space-between;
+
+    .tables-column {
+      flex: 1;
+      margin: 10px;
+    }
+
+  }
+
   img {
     width: 16px;
     height: 16px;
+  }
+
+  #calcPlacementsForm {
+    width: 700px;
+  }
+
+  #halfGapTable,
+  #basisPriceTable {
+    max-width: 50%;
   }
 
   .placement-settings-column {

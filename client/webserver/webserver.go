@@ -531,6 +531,7 @@ func New(cfg *Config) (*WebServer, error) {
 			apiAuth.Post("/removemarketmakingconfig", s.apiRemoveMarketMakingConfig)
 			apiAuth.Get("/marketmakingstatus", s.apiMarketMakingStatus)
 			apiAuth.Post("/marketreport", s.apiMarketReport)
+			apiAuth.Post("/mmdecisioninfo", s.apiMMDecisionInfo)
 		})
 	})
 

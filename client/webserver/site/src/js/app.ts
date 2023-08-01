@@ -243,7 +243,6 @@ export default class Application {
     this.tooltip.style.left = '-10000px'
     Doc.hide(this.page.noteBox, this.page.profileBox)
     // Parse the request.
-    console.log('loadPage', page, window.location.origin)
     const url = new URL(`/${page}`, window.location.origin)
     const requestedHandler = handlerFromPath(page)
     // Fetch and parse the page.
@@ -1002,7 +1001,6 @@ export default class Application {
     const status = {} as MarketMakingStatus
     status.running = !!res.running
     status.runningBots = res.runningBots
-    console.log('market making status', status)
     return status
   }
 }

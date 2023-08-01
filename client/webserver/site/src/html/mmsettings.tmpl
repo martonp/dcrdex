@@ -232,6 +232,7 @@
     </div>
 
     <div class="bot-balance-column">
+      <button id="calcPlacementsBtn" class="fs20 px-2 mx-1 selected">[[[calc_placements]]]</button>
       <div id="oraclesLoading">
         [[[loading_oracles]]]      
         <div class="ico-spinner spinner fs14 d-inline-block" data-tmpl="syncSpinner"></div>
@@ -276,10 +277,95 @@
           </tr>
         </tbody>
       </table>
-
     </div>
   </div>
-
   <div id="vOrderOpts">{{template "orderOptionTemplates"}}</div>
+  
+  {{- /* FORMS */ -}}
+  <div id="forms" class="d-hide">
+
+    {{- /* CALCULATE PLACEMENTS FORM */ -}}
+    <form class="position-relative d-hide" id="calcPlacementsForm" autocomplete="off">
+      <div class="form-closer hoverbg"><span class="ico-cross"></span></div>
+      <div class="bordertop py-2 text-center fs22 sans-light position-relative" data-tmpl="header">
+        [[[calc_placements]]]
+      </div>
+      <div class="fs15 text-start mt-2">
+        [[[calc_placements_description]]]
+      </div>
+
+      <div id="calcPlacementTablesContainer">
+        <div class="tables-column" id="decisionInfoTables">
+          <table class="py-2 oracles-table my-3 w-100">
+            <tbody>
+              <tr>
+                <td class="text-left"><b><span>Basis Price:</span></b></td>
+                <td><b><span id="placementsBasisPrice"></span></b></td>
+              </tr>
+              <tr>
+                <td class="text-left"><span>Market Mid-Gap:</span></td>
+                <td><span id="placementsMidGap"></span></td>
+              </tr>
+              <tr>
+                <td class="text-left"><span>Oracle Rate:</span></td>
+                <td><span id="placementsOracleRate"></span></td>
+              </tr>
+              <tr>
+                <td class="text-left"><span>Fiat Rate:</span></td>
+                <td><span id="placementsFiatRate"></span></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <table id="calcHalfGapTable" class="py-2 oracles-table my-3 w-100">
+            <tbody>
+              <tr>
+                <td class="text-left"><b><span>Half Gap:</span></b></td>
+                <td><b><span id="placementsHalfGap"></span></b></td>
+              </tr>
+              <tr>
+                <td class="text-left"><span>Single lot base fees:</span></td>
+                <td><span id="placementsBaseFees"></span></td>
+              </tr>
+              <tr>
+                <td class="text-left"><span>Single lot quote fees:</span></td>
+                <td><span id="placementsQuoteFees"></span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tables-column" id="placementTables">
+          <span><b>[[[buy_placements]]]</b></span>
+          <table class="py-1 oracles-table my-3 w-100">
+            <thead>
+              <tr scope="col">
+                <td>[[[Lots]]]</td>
+                <td>[[[Rate]]]</td>
+              </tr>
+            </thead>
+            <tbody id="calcBuyPlacementsTableBody">
+              <tr id="calcPlacementTableRowTmpl">
+                <td class="text-left"><span data-tmpl="lots"></span></td>
+                <td><span data-tmpl="rate"></span></td>
+              </tr>
+            </tbody>
+          </table>
+          <span><b>[[[sell_placements]]]</b></span>
+          <table class="py-1 oracles-table my-3 w-100">
+            <thead>
+              <tr scope="col">
+                <td>[[[Lots]]]</td>
+                <td>[[[Rate]]]</td>
+              </tr>
+            </thead>
+            <tbody id="calcSellPlacementsTableBody">
+            </tbody>
+          </table>
+        </div>
+      </div>
+      
+    </form>
+  </div>  {{- /* END FORMS */ -}}
 </div>
 {{template "bottom"}} {{end}}

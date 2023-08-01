@@ -106,7 +106,11 @@ export default class MarketMakerSettingsPage extends BasePage {
   constructor (main: HTMLElement) {
     super()
 
-    const page = (this.page = Doc.idDescendants(main))
+    const page = this.page = Doc.idDescendants(main)
+
+    page.forms.querySelectorAll('.form-closer').forEach(el => {
+      Doc.bind(el, 'click', () => { this.closePopups() })
+    })
 
     setOptionTemplates(page)
     Doc.cleanTemplates(
@@ -114,7 +118,8 @@ export default class MarketMakerSettingsPage extends BasePage {
       page.booleanOptTmpl,
       page.rangeOptTmpl,
       page.placementRowTmpl,
-      page.oracleTmpl
+      page.oracleTmpl,
+      page.calcPlacementTableRowTmpl
     )
 
     Doc.bind(page.resetButton, 'click', () => { this.setOriginalValues(false) })
@@ -132,6 +137,9 @@ export default class MarketMakerSettingsPage extends BasePage {
     Doc.bind(page.cancelButton, 'click', () => {
       app().loadPage('mm')
     })
+    Doc.bind(page.calcPlacementsBtn, 'click', async () => {
+      await this.showCalcPlacementsPopup()
+    })
 
     const urlParams = new URLSearchParams(window.location.search)
     const host = urlParams.get('host')
@@ -147,7 +155,6 @@ export default class MarketMakerSettingsPage extends BasePage {
     page.baseHeader.textContent = app().assets[this.baseID].symbol.toUpperCase()
     page.quoteHeader.textContent = app().assets[this.quoteID].symbol.toUpperCase()
     page.hostHeader.textContent = host
-
     page.baseBalanceLogo.src = Doc.logoPathFromID(this.baseID)
     page.quoteBalanceLogo.src = Doc.logoPathFromID(this.quoteID)
     page.baseLogo.src = Doc.logoPathFromID(this.baseID)
@@ -198,6 +205,27 @@ export default class MarketMakerSettingsPage extends BasePage {
     Doc.show(page.botSettingsContainer)
 
     this.fetchOracles()
+  }
+
+  /* showForm shows a modal form with a little animation. */
+  async showForm (form: HTMLElement, noAnimation?: boolean): Promise<void> {
+    const page = this.page
+    Doc.hide(page.calcPlacementsForm)
+    if (!noAnimation) {
+      form.style.right = '10000px'
+    }
+    Doc.show(page.forms, form)
+    if (!noAnimation) {
+      const shift = (page.forms.offsetWidth + form.offsetWidth) / 2
+      await Doc.animate(300, progress => {
+        form.style.right = `${(1 - progress) * shift}px`
+      }, 'easeOutHard')
+      form.style.right = '0'
+    }
+  }
+
+  closePopups (): void {
+    Doc.hide(this.page.forms)
   }
 
   updateModifiedMarkers () {
@@ -700,6 +728,51 @@ export default class MarketMakerSettingsPage extends BasePage {
     await app().updateMarketMakingConfig(this.updatedConfig)
     this.originalConfig = JSON.parse(JSON.stringify(this.updatedConfig))
     this.updateModifiedMarkers()
+  }
+
+  async showCalcPlacementsPopup () {
+    const page = this.page
+    const res = await postJSON('/api/mmdecisioninfo', this.updatedConfig)
+    if (!app().checkResponse(res)) {
+      console.error('Error fetching market making decision info', res)
+    }
+
+    const baseAsset = app().assets[this.updatedConfig.baseAsset]
+    const quoteAsset = app().assets[this.updatedConfig.quoteAsset]
+    const exchange = app().exchanges[this.updatedConfig.host]
+    const market = exchange.markets[`${baseAsset.symbol}_${quoteAsset.symbol}`]
+
+    page.placementsBasisPrice.textContent = Doc.formatRateFullPrecision(res.info.basisPrice, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+    page.placementsMidGap.textContent = Doc.formatRateFullPrecision(res.info.midGap, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+    page.placementsOracleRate.textContent = Doc.formatRateFullPrecision(res.info.oracleRate, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+    page.placementsFiatRate.textContent = Doc.formatRateFullPrecision(res.info.fiatRate, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+
+    page.placementsHalfGap.textContent = Doc.formatRateFullPrecision(res.info.halfGap, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+    page.placementsBaseFees.textContent = Doc.formatCoinValue(res.info.baseSingleLotFees, baseAsset.unitInfo)
+    page.placementsQuoteFees.textContent = Doc.formatCoinValue(res.info.quoteSingleLotFees, quoteAsset.unitInfo)
+    Doc.setVis(!!res.info.halfGap, page.calcHalfGapTable)
+
+    Doc.empty(page.calcBuyPlacementsTableBody, page.calcSellPlacementsTableBody)
+
+    const addPlacementRow = (placementInfo: any, placementTable: PageElement) => {
+      const row = page.calcPlacementTableRowTmpl.cloneNode(true) as PageElement
+      const rowTmpl = Doc.parseTemplate(row)
+      console.log(rowTmpl)
+      rowTmpl.lots.textContent = placementInfo.lots
+      rowTmpl.rate.textContent = Doc.formatRateFullPrecision(placementInfo.rate, baseAsset.unitInfo, quoteAsset.unitInfo, market.ratestep)
+      placementTable.appendChild(row)
+    }
+
+    const buyPlacements = res.info.buyOrders || []
+    for (let i = 0; i < buyPlacements.length; i++) {
+      addPlacementRow(buyPlacements[i], page.calcBuyPlacementsTableBody)
+    }
+    const sellPlacements = res.info.sellOrders || []
+    for (let i = 0; i < sellPlacements.length; i++) {
+      addPlacementRow(sellPlacements[i], page.calcSellPlacementsTableBody)
+    }
+
+    this.showForm(this.page.calcPlacementsForm)
   }
 
   setupBalanceSelectors (allConfigs: BotConfig[], running: boolean) {

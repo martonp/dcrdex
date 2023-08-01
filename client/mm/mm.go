@@ -812,6 +812,36 @@ func (m *MarketMaker) handleNotification(n core.Notification) {
 	}
 }
 
+// DecisionInfo returns the current information that a bot with the given
+// config would use to decide what orders to place and the resulting
+// orders.
+func (m *MarketMaker) DecisionInfo(cfg *BotConfig) (interface{}, error) {
+	mkt, err := m.core.ExchangeMarket(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get market %s-%d-%d: %w", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, err)
+	}
+
+	orderbook, feed, err := m.core.SyncBook(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sync order book for market %s-%d-%d: %w", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, err)
+	}
+	defer feed.Close()
+
+	user := m.core.User()
+	var baseFiatRate, quoteFiatRate float64
+	if user != nil {
+		baseFiatRate = user.FiatRates[cfg.BaseAsset]
+		quoteFiatRate = user.FiatRates[cfg.QuoteAsset]
+	}
+
+	switch {
+	case cfg.MMCfg != nil:
+		return getBasicMMDecisionInfo(cfg, mkt, orderbook, m.unsyncedOracle, baseFiatRate, quoteFiatRate, m.core, m.log)
+	default:
+		return nil, fmt.Errorf("only basic market making is supported at this time")
+	}
+}
+
 // Run starts the MarketMaker. There can only be one BotConfig per dex market.
 func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) error {
 	if !m.running.CompareAndSwap(false, true) {

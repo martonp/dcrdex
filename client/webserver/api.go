@@ -1552,6 +1552,27 @@ func (s *WebServer) apiMarketReport(w http.ResponseWriter, r *http.Request) {
 	}, s.indent)
 }
 
+func (s *WebServer) apiMMDecisionInfo(w http.ResponseWriter, r *http.Request) {
+	cfg := new(mm.BotConfig)
+	if !readPost(w, r, cfg) {
+		return
+	}
+
+	info, err := s.mm.DecisionInfo(cfg)
+	if err != nil {
+		s.writeAPIError(w, fmt.Errorf("error getting decision info: %w", err))
+		return
+	}
+
+	writeJSON(w, &struct {
+		OK   bool        `json:"ok"`
+		Info interface{} `json:"info"`
+	}{
+		OK:   true,
+		Info: info,
+	}, s.indent)
+}
+
 func (s *WebServer) apiShieldedStatus(w http.ResponseWriter, r *http.Request) {
 	var assetID uint32
 	if !readPost(w, r, &assetID) {

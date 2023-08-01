@@ -417,4 +417,6 @@ var EnUS = map[string]string{
 	"fiat_rates":                  "Fiat Rates",
 	"market_making_running":       "Market making is running",
 	"cannot_manually_trade":       "You cannot manually place orders while market making is running",
+	"calc_placements":             "Calculate Placements",
+	"calc_placements_description": "Below are the orders that would be placed and the information used to determine the rates at which the orders are placed based on the options you have selected. This assumes you have a sufficient balance for all of the orders. If you balance is not sufficient, only the orders for which you have enough balance will be placed, in the order of priority.",
 }
