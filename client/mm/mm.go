@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -163,14 +165,72 @@ type MarketMaker struct {
 	core                  clientCore
 	doNotKillWhenBotsStop bool // used for testing
 	botBalances           map[string]*botBalances
+	// syncedOracle is only available while the MarketMaker is running.
+	syncedOracle   *priceOracle
+	unsyncedOracle *priceOracle
+
+	runningBotsMtx sync.RWMutex
+	runningBots    map[string]interface{}
+
+	noteMtx   sync.RWMutex
+	noteChans map[uint64]chan core.Notification
 
 	ordersMtx sync.RWMutex
 	orders    map[order.OrderID]*orderInfo
 }
 
-// Running returns true if the MarketMaker is running.
+// Running returns if the market maker is running.
 func (m *MarketMaker) Running() bool {
 	return m.running.Load()
+}
+
+type MarketWithHost struct {
+	Host  string `json:"host"`
+	Base  uint32 `json:"base"`
+	Quote uint32 `json:"quote"`
+}
+
+func (m *MarketWithHost) String() string {
+	return fmt.Sprintf("%s-%d-%d", m.Host, m.Base, m.Quote)
+}
+
+func parseMarketWithHost(mkt string) (*MarketWithHost, error) {
+	parts := strings.Split(mkt, "-")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid market %s", mkt)
+	}
+	host := parts[0]
+	base64, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid market %s", mkt)
+	}
+	quote64, err := strconv.ParseUint(parts[2], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid market %s", mkt)
+	}
+	return &MarketWithHost{
+		Host:  host,
+		Base:  uint32(base64),
+		Quote: uint32(quote64),
+	}, nil
+}
+
+// RunningBots returns the markets on which a bot is running.
+func (m *MarketMaker) RunningBots() []*MarketWithHost {
+	m.runningBotsMtx.RLock()
+	defer m.runningBotsMtx.RUnlock()
+
+	mkts := make([]*MarketWithHost, 0, len(m.runningBots))
+	for mkt := range m.runningBots {
+		mktWithHost, err := parseMarketWithHost(mkt)
+		if err != nil {
+			m.log.Errorf("failed to parse market %s: %v", mkt, err)
+			continue
+		}
+		mkts = append(mkts, mktWithHost)
+	}
+
+	return mkts
 }
 
 func marketsRequiringPriceOracle(cfgs []*BotConfig) []*mkt {
@@ -206,13 +266,57 @@ func priceOracleFromConfigs(ctx context.Context, cfgs []*BotConfig, log dex.Logg
 	var err error
 	marketsRequiringOracle := marketsRequiringPriceOracle(cfgs)
 	if len(marketsRequiringOracle) > 0 {
-		oracle, err = newPriceOracle(ctx, marketsRequiringOracle, log)
+		oracle, err = newAutoSyncPriceOracle(ctx, marketsRequiringOracle, log)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create PriceOracle: %v", err)
 		}
 	}
 
 	return oracle, nil
+}
+
+func (m *MarketMaker) markBotAsRunning(id string, running bool) {
+	m.runningBotsMtx.Lock()
+	if running {
+		m.runningBots[id] = struct{}{}
+	} else {
+		delete(m.runningBots, id)
+	}
+
+	if len(m.runningBots) == 0 {
+		m.die()
+	}
+	m.runningBotsMtx.Unlock()
+}
+
+func (m *MarketMaker) MarketReport(base, quote uint32) (*MarketReport, error) {
+	user := m.core.User()
+	baseFiatRate := user.FiatRates[base]
+	quoteFiatRate := user.FiatRates[quote]
+
+	if m.running.Load() {
+		price, oracles, err := m.syncedOracle.GetOracleInfo(base, quote)
+		if err == nil {
+			return &MarketReport{
+				Price:         price,
+				Oracles:       oracles,
+				BaseFiatRate:  baseFiatRate,
+				QuoteFiatRate: quoteFiatRate,
+			}, nil
+		}
+	}
+
+	price, oracles, err := m.unsyncedOracle.GetOracleInfo(base, quote)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MarketReport{
+		Price:         price,
+		Oracles:       oracles,
+		BaseFiatRate:  baseFiatRate,
+		QuoteFiatRate: quoteFiatRate,
+	}, nil
 }
 
 func (m *MarketMaker) loginAndUnlockWallets(pw []byte, cfgs []*BotConfig) error {
@@ -737,6 +841,8 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 		return err
 	}
 
+	m.syncedOracle = oracle
+
 	if err := m.setupBalances(enabledCfgs); err != nil {
 		return err
 	}
@@ -744,6 +850,7 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 	user := m.core.User()
 
 	startedMarketMaking = true
+	m.notify(newMMStartStopNote(true))
 
 	wg := new(sync.WaitGroup)
 
@@ -770,6 +877,16 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 		case cfg.MMCfg != nil:
 			wg.Add(1)
 			go func(cfg *BotConfig) {
+				mkt := &MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
+				m.markBotAsRunning(mkt.String(), true)
+				defer func() {
+					m.markBotAsRunning(mkt.String(), false)
+				}()
+
+				m.notify(newBotStartStopNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, true))
+				defer func() {
+					m.notify(newBotStartStopNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, false))
+				}()
 				logger := m.log.SubLogger(fmt.Sprintf("MarketMaker-%s-%d-%d", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset))
 				mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
 				var baseFiatRate, quoteFiatRate float64
@@ -777,7 +894,7 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 					baseFiatRate = user.FiatRates[cfg.BaseAsset]
 					quoteFiatRate = user.FiatRates[cfg.QuoteAsset]
 				}
-				RunBasicMarketMaker(m.ctx, cfg, m.wrappedCoreForBot(mktID), oracle, baseFiatRate, quoteFiatRate, logger)
+				RunBasicMarketMaker(m.ctx, cfg, m.wrappedCoreForBot(mktID), oracle, baseFiatRate, quoteFiatRate, logger, m.notify)
 				wg.Done()
 			}(cfg)
 		default:
@@ -789,6 +906,7 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 		wg.Wait()
 		m.log.Infof("All bots have stopped running.")
 		m.running.Store(false)
+		m.notify(newMMStartStopNote(false))
 	}()
 
 	return nil
@@ -803,9 +921,12 @@ func (m *MarketMaker) Stop() {
 
 func NewMarketMaker(c clientCore, log dex.Logger) (*MarketMaker, error) {
 	return &MarketMaker{
-		core:    c,
-		log:     log,
-		running: atomic.Bool{},
-		orders:  make(map[order.OrderID]*orderInfo),
+		core:           c,
+		log:            log,
+		orders:         make(map[order.OrderID]*orderInfo),
+		running:        atomic.Bool{},
+		runningBots:    make(map[string]interface{}),
+		noteChans:      make(map[uint64]chan core.Notification),
+		unsyncedOracle: newUnsyncedPriceOracle(log),
 	}, nil
 }

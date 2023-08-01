@@ -97,7 +97,7 @@ type MarketMakingConfig struct {
 
 	// EmptyMarketRate can be set if there is no market data available, and is
 	// ignored if there is market data available.
-	EmptyMarketRate float64 `json:"manualRate"`
+	EmptyMarketRate float64 `json:"emptyMarketRate"`
 
 	// SplitTxAllowed indicates whether the wallet (if it supports multi-splits)
 	// is allowed to do multi split transactions when funding orders. For UTXO
@@ -295,7 +295,7 @@ func basisPrice(book dexOrderBook, oracle oracle, cfg *MarketMakingConfig, mkt *
 	var oracleWeighting, oraclePrice float64
 	if cfg.OracleWeighting != nil && *cfg.OracleWeighting > 0 {
 		oracleWeighting = *cfg.OracleWeighting
-		oraclePrice = oracle.getMarketPrice(mkt.BaseID, mkt.QuoteID)
+		oraclePrice = oracle.GetMarketPrice(mkt.BaseID, mkt.QuoteID)
 		if oraclePrice == 0 {
 			log.Warnf("no oracle price available for %s bot", mkt.Name)
 		}
@@ -538,6 +538,7 @@ func orderPrice(basisPrice, breakEven uint64, strategy GapStrategy, factor float
 	if sell {
 		return basisPrice + halfSpread
 	}
+
 	return basisPrice - halfSpread
 }
 
@@ -781,7 +782,8 @@ func (m *basicMarketMaker) run() {
 }
 
 // RunBasicMarketMaker starts a basic market maker bot.
-func RunBasicMarketMaker(ctx context.Context, cfg *BotConfig, c clientCore, oracle oracle, baseFiatRate, quoteFiatRate float64, log dex.Logger) {
+func RunBasicMarketMaker(ctx context.Context, cfg *BotConfig, c clientCore, oracle oracle, baseFiatRate, quoteFiatRate float64, log dex.Logger,
+	notify func(core.Notification)) {
 	if cfg.MMCfg == nil {
 		// implies bug in caller
 		log.Errorf("No market making config provided. Exiting.")
@@ -790,7 +792,7 @@ func RunBasicMarketMaker(ctx context.Context, cfg *BotConfig, c clientCore, orac
 
 	err := cfg.MMCfg.Validate()
 	if err != nil {
-		log.Errorf("Invalid market making config: %v. Exiting.", err)
+		notify(newValidationErrorNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, fmt.Sprintf("invalid market making config: %v", err)))
 		return
 	}
 

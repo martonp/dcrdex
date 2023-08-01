@@ -264,6 +264,11 @@ export default class Doc {
     return decimalFormatter(prec).format(v)
   }
 
+  static conventionalCoinValue (vAtomic: number, unitInfo?: UnitInfo): number {
+    const [v] = convertToConventional(vAtomic, unitInfo)
+    return v
+  }
+
   /*
    * formatRateFullPrecision formats rate to represent it exactly at rate step
    * precision, trimming non-effectual zeros if there are any.
