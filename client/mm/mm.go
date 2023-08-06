@@ -34,7 +34,7 @@ type clientCore interface {
 	AssetBalance(assetID uint32) (*core.WalletBalance, error)
 	PreOrder(form *core.TradeForm) (*core.OrderEstimate, error)
 	WalletState(assetID uint32) *core.WalletState
-	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error)
+	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, *core.FundingTx, error)
 	MaxFundingFees(fromAsset uint32, numTrades uint32, options map[string]string) (uint64, error)
 	User() *core.User
 	Login(pw []byte) error

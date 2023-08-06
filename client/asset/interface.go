@@ -376,7 +376,7 @@ type Wallet interface {
 	// empty dex.Bytes should be appended to the redeem scripts collection for
 	// coins with no redeem script. The fees returned are any fees paid in the
 	// process of funding the order, such as transaction fees for a split tx.
-	FundOrder(*Order) (coins Coins, redeemScripts []dex.Bytes, fees uint64, err error)
+	FundOrder(*Order) (coins Coins, redeemScripts []dex.Bytes, fundingTxID dex.Bytes, fees uint64, err error)
 	// MaxOrder generates information about the maximum order size and
 	// associated fees that the wallet can support for the specified DEX. The
 	// fees are an estimate based on current network conditions, and will be <=
@@ -514,7 +514,7 @@ type Wallet interface {
 	// be in the same order as the passed orders. If less values are returned
 	// than the number of orders, then the orders at the end of the list were
 	// not about to be funded.
-	FundMultiOrder(ord *MultiOrder, maxLock uint64) (coins []Coins, redeemScripts [][]dex.Bytes, fundingFees uint64, err error)
+	FundMultiOrder(ord *MultiOrder, maxLock uint64) (coins []Coins, redeemScripts [][]dex.Bytes, fundingTxID dex.Bytes, fundingFees uint64, err error)
 	// MaxFundingFees returns the max fees that could be paid for funding a swap.
 	MaxFundingFees(numTrades uint32, options map[string]string) uint64
 }

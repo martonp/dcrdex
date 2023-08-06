@@ -496,7 +496,7 @@ func (m *basicMarketMaker) placeMultiTrade(placements []*rateLots, sell bool) {
 		}
 	}
 
-	orders, err := m.core.MultiTrade(nil, &core.MultiTradeForm{
+	orders, _, err := m.core.MultiTrade(nil, &core.MultiTradeForm{
 		Host:       m.host,
 		Sell:       sell,
 		Base:       m.base,
