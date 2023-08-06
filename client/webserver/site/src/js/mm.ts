@@ -4,9 +4,10 @@ import {
   Market,
   Exchange,
   BotConfig,
-  MarketWithHost,
-  BotStartStopNote,
-  MMStartStopNote
+  MMStatusNote,
+  BotStatusNote,
+  MMStatus,
+  BotStatus
 } from './registry'
 import Doc from './doc'
 import BasePage from './basepage'
@@ -23,6 +24,11 @@ function marketStr (host: string, baseID: number, quoteID: number): string {
   return `${host}-${baseID}-${quoteID}`
 }
 
+function parseMarketStr (str: string): [string, number, number] {
+  const parts = str.split('-')
+  return [parts[0], parseInt(parts[1]), parseInt(parts[2])]
+}
+
 export default class MarketMakerPage extends BasePage {
   page: Record<string, PageElement>
   currentForm: HTMLElement
@@ -30,6 +36,7 @@ export default class MarketMakerPage extends BasePage {
   selectHostCallback: (e: Event) => void
   currentNewMarket: HostedMarket
   newWalletForm: NewWalletForm
+  mmRunning: boolean
 
   constructor (main: HTMLElement) {
     super()
@@ -52,6 +59,7 @@ export default class MarketMakerPage extends BasePage {
     )
 
     Doc.bind(page.addBotBtn, 'click', () => { this.showAddBotForm() })
+    Doc.bind(page.archivedLogsBtn, 'click', () => { app().loadPage('mmarchives') })
     Doc.bind(page.startBotsBtn, 'click', () => { this.showPWSubmitForm() })
     bindForm(page.pwForm, page.pwSubmit, () => this.startBots())
     Doc.bind(page.stopBotsBtn, 'click', () => { this.stopBots() })
@@ -127,11 +135,12 @@ export default class MarketMakerPage extends BasePage {
     const page = this.page
 
     const status = await app().getMarketMakingStatus()
-    const running = status.running
-    const botConfigs = await app().getMarketMakingConfig()
+    console.log(status)
+    this.mmRunning = status.running
+    const botConfigs = await app().getAllMarketMakingConfig()
     app().registerNoteFeeder({
-      botstartstop: (note: BotStartStopNote) => { this.updateBotRunningStatus(note) },
-      mmstartstop: (note: MMStartStopNote) => { this.updateMMRunningStatus(note) }
+      mmstatus: (note: MMStatusNote) => { this.handleMMStatusNote(note) },
+      botstatus: (note: BotStatusNote) => { this.handleBotStatusNote(note) }
     })
 
     const noBots = !botConfigs || botConfigs.length === 0
@@ -139,34 +148,228 @@ export default class MarketMakerPage extends BasePage {
     Doc.setVis(!noBots, page.botTable)
     if (noBots) return
 
-    Doc.setVis(running, page.stopBotsBtn)
-    Doc.setVis(!running, page.startBotsBtn, page.addBotBtn)
-    this.setupBotTable(botConfigs, running, status.runningBots)
+    if (this.mmRunning) {
+      page.runningSinceTime.textContent = (new Date(status.runStart * 1000)).toLocaleString()
+    }
+    Doc.setVis(this.mmRunning, page.stopBotsBtn, page.runningSinceMsg)
+    Doc.setVis(!this.mmRunning, page.startBotsBtn, page.addBotBtn)
+    this.setupBotTable(botConfigs, status)
   }
 
-  updateBotRunningStatus (note: BotStartStopNote) {
-    const tableRows = this.page.botTableBody.children
-    const rowID = marketStr(note.host, note.base, note.quote)
+  handleMMStatusNote (note: MMStatusNote) {
+    const page = this.page
+    this.mmRunning = note.running
+
+    if (this.mmRunning) {
+      page.runningSinceTime.textContent = (new Date(note.runStart * 1000)).toLocaleString()
+    }
+    Doc.setVis(note.running, page.stopBotsBtn, page.runningHeader, page.profitHeader, page.logsHeader, page.runningSinceMsg)
+    Doc.setVis(!note.running, page.startBotsBtn, page.addBotBtn, page.enabledHeader, page.removeHeader)
+
+    const tableRows = page.botTableBody.children
+    for (let i = 0; i < tableRows.length; i++) {
+      const row = tableRows[i] as PageElement
+      if (!this.mmRunning) this.updateTableRow(row, undefined)
+      else {
+        if (!note.bots || note.bots.length === 0) return
+        const status = note.bots.find((s: BotStatus) => {
+          const rowID = marketStr(s.host, s.base, s.quote)
+          return row.id === rowID
+        })
+        this.updateTableRow(row, status)
+      }
+    }
+  }
+
+  async handleBotStatusNote (note: BotStatusNote) {
+    const page = this.page
+    const tableRows = page.botTableBody.children
+    const status = note.status
+    const rowID = marketStr(status.host, status.base, status.quote)
     for (let i = 0; i < tableRows.length; i++) {
       const row = tableRows[i] as PageElement
       if (row.id === rowID) {
-        const rowTmpl = Doc.parseTemplate(row)
-        this.setTableRowRunning(rowTmpl, undefined, note.running)
+        this.updateTableRow(row, status)
         return
       }
     }
   }
 
-  updateMMRunningStatus (note: MMStartStopNote) {
+  async updateTableRow (row: PageElement, status: BotStatus | undefined) {
+    const [host, base, quote] = parseMarketStr(row.id)
+    const cfg = await app().getMarketMakingConfig(host, base, quote)
+    if (!cfg) {
+      console.error('no config for', host, base, quote)
+      return
+    }
+    const rowTmpl = Doc.parseTemplate(row)
+
+    Doc.setVis(this.mmRunning, rowTmpl.running, rowTmpl.runningBaseBalanceTd, rowTmpl.runningQuoteBalanceTd, rowTmpl.profitTd, rowTmpl.logsTd)
+    Doc.setVis(!this.mmRunning, rowTmpl.enabled, rowTmpl.stoppedBaseBalanceTd, rowTmpl.stoppedQuoteBalanceTd, rowTmpl.removeTd)
+
+    Doc.setVis(status && status.running, rowTmpl.runningIcon)
+    Doc.setVis(!status || !status.running, rowTmpl.notRunningIcon)
+
+    if (this.mmRunning) {
+      Doc.setVis(status && status.running,
+        rowTmpl.runningBaseBalance, rowTmpl.runningBaseBalanceLogo, rowTmpl.baseBalanceInfo,
+        rowTmpl.runningQuoteBalance, rowTmpl.runningQuoteBalanceLogo, rowTmpl.quoteBalanceInfo,
+        rowTmpl.profit, rowTmpl.profitInfo, rowTmpl.logsBtn)
+    }
+
+    if (!status || !status.running) return
+
+    const baseAssetUnitInfo = app().assets[cfg.baseAsset].unitInfo
+    const quoteAssetUnitInfo = app().assets[cfg.quoteAsset].unitInfo
+
+    const baseBalance = status.baseBalance
+    const totalBaseBalance = baseBalance.available + baseBalance.fundingOrder + baseBalance.pendingRedeem + baseBalance.pendingRefund
+    const totalBaseBalanceStr = Doc.formatCoinValue(totalBaseBalance, baseAssetUnitInfo)
+    const availableBaseBalanceStr = Doc.formatCoinValue(baseBalance.available, baseAssetUnitInfo)
+    const fundingBaseBalanceStr = Doc.formatCoinValue(baseBalance.fundingOrder, baseAssetUnitInfo)
+    const pendingRedeemBaseBalanceStr = Doc.formatCoinValue(baseBalance.pendingRedeem, baseAssetUnitInfo)
+    const pendingRefundBaseBalanceStr = Doc.formatCoinValue(baseBalance.pendingRefund, baseAssetUnitInfo)
+    rowTmpl.runningBaseBalance.textContent = totalBaseBalanceStr
+    rowTmpl.runningBaseBalanceTotal.textContent = totalBaseBalanceStr
+    rowTmpl.runningBaseBalanceAvailable.textContent = availableBaseBalanceStr
+    rowTmpl.runningBaseBalanceFunding.textContent = fundingBaseBalanceStr
+    rowTmpl.runningBaseBalancePendingRedeem.textContent = pendingRedeemBaseBalanceStr
+    rowTmpl.runningBaseBalancePendingRefund.textContent = pendingRefundBaseBalanceStr
+
+    const quoteBalance = status.quoteBalance
+    const totalQuoteBalance = quoteBalance.available + quoteBalance.fundingOrder + quoteBalance.pendingRedeem + quoteBalance.pendingRefund
+    const totalQuoteBalanceStr = Doc.formatCoinValue(totalQuoteBalance, quoteAssetUnitInfo)
+    const availableQuoteBalanceStr = Doc.formatCoinValue(quoteBalance.available, quoteAssetUnitInfo)
+    const fundingQuoteBalanceStr = Doc.formatCoinValue(quoteBalance.fundingOrder, quoteAssetUnitInfo)
+    const pendingRedeemQuoteBalanceStr = Doc.formatCoinValue(quoteBalance.pendingRedeem, quoteAssetUnitInfo)
+    const pendingRefundQuoteBalanceStr = Doc.formatCoinValue(quoteBalance.pendingRefund, quoteAssetUnitInfo)
+    rowTmpl.runningQuoteBalance.textContent = totalQuoteBalanceStr
+    rowTmpl.runningQuoteBalanceTotal.textContent = totalQuoteBalanceStr
+    rowTmpl.runningQuoteBalanceAvailable.textContent = availableQuoteBalanceStr
+    rowTmpl.runningQuoteBalanceFunding.textContent = fundingQuoteBalanceStr
+    rowTmpl.runningQuoteBalancePendingRedeem.textContent = pendingRedeemQuoteBalanceStr
+    rowTmpl.runningQuoteBalancePendingRefund.textContent = pendingRefundQuoteBalanceStr
+
+    rowTmpl.profit.textContent = `$${Doc.formatFiatValue(status.fiatGainLoss)}`
+    if (status.fiatGainLoss < 0) {
+      rowTmpl.profit.classList.add('loss-color')
+      rowTmpl.profit.classList.remove('profit-color')
+    } else {
+      rowTmpl.profit.classList.remove('loss-color')
+      rowTmpl.profit.classList.add('profit-color')
+    }
+
+    let baseChangeStr = Doc.formatCoinValue(status.baseChange, baseAssetUnitInfo)
+    if (status.baseChange > 0) {
+      baseChangeStr = `+${baseChangeStr}`
+    }
+    let quoteChangeStr = Doc.formatCoinValue(status.quoteChange, quoteAssetUnitInfo)
+    if (status.quoteChange > 0) {
+      quoteChangeStr = `+${quoteChangeStr}`
+    }
+    const baseFeesStr = Doc.formatCoinValue(status.baseFees, baseAssetUnitInfo)
+    const quoteFeesStr = Doc.formatCoinValue(status.quoteFees, quoteAssetUnitInfo)
+    rowTmpl.baseChange.textContent = baseChangeStr
+    if (status.baseChange < 0) {
+      rowTmpl.baseChange.classList.add('loss-color')
+      rowTmpl.baseChange.classList.remove('profit-color')
+    } else {
+      rowTmpl.baseChange.classList.remove('loss-color')
+      rowTmpl.baseChange.classList.add('profit-color')
+    }
+    rowTmpl.quoteChange.textContent = quoteChangeStr
+    if (status.quoteChange < 0) {
+      rowTmpl.quoteChange.classList.add('loss-color')
+      rowTmpl.quoteChange.classList.remove('profit-color')
+    } else {
+      rowTmpl.quoteChange.classList.remove('loss-color')
+      rowTmpl.quoteChange.classList.add('profit-color')
+    }
+    rowTmpl.baseFees.textContent = baseFeesStr
+    rowTmpl.quoteFees.textContent = quoteFeesStr
+  }
+
+  setupBotTable (botConfigs: BotConfig[], mmStatus: MMStatus) {
     const page = this.page
-    Doc.setVis(note.running, page.stopBotsBtn, page.runningHeader)
-    Doc.setVis(!note.running, page.startBotsBtn, page.addBotBtn, page.enabledHeader,
-      page.baseBalanceHeader, page.quoteBalanceHeader, page.removeHeader)
-    const tableRows = page.botTableBody.children
-    for (let i = 0; i < tableRows.length; i++) {
-      const row = tableRows[i] as PageElement
+    Doc.empty(page.botTableBody)
+
+    Doc.setVis(this.mmRunning, page.runningHeader, page.profitHeader, page.logsHeader)
+    Doc.setVis(!this.mmRunning, page.enabledHeader, page.removeHeader)
+
+    for (const botCfg of botConfigs) {
+      const row = page.botTableRowTmpl.cloneNode(true) as PageElement
+      row.id = marketStr(botCfg.host, botCfg.baseAsset, botCfg.quoteAsset)
       const rowTmpl = Doc.parseTemplate(row)
-      this.setTableRowRunning(rowTmpl, note.running, undefined)
+
+      const baseSymbol = app().assets[botCfg.baseAsset].symbol
+      const quoteSymbol = app().assets[botCfg.quoteAsset].symbol
+      const baseLogoPath = Doc.logoPath(baseSymbol)
+      const quoteLogoPath = Doc.logoPath(quoteSymbol)
+
+      rowTmpl.enabledCheckbox.checked = !botCfg.disabled
+      rowTmpl.enabledCheckbox.onclick = async () => {
+        app().setMarketMakingEnabled(botCfg.host, botCfg.baseAsset, botCfg.quoteAsset, !!rowTmpl.enabledCheckbox.checked)
+      }
+      rowTmpl.host.textContent = botCfg.host
+      rowTmpl.baseMktLogo.src = baseLogoPath
+      rowTmpl.quoteMktLogo.src = quoteLogoPath
+      rowTmpl.baseSymbol.textContent = baseSymbol.toUpperCase()
+      rowTmpl.quoteSymbol.textContent = quoteSymbol.toUpperCase()
+      rowTmpl.botType.textContent = 'Market Maker'
+      rowTmpl.baseBalance.textContent = this.walletBalanceStr(botCfg.baseAsset, botCfg.baseBalance)
+      rowTmpl.quoteBalance.textContent = this.walletBalanceStr(botCfg.quoteAsset, botCfg.quoteBalance)
+      rowTmpl.baseBalanceLogo.src = baseLogoPath
+      rowTmpl.quoteBalanceLogo.src = quoteLogoPath
+      rowTmpl.runningBaseBalanceLogo.src = baseLogoPath
+      rowTmpl.runningQuoteBalanceLogo.src = quoteLogoPath
+      rowTmpl.baseChangeLogo.src = baseLogoPath
+      rowTmpl.quoteChangeLogo.src = quoteLogoPath
+      rowTmpl.baseFeesLogo.src = baseLogoPath
+      rowTmpl.quoteFeesLogo.src = quoteLogoPath
+      rowTmpl.remove.onclick = async () => {
+        await app().removeMarketMakingConfig(botCfg)
+        row.remove()
+        const mmCfg = await app().getAllMarketMakingConfig()
+        const noBots = !mmCfg || !mmCfg.length
+        Doc.setVis(noBots, page.noBotsHeader)
+        Doc.setVis(!noBots, page.botTable)
+      }
+      rowTmpl.settings.onclick = () => {
+        app().loadPage(`mmsettings?host=${botCfg.host}&base=${botCfg.baseAsset}&quote=${botCfg.quoteAsset}`)
+      }
+      page.botTableBody.appendChild(row)
+      let botStatus: BotStatus | undefined
+      console.log(mmStatus.bots)
+      if (mmStatus.bots) {
+        botStatus = mmStatus.bots.find((s: BotStatus) => {
+          const rowID = marketStr(s.host, s.base, s.quote)
+          return row.id === rowID
+        })
+        console.log('found bot status = ', botStatus)
+      }
+
+      Doc.bind(rowTmpl.baseBalanceInfo, 'mouseover', () => {
+        Doc.show(rowTmpl.baseBalanceHoverContainer)
+      })
+      Doc.bind(rowTmpl.baseBalanceInfo, 'mouseout', () => {
+        Doc.hide(rowTmpl.baseBalanceHoverContainer)
+      })
+      Doc.bind(rowTmpl.quoteBalanceInfo, 'mouseover', () => {
+        Doc.show(rowTmpl.quoteBalanceHoverContainer)
+      })
+      Doc.bind(rowTmpl.quoteBalanceInfo, 'mouseout', () => {
+        Doc.hide(rowTmpl.quoteBalanceHoverContainer)
+      })
+      Doc.bind(rowTmpl.profitInfo, 'mouseover', () => {
+        Doc.show(rowTmpl.profitHoverContainer)
+      })
+      Doc.bind(rowTmpl.profitInfo, 'mouseout', () => {
+        Doc.hide(rowTmpl.profitHoverContainer)
+      })
+      Doc.bind(rowTmpl.logsBtn, 'click', () => {
+        app().loadPage(`mmlogs?host=${botCfg.host}&base=${botCfg.baseAsset}&quote=${botCfg.quoteAsset}`)
+      })
+      this.updateTableRow(row, botStatus)
     }
   }
 
@@ -260,70 +463,7 @@ export default class MarketMakerPage extends BasePage {
     const balance = wallet.balance.available
     const unitInfo = asset.unitInfo
     const assetValue = Doc.formatCoinValue((balance * percentage) / 100, unitInfo)
-    return `${percentage}% (${assetValue} ${asset.symbol})`
-  }
-
-  setTableRowRunning (rowTmpl: Record<string, PageElement>, mmRunning: boolean | undefined, thisBotRunning: boolean | undefined) {
-    if (mmRunning !== undefined) {
-      Doc.setVis(mmRunning, rowTmpl.running)
-      Doc.setVis(!mmRunning, rowTmpl.enabled, rowTmpl.baseBalanceTd, rowTmpl.quoteBalanceTd, rowTmpl.removeTd)
-    }
-    if (thisBotRunning !== undefined) {
-      Doc.setVis(thisBotRunning, rowTmpl.runningIcon)
-      Doc.setVis(!thisBotRunning, rowTmpl.notRunningIcon)
-    }
-  }
-
-  setupBotTable (botConfigs: BotConfig[], running: boolean, runningBots: MarketWithHost[]) {
-    const page = this.page
-    Doc.empty(page.botTableBody)
-
-    Doc.setVis(running, page.runningHeader)
-    Doc.setVis(!running, page.enabledHeader, page.baseBalanceHeader, page.quoteBalanceHeader, page.removeHeader)
-
-    for (const botCfg of botConfigs) {
-      const row = page.botTableRowTmpl.cloneNode(true) as PageElement
-      row.id = marketStr(botCfg.host, botCfg.baseAsset, botCfg.quoteAsset)
-      const rowTmpl = Doc.parseTemplate(row)
-      const thisBotRunning = runningBots.some((bot) => {
-        return bot.host === botCfg.host &&
-          bot.base === botCfg.baseAsset &&
-          bot.quote === botCfg.quoteAsset
-      })
-      this.setTableRowRunning(rowTmpl, running, thisBotRunning)
-
-      const baseSymbol = app().assets[botCfg.baseAsset].symbol
-      const quoteSymbol = app().assets[botCfg.quoteAsset].symbol
-      const baseLogoPath = Doc.logoPath(baseSymbol)
-      const quoteLogoPath = Doc.logoPath(quoteSymbol)
-
-      rowTmpl.enabledCheckbox.checked = !botCfg.disabled
-      rowTmpl.enabledCheckbox.onclick = async () => {
-        app().setMarketMakingEnabled(botCfg.host, botCfg.baseAsset, botCfg.quoteAsset, !!rowTmpl.enabledCheckbox.checked)
-      }
-      rowTmpl.host.textContent = botCfg.host
-      rowTmpl.baseMktLogo.src = baseLogoPath
-      rowTmpl.quoteMktLogo.src = quoteLogoPath
-      rowTmpl.baseSymbol.textContent = baseSymbol
-      rowTmpl.quoteSymbol.textContent = quoteSymbol
-      rowTmpl.botType.textContent = 'Market Maker'
-      rowTmpl.baseBalance.textContent = this.walletBalanceStr(botCfg.baseAsset, botCfg.baseBalance)
-      rowTmpl.quoteBalance.textContent = this.walletBalanceStr(botCfg.quoteAsset, botCfg.quoteBalance)
-      rowTmpl.baseBalanceLogo.src = baseLogoPath
-      rowTmpl.quoteBalanceLogo.src = quoteLogoPath
-      rowTmpl.remove.onclick = async () => {
-        await app().removeMarketMakingConfig(botCfg)
-        row.remove()
-        const mmCfg = await app().getMarketMakingConfig()
-        const noBots = !mmCfg || !mmCfg.length
-        Doc.setVis(noBots, page.noBotsHeader)
-        Doc.setVis(!noBots, page.botTable)
-      }
-      rowTmpl.settings.onclick = () => {
-        app().loadPage(`mmsettings?host=${botCfg.host}&base=${botCfg.baseAsset}&quote=${botCfg.quoteAsset}`)
-      }
-      page.botTableBody.appendChild(row)
-    }
+    return `${percentage}% (${assetValue} ${asset.symbol.toUpperCase()})`
   }
 
   // TODO: HANDLE MULTIPLE SERVERS
@@ -401,7 +541,7 @@ export default class MarketMakerPage extends BasePage {
     }
     for (const xc of Object.values(app().user.exchanges)) mkts.push(...convertMarkets(xc))
 
-    const mmCfg = await app().getMarketMakingConfig()
+    const mmCfg = await app().getAllMarketMakingConfig()
     const existingMarkets : Record<string, boolean> = {}
     for (const cfg of mmCfg) {
       existingMarkets[marketStr(cfg.host, cfg.baseAsset, cfg.quoteAsset)] = true

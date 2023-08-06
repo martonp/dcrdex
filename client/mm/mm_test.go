@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,6 +140,7 @@ type tCore struct {
 	sellsPlaced                  []*core.TradeForm
 	multiTradesPlaced            []*core.MultiTradeForm
 	maxFundingFees               uint64
+	ordersMap                    map[order.OrderID]*core.Order
 }
 
 func (c *tCore) NotificationFeed() *core.NoteFeed {
@@ -231,8 +233,61 @@ func (c *tCore) OpenWallet(assetID uint32, pw []byte) error {
 func (c *tCore) User() *core.User {
 	return nil
 }
+func (c *tCore) Order(oid dex.Bytes) (*core.Order, error) {
+	var id order.OrderID
+	copy(id[:], oid)
+	return c.ordersMap[id], nil
+}
 
 var _ clientCore = (*tCore)(nil)
+
+type tEventLogDB struct{}
+
+func (db *tEventLogDB) storeEvent(startTime int64, market *MarketWithHost, event *Event, updatedStats *RunStats, finalized bool) error {
+	return nil
+}
+func (db *tEventLogDB) allRuns() ([]int64, error) {
+	return nil, nil
+}
+func (db *tEventLogDB) marketsInRun(startTime int64) ([]*MarketWithHost, error) {
+	return nil, nil
+}
+func (db *tEventLogDB) runLogs(startTime int64, market *MarketWithHost) ([]*Event, *RunStats, bool, error) {
+	return nil, nil, false, nil
+}
+func (db *tEventLogDB) storeFiatRates(startTime int64, rates map[uint32]float64) error {
+	return nil
+}
+func (db *tEventLogDB) fiatRates(startTime int64) (map[uint32]float64, error) {
+	return nil, nil
+}
+func (db *tEventLogDB) runConfig(startTime int64, market *MarketWithHost) (*BotConfig, error) {
+	return nil, nil
+}
+func (db *tEventLogDB) runOverviews(startTime int64) (map[string]*RunOverview, error) {
+	return nil, nil
+}
+func (db *tEventLogDB) storeNewRun(startTime int64, cfg []*BotConfig, fiatRates map[uint32]float64) error {
+	return nil
+}
+
+var _ eventLogDB = (*tEventLogDB)(nil)
+
+func newTestMarketMaker() (*MarketMaker, *tCore, eventLogDB) {
+	tCore := newTCore()
+	db := &tEventLogDB{}
+	mm := &MarketMaker{
+		core:           tCore,
+		log:            tLogger,
+		orders:         make(map[order.OrderID]*orderInfo),
+		running:        atomic.Bool{},
+		runningBots:    make(map[string]bool),
+		noteChans:      make(map[uint64]chan core.Notification),
+		unsyncedOracle: newUnsyncedPriceOracle(tLogger),
+		eventLogDB:     db,
+	}
+	return mm, tCore, db
+}
 
 func tMaxOrderEstimate(lots uint64, swapFees, redeemFees uint64) *core.MaxOrderEstimate {
 	return &core.MaxOrderEstimate{
@@ -274,6 +329,7 @@ func newTCore() *tCore {
 		cancelsPlaced:   make([]dex.Bytes, 0),
 		buysPlaced:      make([]*core.TradeForm, 0),
 		sellsPlaced:     make([]*core.TradeForm, 0),
+		ordersMap:       make(map[order.OrderID]*core.Order),
 	}
 }
 
@@ -300,8 +356,6 @@ func (o *tOracle) GetMarketPrice(base, quote uint32) float64 {
 var tLogger = dex.StdOutLogger("mm_TEST", dex.LevelTrace)
 
 func TestSetupBalances(t *testing.T) {
-	tCore := newTCore()
-
 	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
 	dcrEthID := fmt.Sprintf("%s-%d-%d", "host1", 42, 60)
 
@@ -460,14 +514,11 @@ func TestSetupBalances(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		mm, tCore, _ := newTestMarketMaker()
+
 		tCore.setAssetBalances(test.assetBalances)
 
-		mm, err := NewMarketMaker(tCore, tLogger)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
-
-		err = mm.setupBalances(test.cfgs)
+		err := mm.setupBalances(test.cfgs)
 		if test.wantErr {
 			if err == nil {
 				t.Fatalf("%s: expected error, got nil", test.name)
@@ -492,8 +543,6 @@ func TestSetupBalances(t *testing.T) {
 }
 
 func TestSegregatedCoreMaxSell(t *testing.T) {
-	tCore := newTCore()
-	tCore.isAccountLocker[60] = true
 	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
 	dcrEthID := fmt.Sprintf("%s-%d-%d", "host1", 42, 60)
 
@@ -516,7 +565,6 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			},
 		},
 	}
-	tCore.orderEstimate = orderEstimate
 
 	expectedResult := &core.MaxOrderEstimate{
 		Swap: &asset.SwapEstimate{
@@ -677,17 +725,15 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		mm, tCore, _ := newTestMarketMaker()
+		tCore.isAccountLocker[60] = true
+		tCore.orderEstimate = orderEstimate
 		tCore.setAssetBalances(test.assetBalances)
 		tCore.market = test.market
 		tCore.sellSwapFees = test.swapFees
 		tCore.sellRedeemFees = test.redeemFees
 
-		mm, err := NewMarketMaker(tCore, tLogger)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
-
-		err = mm.setupBalances([]*BotConfig{test.cfg})
+		err := mm.setupBalances([]*BotConfig{test.cfg})
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
@@ -720,9 +766,6 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 }
 
 func TestSegregatedCoreMaxBuy(t *testing.T) {
-	tCore := newTCore()
-
-	tCore.isAccountLocker[60] = true
 	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
 	ethBtcID := fmt.Sprintf("%s-%d-%d", "host1", 60, 0)
 
@@ -745,7 +788,6 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			},
 		},
 	}
-	tCore.orderEstimate = orderEstimate
 
 	expectedResult := &core.MaxOrderEstimate{
 		Swap: &asset.SwapEstimate{
@@ -915,17 +957,15 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		mm, tCore, _ := newTestMarketMaker()
+		tCore.isAccountLocker[60] = true
+		tCore.orderEstimate = orderEstimate
 		tCore.setAssetBalances(test.assetBalances)
 		tCore.market = test.market
 		tCore.buySwapFees = test.swapFees
 		tCore.buyRedeemFees = test.redeemFees
 
-		mm, err := NewMarketMaker(tCore, tLogger)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
-
-		err = mm.setupBalances([]*BotConfig{test.cfg})
+		err := mm.setupBalances([]*BotConfig{test.cfg})
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
@@ -2529,7 +2569,7 @@ func testSegregatedCoreTrade(t *testing.T, testMultiTrade bool) {
 			return
 		}
 
-		tCore := newTCore()
+		mm, tCore, _ := newTestMarketMaker()
 		tCore.setAssetBalances(test.assetBalances)
 		tCore.market = test.market
 		if !test.multiTradeOnly {
@@ -2567,14 +2607,10 @@ func testSegregatedCoreTrade(t *testing.T, testMultiTrade bool) {
 		}
 		tCore.noteFeed = make(chan core.Notification)
 
-		mm, err := NewMarketMaker(tCore, tLogger)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
 		mm.doNotKillWhenBotsStop = true
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		err = mm.Run(ctx, []*BotConfig{test.cfg}, []byte{})
+		err := mm.Run(ctx, []*BotConfig{test.cfg}, []byte{})
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}

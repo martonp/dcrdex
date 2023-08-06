@@ -1,0 +1,17 @@
+#main.mmlogs {
+    #eventsTable {
+        @extend .table; 
+        @extend .table-striped; 
+    }
+
+    img {
+        width: 16px;
+        height: 16px;
+    }  
+}
+
+body.dark #main.mmlogs {  
+    #eventsTable {
+      @extend .table-dark;
+    }
+}

@@ -95,9 +95,11 @@ export default class MarketMakerSettingsPage extends BasePage {
   originalConfig: BotConfig
   updatedConfig: BotConfig
   creatingNewBot: boolean
+  readOnly: boolean
   host: string
   baseID: number
   quoteID: number
+  startTime: number
   oracleBiasRangeHandler: XYRangeHandler
   oracleWeightingRangeHandler: XYRangeHandler
   splitBufferRangeHandler: XYRangeHandler
@@ -122,7 +124,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       page.calcPlacementTableRowTmpl
     )
 
-    Doc.bind(page.resetButton, 'click', () => { this.setOriginalValues(false) })
+    Doc.bind(page.resetButton, 'click', () => { this.setOriginalValues() })
     Doc.bind(page.updateButton, 'click', () => {
       this.saveSettings()
       Doc.show(page.settingsUpdatedMsg)
@@ -145,16 +147,24 @@ export default class MarketMakerSettingsPage extends BasePage {
     const host = urlParams.get('host')
     const base = urlParams.get('base')
     const quote = urlParams.get('quote')
+    const startTime = urlParams.get('startTime')
     if (!host || !base || !quote) {
       console.log("Missing 'host', 'base', or 'quote' URL parameter")
       return
     }
+
     this.baseID = parseInt(base)
     this.quoteID = parseInt(quote)
+    this.startTime = parseInt(startTime || '0')
     this.host = host
     page.baseHeader.textContent = app().assets[this.baseID].symbol.toUpperCase()
     page.quoteHeader.textContent = app().assets[this.quoteID].symbol.toUpperCase()
     page.hostHeader.textContent = host
+    if (this.startTime > 0) {
+      page.runTime.textContent = (new Date(this.startTime * 1000)).toLocaleString()
+      Doc.show(page.runTime)
+    }
+
     page.baseBalanceLogo.src = Doc.logoPathFromID(this.baseID)
     page.quoteBalanceLogo.src = Doc.logoPathFromID(this.quoteID)
     page.baseLogo.src = Doc.logoPathFromID(this.baseID)
@@ -163,18 +173,33 @@ export default class MarketMakerSettingsPage extends BasePage {
     this.setup()
   }
 
+  async getBotConfig () : Promise<BotConfig | undefined> {
+    if (this.startTime > 0) {
+      const res = await postJSON('/api/archivedbotcfg', {
+        host: this.host,
+        baseID: this.baseID,
+        quoteID: this.quoteID,
+        startTime: this.startTime
+      })
+      if (!app().checkResponse(res)) {
+        console.error('failed to get archived bot config', res)
+        return
+      }
+      return res.cfg
+    }
+
+    return await app().getMarketMakingConfig(this.host, this.baseID, this.quoteID)
+  }
+
   async setup () {
     const page = this.page
-    const botConfigs = await app().getMarketMakingConfig()
-    const status = await app().getMarketMakingStatus()
-
-    for (const cfg of botConfigs) {
-      if (cfg.host === this.host && cfg.baseAsset === this.baseID && cfg.quoteAsset === this.quoteID) {
-        this.originalConfig = JSON.parse(JSON.stringify(cfg))
-        this.updatedConfig = JSON.parse(JSON.stringify(cfg))
-        break
-      }
+    const cfg = await this.getBotConfig()
+    if (cfg) {
+      this.originalConfig = JSON.parse(JSON.stringify(cfg))
+      this.updatedConfig = JSON.parse(JSON.stringify(cfg))
     }
+    const status = await app().getMarketMakingStatus()
+    this.readOnly = status.running || this.startTime > 0
 
     if (!this.updatedConfig) {
       this.originalConfig = JSON.parse(JSON.stringify({
@@ -195,13 +220,13 @@ export default class MarketMakerSettingsPage extends BasePage {
       Doc.show(page.createButton)
     }
 
-    if (status.running) {
-      Doc.hide(page.updateButton, page.createButton, page.resetButton)
+    if (this.readOnly) {
+      Doc.hide(page.updateButton, page.createButton, page.resetButton, page.cancelButton)
     }
 
-    this.setupSettings(status.running)
-    this.setOriginalValues(status.running)
-    this.setupBalanceSelectors(botConfigs, status.running)
+    this.setupSettings()
+    this.setOriginalValues()
+    await this.setupBalanceSelectors()
     Doc.show(page.botSettingsContainer)
 
     this.fetchOracles()
@@ -498,7 +523,7 @@ export default class MarketMakerSettingsPage extends BasePage {
     page.sellGapFactorHdr.textContent = header
   }
 
-  setupSettings (running: boolean) {
+  setupSettings () {
     const page = this.page
 
     // Gap Strategy
@@ -516,7 +541,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       this.setGapFactorLabels(page.gapStrategySelect.value)
       this.updateModifiedMarkers()
     }
-    if (running) {
+    if (this.readOnly) {
       page.gapStrategySelect.setAttribute('disabled', 'true')
     }
 
@@ -533,7 +558,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       page.addSellPlacementGapFactor.value = ''
       this.updateModifiedMarkers()
     }
-    Doc.setVis(!running, page.addBuyPlacementRow, page.addSellPlacementRow)
+    Doc.setVis(!this.readOnly, page.addBuyPlacementRow, page.addSellPlacementRow)
 
     // Drift Tolerance
     const updatedDriftTolerance = (x: number) => {
@@ -554,7 +579,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       doNothing,
       false,
       false,
-      running
+      this.readOnly
     )
     page.driftToleranceContainer.appendChild(
       this.driftToleranceRangeHandler.control
@@ -572,7 +597,7 @@ export default class MarketMakerSettingsPage extends BasePage {
         this.updatedConfig.marketMakingConfig.oracleWeighting = 0
       }
     }
-    if (running) {
+    if (this.readOnly) {
       page.useOracleCheckbox.setAttribute('disabled', 'true')
     }
 
@@ -589,7 +614,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       doNothing,
       false,
       false,
-      running
+      this.readOnly
     )
     page.oracleBiasContainer.appendChild(this.oracleBiasRangeHandler.control)
 
@@ -606,7 +631,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       doNothing,
       false,
       false,
-      running
+      this.readOnly
     )
     page.oracleWeightingContainer.appendChild(
       this.oracleWeightingRangeHandler.control
@@ -632,7 +657,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       this.updatedConfig.marketMakingConfig.emptyMarketRate = emptyMarketRate
       this.updateModifiedMarkers()
     }
-    if (running) {
+    if (this.readOnly) {
       page.emptyMarketRateCheckbox.setAttribute('disabled', 'true')
       page.emptyMarketRateInput.setAttribute('disabled', 'true')
     }
@@ -646,7 +671,7 @@ export default class MarketMakerSettingsPage extends BasePage {
       )
       this.updateModifiedMarkers()
     }
-    if (running) {
+    if (this.readOnly) {
       page.splitTxCheckbox.setAttribute('disabled', 'true')
     }
 
@@ -663,12 +688,12 @@ export default class MarketMakerSettingsPage extends BasePage {
       doNothing,
       true,
       true,
-      running
+      this.readOnly
     )
     page.splitBufferContainer.appendChild(this.splitBufferRangeHandler.control)
   }
 
-  setOriginalValues (running: boolean) {
+  setOriginalValues () {
     const page = this.page
     this.updatedConfig = JSON.parse(JSON.stringify(this.originalConfig))
 
@@ -689,10 +714,10 @@ export default class MarketMakerSettingsPage extends BasePage {
       page.sellPlacementsTableBody.children[0].remove()
     }
     this.originalConfig.marketMakingConfig.buyPlacements.forEach((placement) => {
-      this.addPlacement(true, placement, running)
+      this.addPlacement(true, placement, this.readOnly)
     })
     this.originalConfig.marketMakingConfig.sellPlacements.forEach((placement) => {
-      this.addPlacement(false, placement, running)
+      this.addPlacement(false, placement, this.readOnly)
     })
 
     page.emptyMarketRateCheckbox.checked =
@@ -775,8 +800,9 @@ export default class MarketMakerSettingsPage extends BasePage {
     this.showForm(this.page.calcPlacementsForm)
   }
 
-  setupBalanceSelectors (allConfigs: BotConfig[], running: boolean) {
+  async setupBalanceSelectors () {
     const page = this.page
+    const allConfigs = await app().getAllMarketMakingConfig()
 
     const baseAsset = app().assets[this.updatedConfig.baseAsset]
     const quoteAsset = app().assets[this.updatedConfig.quoteAsset]
@@ -880,7 +906,7 @@ export default class MarketMakerSettingsPage extends BasePage {
         doNothing,
         false,
         true,
-        running
+        this.readOnly
       )
       page.baseBalanceContainer.appendChild(baseRangeHandler.control)
       Doc.show(page.baseBalanceContainer)
@@ -902,7 +928,7 @@ export default class MarketMakerSettingsPage extends BasePage {
         doNothing,
         false,
         true,
-        running
+        this.readOnly
       )
       Doc.empty(page.quoteBalanceContainer)
       page.quoteBalanceContainer.appendChild(quoteRangeHandler.control)

@@ -6,9 +6,17 @@
     <div class="px-1 py-2">
       <span id="mmErr" class="errcolor px-2 d-hide"></span>
       <br/>
-      <button type="button" class="fs20 mx-1 px-2 selected" id="addBotBtn">[[[add_a_bot]]]</button>
-      <button type="button" class="fs20 mx-1 px-2 selected d-hide" id="startBotsBtn">[[[start_market_making]]]</button>
-      <button type="button" class="fs20 mx-1 px-2 selected stopred-bg d-hide" id="stopBotsBtn">[[[stop_market_making]]]</button>
+      <div id="ctrlButtons">
+        <div>
+          <button type="button" class="fs20 mx-1 px-2 selected" id="addBotBtn">[[[add_a_bot]]]</button>
+          <button type="button" class="fs20 mx-1 px-2 selected d-hide" id="startBotsBtn">[[[start_market_making]]]</button>
+          <button type="button" class="fs20 mx-1 px-2 selected stopred-bg d-hide" id="stopBotsBtn">[[[stop_market_making]]]</button>
+          <span class="d-hide" id="runningSinceMsg">[[[running_since]]] <span id="runningSinceTime"></span></span>
+        </div>
+        <div>
+          <button type="button" class="fs20 mx-1 px-2 selected" id="archivedLogsBtn">[[[past_run_logs]]]</button>
+        </div>
+      </div>
     </div>
 
     <table id="botTable" class="d-hide">
@@ -18,10 +26,12 @@
         <th scope="col">[[[Host]]]</th>
         <th scope="col">[[[Market]]]</th>
         <th scope="col">[[[bot_type]]]</th>
-        <th scope="col" id="baseBalanceHeader">[[[base_balance]]]</th>
-        <th scope="col" id="quoteBalanceHeader">[[[quote_balance]]]</th>
+        <th scope="col">[[[base_balance]]]</th>
+        <th scope="col">[[[quote_balance]]]</th>
+        <th scope="col" id="profitHeader">[[[profit]]]</th>
         <th scope="col" id="removeHeader">[[[Remove]]]</th>
         <th scope="col">[[[Settings]]]</th>
+        <th scope="col" id="logsHeader">[[[logs]]]</th>
       </thead>
       <tbody id="botTableBody">
         <tr id="botTableRowTmpl">
@@ -31,17 +41,56 @@
             <span class="ico-sleeping fs20 mx-2" data-tmpl="notRunningIcon"></span>
           </td>
           <td data-tmpl="host"></td>
-          <td><img data-tmpl="baseMktLogo"><span data-tmpl="baseSymbol"></span> - <img data-tmpl="quoteMktLogo"><span data-tmpl="quoteSymbol"></span></td>
+          <td><img data-tmpl="baseMktLogo"><img data-tmpl="quoteMktLogo"> <span data-tmpl="baseSymbol"></span>-<span data-tmpl="quoteSymbol"></span></td>
           <td data-tmpl="botType"></td>
-          <td data-tmpl="baseBalanceTd"><img data-tmpl="baseBalanceLogo"><span data-tmpl="baseBalance"></span></td>
-          <td data-tmpl="quoteBalanceTd"></span><img data-tmpl="quoteBalanceLogo"><span data-tmpl="quoteBalance"></td>
+          <td data-tmpl="stoppedBaseBalanceTd">
+            <span data-tmpl="baseBalance"></span>
+            <img data-tmpl="baseBalanceLogo">
+          </td>
+          <td data-tmpl="stoppedQuoteBalanceTd">
+            <span data-tmpl="quoteBalance"></span>
+            <img data-tmpl="quoteBalanceLogo">
+          </td>
+          <td data-tmpl="runningBaseBalanceTd" class="d-hide">
+            <img data-tmpl="runningBaseBalanceLogo">
+            <span data-tmpl="runningBaseBalance"></span>
+            <span class="ico-info mx-1" data-tmpl="baseBalanceInfo"></span>
+            <div data-tmpl="baseBalanceHoverContainer" class="balance-layover d-flex flex-column d-hide">
+              <span>[[[Total]]]: <span data-tmpl="runningBaseBalanceTotal"></span></span>
+              <span>[[[Available]]]: <span data-tmpl="runningBaseBalanceAvailable"></span></span>
+              <span>[[[funding_order]]]: <span data-tmpl="runningBaseBalanceFunding"></span></span>
+              <span>[[[pending_redeem]]]: <span data-tmpl="runningBaseBalancePendingRedeem"></span></span>
+              <span>[[[pending_refund]]]: <span data-tmpl="runningBaseBalancePendingRefund"></span></span>
+            </div>
+          </td>
+          <td data-tmpl="runningQuoteBalanceTd" class="d-hide">
+            <img data-tmpl="runningQuoteBalanceLogo">
+            <span data-tmpl="runningQuoteBalance"></span>
+            <span class="ico-info mx-1" data-tmpl="quoteBalanceInfo"></span>
+            <div data-tmpl="quoteBalanceHoverContainer" class="balance-layover d-flex flex-column align-items-stretch d-hide">
+              <span>[[[Total]]]: <span data-tmpl="runningQuoteBalanceTotal"></span></span>
+              <span>[[[Available]]]: <span data-tmpl="runningQuoteBalanceAvailable"></span></span>
+              <span>[[[funding_order]]]: <span data-tmpl="runningQuoteBalanceFunding"></span></span>
+              <span>[[[pending_redeem]]]: <span data-tmpl="runningQuoteBalancePendingRedeem"></span></span>
+              <span>[[[pending_refund]]]: <span data-tmpl="runningQuoteBalancePendingRefund"></span></span>
+            </div>
+          </td>
+          <td data-tmpl="profitTd">
+            <span data-tmpl="profit"></span><span class="ico-info mx-1" data-tmpl="profitInfo"></span>
+            <div data-tmpl="profitHoverContainer" class="balance-layover d-flex flex-column align-items-stretch d-hide">
+              <span>[[[base_change]]]: <img data-tmpl="baseChangeLogo"><span data-tmpl="baseChange"></span></span>
+              <span>[[[quote_change]]]: <img data-tmpl="quoteChangeLogo"><span data-tmpl="quoteChange"></span></span>
+              <span>[[[base_fees]]]: <img data-tmpl="baseFeesLogo"><span data-tmpl="baseFees" class="loss-color"></span></span>
+              <span>[[[quote_fees]]]: <img data-tmpl="quoteFeesLogo"><span data-tmpl="quoteFees" class="loss-color"></span></span>
+            </div>
+          </td>
           <td data-tmpl="removeTd"><span class="ico-cross fs20 pointer mx-2 red" data-tmpl="remove"></span></td>
-          <td><span class="ico-settings fs20 pointer mx-2" data-tmpl="settings"></span></td>          
+          <td><span class="ico-settings fs20 pointer mx-2" data-tmpl="settings"></span></td>        
+          <td data-tmpl="logsTd"><button data-tmpl="logsBtn">[[[view_logs]]]</button></td>
         </tr>
       </tbody>
     </table>
     <h2 id="noBotsHeader" class="text-center d-hide">[[[add_bot_get_started]]]</h2>
-    
 
   {{- /* FORMS */ -}}
   <div id="forms" class="d-hide">

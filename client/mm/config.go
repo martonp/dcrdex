@@ -1,9 +1,5 @@
 package mm
 
-import (
-	"fmt"
-)
-
 // MarketMakingWithCEXConfig is the configuration for a market
 // maker that places orders on both sides of the order book, but
 // only if there is profitable counter-trade on the CEX
@@ -50,8 +46,4 @@ func (c *BotConfig) requiresPriceOracle() bool {
 		return c.MMCfg.OracleWeighting != nil && *c.MMCfg.OracleWeighting > 0
 	}
 	return false
-}
-
-func dexMarketID(host string, base, quote uint32) string {
-	return fmt.Sprintf("%s-%d-%d", host, base, quote)
 }

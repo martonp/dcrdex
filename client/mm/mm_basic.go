@@ -518,6 +518,7 @@ func (m *basicMarketMaker) placeMultiTrade(placements []*rateLots, sell bool) {
 		m.oidToPlacement[oid] = placementIndex
 	}
 	m.ordMtx.Unlock()
+
 }
 
 func (m *basicMarketMaker) processFiatRates(rates map[uint32]float64) {
@@ -605,6 +606,7 @@ func (m *basicMarketMaker) rebalance(newEpoch uint64) {
 	if len(buyOrders) > 0 {
 		m.placeMultiTrade(buyOrders, false)
 	}
+
 	if len(sellOrders) > 0 {
 		m.placeMultiTrade(sellOrders, true)
 	}

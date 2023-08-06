@@ -9,6 +9,8 @@ import OrdersPage from './orders'
 import OrderPage from './order'
 import MarketMakerPage from './mm'
 import MarketMakerSettingsPage from './mmsettings'
+import MarketMakerLogsPage from './mmlogs'
+import MarketMakerArchivesPage from './mmarchives'
 import DexSettingsPage from './dexsettings'
 import InitPage from './init'
 import { RateEncodingFactor, StatusExecuted, hasActiveMatches } from './orderutil'
@@ -42,8 +44,9 @@ import {
   RateNote,
   InFlightOrder,
   BotConfig,
-  MMStartStopNote,
-  MarketMakingStatus
+  MMStatus,
+  MMStatusNote,
+  BotStatusNote
 } from './registry'
 
 const idel = Doc.idel // = element by id
@@ -77,7 +80,9 @@ const constructors: Record<string, PageClass> = {
   dexsettings: DexSettingsPage,
   init: InitPage,
   mm: MarketMakerPage,
-  mmsettings: MarketMakerSettingsPage
+  mmsettings: MarketMakerSettingsPage,
+  mmlogs: MarketMakerLogsPage,
+  mmarchives: MarketMakerArchivesPage
 }
 
 // Application is the main javascript web application for the Decred DEX client.
@@ -104,7 +109,7 @@ export default class Application {
   popupTmpl: HTMLElement
   noteReceivers: Record<string, (n: CoreNote) => void>[]
   marketMakingCfg: BotConfig[]
-  marketMakingStatus: MarketMakingStatus | undefined
+  marketMakingStatus: MMStatus | undefined
 
   constructor () {
     this.notes = []
@@ -632,10 +637,25 @@ export default class Application {
         this.fiatRatesMap = (note as RateNote).fiatRates
         break
       }
-      case 'mmstartstop': {
-        const n = note as MMStartStopNote
-        if (!this.marketMakingStatus) return
+      case 'mmstatus': {
+        const n = note as MMStatusNote
+        this.marketMakingStatus = {} as MMStatus
+        this.marketMakingStatus.runStart = n.runStart
         this.marketMakingStatus.running = n.running
+        this.marketMakingStatus.bots = n.bots
+        break
+      }
+      case 'botstatus': {
+        const n = note as BotStatusNote
+        if (!this.marketMakingStatus || !this.marketMakingStatus.bots) return
+        for (let i = 0; i < this.marketMakingStatus.bots.length; i++) {
+          const bot = this.marketMakingStatus.bots[i]
+          if (bot.host === n.status.host && bot.base === n.status.base && bot.quote === n.status.quote) {
+            this.marketMakingStatus.bots[i] = n.status
+            break
+          }
+        }
+        break
       }
     }
   }
@@ -940,7 +960,7 @@ export default class Application {
     window.location.href = '/login'
   }
 
-  async getMarketMakingConfig () : Promise<BotConfig[]> {
+  async getAllMarketMakingConfig () : Promise<BotConfig[]> {
     if (this.marketMakingCfg) return this.marketMakingCfg
     const res = await getJSON('/api/marketmakingconfig')
     if (!this.checkResponse(res)) {
@@ -948,6 +968,14 @@ export default class Application {
     }
     this.marketMakingCfg = res.cfg
     return this.marketMakingCfg
+  }
+
+  async getMarketMakingConfig (host: string, baseAsset: number, quoteAsset: number) : Promise<BotConfig | undefined> {
+    const cfgs = await this.getAllMarketMakingConfig()
+    const cfg = cfgs.find(cfg => {
+      return cfg.host === host && cfg.baseAsset === baseAsset && cfg.quoteAsset === quoteAsset
+    })
+    return cfg
   }
 
   async updateMarketMakingConfig (cfg: BotConfig) : Promise<void> {
@@ -992,16 +1020,14 @@ export default class Application {
     await postJSON('/api/stopmarketmaking')
   }
 
-  async getMarketMakingStatus () : Promise<MarketMakingStatus> {
+  async getMarketMakingStatus () : Promise<MMStatus> {
     if (this.marketMakingStatus !== undefined) return this.marketMakingStatus
     const res = await getJSON('/api/marketmakingstatus')
     if (!this.checkResponse(res)) {
       throw new Error('failed to fetch market making status')
     }
-    const status = {} as MarketMakingStatus
-    status.running = !!res.running
-    status.runningBots = res.runningBots
-    return status
+    this.marketMakingStatus = res.status
+    return res.status
   }
 }
 

@@ -5,6 +5,7 @@ package mm
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"decred.org/dcrdex/client/core"
 	"decred.org/dcrdex/client/orderbook"
@@ -39,6 +41,7 @@ type clientCore interface {
 	User() *core.User
 	Login(pw []byte) error
 	OpenWallet(assetID uint32, appPW []byte) error
+	Order(oidB dex.Bytes) (*core.Order, error)
 }
 
 var _ clientCore = (*core.Core)(nil)
@@ -135,6 +138,7 @@ type orderInfo struct {
 	excessFeesReturned        bool
 	matchesSeen               map[order.MatchID]struct{}
 	matchesRefunded           map[order.MatchID]struct{}
+	cancelLogged              bool
 }
 
 // finishedProcessing returns true when the MarketMaker no longer needs to
@@ -168,9 +172,17 @@ type MarketMaker struct {
 	// syncedOracle is only available while the MarketMaker is running.
 	syncedOracle   *priceOracle
 	unsyncedOracle *priceOracle
+	eventLogDB     eventLogDB
+	currRunStart   int64
+
+	eventLogsMtx sync.RWMutex
+	eventLogs    map[string]*eventLog
 
 	runningBotsMtx sync.RWMutex
-	runningBots    map[string]interface{}
+	runningBots    map[string]bool
+
+	enabledCfgsMtx sync.RWMutex
+	enabledCfgs    []*BotConfig
 
 	noteMtx   sync.RWMutex
 	noteChans map[uint64]chan core.Notification
@@ -184,10 +196,48 @@ func (m *MarketMaker) Running() bool {
 	return m.running.Load()
 }
 
+type Status struct {
+	Running     bool         `json:"running"`
+	RunStart    int64        `json:"runStart"`
+	BotStatuses []*BotStatus `json:"bots"`
+}
+
+func (m *MarketMaker) Status() *Status {
+	if !m.Running() {
+		return &Status{
+			Running: false,
+		}
+	}
+
+	return &Status{
+		Running:     m.Running(),
+		RunStart:    m.currRunStart,
+		BotStatuses: m.BotStatuses(),
+	}
+}
+
 type MarketWithHost struct {
 	Host  string `json:"host"`
 	Base  uint32 `json:"base"`
 	Quote uint32 `json:"quote"`
+}
+
+func (m *MarketWithHost) Serialize() []byte {
+	mktBytes := make([]byte, 0, len(m.Host)+8)
+	mktBytes = binary.BigEndian.AppendUint32(mktBytes, m.Base)
+	mktBytes = binary.BigEndian.AppendUint32(mktBytes, m.Quote)
+	mktBytes = append(mktBytes, []byte(m.Host)...)
+	return mktBytes
+}
+
+func (m *MarketWithHost) Deserialize(b []byte) error {
+	if len(b) < 8 {
+		return errors.New("invalid market")
+	}
+	m.Base = binary.BigEndian.Uint32(b[:4])
+	m.Quote = binary.BigEndian.Uint32(b[4:8])
+	m.Host = string(b[8:])
+	return nil
 }
 
 func (m *MarketWithHost) String() string {
@@ -215,22 +265,93 @@ func parseMarketWithHost(mkt string) (*MarketWithHost, error) {
 	}, nil
 }
 
-// RunningBots returns the markets on which a bot is running.
-func (m *MarketMaker) RunningBots() []*MarketWithHost {
+// BotStatuses returns the status of each configured bot.
+func (m *MarketMaker) BotStatuses() []*BotStatus {
+	if !m.Running() {
+		return nil
+	}
+
+	m.enabledCfgsMtx.RLock()
+	defer m.enabledCfgsMtx.RUnlock()
+
+	statuses := make([]*BotStatus, 0, len(m.runningBots))
+	for _, cfg := range m.enabledCfgs {
+		botStatus, err := m.botStatus(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+		if err != nil {
+			m.log.Errorf("failed to get bot status for %s-%d-%d: %v",
+				cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, err)
+			continue
+		}
+
+		statuses = append(statuses, botStatus)
+	}
+
+	return statuses
+}
+
+func (m *MarketMaker) runningBotLogs(host string, base, quote uint32) ([]*Event, *RunStats, error) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	eventLog, found := m.eventLogs[(&MarketWithHost{host, base, quote}).String()]
+	if !found {
+		return nil, nil, fmt.Errorf("no event log for %s-%d-%d", host, base, quote)
+	}
+
+	events, stats := eventLog.logsAndStats()
+	return events, stats, nil
+}
+
+func (m *MarketMaker) RunOverviews(startTime int64) (map[string]*RunOverview, error) {
+	return m.eventLogDB.runOverviews(startTime)
+}
+
+func (m *MarketMaker) RunConfig(startTime int64, host string, base, quote uint32) (*BotConfig, error) {
+	mkt := &MarketWithHost{
+		Host:  host,
+		Base:  base,
+		Quote: quote,
+	}
+	return m.eventLogDB.runConfig(startTime, mkt)
+}
+
+func (m *MarketMaker) AllArchivedRuns() ([]int64, error) {
+	return m.eventLogDB.allRuns()
+}
+
+func (m *MarketMaker) BotLogs(host string, base, quote uint32, startTime *int64) ([]*Event, *RunStats, error) {
+	if !m.Running() && startTime == nil {
+		return nil, nil, errors.New("market maker is not running")
+	}
+
+	if startTime != nil {
+		mkt := &MarketWithHost{
+			Host:  host,
+			Base:  base,
+			Quote: quote,
+		}
+		events, stats, finalized, err := m.eventLogDB.runLogs(*startTime, mkt)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !finalized {
+			events, stats, _, err = finalizeArchivedEventLog(m.eventLogDB, m.core, *startTime, mkt, events, stats, m.log)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		return events, stats, nil
+	}
+
+	return m.runningBotLogs(host, base, quote)
+}
+
+func (m *MarketMaker) botIsRunning(mkt string) bool {
 	m.runningBotsMtx.RLock()
 	defer m.runningBotsMtx.RUnlock()
 
-	mkts := make([]*MarketWithHost, 0, len(m.runningBots))
-	for mkt := range m.runningBots {
-		mktWithHost, err := parseMarketWithHost(mkt)
-		if err != nil {
-			m.log.Errorf("failed to parse market %s: %v", mkt, err)
-			continue
-		}
-		mkts = append(mkts, mktWithHost)
-	}
-
-	return mkts
+	_, found := m.runningBots[mkt]
+	return found
 }
 
 func marketsRequiringPriceOracle(cfgs []*BotConfig) []*mkt {
@@ -251,11 +372,11 @@ func duplicateBotConfig(cfgs []*BotConfig) error {
 	mkts := make(map[string]struct{})
 
 	for _, cfg := range cfgs {
-		mkt := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
-		if _, found := mkts[mkt]; found {
+		mkt := &MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
+		if _, found := mkts[mkt.String()]; found {
 			return fmt.Errorf("duplicate bot config for market %s", mkt)
 		}
-		mkts[mkt] = struct{}{}
+		mkts[mkt.String()] = struct{}{}
 	}
 
 	return nil
@@ -277,16 +398,21 @@ func priceOracleFromConfigs(ctx context.Context, cfgs []*BotConfig, log dex.Logg
 
 func (m *MarketMaker) markBotAsRunning(id string, running bool) {
 	m.runningBotsMtx.Lock()
-	if running {
-		m.runningBots[id] = struct{}{}
-	} else {
-		delete(m.runningBots, id)
+	defer m.runningBotsMtx.Unlock()
+
+	m.runningBots[id] = running
+
+	if m.doNotKillWhenBotsStop {
+		return
 	}
 
-	if len(m.runningBots) == 0 {
-		m.die()
+	for _, running := range m.runningBots {
+		if running {
+			return
+		}
 	}
-	m.runningBotsMtx.Unlock()
+
+	m.die()
 }
 
 func (m *MarketMaker) MarketReport(base, quote uint32) (*MarketReport, error) {
@@ -317,6 +443,67 @@ func (m *MarketMaker) MarketReport(base, quote uint32) (*MarketReport, error) {
 		BaseFiatRate:  baseFiatRate,
 		QuoteFiatRate: quoteFiatRate,
 	}, nil
+}
+
+type BotStatus struct {
+	Host    string `json:"host"`
+	Base    uint32 `json:"base"`
+	Quote   uint32 `json:"quote"`
+	Running bool   `json:"running"`
+
+	*RunStats
+	BaseBalance  *botBalance `json:"baseBalance"`
+	QuoteBalance *botBalance `json:"quoteBalance"`
+}
+
+func (m *MarketMaker) botStatus(host string, base, quote uint32) (*BotStatus, error) {
+	mktID := (&MarketWithHost{host, base, quote}).String()
+
+	if running := m.botIsRunning(mktID); !running {
+		return &BotStatus{
+			Host:    host,
+			Base:    base,
+			Quote:   quote,
+			Running: false,
+		}, nil
+	}
+
+	m.eventLogsMtx.RLock()
+	eventLog, found := m.eventLogs[mktID]
+	if !found {
+		m.eventLogsMtx.RUnlock()
+		return nil, fmt.Errorf("no event log for %s", mktID)
+	}
+	m.eventLogsMtx.RUnlock()
+
+	baseBalance := m.botBalance(mktID, base)
+	quoteBalance := m.botBalance(mktID, quote)
+
+	return &BotStatus{
+		Host:         host,
+		Base:         base,
+		Quote:        quote,
+		Running:      true,
+		RunStats:     eventLog.stats(),
+		BaseBalance:  &baseBalance,
+		QuoteBalance: &quoteBalance,
+	}, nil
+}
+
+func (m *MarketMaker) sendBotStatusNotification(botID string) {
+	mkt, err := parseMarketWithHost(botID)
+	if err != nil {
+		m.log.Errorf("failed to parse market %s: %v", botID, err)
+		return
+	}
+
+	botStatus, err := m.botStatus(mkt.Host, mkt.Base, mkt.Quote)
+	if err != nil {
+		m.log.Errorf("failed to get bot status for %s: %v", botID, err)
+		return
+	}
+
+	m.notify(newBotStatusNote(botStatus))
 }
 
 func (m *MarketMaker) loginAndUnlockWallets(pw []byte, cfgs []*BotConfig) error {
@@ -360,6 +547,95 @@ func validateAndFilterEnabledConfigs(cfgs []*BotConfig) ([]*BotConfig, error) {
 		return nil, err
 	}
 	return enabledCfgs, nil
+}
+
+func (m *MarketMaker) setupEventLogs(cfgs []*BotConfig, user *core.User) error {
+	m.eventLogsMtx.Lock()
+	defer m.eventLogsMtx.Unlock()
+
+	m.eventLogs = make(map[string]*eventLog, len(cfgs))
+
+	var fiatRates map[uint32]float64
+	if user != nil {
+		fiatRates = user.FiatRates
+	}
+
+	err := m.eventLogDB.storeNewRun(m.currRunStart, cfgs, fiatRates)
+	if err != nil {
+		return fmt.Errorf("failed to store new run: %w", err)
+	}
+
+	for _, cfg := range cfgs {
+		var baseFiatRate, quoteFiatRate float64
+		if user != nil {
+			baseFiatRate = user.FiatRates[cfg.BaseAsset]
+			quoteFiatRate = user.FiatRates[cfg.QuoteAsset]
+		}
+
+		log, err := newEventLog(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, m.currRunStart, m.eventLogDB, m.log.SubLogger("EVENT_LOG"), m.notify)
+		if err != nil {
+			return fmt.Errorf("failed to create event log for market %s-%d-%d: %w",
+				cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, err)
+		}
+
+		log.updateFiatRates(baseFiatRate, quoteFiatRate)
+		mktID := (&MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}).String()
+		m.eventLogs[mktID] = log
+	}
+
+	return nil
+}
+
+func (m *MarketMaker) logOrdersPlaced(botID string, orderIDs []dex.Bytes, fundingTx *core.FundingTx, sell bool) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	log, ok := m.eventLogs[botID]
+	if !ok {
+		m.log.Errorf("logOrdersPlaced: event log not found for bot %s", botID)
+		return
+	}
+
+	log.logOrdersPlaced(orderIDs, fundingTx, sell)
+}
+
+func (m *MarketMaker) logOrderCanceled(botID string, orderID dex.Bytes) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	log, ok := m.eventLogs[botID]
+	if !ok {
+		m.log.Errorf("logOrdersCanceled: event log not found for bot %s", botID)
+		return
+	}
+
+	log.logOrderCanceled(orderID)
+}
+
+func (m *MarketMaker) logMatch(botID string, orderID dex.Bytes, matchID dex.Bytes, sell bool, qty, rate uint64) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	log, ok := m.eventLogs[botID]
+	if !ok {
+		m.log.Errorf("logMatch: event log not found for bot %s", botID)
+		return
+	}
+
+	log.logMatch(orderID, matchID, sell, qty, rate)
+}
+
+func (m *MarketMaker) logFeesConfirmed(botID string, orderID dex.Bytes, swapFees, redeemFees uint64, sell bool) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	log, ok := m.eventLogs[botID]
+	if !ok {
+		m.log.Errorf("logOrder: event log not found for bot %s", botID)
+		return
+	}
+
+	log.logFeesConfirmed(orderID, swapFees, redeemFees, sell)
 }
 
 func (m *MarketMaker) setupBalances(cfgs []*BotConfig) error {
@@ -425,7 +701,7 @@ func (m *MarketMaker) setupBalances(cfgs []*BotConfig) error {
 		baseBalance.balanceReserved += baseRequired
 		quoteBalance.balanceReserved += quoteRequired
 
-		mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+		mktID := (&MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}).String()
 		m.botBalances[mktID] = &botBalances{
 			balances: map[uint32]*botBalance{
 				cfg.BaseAsset: {
@@ -479,6 +755,7 @@ func (m *MarketMaker) modifyBotBalance(botID string, mods []*balanceMod) {
 	}
 
 	bb.mtx.Lock()
+	defer m.sendBotStatusNotification(botID)
 	defer bb.mtx.Unlock()
 
 	for _, mod := range mods {
@@ -542,22 +819,27 @@ func (m *MarketMaker) modifyBotBalance(botID string, mods []*balanceMod) {
 }
 
 // botBalance returns a bot's balance of an asset.
-func (m *MarketMaker) botBalance(botID string, assetID uint32) uint64 {
+func (m *MarketMaker) botBalance(botID string, assetID uint32) botBalance {
 	bb := m.botBalances[botID]
 	if bb == nil {
 		m.log.Errorf("balance: bot %s not found", botID)
-		return 0
+		return botBalance{}
 	}
 
 	bb.mtx.RLock()
 	defer bb.mtx.RUnlock()
 
-	if _, found := bb.balances[assetID]; found {
-		return bb.balances[assetID].Available
+	balance, found := bb.balances[assetID]
+	if found {
+		return *balance
 	}
 
 	m.log.Errorf("balance: asset %d not found for bot %s", assetID, botID)
-	return 0
+	return botBalance{}
+}
+
+func (m *MarketMaker) botAvailableBalance(botID string, assetID uint32) uint64 {
+	return m.botBalance(botID, assetID).Available
 }
 
 func (m *MarketMaker) getOrderInfo(id dex.Bytes) *orderInfo {
@@ -594,6 +876,8 @@ func (m *MarketMaker) handleMatchUpdate(match *core.Match, oid dex.Bytes) {
 
 	if _, seen := orderInfo.matchesSeen[matchID]; !seen {
 		orderInfo.matchesSeen[matchID] = struct{}{}
+
+		m.logMatch(orderInfo.bot, oid, matchID[:], orderInfo.order.Sell, match.Qty, match.Rate)
 
 		var maxRedeemFees uint64
 		if orderInfo.initialRedeemFeesLocked == 0 {
@@ -718,8 +1002,10 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 	}
 
 	var filledQty, filledLots uint64
+	var canceled bool
 	for _, match := range o.Matches {
 		if match.IsCancel {
+			canceled = true
 			continue
 		}
 
@@ -729,6 +1015,11 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 		} else {
 			filledQty += match.Qty
 		}
+	}
+
+	if canceled && !orderInfo.cancelLogged {
+		m.logOrderCanceled(orderInfo.bot, o.ID)
+		orderInfo.cancelLogged = true
 	}
 
 	// Step 4 (from botBalance doc): OrderStatus > Booked - return over locked amount
@@ -754,6 +1045,8 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 
 	// Step 5 (from botBalance doc): All Fees Confirmed - return excess swap and redeem fees
 	if !orderInfo.excessFeesReturned && o.AllFeesConfirmed {
+		m.logFeesConfirmed(orderInfo.bot, o.ID, o.FeesPaid.Swap, o.FeesPaid.Redemption, o.Sell)
+
 		// Return excess swap fees
 		maxSwapFees := filledLots * orderInfo.singleLotSwapFees
 		if maxSwapFees > o.FeesPaid.Swap {
@@ -803,12 +1096,25 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 	}
 }
 
+func (m *MarketMaker) processFiatRates(rates map[uint32]float64) {
+	m.eventLogsMtx.RLock()
+	defer m.eventLogsMtx.RUnlock()
+
+	for _, log := range m.eventLogs {
+		log.updateFiatRates(rates[log.baseID], rates[log.quoteID])
+	}
+
+	m.eventLogDB.storeFiatRates(m.currRunStart, rates)
+}
+
 func (m *MarketMaker) handleNotification(n core.Notification) {
 	switch note := n.(type) {
 	case *core.OrderNote:
 		m.handleOrderUpdate(note.Order)
 	case *core.MatchNote:
 		m.handleMatchUpdate(note.Match, note.OrderID)
+	case *core.FiatRatesNote:
+		go m.processFiatRates(note.FiatRates)
 	}
 }
 
@@ -847,6 +1153,7 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 	if !m.running.CompareAndSwap(false, true) {
 		return errors.New("market making is already running")
 	}
+	m.currRunStart = time.Now().Unix()
 
 	var startedMarketMaking bool
 	defer func() {
@@ -861,6 +1168,10 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 	if err != nil {
 		return err
 	}
+
+	m.enabledCfgsMtx.Lock()
+	m.enabledCfgs = enabledCfgs
+	m.enabledCfgsMtx.Unlock()
 
 	if err := m.loginAndUnlockWallets(pw, enabledCfgs); err != nil {
 		return err
@@ -879,8 +1190,12 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 
 	user := m.core.User()
 
+	if err := m.setupEventLogs(enabledCfgs, user); err != nil {
+		return err
+	}
+
 	startedMarketMaking = true
-	m.notify(newMMStartStopNote(true))
+	m.notify(newMMStatusNote(true, m.currRunStart, m.BotStatuses()))
 
 	wg := new(sync.WaitGroup)
 
@@ -909,16 +1224,12 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 			go func(cfg *BotConfig) {
 				mkt := &MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
 				m.markBotAsRunning(mkt.String(), true)
-				defer func() {
-					m.markBotAsRunning(mkt.String(), false)
-				}()
+				m.sendBotStatusNotification(mkt.String())
+				defer m.sendBotStatusNotification(mkt.String())
+				defer m.markBotAsRunning(mkt.String(), false)
 
-				m.notify(newBotStartStopNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, true))
-				defer func() {
-					m.notify(newBotStartStopNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, false))
-				}()
 				logger := m.log.SubLogger(fmt.Sprintf("MarketMaker-%s-%d-%d", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset))
-				mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+				mktID := (&MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}).String()
 				var baseFiatRate, quoteFiatRate float64
 				if user != nil {
 					baseFiatRate = user.FiatRates[cfg.BaseAsset]
@@ -936,7 +1247,7 @@ func (m *MarketMaker) Run(ctx context.Context, cfgs []*BotConfig, pw []byte) err
 		wg.Wait()
 		m.log.Infof("All bots have stopped running.")
 		m.running.Store(false)
-		m.notify(newMMStartStopNote(false))
+		m.notify(newMMStatusNote(false, 0, nil))
 	}()
 
 	return nil
@@ -949,14 +1260,20 @@ func (m *MarketMaker) Stop() {
 	}
 }
 
-func NewMarketMaker(c clientCore, log dex.Logger) (*MarketMaker, error) {
+func NewMarketMaker(c *core.Core, log dex.Logger, dbPath string) (*MarketMaker, error) {
+	eventLogDB, err := newEventLogDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
 	return &MarketMaker{
 		core:           c,
 		log:            log,
 		orders:         make(map[order.OrderID]*orderInfo),
 		running:        atomic.Bool{},
-		runningBots:    make(map[string]interface{}),
+		runningBots:    make(map[string]bool),
 		noteChans:      make(map[uint64]chan core.Notification),
 		unsyncedOracle: newUnsyncedPriceOracle(log),
+		eventLogDB:     eventLogDB,
 	}, nil
 }

@@ -15,7 +15,9 @@ import (
 const (
 	validationNote = "validation"
 	botStartStop   = "botstartstop"
-	mmStartStop    = "mmstartstop"
+	mmStatus       = "mmstatus"
+	botStatus      = "botstatus"
+	botEvent       = "botevent"
 )
 
 // NoteFeed contains a receiving channel for notifications.
@@ -110,34 +112,53 @@ func newValidationErrorNote(host string, baseID, quoteID uint32, errorMsg string
 	}
 }
 
-type botStartStopNote struct {
+type mmStatusNote struct {
 	db.Notification
 
-	Host    string `json:"host"`
-	Base    uint32 `json:"base"`
-	Quote   uint32 `json:"quote"`
-	Running bool   `json:"running"`
+	Running  bool         `json:"running"`
+	RunStart int64        `json:"runStart"`
+	Bots     []*BotStatus `json:"bots,omitempty"`
 }
 
-func newBotStartStopNote(host string, base, quote uint32, running bool) *botStartStopNote {
-	return &botStartStopNote{
-		Notification: db.NewNotification(botStartStop, "", "", "", db.Data),
-		Host:         host,
-		Base:         base,
-		Quote:        quote,
+func newMMStatusNote(running bool, runStart int64, bots []*BotStatus) *mmStatusNote {
+	return &mmStatusNote{
+		Notification: db.NewNotification(mmStatus, "", "", "", db.Data),
 		Running:      running,
+		RunStart:     runStart,
+		Bots:         bots,
 	}
 }
 
-type mmStartStopNote struct {
+type botStatusNote struct {
 	db.Notification
 
-	Running bool `json:"running"`
+	Status *BotStatus `json:"status"`
 }
 
-func newMMStartStopNote(running bool) *mmStartStopNote {
-	return &mmStartStopNote{
-		Notification: db.NewNotification(mmStartStop, "", "", "", db.Data),
-		Running:      running,
+func newBotStatusNote(status *BotStatus) *botStatusNote {
+	return &botStatusNote{
+		Notification: db.NewNotification(botStatus, "", "", "", db.Data),
+		Status:       status,
+	}
+}
+
+type botEventNote struct {
+	db.Notification
+
+	Host     string    `json:"host"`
+	Base     uint32    `json:"base"`
+	Quote    uint32    `json:"quote"`
+	Event    *Event    `json:"event"`
+	RunStats *RunStats `json:"stats"`
+}
+
+func newBotEventNote(host string, base, quote uint32, event *Event, stats *RunStats) *botEventNote {
+	return &botEventNote{
+		Notification: db.NewNotification(botEvent, "", "", "", db.Data),
+		Host:         host,
+		Base:         base,
+		Quote:        quote,
+		Event:        event,
+		RunStats:     stats,
 	}
 }
