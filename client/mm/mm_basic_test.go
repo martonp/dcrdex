@@ -5,6 +5,7 @@ package mm
 import (
 	"errors"
 	"reflect"
+	"sort"
 	"testing"
 
 	"decred.org/dcrdex/client/core"
@@ -163,14 +164,14 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate: midGap - (breakEven * 3),
-					lots: 1,
+					Rate: midGap - (breakEven * 3),
+					Lots: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 3),
-					lots: 1,
+					Rate: midGap + (breakEven * 3),
+					Lots: 1,
 				},
 			},
 		},
@@ -195,8 +196,8 @@ func TestRebalance(t *testing.T) {
 
 			expectedBuys: []rateLots{
 				{
-					rate: midGap - (breakEven * 3),
-					lots: 1,
+					Rate: midGap - (breakEven * 3),
+					Lots: 1,
 				},
 			},
 			expectedSells: []rateLots{},
@@ -223,8 +224,8 @@ func TestRebalance(t *testing.T) {
 			expectedBuys: []rateLots{},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 3),
-					lots: 1,
+					Rate: midGap + (breakEven * 3),
+					Lots: 1,
 				},
 			},
 		},
@@ -262,25 +263,25 @@ func TestRebalance(t *testing.T) {
 
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
+					Rate:           midGap - (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
+					Rate:           midGap + (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -336,25 +337,25 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
+					Rate:           midGap - (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
+					Rate:           midGap + (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -411,14 +412,14 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
+					Rate: midGap - (breakEven * 2),
+					Lots: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
+					Rate: midGap + (breakEven * 2),
+					Lots: 1,
 				},
 			},
 		},
@@ -474,25 +475,25 @@ func TestRebalance(t *testing.T) {
 
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
+					Rate:           midGap - (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           2,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           2,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
+					Rate:           midGap + (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           2,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           2,
 					placementIndex: 1,
 				},
 			},
@@ -549,23 +550,23 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
+					Rate: midGap - (breakEven * 2),
+					Lots: 1,
 				},
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
+					Rate: midGap + (breakEven * 2),
+					Lots: 1,
 				},
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -618,15 +619,15 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
+					Rate:           midGap + (breakEven * 2),
+					Lots:           1,
 					placementIndex: 0,
 				},
 			},
@@ -675,15 +676,15 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
+					Rate: midGap + (breakEven * 2),
+					Lots: 1,
 				},
 			},
 		},
@@ -731,23 +732,23 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
+					Rate: midGap - (breakEven * 2),
+					Lots: 1,
 				},
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
+					Rate: midGap + (breakEven * 2),
+					Lots: 1,
 				},
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -795,15 +796,15 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -851,15 +852,15 @@ func TestRebalance(t *testing.T) {
 			},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -905,15 +906,15 @@ func TestRebalance(t *testing.T) {
 			expectedCancels: []order.OrderID{},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -959,15 +960,15 @@ func TestRebalance(t *testing.T) {
 			expectedCancels: []order.OrderID{},
 			expectedBuys: []rateLots{
 				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
+					Rate:           midGap - (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
 			expectedSells: []rateLots{
 				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
+					Rate:           midGap + (breakEven * 3),
+					Lots:           1,
 					placementIndex: 1,
 				},
 			},
@@ -1014,11 +1015,11 @@ func TestRebalance(t *testing.T) {
 		}
 
 		for i, buy := range buys {
-			if buy.rate != tt.expectedBuys[i].rate {
-				t.Fatalf("%s: buy rate mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].rate, buy.rate)
+			if buy.Rate != tt.expectedBuys[i].Rate {
+				t.Fatalf("%s: buy rate mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].Rate, buy.Rate)
 			}
-			if buy.lots != tt.expectedBuys[i].lots {
-				t.Fatalf("%s: buy lots mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].lots, buy.lots)
+			if buy.Lots != tt.expectedBuys[i].Lots {
+				t.Fatalf("%s: buy lots mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].Lots, buy.Lots)
 			}
 			if buy.placementIndex != tt.expectedBuys[i].placementIndex {
 				t.Fatalf("%s: buy placement index mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].placementIndex, buy.placementIndex)
@@ -1026,11 +1027,11 @@ func TestRebalance(t *testing.T) {
 		}
 
 		for i, sell := range sells {
-			if sell.rate != tt.expectedSells[i].rate {
-				t.Fatalf("%s: sell rate mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].rate, sell.rate)
+			if sell.Rate != tt.expectedSells[i].Rate {
+				t.Fatalf("%s: sell rate mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].Rate, sell.Rate)
 			}
-			if sell.lots != tt.expectedSells[i].lots {
-				t.Fatalf("%s: sell lots mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].lots, sell.lots)
+			if sell.Lots != tt.expectedSells[i].Lots {
+				t.Fatalf("%s: sell lots mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].Lots, sell.Lots)
 			}
 			if sell.placementIndex != tt.expectedSells[i].placementIndex {
 				t.Fatalf("%s: sell placement index mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].placementIndex, sell.placementIndex)
@@ -1244,7 +1245,7 @@ func TestGroupedOrders(t *testing.T) {
 		orderIDs[4]: {
 			ID:   orderIDs[4][:],
 			Sell: false,
-			Rate: 400e8,
+			Rate: 402e8,
 			Qty:  1 * lotSize,
 		},
 	}
@@ -1278,7 +1279,7 @@ func TestGroupedOrders(t *testing.T) {
 		}, {
 			Order: orders[orderIDs[4]],
 			id:    orderIDs[4],
-			rate:  400e8,
+			rate:  402e8,
 			lots:  1,
 		}},
 	}
@@ -1301,14 +1302,16 @@ func TestGroupedOrders(t *testing.T) {
 	buys, sells := mm.groupedOrders()
 
 	for i, buy := range buys {
-		if !reflect.DeepEqual(buy, expectedBuys[i]) {
-			t.Fatalf("buys[%d] = %v, expected %v", i, buy, expectedBuys[i])
-		}
+		sort.Slice(buy, func(i, j int) bool {
+			return buy[i].rate < buy[j].rate
+		})
+		reflect.DeepEqual(buy, expectedBuys[i])
 	}
 
 	for i, sell := range sells {
-		if !reflect.DeepEqual(sell, expectedSells[i]) {
-			t.Fatalf("sells[%d] = %v, expected %v", i, sell, expectedSells[i])
-		}
+		sort.Slice(sell, func(i, j int) bool {
+			return sell[i].rate < sell[j].rate
+		})
+		reflect.DeepEqual(sell, expectedSells[i])
 	}
 }
