@@ -131,6 +131,14 @@ if [ $ETH_ON -eq 0 ]; then
             "marketBuyBuffer": 1.2
         },
         {
+            "base": "BTC_simnet",
+            "quote": "ETH_simnet",
+            "lotSize": 1000000000,
+            "rateStep": 1000,
+            "epochDuration": ${EPOCH_DURATION},
+            "marketBuyBuffer": 1.2
+        },
+        {
             "base": "DCR_simnet",
             "quote": "DEXTT_simnet",
             "lotSize": 100000000,

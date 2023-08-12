@@ -906,19 +906,24 @@ func handleNotificationsRoute(s *RPCServer, params *RawParams) *msgjson.Response
 
 // parseMarketMakingConfig takes a path to a json file, parses the contents, and
 // returns a []*mm.BotConfig.
-func parseMarketMakingConfig(path string) ([]*mm.BotConfig, error) {
+func parseMarketMakingConfig(path string) ([]*mm.BotConfig, []*mm.CEXConfig, error) {
+	type mmConfig struct {
+		BotCfgs []*mm.BotConfig `json:"botCfgs"`
+		CexCfgs []*mm.CEXConfig `json:"cexCfgs"`
+	}
+
 	contents, err := ioutil.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var configs []*mm.BotConfig
-	err = json.Unmarshal(contents, &configs)
+	cfg := mmConfig{}
+	err = json.Unmarshal(contents, &cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return configs, nil
+	return cfg.BotCfgs, cfg.CexCfgs, nil
 }
 
 func handleStartMarketMakingRoute(s *RPCServer, params *RawParams) *msgjson.ResponsePayload {
@@ -927,14 +932,14 @@ func handleStartMarketMakingRoute(s *RPCServer, params *RawParams) *msgjson.Resp
 		return usage(startMarketMakingRoute, err)
 	}
 
-	configs, err := parseMarketMakingConfig(form.cfgFilePath)
+	botConfigs, cexConfigs, err := parseMarketMakingConfig(form.cfgFilePath)
 	if err != nil {
 		errMsg := fmt.Sprintf("unable to parse market making config: %v", err)
 		resErr := msgjson.NewError(msgjson.RPCStartMarketMakingError, errMsg)
 		return createResponse(startMarketMakingRoute, nil, resErr)
 	}
 
-	err = s.mm.Run(s.ctx, configs, form.appPass)
+	err = s.mm.Run(s.ctx, botConfigs, cexConfigs, form.appPass)
 	if err != nil {
 		errMsg := fmt.Sprintf("unable to start market making: %v", err)
 		resErr := msgjson.NewError(msgjson.RPCStartMarketMakingError, errMsg)
