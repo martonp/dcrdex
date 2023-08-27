@@ -717,11 +717,11 @@ export default class MarketsPage extends BasePage {
   /* resolveOrderFormVisibility displays or hides the 'orderForm' based on
    * a set of conditions to be met.
    */
-  resolveOrderFormVisibility () {
+  async resolveOrderFormVisibility () {
     const page = this.page
     // By default the order form should be hidden, and only if market is set
     // and ready for trading the form should show up.
-    Doc.hide(page.orderForm, page.orderTypeBttns)
+    Doc.hide(page.orderForm, page.orderTypeBttns, page.mmRunning)
 
     if (!this.assetsAreSupported().isSupported) return // assets not supported
 
@@ -733,6 +733,12 @@ export default class MarketsPage extends BasePage {
     const { base, quote } = this.market
     const hasWallets = base && app().assets[base.id].wallet && quote && app().assets[quote.id].wallet
     if (!hasWallets) return
+
+    const marketMakingStatus = await app().getMarketMakingStatus()
+    if (marketMakingStatus.running) {
+      Doc.show(page.mmRunning)
+      return
+    }
 
     Doc.show(page.orderForm, page.orderTypeBttns)
   }
@@ -951,7 +957,7 @@ export default class MarketsPage extends BasePage {
    * setRegistrationStatusVisibility toggles the registration status view based
    * on the dex data.
    */
-  setRegistrationStatusVisibility () {
+  async setRegistrationStatusVisibility () {
     const { page, market } = this
     if (!market || !market.dex) return
 
@@ -962,9 +968,9 @@ export default class MarketsPage extends BasePage {
     this.updateRegistrationStatusView()
 
     if (market.dex.tier >= 1) {
-      const toggle = () => {
+      const toggle = async () => {
         Doc.hide(page.registrationStatus, page.bondRequired, page.bondCreationPending)
-        this.resolveOrderFormVisibility()
+        await this.resolveOrderFormVisibility()
       }
       if (Doc.isHidden(page.orderForm)) {
         // wait a couple of seconds before showing the form so the success
@@ -972,7 +978,7 @@ export default class MarketsPage extends BasePage {
         setTimeout(toggle, 5000)
         return
       }
-      toggle()
+      await toggle()
     } else if (market.dex.viewOnly) {
       page.unregisteredDex.textContent = market.dex.host
       Doc.show(page.notRegistered)
@@ -1100,8 +1106,8 @@ export default class MarketsPage extends BasePage {
     this.marketList.select(host, base, quote)
     this.setLoaderMsgVisibility()
     this.setTokenApprovalVisibility()
-    this.setRegistrationStatusVisibility()
-    this.resolveOrderFormVisibility()
+    await this.setRegistrationStatusVisibility()
+    await this.resolveOrderFormVisibility()
     this.setOrderBttnText()
     this.setCandleDurBttns()
     this.previewQuoteAmt(false)
@@ -2235,12 +2241,12 @@ export default class MarketsPage extends BasePage {
     this.marketList.updateSpots(note)
   }
 
-  handleWalletState (note: WalletStateNote) {
+  async handleWalletState (note: WalletStateNote) {
     if (!this.market) return // This note can arrive before the market is set.
     // if (note.topic !== 'TokenApproval') return
     if (note.wallet.assetID !== this.market.base.id && note.wallet.assetID !== this.market.quote.id) return
     this.setTokenApprovalVisibility()
-    this.resolveOrderFormVisibility()
+    await this.resolveOrderFormVisibility()
   }
 
   /*
@@ -2256,7 +2262,7 @@ export default class MarketsPage extends BasePage {
     if (note.topic === 'AccountRegistered') await app().fetchUser()
     // Update local copy of Exchange.
     this.market.dex = app().exchanges[dexAddr]
-    this.setRegistrationStatusVisibility()
+    await this.setRegistrationStatusVisibility()
   }
 
   handleMatchNote (note: MatchNote) {
@@ -2439,7 +2445,7 @@ export default class MarketsPage extends BasePage {
     Doc.hide(this.page.forms)
     this.balanceWgt.updateAsset(asset.id)
     Doc.setVis(!(this.market.base.wallet && this.market.quote.wallet), this.page.noWallet)
-    this.resolveOrderFormVisibility()
+    await this.resolveOrderFormVisibility()
   }
 
   /*

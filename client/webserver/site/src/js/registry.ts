@@ -353,8 +353,47 @@ export interface SpotPriceNote extends CoreNote {
   spots: Record<string, Spot>
 }
 
-export interface BotNote extends CoreNote {
-  report: BotReport
+export interface BotStartStopNote extends CoreNote {
+  host: string
+  base: number
+  quote: number
+  running: boolean
+}
+
+export interface MMStartStopNote extends CoreNote {
+  running: boolean
+}
+
+export interface MakerProgram {
+  host: string
+  baseID: number
+  quoteID: number
+  lots: number
+  oracleWeighting: number
+  oracleBias: number
+  driftTolerance: number
+  gapFactor: number
+  gapStrategy: string
+}
+
+export interface BotOrder {
+  host: string
+  marketID: string
+  orderID: string
+}
+
+export interface BotReport {
+  programID: number
+  program: MakerProgram
+  running: boolean
+  orders: BotOrder
+}
+
+export interface MarketReport {
+  price: number
+  oracles: OracleReport[]
+  baseFiatRate: number
+  quoteFiatRate: number
 }
 
 export interface MatchNote extends CoreNote {
@@ -427,6 +466,8 @@ export interface PageElement extends HTMLElement {
   checked?: boolean
   href?: string
   htmlFor?: string
+  options?: HTMLOptionElement[]
+  selectedIndex?: number
 }
 
 export interface BooleanConfig {
@@ -550,36 +591,49 @@ export interface OrderFilter {
   statuses: number[]
 }
 
-export interface MakerProgram {
-  host: string
-  baseID: number
-  quoteID: number
-  lots: number
+export interface OrderPlacement {
+  lots : number
+  gapFactor : number
+}
+
+export interface MarketMakingConfig {
+  gapStrategy: string
+  sellPlacements: OrderPlacement[]
+  buyPlacements: OrderPlacement[]
+  driftTolerance: number
   oracleWeighting: number
   oracleBias: number
-  driftTolerance: number
-  gapFactor: number
-  gapStrategy: string
+  emptyMarketRate?: number
+  splitTxAllowed: boolean
+  splitBuffer: number
 }
 
-export interface BotOrder {
+export enum BalanceType {
+  Percentage,
+  Amount
+}
+
+export interface BotConfig {
   host: string
-  marketID: string
-  orderID: string
+  baseAsset: number
+  quoteAsset: number
+  baseBalanceType: BalanceType
+  baseBalance: number
+  quoteBalanceType: BalanceType
+  quoteBalance: number
+  marketMakingConfig: MarketMakingConfig
+  disabled: boolean
 }
 
-export interface BotReport {
-  programID: number
-  program: MakerProgram
+export interface MarketWithHost {
+  host: string
+  base: number
+  quote: number
+}
+
+export interface MarketMakingStatus {
   running: boolean
-  orders: BotOrder
-}
-
-export interface MarketReport {
-  basisPrice: number
-  price: number
-  oracles: OracleReport[]
-  breakEvenSpread: number
+  runningBots: MarketWithHost[]
 }
 
 export interface OracleReport {
@@ -650,6 +704,13 @@ export interface Application {
   checkResponse (resp: APIResponse): boolean
   signOut (): Promise<void>
   registerNoteFeeder (receivers: Record<string, (n: CoreNote) => void>): void
+  getMarketMakingStatus (): Promise<MarketMakingStatus>
+  startMarketMaking (pw: string): Promise<void>
+  stopMarketMaking (): Promise<void>
+  getMarketMakingConfig (): Promise<BotConfig[]>
+  updateMarketMakingConfig (cfg: BotConfig): Promise<void>
+  removeMarketMakingConfig (cfg: BotConfig): Promise<void>
+  setMarketMakingEnabled (host: string, baseAsset: number, quoteAsset: number, enabled: boolean): void
 }
 
 // TODO: Define an interface for Application?
