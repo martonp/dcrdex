@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/big"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -180,7 +181,9 @@ func (n *testNode) txOpts(ctx context.Context, val, maxGas uint64, maxFeeRate, n
 	if maxFeeRate == nil {
 		maxFeeRate = n.maxFeeRate
 	}
-	return newTxOpts(ctx, n.addr, val, maxGas, maxFeeRate, dexeth.GweiToWei(2)), nil
+	txOpts := newTxOpts(ctx, n.addr, val, maxGas, maxFeeRate, dexeth.GweiToWei(2))
+	txOpts.Nonce = big.NewInt(1)
+	return txOpts, nil
 }
 
 func (n *testNode) currentFees(ctx context.Context) (baseFees, tipCap *big.Int, err error) {
@@ -401,6 +404,23 @@ func (c *tTokenContractor) estimateTransferGas(context.Context, *big.Int) (uint6
 	return c.transferEstimate, c.transferEstimateErr
 }
 
+type tTxHistoryStore struct{}
+
+var _ txHistoryStore = (*tTxHistoryStore)(nil)
+
+func (s *tTxHistoryStore) storeTx(nonce uint64, wt *confirmedWalletTx) error {
+	return nil
+}
+func (s *tTxHistoryStore) getTxs(n int, refID *dex.Bytes, past bool) ([]*asset.WalletTransaction, error) {
+	return nil, nil
+}
+func (s *tTxHistoryStore) close() error {
+	return nil
+}
+func (s *tTxHistoryStore) getUnconfirmedTxs() ([]*confirmedWalletTx, error) {
+	return nil, nil
+}
+
 func TestCheckForNewBlocks(t *testing.T) {
 	header0 := &types.Header{Number: new(big.Int)}
 	header1 := &types.Header{Number: big.NewInt(1)}
@@ -444,6 +464,7 @@ func TestCheckForNewBlocks(t *testing.T) {
 					ctx:        ctx,
 					log:        tLogger,
 					currentTip: header0,
+					txDB:       &tTxHistoryStore{},
 				},
 				log:       tLogger.SubLogger("ETH"),
 				tipChange: tipChange,
@@ -595,17 +616,19 @@ func tassetWallet(assetID uint32) (asset.Wallet, *assetWallet, *tMempoolNode, co
 
 	aw := &assetWallet{
 		baseWallet: &baseWallet{
-			bipID:         BipID,
-			chainID:       dexeth.ChainIDs[dex.Simnet],
-			addr:          node.addr,
-			net:           dex.Simnet,
-			node:          node,
-			ctx:           ctx,
-			log:           tLogger,
-			gasFeeLimitV:  defaultGasFeeLimit,
-			monitoredTxs:  make(map[common.Hash]*monitoredTx),
-			monitoredTxDB: kvdb.NewMemoryDB(),
-			pendingTxs:    make(map[common.Hash]*pendingTx),
+			bipID:          BipID,
+			chainID:        dexeth.ChainIDs[dex.Simnet],
+			addr:           node.addr,
+			net:            dex.Simnet,
+			node:           node,
+			ctx:            ctx,
+			log:            tLogger,
+			gasFeeLimitV:   defaultGasFeeLimit,
+			monitoredTxs:   make(map[common.Hash]*monitoredTx),
+			monitoredTxDB:  kvdb.NewMemoryDB(),
+			pendingTxs:     make(map[common.Hash]*pendingTx),
+			unconfirmedTxs: make(map[uint64]*confirmedWalletTx),
+			txDB:           &tTxHistoryStore{},
 		},
 		log:                tLogger.SubLogger(strings.ToUpper(dex.BipIDSymbol(assetID))),
 		assetID:            assetID,
@@ -5479,6 +5502,193 @@ func TestDomain(t *testing.T) {
 				t.Fatalf("wanted domain %s but got %s", test.wantDomain, d)
 			}
 		})
+	}
+}
+
+func TestTxHistoryStore(t *testing.T) {
+	tempDir := t.TempDir()
+
+	txHistoryStore, err := newTxHistoryStore(tempDir, tLogger)
+	if err != nil {
+		t.Fatalf("error creating tx history store: %v", err)
+	}
+
+	txs, err := txHistoryStore.getTxs(0, nil, true)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	if len(txs) != 0 {
+		t.Fatalf("expected 0 txs but got %d", len(txs))
+	}
+
+	wt1 := &confirmedWalletTx{
+		WalletTransaction: &asset.WalletTransaction{
+			Type:        asset.Send,
+			ID:          encode.RandomBytes(32),
+			AmtIn:       100,
+			AmtOut:      200,
+			Fees:        300,
+			BlockNumber: 123,
+			AdditionalData: map[string]string{
+				"Nonce": "1",
+			},
+		},
+		Confirmed: true,
+	}
+
+	wt2 := &confirmedWalletTx{
+		WalletTransaction: &asset.WalletTransaction{
+			Type:        asset.Swap,
+			ID:          encode.RandomBytes(32),
+			AmtIn:       200,
+			AmtOut:      400,
+			Fees:        100,
+			BlockNumber: 124,
+			AdditionalData: map[string]string{
+				"Nonce": "2",
+			},
+		},
+	}
+
+	wt3 := &confirmedWalletTx{
+		WalletTransaction: &asset.WalletTransaction{
+			Type:        asset.Redeem,
+			ID:          encode.RandomBytes(32),
+			AmtIn:       300,
+			AmtOut:      600,
+			Fees:        200,
+			BlockNumber: 125,
+			AdditionalData: map[string]string{
+				"Nonce": "3",
+			},
+		},
+	}
+
+	wt4 := &confirmedWalletTx{
+		WalletTransaction: &asset.WalletTransaction{
+			Type:        asset.Redeem,
+			ID:          encode.RandomBytes(32),
+			AmtIn:       300,
+			AmtOut:      600,
+			Fees:        200,
+			BlockNumber: 125,
+			AdditionalData: map[string]string{
+				"Nonce": "3",
+			},
+		},
+	}
+
+	err = txHistoryStore.storeTx(1, wt1)
+	if err != nil {
+		t.Fatalf("error storing tx: %v", err)
+	}
+	txs, err = txHistoryStore.getTxs(0, nil, true)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs := []*asset.WalletTransaction{wt1.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	err = txHistoryStore.storeTx(2, wt2)
+	if err != nil {
+		t.Fatalf("error storing tx: %v", err)
+	}
+	txs, err = txHistoryStore.getTxs(0, nil, true)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt1.WalletTransaction, wt2.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	err = txHistoryStore.storeTx(3, wt3)
+	if err != nil {
+		t.Fatalf("error storing tx: %v", err)
+	}
+	txs, err = txHistoryStore.getTxs(2, nil, true)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt2.WalletTransaction, wt3.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	txs, err = txHistoryStore.getTxs(0, &wt2.ID, true)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt1.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	txs, err = txHistoryStore.getTxs(0, &wt2.ID, false)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt3.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	// Update nonce with different tx
+	err = txHistoryStore.storeTx(3, wt4)
+	if err != nil {
+		t.Fatalf("error storing tx: %v", err)
+	}
+	txs, err = txHistoryStore.getTxs(0, nil, false)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	if len(txs) != 3 {
+		t.Fatalf("expected 3 txs but got %d", len(txs))
+	}
+	expectedTxs = []*asset.WalletTransaction{wt1.WalletTransaction, wt2.WalletTransaction, wt4.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	// Update same tx with new fee
+	wt4.Fees = 300
+	err = txHistoryStore.storeTx(3, wt4)
+	if err != nil {
+		t.Fatalf("error storing tx: %v", err)
+	}
+	txs, err = txHistoryStore.getTxs(0, nil, false)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt1.WalletTransaction, wt2.WalletTransaction, wt4.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	txHistoryStore.close()
+	txHistoryStore, err = newTxHistoryStore(tempDir, tLogger)
+	if err != nil {
+		t.Fatalf("error creating tx history store: %v", err)
+	}
+
+	txs, err = txHistoryStore.getTxs(0, nil, false)
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedTxs = []*asset.WalletTransaction{wt1.WalletTransaction, wt2.WalletTransaction, wt4.WalletTransaction}
+	if !reflect.DeepEqual(expectedTxs, txs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedTxs, txs)
+	}
+
+	unconfirmedTxs, err := txHistoryStore.getUnconfirmedTxs()
+	if err != nil {
+		t.Fatalf("error retrieving txs: %v", err)
+	}
+	expectedUnconfirmedTxs := []*confirmedWalletTx{wt4, wt2}
+	if !reflect.DeepEqual(expectedUnconfirmedTxs, unconfirmedTxs) {
+		t.Fatalf("expected txs %+v but got %+v", expectedUnconfirmedTxs, unconfirmedTxs)
 	}
 }
 

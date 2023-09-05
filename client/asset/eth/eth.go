@@ -35,6 +35,7 @@ import (
 	dexpolygon "decred.org/dcrdex/dex/networks/polygon"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/hdkeychain/v3"
+	"github.com/dgraph-io/badger"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
@@ -447,6 +448,8 @@ var _ asset.DynamicSwapper = (*ETHWallet)(nil)
 var _ asset.DynamicSwapper = (*TokenWallet)(nil)
 var _ asset.Authenticator = (*ETHWallet)(nil)
 var _ asset.TokenApprover = (*TokenWallet)(nil)
+var _ asset.WalletHistorian = (*ETHWallet)(nil)
+var _ asset.WalletHistorian = (*TokenWallet)(nil)
 
 type baseWallet struct {
 	// The asset subsystem starts with Connect(ctx). This ctx will be initialized
@@ -488,6 +491,11 @@ type baseWallet struct {
 	// nonceSendMtx should be locked for the node.txOpts -> tx send sequence
 	// for all txs, to ensure nonce correctness.
 	nonceSendMtx sync.Mutex
+
+	unconfirmedTxsMtx sync.RWMutex
+	unconfirmedTxs    map[uint64]*confirmedWalletTx // nonce -> tx
+
+	txDB txHistoryStore
 }
 
 // assetWallet is a wallet backend for Ethereum and Eth tokens. The backend is
@@ -697,19 +705,19 @@ func NewEVMWallet(assetID uint32, chainID int64, assetCFG *asset.WalletConfig, l
 	if gasFeeLimit == 0 {
 		gasFeeLimit = defaultGasFeeLimit
 	}
-
 	eth := &baseWallet{
-		bipID:        assetID,
-		chainID:      chainID,
-		log:          logger,
-		net:          net,
-		dir:          assetCFG.DataDir,
-		walletType:   assetCFG.Type,
-		settings:     assetCFG.Settings,
-		gasFeeLimitV: gasFeeLimit,
-		wallets:      make(map[uint32]*assetWallet),
-		monitoredTxs: make(map[common.Hash]*monitoredTx),
-		pendingTxs:   make(map[common.Hash]*pendingTx),
+		bipID:          assetID,
+		chainID:        chainID,
+		log:            logger,
+		net:            net,
+		dir:            assetCFG.DataDir,
+		walletType:     assetCFG.Type,
+		settings:       assetCFG.Settings,
+		gasFeeLimitV:   gasFeeLimit,
+		wallets:        make(map[uint32]*assetWallet),
+		monitoredTxs:   make(map[common.Hash]*monitoredTx),
+		pendingTxs:     make(map[common.Hash]*pendingTx),
+		unconfirmedTxs: make(map[uint64]*confirmedWalletTx),
 	}
 
 	var maxSwapGas, maxRedeemGas uint64
@@ -767,6 +775,9 @@ func (w *ETHWallet) shutdown() {
 	w.node.shutdown()
 	if err := w.monitoredTxDB.Close(); err != nil {
 		w.log.Errorf("error closing tx db: %v", err)
+	}
+	if err := w.txDB.close(); err != nil {
+		w.log.Errorf("error closing tx history db: %v", err)
 	}
 }
 
@@ -852,6 +863,29 @@ func (w *ETHWallet) Connect(ctx context.Context) (_ *sync.WaitGroup, err error) 
 	w.monitoredTxs, err = loadMonitoredTxs(w.monitoredTxDB)
 	if err != nil {
 		return nil, err
+	}
+
+	w.txDB, err = newTxHistoryStore(filepath.Join(w.dir, "txhistory.db"), w.log.SubLogger("TXHISTDB"))
+	if err != nil {
+		return nil, err
+	}
+
+	unconfirmedTxs, err := w.txDB.getUnconfirmedTxs()
+	if err != nil {
+		return nil, err
+	}
+	for _, tx := range unconfirmedTxs {
+		nonceStr := tx.AdditionalData[txHistoryNonceKey]
+		if nonceStr == "" {
+			w.log.Errorf("unconfirmed tx %s has no nonce", tx.ID)
+			continue
+		}
+		nonce, err := strconv.ParseUint(nonceStr, 10, 64)
+		if err != nil {
+			w.log.Errorf("error parsing nonce %q for tx %s: %v", nonceStr, tx.ID, err)
+			continue
+		}
+		w.unconfirmedTxs[nonce] = tx
 	}
 
 	// Initialize the best block.
@@ -1943,6 +1977,11 @@ func (w *ETHWallet) Swap(swaps *asset.Swaps) ([]asset.Receipt, asset.Coin, uint6
 	txHash := tx.Hash()
 	w.addPendingTx(w.bipID, txHash, tx.Nonce(), swapVal, 0, fees)
 
+	err = w.addToTxHistory(tx.Nonce(), 0, swapVal, swaps.FeeRate*gasLimit, 0, txHash[:], asset.Swap)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
+
 	receipts := make([]asset.Receipt, 0, n)
 	for _, swap := range swaps.Contracts {
 		var secretHash [dexeth.SecretHashSize]byte
@@ -2033,6 +2072,11 @@ func (w *TokenWallet) Swap(swaps *asset.Swaps) ([]asset.Receipt, asset.Coin, uin
 
 	txHash := tx.Hash()
 	w.addPendingTx(w.assetID, txHash, tx.Nonce(), swapVal, 0, fees)
+
+	err = w.addToTxHistory(tx.Nonce(), 0, swapVal, swaps.FeeRate*gasLimit, 0, txHash[:], asset.Swap)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
 
 	receipts := make([]asset.Receipt, 0, n)
 	for _, swap := range swaps.Contracts {
@@ -2207,6 +2251,11 @@ func (w *assetWallet) Redeem(form *asset.RedeemForm, feeWallet *assetWallet, non
 	txHash := tx.Hash()
 	w.addPendingTx(w.assetID, txHash, tx.Nonce(), 0, redeemedValue, gasFeeCap*gasLimit)
 
+	err = w.addToTxHistory(tx.Nonce(), redeemedValue, 0, gasFeeCap*gasLimit, 0, txHash[:], asset.Redeem)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
+
 	txs := make([]dex.Bytes, len(form.Redemptions))
 	for i := range txs {
 		txs[i] = txHash[:]
@@ -2281,7 +2330,13 @@ func (w *assetWallet) approveToken(amount *big.Int, maxFeeRate, gasLimit uint64,
 		w.log.Infof("Approval sent for %s at token address %s, nonce = %s, txID = %s",
 			dex.BipIDSymbol(w.assetID), c.tokenAddress(), txOpts.Nonce, tx.Hash().Hex())
 
+		txHash := tx.Hash()
 		w.addPendingTx(w.assetID, tx.Hash(), txOpts.Nonce.Uint64(), 0, 0, maxFeeRate*gasLimit)
+
+		err = w.addToTxHistory(tx.Nonce(), 0, 0, maxFeeRate*gasLimit, 0, txHash[:], asset.ApproveToken)
+		if err != nil {
+			w.log.Errorf("error storing tx data: %v", err)
+		}
 
 		return nil
 	})
@@ -2697,14 +2752,25 @@ func (w *assetWallet) ContractLockTimeExpired(ctx context.Context, contract dex.
 	return expired, swap.LockTime, nil
 }
 
+func (eth *baseWallet) tip() (uint64, error) {
+	eth.tipMtx.RLock()
+	defer eth.tipMtx.RUnlock()
+	if eth.currentTip == nil {
+		return 0, fmt.Errorf("no tip available")
+	}
+	return eth.currentTip.Number.Uint64(), nil
+}
+
 func (eth *baseWallet) addPendingTx(assetID uint32, txHash common.Hash, nonce, out, in, fees uint64) {
 	// We don't track pending txs locally if we have access to txpool.
 	if _, is := eth.node.(txPoolFetcher); is {
 		return
 	}
-	eth.tipMtx.RLock()
-	tip := eth.currentTip.Number.Uint64()
-	eth.tipMtx.RUnlock()
+	tip, err := eth.tip()
+	if err != nil {
+		eth.log.Errorf("addPendingTx: error getting tip: %v", err)
+		tip = 0
+	}
 	eth.pendingTxMtx.Lock()
 	eth.pendingTxs[txHash] = &pendingTx{
 		assetID:   assetID,
@@ -2884,7 +2950,13 @@ func (w *assetWallet) Refund(_, contract dex.Bytes, feeRate uint64) (dex.Bytes, 
 	}
 
 	txHash := tx.Hash()
-	w.addPendingTx(w.assetID, txHash, tx.Nonce(), 0, dexeth.WeiToGwei(swap.Value), fees)
+	refundValue := dexeth.WeiToGwei(swap.Value)
+	w.addPendingTx(w.assetID, txHash, tx.Nonce(), 0, refundValue, fees)
+
+	err = w.addToTxHistory(tx.Nonce(), refundValue, 0, fees, 0, txHash[:], asset.Refund)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
 
 	return txHash[:], nil
 }
@@ -3155,6 +3227,12 @@ func (w *ETHWallet) Send(addr string, value, _ uint64) (asset.Coin, error) {
 	}
 	txHash := tx.Hash()
 	w.addPendingTx(w.assetID, txHash, tx.Nonce(), value, 0, maxFee)
+
+	err = w.addToTxHistory(tx.Nonce(), 0, value, maxFee, 0, txHash[:], asset.Send)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
+
 	return &coin{id: txHash, value: value}, nil
 }
 
@@ -3177,6 +3255,12 @@ func (w *TokenWallet) Send(addr string, value, _ uint64) (asset.Coin, error) {
 	}
 	txHash := tx.Hash()
 	w.addPendingTx(w.assetID, txHash, tx.Nonce(), value, 0, maxFee)
+
+	err = w.addToTxHistory(tx.Nonce(), 0, value, maxFee, 0, txHash[:], asset.Send)
+	if err != nil {
+		w.log.Errorf("error storing tx data: %v", err)
+	}
+
 	return &coin{id: txHash, value: value}, nil
 }
 
@@ -3475,6 +3559,8 @@ func (eth *ETHWallet) checkForNewBlocks(ctx context.Context, reportErr func(erro
 			w.checkPendingApprovals()
 		}
 	}()
+
+	go eth.checkUnconfirmedTransactions(bestHdr.Number.Uint64())
 }
 
 // getLatestMonitoredTx looks up a txHash in the monitoredTxs map. If the
@@ -4221,7 +4307,7 @@ func (w *assetWallet) initiate(ctx context.Context, assetID uint32, contracts []
 	if err != nil {
 		return nil, err
 	}
-	return tx, w.withContractor(contractVer, func(c contractor) error {
+	err = w.withContractor(contractVer, func(c contractor) error {
 		tx, err = c.initiate(txOpts, contracts)
 		if err != nil {
 			c.voidUnusedNonce()
@@ -4229,6 +4315,8 @@ func (w *assetWallet) initiate(ctx context.Context, assetID uint32, contracts []
 		}
 		return nil
 	})
+
+	return tx, err
 }
 
 // estimateInitGas checks the amount of gas that is used for the
@@ -4428,6 +4516,312 @@ func checkTxStatus(receipt *types.Receipt, gasLimit uint64) error {
 	}
 
 	return nil
+}
+
+// badgerLoggerWrapper wraps dex.Logger and translates Warnf to Warningf to
+// satisfy badger.Logger.
+type badgerLoggerWrapper struct {
+	dex.Logger
+}
+
+var _ badger.Logger = (*badgerLoggerWrapper)(nil)
+
+// Warningf -> dex.Logger.Warnf
+func (log *badgerLoggerWrapper) Warningf(s string, a ...interface{}) {
+	log.Warnf(s, a...)
+}
+
+type confirmedWalletTx struct {
+	*asset.WalletTransaction
+	Confirmed bool `json:"confirmed"`
+}
+
+type txHistoryStore interface {
+	storeTx(nonce uint64, wt *confirmedWalletTx) error
+	getTxs(n int, refID *dex.Bytes, past bool) ([]*asset.WalletTransaction, error)
+	getUnconfirmedTxs() ([]*confirmedWalletTx, error)
+	close() error
+}
+
+type baderTxHistoryStore struct {
+	*badger.DB
+	log dex.Logger
+}
+
+var _ txHistoryStore = (*baderTxHistoryStore)(nil)
+
+func newTxHistoryStore(filePath string, log dex.Logger) (*baderTxHistoryStore, error) {
+	// If memory use is a concern, could try
+	//   .WithValueLogLoadingMode(options.FileIO) // default options.MemoryMap
+	//   .WithMaxTableSize(sz int64); // bytes, default 6MB
+	//   .WithValueLogFileSize(sz int64), bytes, default 1 GB, must be 1MB <= sz <= 1GB
+	opts := badger.DefaultOptions(filePath).WithLogger(&badgerLoggerWrapper{log})
+	db, err := badger.Open(opts)
+	if err == badger.ErrTruncateNeeded {
+		// Probably a Windows thing.
+		// https://github.com/dgraph-io/badger/issues/744
+		log.Warnf("newTxHistoryStore badger db: %v", err)
+		// Try again with value log truncation enabled.
+		opts.Truncate = true
+		log.Warnf("Attempting to reopen badger DB with the Truncate option set...")
+		db, err = badger.Open(opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &baderTxHistoryStore{
+		DB:  db,
+		log: log}, nil
+}
+
+func (s *baderTxHistoryStore) close() error {
+	return s.Close()
+}
+
+var noncePrefix = []byte("n")
+var txHashPrefix = []byte("t")
+var maxNonceKey = nonceKey(math.MaxUint64)
+
+func nonceKey(nonce uint64) []byte {
+	return append(noncePrefix, []byte(fmt.Sprintf("%016x", nonce))...)
+}
+
+func txHashKey(txHash dex.Bytes) []byte {
+	return append(txHashPrefix, txHash...)
+}
+
+func (s *baderTxHistoryStore) storeTx(nonce uint64, wt *confirmedWalletTx) error {
+	wtB, err := json.Marshal(wt)
+	if err != nil {
+		return err
+	}
+	nk := nonceKey(nonce)
+	tk := txHashKey(wt.ID)
+
+	return s.Update(func(txn *badger.Txn) error {
+		oldWtItem, err := txn.Get(nk)
+		if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+
+		// If there is an existing transaction with this nonce, delete the
+		// mapping from tx hash to nonce.
+		if err == nil {
+			oldWt := new(confirmedWalletTx)
+			err = oldWtItem.Value(func(oldWtB []byte) error {
+				err := json.Unmarshal(oldWtB, oldWt)
+				if err != nil {
+					s.log.Errorf("unable to unmarhsal wallet transaction: %s: %v", string(oldWtB), err)
+				}
+				return err
+			})
+			if err == nil && !bytes.Equal(oldWt.ID, wt.ID) {
+				err = txn.Delete(txHashKey(oldWt.ID))
+				if err != nil {
+					s.log.Errorf("failed to delete old tx id: %s: %v", oldWt.ID.String(), err)
+				}
+			}
+		}
+
+		// Store nonce key -> wallet transaction
+		if err := txn.Set(nk, wtB); err != nil {
+			return err
+		}
+
+		// Store tx hash -> nonce key
+		return txn.Set(tk, nk)
+	})
+}
+
+func (s *baderTxHistoryStore) getTxs(n int, refID *dex.Bytes, past bool) ([]*asset.WalletTransaction, error) {
+	var txs []*asset.WalletTransaction
+
+	err := s.View(func(txn *badger.Txn) error {
+		var startNonceKey []byte
+		if refID != nil {
+			// Get the nonce for the provided tx hash.
+			tk := txHashKey(*refID)
+			item, err := txn.Get(tk)
+			if err != nil {
+				return err
+			}
+			err = item.Value(func(nonceB []byte) error {
+				startNonceKey = nonceB
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		} else {
+			past = true
+		}
+		if startNonceKey == nil {
+			startNonceKey = maxNonceKey
+		}
+
+		opts := badger.DefaultIteratorOptions
+		opts.Reverse = past
+		opts.Prefix = noncePrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(startNonceKey); it.Valid() && n <= 0 || len(txs) < n; it.Next() {
+			item := it.Item()
+			err := item.Value(func(wtB []byte) error {
+				wt := new(asset.WalletTransaction)
+				err := json.Unmarshal(wtB, wt)
+				if err != nil {
+					s.log.Errorf("unable to unmarhsal wallet transaction: %s: %v", string(wtB), err)
+					return err
+				}
+				if refID != nil && bytes.Equal(wt.ID, *refID) {
+					return nil
+				}
+				if past {
+					txs = append([]*asset.WalletTransaction{wt}, txs...)
+				} else {
+					txs = append(txs, wt)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return txs, err
+}
+
+func (s *baderTxHistoryStore) getUnconfirmedTxs() ([]*confirmedWalletTx, error) {
+	var txs []*confirmedWalletTx
+
+	err := s.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Reverse = true
+		opts.Prefix = noncePrefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(maxNonceKey); it.Valid(); it.Next() {
+			item := it.Item()
+			err := item.Value(func(wtB []byte) error {
+				wt := new(confirmedWalletTx)
+				err := json.Unmarshal(wtB, wt)
+				if err != nil {
+					s.log.Errorf("unable to unmarhsal wallet transaction: %s: %v", string(wtB), err)
+					return err
+				}
+				if !wt.Confirmed {
+					txs = append(txs, wt)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	return txs, err
+}
+
+func (w *baseWallet) checkUnconfirmedTransactions(bestBlock uint64) {
+	w.unconfirmedTxsMtx.Lock()
+	unconfirmed := make(map[uint64]*confirmedWalletTx, len(w.unconfirmedTxs))
+	for nonce, tx := range w.unconfirmedTxs {
+		unconfirmed[nonce] = tx
+	}
+	w.unconfirmedTxsMtx.Unlock()
+
+	for nonce, unconfirmedTx := range unconfirmed {
+		var txHash common.Hash
+		copy(txHash[:], unconfirmedTx.ID)
+
+		receipt, tx, err := w.node.transactionReceipt(w.ctx, txHash)
+		if err != nil {
+			w.log.Errorf("Error getting transaction: %v", err)
+			continue
+		}
+		if receipt.BlockNumber == nil {
+			continue
+		}
+
+		hdr, err := w.node.headerByHash(w.ctx, receipt.BlockHash)
+		if err != nil {
+			w.log.Errorf("Error getting header for hash %v: %v", receipt.BlockHash, err)
+			continue
+		}
+		if hdr == nil {
+			w.log.Errorf("Header for hash %v is nil", receipt.BlockHash)
+			continue
+		}
+
+		effectiveGasPrice := new(big.Int).Add(hdr.BaseFee, tx.EffectiveGasTipValue(hdr.BaseFee))
+		bigFees := new(big.Int).Mul(effectiveGasPrice, big.NewInt(int64(receipt.GasUsed)))
+		fees := dexeth.WeiToGwei(bigFees)
+		blockNum := receipt.BlockNumber.Uint64()
+
+		w.addToTxHistory(nonce, unconfirmedTx.AmtIn, unconfirmedTx.AmtOut, fees, blockNum, unconfirmedTx.ID, unconfirmedTx.Type)
+	}
+}
+
+const txHistoryNonceKey = "Nonce"
+
+func (w *baseWallet) addToTxHistory(nonce, in, out, fees, blockNumber uint64, id dex.Bytes, typ asset.TransactionType) error {
+	var confs uint64
+	tip, err := w.tip()
+	if err != nil {
+		w.log.Errorf("error getting tip: %v", err)
+	} else if blockNumber > 0 && tip >= blockNumber {
+		confs = tip - blockNumber + 1
+	}
+
+	wt := &confirmedWalletTx{
+		WalletTransaction: &asset.WalletTransaction{
+			Type:        typ,
+			ID:          id,
+			AmtIn:       in,
+			AmtOut:      out,
+			Fees:        fees,
+			BlockNumber: blockNumber,
+			AdditionalData: map[string]string{
+				txHistoryNonceKey: strconv.FormatUint(nonce, 10),
+			},
+		},
+		Confirmed: confs >= txConfsNeededToConfirm,
+	}
+
+	if !wt.Confirmed {
+		w.unconfirmedTxsMtx.Lock()
+		w.unconfirmedTxs[nonce] = wt
+		w.unconfirmedTxsMtx.Unlock()
+	}
+
+	err = w.txDB.storeTx(nonce, wt)
+	if err != nil {
+		return err
+	}
+
+	if wt.Confirmed {
+		w.unconfirmedTxsMtx.Lock()
+		delete(w.unconfirmedTxs, nonce)
+		w.unconfirmedTxsMtx.Unlock()
+	}
+
+	return nil
+}
+
+func (w *baseWallet) TxHistory(n int, refID *dex.Bytes, past bool) ([]*asset.WalletTransaction, error) {
+	parentWallet := w.wallet(w.bipID)
+	if parentWallet == nil || !parentWallet.connected.Load() {
+		return nil, fmt.Errorf("wallet not connected")
+	}
+
+	return w.txDB.getTxs(n, refID, past)
 }
 
 // fileCredentials contain the seed and providers to use for GetGasEstimates.

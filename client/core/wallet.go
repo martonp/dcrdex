@@ -533,6 +533,19 @@ func (w *xcWallet) swapConfirmations(ctx context.Context, coinID []byte, contrac
 	return w.Wallet.SwapConfirmations(ctx, coinID, contract, time.UnixMilli(int64(matchTime)))
 }
 
+func (w *xcWallet) TxHistory(n int, refID *dex.Bytes, past bool) ([]*asset.WalletTransaction, error) {
+	if !w.connected() {
+		return nil, errWalletNotConnected
+	}
+
+	historian, ok := w.Wallet.(asset.WalletHistorian)
+	if !ok {
+		return nil, fmt.Errorf("wallet does not support transaction history")
+	}
+
+	return historian.TxHistory(n, refID, past)
+}
+
 // MakeBondTx authors a DEX time-locked fidelity bond transaction if the
 // asset.Wallet implementation is a Bonder.
 func (w *xcWallet) MakeBondTx(ver uint16, amt, feeRate uint64, lockTime time.Time, priv *secp256k1.PrivateKey, acctID []byte) (*asset.Bond, func(), error) {

@@ -1059,13 +1059,13 @@ type WalletTransaction struct {
 // WalletHistorian is a wallet that is able to retrieve the history of all
 // transactions it has made.
 type WalletHistorian interface {
-	// WalletHistory returns all the transactions a wallet has made. If refID
+	// TxHistory returns all the transactions a wallet has made. If refID
 	// is nil, then transactions starting from the most recent are returned
 	// (past is ignored). If past is true, the transactions prior to the
 	// refID are returned, otherwise the transactions after the refID are
 	// returned. n is the number of transactions to return. If n is <= 0,
 	// all the transactions will be returned.
-	WalletHistory(refID *dex.Bytes, past bool, n int) ([]*WalletTransaction, error)
+	TxHistory(n int, refID *dex.Bytes, past bool) ([]*WalletTransaction, error)
 }
 
 // Bond is the fidelity bond info generated for a certain account ID, amount,
