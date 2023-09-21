@@ -308,7 +308,11 @@ export default class MarketsPage extends BasePage {
         const maxSell = this.market.maxSell
         if (!maxSell) return
         page.lotField.value = String(maxSell.swap.lots)
-      } else page.lotField.value = String(this.market.maxBuys[this.adjustedRate()].swap.lots)
+      } else {
+        const maxBuy = this.market.maxBuys[this.adjustedRate()]
+        if (!maxBuy) return
+        page.lotField.value = String(maxBuy.swap.lots)
+      }
       this.lotChanged()
     })
 
@@ -568,6 +572,9 @@ export default class MarketsPage extends BasePage {
     this.setOrderBttnText()
     this.setOrderVisibility()
     this.drawChartLines()
+    if (!this.isLimit()) {
+      this.marketBuyChanged()
+    }
   }
 
   setSell () {
@@ -1008,6 +1015,72 @@ export default class MarketsPage extends BasePage {
     } else this.page.submitBttn.textContent = intl.prep(intl.ID_SET_BUTTON_BUY, { asset: Doc.shortSymbol(this.market.baseCfg.unitInfo.conventional.unit) })
   }
 
+  setOrderBttnEnabled (isEnabled: boolean, disabledTooltipMsg?: string) {
+    const btn = this.page.submitBttn
+    if (isEnabled) {
+      btn.removeAttribute('disabled')
+      btn.removeAttribute('title')
+    } else {
+      btn.setAttribute('disabled', 'disabled')
+      if (disabledTooltipMsg) btn.setAttribute('title', disabledTooltipMsg)
+    }
+  }
+
+  updateOrderBttnState () {
+    const mkt = this.market
+    const order = this.currentOrder
+    const orderQty = order.qty
+    const baseWallet = app().assets[this.market.base.id].wallet
+
+    if (!order.isLimit) {
+      if (order.sell) {
+        this.setOrderBttnEnabled(orderQty <= baseWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
+      }
+      return
+    }
+
+    if (orderQty <= 0) {
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+      return
+    }
+
+    if (order.sell) {
+      const baseWallet = app().assets[mkt.base.id].wallet
+
+      if (baseWallet.balance.available < mkt.cfg.lotsize) {
+        this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
+        return
+      }
+
+      if (mkt.maxSell) {
+        if (orderQty > mkt.maxSell.swap.value) {
+          this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
+          return
+        }
+        this.setOrderBttnEnabled(true)
+      }
+    } else {
+      const quoteWallet = app().assets[mkt.quote.id].wallet
+      if (!quoteWallet) return
+
+      const rate = this.adjustedRate()
+      const aLot = mkt.cfg.lotsize * (rate / OrderUtil.RateEncodingFactor)
+
+      if (quoteWallet.balance.available < aLot) {
+        this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_BUY_BALANCE_ERROR))
+        return
+      }
+
+      if (mkt.maxBuys[rate]) {
+        if (orderQty > mkt.maxBuys[rate].swap.lots * mkt.cfg.lotsize) {
+          this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_BUY_BALANCE_ERROR))
+          return
+        }
+        this.setOrderBttnEnabled(true)
+      }
+    }
+  }
+
   setCandleDurBttns () {
     const { page, market } = this
     Doc.empty(page.durBttnBox)
@@ -1118,6 +1191,7 @@ export default class MarketsPage extends BasePage {
     this.setRegistrationStatusVisibility()
     this.resolveOrderFormVisibility()
     this.setOrderBttnText()
+    this.setOrderBttnEnabled(false)
     this.setCandleDurBttns()
     this.previewQuoteAmt(false)
     this.updateTitle()
@@ -1233,7 +1307,7 @@ export default class MarketsPage extends BasePage {
   previewQuoteAmt (show: boolean) {
     const page = this.page
     if (!this.market.base || !this.market.quote) return // Not a supported asset
-    const order = this.parseOrder()
+    const order = this.currentOrder = this.parseOrder()
     const adjusted = this.adjustedRate()
     page.orderErr.textContent = ''
     if (adjusted) {
@@ -1270,12 +1344,15 @@ export default class MarketsPage extends BasePage {
     const baseWallet = app().assets[mkt.base.id].wallet
     if (baseWallet.balance.available < mkt.cfg.lotsize) {
       this.setMaxOrder(null)
+      this.updateOrderBttnState()
       return
     }
     if (mkt.maxSell) {
       this.setMaxOrder(mkt.maxSell.swap)
+      this.updateOrderBttnState()
       return
     }
+
     if (mkt.maxSellRequested) return
     mkt.maxSellRequested = true
     // We only fetch pre-sell once per balance update, so don't delay.
@@ -1284,6 +1361,7 @@ export default class MarketsPage extends BasePage {
       mkt.maxSell = res.maxSell
       mkt.sellBalance = baseWallet.balance.available
       this.setMaxOrder(res.maxSell.swap)
+      this.updateOrderBttnState()
     })
   }
 
@@ -1298,10 +1376,12 @@ export default class MarketsPage extends BasePage {
     const aLot = mkt.cfg.lotsize * (rate / OrderUtil.RateEncodingFactor)
     if (quoteWallet.balance.available < aLot) {
       this.setMaxOrder(null)
+      this.updateOrderBttnState()
       return
     }
     if (mkt.maxBuys[rate]) {
       this.setMaxOrder(mkt.maxBuys[rate].swap)
+      this.updateOrderBttnState()
       return
     }
     // 0 delay for first fetch after balance update or market change, otherwise
@@ -1311,6 +1391,7 @@ export default class MarketsPage extends BasePage {
       mkt.maxBuys[rate] = res.maxBuy
       mkt.buyBalance = app().assets[mkt.quote.id].wallet.balance.available
       this.setMaxOrder(res.maxBuy.swap)
+      this.updateOrderBttnState()
     })
   }
 
@@ -2590,12 +2671,19 @@ export default class MarketsPage extends BasePage {
       page.lotField.value = '0'
       page.qtyField.value = ''
       this.previewQuoteAmt(false)
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
       return
     }
     const lotSize = this.market.cfg.lotsize
+    const orderQty = lots * lotSize
     page.lotField.value = String(lots)
     // Conversion factor must be a multiple of 10.
-    page.qtyField.value = String(lots * lotSize / this.market.baseUnitInfo.conventional.conversionFactor)
+    page.qtyField.value = String(orderQty / this.market.baseUnitInfo.conventional.conversionFactor)
+
+    if (!this.isLimit() && this.isSell()) {
+      const baseWallet = app().assets[this.market.base.id].wallet
+      this.setOrderBttnEnabled(orderQty <= baseWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
+    }
     this.previewQuoteAmt(true)
   }
 
@@ -2610,13 +2698,20 @@ export default class MarketsPage extends BasePage {
       page.lotField.value = '0'
       page.qtyField.value = ''
       this.previewQuoteAmt(false)
+      this.updateOrderBttnState()
       return
     }
     const lotSize = this.market.cfg.lotsize
     const lots = Math.floor(order.qty / lotSize)
-    const adjusted = lots * lotSize
+    if (!lots) {
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+    }
+    const adjusted = order.qty = lots * lotSize
     page.lotField.value = String(lots)
     if (!order.isLimit && !order.sell) return
+
+    this.updateOrderBttnState()
+
     // Conversion factor must be a multiple of 10.
     if (finalize) page.qtyField.value = String(adjusted / this.market.baseUnitInfo.conventional.conversionFactor)
     this.previewQuoteAmt(true)
@@ -2633,12 +2728,16 @@ export default class MarketsPage extends BasePage {
     if (!gap || !qty) {
       page.mktBuyLots.textContent = '0'
       page.mktBuyScore.textContent = '0'
+      this.setOrderBttnEnabled(false)
       return
     }
     const lotSize = this.market.cfg.lotsize
     const received = qty / gap
-    page.mktBuyLots.textContent = (received / lotSize).toFixed(1)
+    const lots = (received / lotSize)
+    page.mktBuyLots.textContent = lots.toFixed(1)
     page.mktBuyScore.textContent = Doc.formatCoinValue(received, this.market.baseUnitInfo)
+    const quoteWallet = app().assets[this.market.quote.id].wallet
+    this.setOrderBttnEnabled(qty <= quoteWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_BUY_BALANCE_ERROR))
   }
 
   /*
