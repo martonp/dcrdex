@@ -421,7 +421,7 @@ export default class MarketsPage extends BasePage {
     bind(page.mktBuyField, 'change', () => { this.marketBuyChanged() })
     bind(page.mktBuyField, 'keyup', () => { this.marketBuyChanged() })
     bind(page.rateField, 'change', () => { this.rateFieldChanged() })
-    bind(page.rateField, 'keyup', () => { this.previewQuoteAmt(true) })
+    bind(page.rateField, 'keyup', () => { this.rateFieldChanged() })
 
     // Market search input bindings.
     bind(page.marketSearchV1, 'change', () => { this.filterMarkets() })
@@ -1036,17 +1036,23 @@ export default class MarketsPage extends BasePage {
     const mkt = this.market
     const order = this.currentOrder
     const orderQty = order.qty
+    const orderRate = order.rate
     const baseWallet = app().assets[this.market.base.id].wallet
 
-    if (orderQty <= 0) {
-      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
-      return
-    }
-
+    // market orders
     if (!order.isLimit) {
+      if (orderQty <= 0) {
+        this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+        return
+      }
       if (order.sell) {
         this.setOrderBttnEnabled(orderQty <= baseWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
+        return
       }
+    }
+
+    if (orderQty <= 0 || !orderRate) {
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_RATE_ERROR))
       return
     }
 
@@ -1197,7 +1203,7 @@ export default class MarketsPage extends BasePage {
     this.setRegistrationStatusVisibility()
     this.resolveOrderFormVisibility()
     this.setOrderBttnText()
-    this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+    this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_RATE_ERROR))
     this.setCandleDurBttns()
     this.previewQuoteAmt(false)
     this.updateTitle()
@@ -2709,14 +2715,11 @@ export default class MarketsPage extends BasePage {
     }
     const lotSize = this.market.cfg.lotsize
     const lots = Math.floor(order.qty / lotSize)
-    if (!lots) {
-      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
-    }
-    const adjusted = order.qty = lots * lotSize
+    const adjusted = order.qty = this.currentOrder.qty = lots * lotSize
     page.lotField.value = String(lots)
-    if (!order.isLimit && !order.sell) return
-
     this.updateOrderBttnState()
+
+    if (!order.isLimit && !order.sell) return
 
     // Conversion factor must be a multiple of 10.
     if (finalize) page.qtyField.value = String(adjusted / this.market.baseUnitInfo.conventional.conversionFactor)
@@ -2760,9 +2763,11 @@ export default class MarketsPage extends BasePage {
       this.depthLines.input = []
       this.drawChartLines()
       this.page.rateField.value = '0'
+      this.previewQuoteAmt(true)
+      this.updateOrderBttnState()
       return
     }
-    const order = this.parseOrder()
+    const order = this.currentOrder = this.parseOrder()
     const r = adjusted / this.market.rateConversionFactor
     this.page.rateField.value = String(r)
     this.depthLines.input = [{
@@ -2771,6 +2776,7 @@ export default class MarketsPage extends BasePage {
     }]
     this.drawChartLines()
     this.previewQuoteAmt(true)
+    this.updateOrderBttnState()
   }
 
   /*
