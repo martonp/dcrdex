@@ -574,6 +574,9 @@ export default class MarketsPage extends BasePage {
     this.drawChartLines()
     if (!this.isLimit()) {
       this.marketBuyChanged()
+    } else {
+      this.currentOrder = this.parseOrder()
+      this.updateOrderBttnState()
     }
   }
 
@@ -586,6 +589,8 @@ export default class MarketsPage extends BasePage {
     this.setOrderBttnText()
     this.setOrderVisibility()
     this.drawChartLines()
+    this.currentOrder = this.parseOrder()
+    this.updateOrderBttnState()
   }
 
   /* hasPendingBonds is true if there are pending bonds */
@@ -723,6 +728,7 @@ export default class MarketsPage extends BasePage {
         this.previewQuoteAmt(false)
       }
     }
+    this.updateOrderBttnState()
   }
 
   /* resolveOrderFormVisibility displays or hides the 'orderForm' based on
@@ -1032,15 +1038,15 @@ export default class MarketsPage extends BasePage {
     const orderQty = order.qty
     const baseWallet = app().assets[this.market.base.id].wallet
 
+    if (orderQty <= 0) {
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+      return
+    }
+
     if (!order.isLimit) {
       if (order.sell) {
         this.setOrderBttnEnabled(orderQty <= baseWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_SELL_BALANCE_ERROR))
       }
-      return
-    }
-
-    if (orderQty <= 0) {
-      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
       return
     }
 
@@ -1191,7 +1197,7 @@ export default class MarketsPage extends BasePage {
     this.setRegistrationStatusVisibility()
     this.resolveOrderFormVisibility()
     this.setOrderBttnText()
-    this.setOrderBttnEnabled(false)
+    this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
     this.setCandleDurBttns()
     this.previewQuoteAmt(false)
     this.updateTitle()
@@ -2693,8 +2699,8 @@ export default class MarketsPage extends BasePage {
    */
   quantityChanged (finalize: boolean) {
     const page = this.page
-    const order = this.parseOrder()
-    if (order.qty < 0) {
+    const order = this.currentOrder = this.parseOrder()
+    if (order.qty <= 0) {
       page.lotField.value = '0'
       page.qtyField.value = ''
       this.previewQuoteAmt(false)
@@ -2725,10 +2731,15 @@ export default class MarketsPage extends BasePage {
     const page = this.page
     const qty = convertToAtoms(page.mktBuyField.value || '', this.market.quoteUnitInfo.conventional.conversionFactor)
     const gap = this.midGap()
+    if (qty > 0) {
+      const quoteWallet = app().assets[this.market.quote.id].wallet
+      this.setOrderBttnEnabled(qty <= quoteWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_BUY_BALANCE_ERROR))
+    } else {
+      this.setOrderBttnEnabled(false, intl.prep(intl.ID_ORDER_BUTTON_QTY_ERROR))
+    }
     if (!gap || !qty) {
       page.mktBuyLots.textContent = '0'
       page.mktBuyScore.textContent = '0'
-      this.setOrderBttnEnabled(false)
       return
     }
     const lotSize = this.market.cfg.lotsize
@@ -2736,8 +2747,6 @@ export default class MarketsPage extends BasePage {
     const lots = (received / lotSize)
     page.mktBuyLots.textContent = lots.toFixed(1)
     page.mktBuyScore.textContent = Doc.formatCoinValue(received, this.market.baseUnitInfo)
-    const quoteWallet = app().assets[this.market.quote.id].wallet
-    this.setOrderBttnEnabled(qty <= quoteWallet.balance.available, intl.prep(intl.ID_ORDER_BUTTON_BUY_BALANCE_ERROR))
   }
 
   /*
