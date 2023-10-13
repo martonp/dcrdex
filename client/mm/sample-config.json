@@ -8,8 +8,14 @@
             "quoteBalanceType": 0,
             "baseBalance": 100,
             "quoteBalance": 100,
+            "cexCfg": {
+                "name": "Binance",
+                "baseBalanceType": 0,
+                "quoteBalanceType": 0,
+                "baseBalance": 100,
+                "quoteBalance": 100
+            },
             "simpleArbConfig": {
-                "cexName": "Binance",
                 "profitTrigger": 0.01,
                 "maxActiveArbs": 5,
                 "numEpochsLeaveOpen": 5
