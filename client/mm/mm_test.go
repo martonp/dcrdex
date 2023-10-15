@@ -57,6 +57,17 @@ var (
 		SwapConf:     1,
 	}
 
+	tACCTAssetB = &dex.Asset{
+		ID:           966,
+		Symbol:       "polygon",
+		Version:      0, // match the stubbed (*TXCWallet).Info result
+		SwapSize:     135000,
+		SwapSizeBase: 135000,
+		RedeemSize:   68000,
+		MaxFeeRate:   20,
+		SwapConf:     1,
+	}
+
 	tWalletInfo = &asset.WalletInfo{
 		Version:           0,
 		SupportedVersions: []uint32{0},
@@ -88,6 +99,19 @@ func init() {
 			winfo:         tWalletInfo,
 		},
 	})
+	asset.Register(tACCTAssetB.ID, &tCreator{
+		tDriver: &tDriver{
+			decodedCoinID: tACCTAssetB.Symbol + "-coin",
+			winfo:         tWalletInfo,
+		},
+	})
+	asset.RegisterToken(60001, &dex.Token{
+		ParentID: 60,
+	}, &asset.WalletDefinition{}, dex.Simnet)
+	asset.RegisterToken(966001, &dex.Token{
+		ParentID: 966,
+	}, nil, dex.Simnet)
+
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -769,7 +793,6 @@ func TestSetupBalances(t *testing.T) {
 				},
 			},
 		},
-
 		// "CEX combine amount and percentages"
 		{
 			name: "CEX combine amount and percentages, too high error",
@@ -830,19 +853,20 @@ func TestSetupBalances(t *testing.T) {
 
 			wantErr: true,
 		},
-
 		// "CEX same asset on different chains"
 		{
-			name: "CEX combine amount and percentages, too high error",
+			name: "CEX same asset on different chains",
 			cfgs: []*BotConfig{
 				{
-					Host:             "host1",
-					BaseAsset:        60001,
-					QuoteAsset:       0,
-					BaseBalanceType:  Percentage,
-					BaseBalance:      50,
-					QuoteBalanceType: Percentage,
-					QuoteBalance:     50,
+					Host:                    "host1",
+					BaseAsset:               60001,
+					QuoteAsset:              0,
+					BaseBalanceType:         Percentage,
+					BaseBalance:             50,
+					QuoteBalanceType:        Percentage,
+					QuoteBalance:            50,
+					BaseFeeAssetBalanceType: Amount,
+					BaseFeeAssetBalance:     500,
 
 					CEXCfg: &BotCEXCfg{
 						Name:             "Binance",
@@ -853,13 +877,15 @@ func TestSetupBalances(t *testing.T) {
 					},
 				},
 				{
-					Host:             "host1",
-					BaseAsset:        966001,
-					QuoteAsset:       60,
-					BaseBalanceType:  Percentage,
-					BaseBalance:      50,
-					QuoteBalanceType: Percentage,
-					QuoteBalance:     50,
+					Host:                     "host1",
+					BaseAsset:                60,
+					QuoteAsset:               966001,
+					BaseBalanceType:          Percentage,
+					BaseBalance:              50,
+					QuoteBalanceType:         Percentage,
+					QuoteBalance:             50,
+					QuoteFeeAssetBalanceType: Amount,
+					QuoteFeeAssetBalance:     500,
 
 					CEXCfg: &BotCEXCfg{
 						Name:             "Binance",
@@ -874,6 +900,7 @@ func TestSetupBalances(t *testing.T) {
 			assetBalances: map[uint32]uint64{
 				0:      1000,
 				60:     2000,
+				966:    1000,
 				60001:  2000,
 				966001: 2000,
 			},
@@ -892,9 +919,11 @@ func TestSetupBalances(t *testing.T) {
 				dexMarketID("host1", 60001, 0): {
 					60001: 1000,
 					0:     500,
+					60:    500,
 				},
-				dexMarketID("host1", 966001, 60): {
+				dexMarketID("host1", 60, 966001): {
 					966001: 1000,
+					966:    500,
 					60:     1000,
 				},
 			},
@@ -904,16 +933,79 @@ func TestSetupBalances(t *testing.T) {
 					60001: 1000,
 					0:     1500,
 				},
-				dexMarketID("host1", 966001, 60): {
+				dexMarketID("host1", 60, 966001): {
 					966001: 1000,
 					60:     1000,
 				},
 			},
 		},
-
 		// "CEX same asset on different chains, too high error"
 		{
-			name: "CEX combine amount and percentages, too high error",
+			name: "CEX same asset on different chains, too high error",
+			cfgs: []*BotConfig{
+				{
+					Host:                    "host1",
+					BaseAsset:               60001,
+					QuoteAsset:              0,
+					BaseBalanceType:         Percentage,
+					BaseBalance:             50,
+					QuoteBalanceType:        Percentage,
+					QuoteBalance:            50,
+					BaseFeeAssetBalanceType: Amount,
+					BaseFeeAssetBalance:     1,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      50,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     50,
+					},
+				},
+				{
+					Host:                    "host1",
+					BaseAsset:               966001,
+					QuoteAsset:              60,
+					BaseBalanceType:         Percentage,
+					BaseBalance:             50,
+					QuoteBalanceType:        Percentage,
+					QuoteBalance:            100,
+					BaseFeeAssetBalanceType: Amount,
+					BaseFeeAssetBalance:     1,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      51,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     100,
+					},
+				},
+			},
+
+			assetBalances: map[uint32]uint64{
+				0:      1000,
+				60:     2000,
+				966:    1000,
+				60001:  2000,
+				966001: 2000,
+			},
+
+			cexBalances: map[string]map[uint32]uint64{
+				"Binance": {
+					0:      3000,
+					60:     2000,
+					60001:  2000,
+					966001: 2000,
+					61001:  2000,
+				},
+			},
+
+			wantErr: true,
+		},
+		// "No base fee asset specified, error"
+		{
+			name: "No base fee asset specified, error",
 			cfgs: []*BotConfig{
 				{
 					Host:             "host1",
@@ -933,20 +1025,22 @@ func TestSetupBalances(t *testing.T) {
 					},
 				},
 				{
-					Host:             "host1",
-					BaseAsset:        966001,
-					QuoteAsset:       60,
-					BaseBalanceType:  Percentage,
-					BaseBalance:      50,
-					QuoteBalanceType: Percentage,
-					QuoteBalance:     100,
+					Host:                     "host1",
+					BaseAsset:                60,
+					QuoteAsset:               966001,
+					BaseBalanceType:          Percentage,
+					BaseBalance:              50,
+					QuoteBalanceType:         Percentage,
+					QuoteBalance:             50,
+					QuoteFeeAssetBalanceType: Amount,
+					QuoteFeeAssetBalance:     500,
 
 					CEXCfg: &BotCEXCfg{
 						Name:             "Binance",
 						BaseBalanceType:  Percentage,
-						BaseBalance:      51,
+						BaseBalance:      50,
 						QuoteBalanceType: Percentage,
-						QuoteBalance:     100,
+						QuoteBalance:     50,
 					},
 				},
 			},
@@ -954,6 +1048,133 @@ func TestSetupBalances(t *testing.T) {
 			assetBalances: map[uint32]uint64{
 				0:      1000,
 				60:     2000,
+				966:    1000,
+				60001:  2000,
+				966001: 2000,
+			},
+
+			cexBalances: map[string]map[uint32]uint64{
+				"Binance": {
+					0:      3000,
+					60:     2000,
+					60001:  2000,
+					966001: 2000,
+					61001:  2000,
+				},
+			},
+
+			wantErr: true,
+		},
+		// "No quote fee asset specified, error"
+		{
+			name: "No quote fee asset specified, error",
+			cfgs: []*BotConfig{
+				{
+					Host:                    "host1",
+					BaseAsset:               60001,
+					QuoteAsset:              0,
+					BaseBalanceType:         Percentage,
+					BaseBalance:             50,
+					QuoteBalanceType:        Percentage,
+					QuoteBalance:            50,
+					BaseFeeAssetBalanceType: Amount,
+					BaseFeeAssetBalance:     500,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      50,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     50,
+					},
+				},
+				{
+					Host:             "host1",
+					BaseAsset:        60,
+					QuoteAsset:       966001,
+					BaseBalanceType:  Percentage,
+					BaseBalance:      50,
+					QuoteBalanceType: Percentage,
+					QuoteBalance:     50,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      50,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     50,
+					},
+				},
+			},
+
+			assetBalances: map[uint32]uint64{
+				0:      1000,
+				60:     2000,
+				966:    1000,
+				60001:  2000,
+				966001: 2000,
+			},
+
+			cexBalances: map[string]map[uint32]uint64{
+				"Binance": {
+					0:      3000,
+					60:     2000,
+					60001:  2000,
+					966001: 2000,
+					61001:  2000,
+				},
+			},
+
+			wantErr: true,
+		},
+		// "Token asset insufficient balance, error"
+		{
+			name: "Token asset insufficient balance, error",
+			cfgs: []*BotConfig{
+				{
+					Host:                    "host1",
+					BaseAsset:               60001,
+					QuoteAsset:              0,
+					BaseBalanceType:         Percentage,
+					BaseBalance:             50,
+					QuoteBalanceType:        Percentage,
+					QuoteBalance:            50,
+					BaseFeeAssetBalanceType: Percentage,
+					BaseFeeAssetBalance:     51,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      50,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     50,
+					},
+				},
+				{
+					Host:                     "host1",
+					BaseAsset:                60,
+					QuoteAsset:               966001,
+					BaseBalanceType:          Percentage,
+					BaseBalance:              50,
+					QuoteBalanceType:         Percentage,
+					QuoteBalance:             50,
+					QuoteFeeAssetBalanceType: Amount,
+					QuoteFeeAssetBalance:     500,
+
+					CEXCfg: &BotCEXCfg{
+						Name:             "Binance",
+						BaseBalanceType:  Percentage,
+						BaseBalance:      50,
+						QuoteBalanceType: Percentage,
+						QuoteBalance:     50,
+					},
+				},
+			},
+
+			assetBalances: map[uint32]uint64{
+				0:      1000,
+				60:     2000,
+				966:    1000,
 				60001:  2000,
 				966001: 2000,
 			},
@@ -1003,6 +1224,7 @@ func TestSetupBalances(t *testing.T) {
 
 		for botID, wantReserve := range test.wantReserves {
 			botReserves := mm.botBalances[botID]
+
 			for assetID, wantReserve := range wantReserve {
 				if botReserves.balances[assetID].Available != wantReserve {
 					t.Fatalf("%s: unexpected reserve for bot %s, asset %d. "+
@@ -1023,6 +1245,7 @@ func TestSetupBalances(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		fmt.Println("running test ", test.name)
 		runTest(test)
 	}
 }
@@ -1030,8 +1253,7 @@ func TestSetupBalances(t *testing.T) {
 func TestSegregatedCoreMaxSell(t *testing.T) {
 	tCore := newTCore()
 	tCore.isAccountLocker[60] = true
-	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
-	dcrEthID := fmt.Sprintf("%s-%d-%d", "host1", 42, 60)
+	tCore.isAccountLocker[60001] = true
 
 	// Whatever is returned from PreOrder is returned from this function.
 	// What we need to test is what is passed to PreOrder.
@@ -1080,6 +1302,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 		expectPreOrderParam *core.TradeForm
 		wantErr             bool
 	}{
+		// "ok"
 		{
 			name: "ok",
 			cfg: &BotConfig{
@@ -1109,6 +1332,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			swapFees:   1000,
 			redeemFees: 1000,
 		},
+		// "1 lot"
 		{
 			name: "1 lot",
 			cfg: &BotConfig{
@@ -1138,6 +1362,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			swapFees:   1000,
 			redeemFees: 1000,
 		},
+		// "not enough for 1 swap"
 		{
 			name: "not enough for 1 swap",
 			cfg: &BotConfig{
@@ -1160,6 +1385,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			redeemFees: 1000,
 			wantErr:    true,
 		},
+		// "not enough for 1 lot of redeem fees"
 		{
 			name: "not enough for 1 lot of redeem fees",
 			cfg: &BotConfig{
@@ -1182,6 +1408,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			redeemFees: 1000,
 			wantErr:    true,
 		},
+		// "redeem fees don't matter if not account locker"
 		{
 			name: "redeem fees don't matter if not account locker",
 			cfg: &BotConfig{
@@ -1211,6 +1438,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 				Qty:     1e6,
 			},
 		},
+		// "2 lots with refund fees, not account locker"
 		{
 			name: "2 lots with refund fees, not account locker",
 			cfg: &BotConfig{
@@ -1241,6 +1469,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			redeemFees: 1000,
 			refundFees: 1000,
 		},
+		// "1 lot with refund fees, account locker"
 		{
 			name: "1 lot with refund fees, account locker",
 			cfg: &BotConfig{
@@ -1271,6 +1500,101 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			redeemFees: 1000,
 			refundFees: 1000,
 		},
+		// "edge 1 lot token fee asset"
+		{
+			name: "edge 1 lot token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             50,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            50,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     1500,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60:    2000,
+				60001: 1e7,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			expectPreOrderParam: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    true,
+				Qty:     1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 500,
+		},
+		// "not enough 1 lot token fee asset"
+		{
+			name: "not enough 1 lot token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             50,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            50,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     1499,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60:    2000,
+				60001: 1e7,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 500,
+			wantErr:    true,
+		},
+		// "1 lot with redeem fees, account locker, token"
+		{
+			name: "1 lot with refund fees, account locker, token",
+			cfg: &BotConfig{
+				Host:                     "host1",
+				BaseAsset:                42,
+				QuoteAsset:               60001,
+				BaseBalanceType:          Amount,
+				BaseBalance:              2e6 + 2000,
+				QuoteBalanceType:         Amount,
+				QuoteBalance:             2e6 + 2000,
+				QuoteFeeAssetBalanceType: Amount,
+				QuoteFeeAssetBalance:     1000,
+			},
+			assetBalances: map[uint32]uint64{
+				60001: 1e7,
+				60:    2000,
+				42:    1e7,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			expectPreOrderParam: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    42,
+				Quote:   60001,
+				Sell:    true,
+				Qty:     1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 1000,
+		},
 	}
 
 	tempDir := t.TempDir()
@@ -1291,11 +1615,7 @@ func TestSegregatedCoreMaxSell(t *testing.T) {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
 
-		mkt := dcrBtcID
-		if test.cfg.QuoteAsset == 60 {
-			mkt = dcrEthID
-		}
-
+		mkt := dexMarketID("host1", test.cfg.BaseAsset, test.cfg.QuoteAsset)
 		segregatedCore := mm.wrappedCoreForBot(mkt)
 		res, err := segregatedCore.MaxSell("host1", test.cfg.BaseAsset, test.cfg.QuoteAsset)
 		if test.wantErr {
@@ -1322,8 +1642,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 	tCore := newTCore()
 
 	tCore.isAccountLocker[60] = true
-	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
-	ethBtcID := fmt.Sprintf("%s-%d-%d", "host1", 60, 0)
+	tCore.isAccountLocker[60001] = true
 
 	// Whatever is returned from PreOrder is returned from this function.
 	// What we need to test is what is passed to PreOrder.
@@ -1373,6 +1692,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 		expectPreOrderParam *core.TradeForm
 		wantErr             bool
 	}{
+		// "ok"
 		{
 			name: "ok",
 			cfg: &BotConfig{
@@ -1404,6 +1724,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			swapFees:   1000,
 			redeemFees: 1000,
 		},
+		// "1 lot"
 		{
 			name: "1 lot",
 			cfg: &BotConfig{
@@ -1435,6 +1756,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			swapFees:   1000,
 			redeemFees: 1000,
 		},
+		// "not enough for 1 swap"
 		{
 			name: "not enough for 1 swap",
 			cfg: &BotConfig{
@@ -1458,6 +1780,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			redeemFees: 1000,
 			wantErr:    true,
 		},
+		// "not enough for 1 lot of redeem fees"
 		{
 			name: "not enough for 1 lot of redeem fees",
 			cfg: &BotConfig{
@@ -1481,6 +1804,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			redeemFees: 1000,
 			wantErr:    true,
 		},
+		// "only account locker affected by redeem fees"
 		{
 			name: "only account locker affected by redeem fees",
 			cfg: &BotConfig{
@@ -1512,6 +1836,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 				Rate:    5e7,
 			},
 		},
+		//  "2 lots with refund fees, not account locker"
 		{
 			name: "2 lots with refund fees, not account locker",
 			cfg: &BotConfig{
@@ -1544,6 +1869,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			redeemFees: 1000,
 			refundFees: 1000,
 		},
+		//  "1 lot with refund fees, account locker"
 		{
 			name: "1 lot with refund fees, account locker",
 			cfg: &BotConfig{
@@ -1576,17 +1902,115 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			redeemFees: 1000,
 			refundFees: 1000,
 		},
+		// "edge 1 lot token fee asset"
+		{
+			name: "edge 1 lot token fee asset",
+			cfg: &BotConfig{
+				Host:                     "host1",
+				BaseAsset:                42,
+				QuoteAsset:               60001,
+				BaseBalanceType:          Percentage,
+				BaseBalance:              50,
+				QuoteBalanceType:         Percentage,
+				QuoteBalance:             50,
+				QuoteFeeAssetBalanceType: Amount,
+				QuoteFeeAssetBalance:     1500,
+			},
+			rate: 5e7,
+			assetBalances: map[uint32]uint64{
+				60001: 1e7,
+				42:    1e7,
+				60:    2000,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			expectPreOrderParam: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    42,
+				Quote:   60001,
+				Sell:    false,
+				Rate:    5e7,
+				Qty:     1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 500,
+		},
+		// "not enough for 1 lot, token fee asset"
+		{
+			name: "not enough for 1 lot, token fee asset",
+			cfg: &BotConfig{
+				Host:                     "host1",
+				BaseAsset:                42,
+				QuoteAsset:               60001,
+				BaseBalanceType:          Percentage,
+				BaseBalance:              50,
+				QuoteBalanceType:         Percentage,
+				QuoteBalance:             50,
+				QuoteFeeAssetBalanceType: Amount,
+				QuoteFeeAssetBalance:     1499,
+			},
+			rate: 5e7,
+			assetBalances: map[uint32]uint64{
+				60001: 1e7,
+				42:    1e7,
+				60:    2000,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 500,
+			wantErr:    true,
+		},
+		// "1 lot with redeem fees, account locker, token"
+		{
+			name: "1 lot with redeem fees, account locker, token",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             50,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            50,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     1000,
+			},
+			rate: 5e7,
+			assetBalances: map[uint32]uint64{
+				60001: 1e7,
+				42:    1e7,
+				60:    2000,
+			},
+			market: &core.Market{
+				LotSize: 1e6,
+			},
+			expectPreOrderParam: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    false,
+				Rate:    5e7,
+				Qty:     1e6,
+			},
+			swapFees:   1000,
+			redeemFees: 1000,
+			refundFees: 500,
+		},
 	}
 
 	tempDir := t.TempDir()
 	for _, test := range tests {
-		if test.name != "1 lot with refund fees, account locker" {
-			continue
-		}
 		tCore.setAssetBalances(test.assetBalances)
 		tCore.market = test.market
 		tCore.buySwapFees = test.swapFees
 		tCore.buyRedeemFees = test.redeemFees
+		tCore.buyRefundFees = test.refundFees
 
 		mm, err := NewMarketMaker(tCore, filepath.Join(tempDir, "mm.cfg"), tLogger)
 		if err != nil {
@@ -1598,10 +2022,7 @@ func TestSegregatedCoreMaxBuy(t *testing.T) {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
 
-		mkt := dcrBtcID
-		if test.cfg.BaseAsset != 42 {
-			mkt = ethBtcID
-		}
+		mkt := dexMarketID("host1", test.cfg.BaseAsset, test.cfg.QuoteAsset)
 		segregatedCore := mm.wrappedCoreForBot(mkt)
 		res, err := segregatedCore.MaxBuy("host1", test.cfg.BaseAsset, test.cfg.QuoteAsset, test.rate)
 		if test.wantErr {
@@ -3917,6 +4338,476 @@ func testSegregatedCoreTrade(t *testing.T, testMultiTrade bool) {
 			redeemFees:     1000,
 			maxFundingFees: 500,
 			wantErr:        true,
+		},
+		// "edge enough balance for single buy, token fee asset"
+		{
+			name: "edge enough balance for single buy, token fee asset",
+			cfg: &BotConfig{
+				Host:                     "host1",
+				BaseAsset:                42,
+				QuoteAsset:               60001,
+				BaseBalanceType:          Percentage,
+				BaseBalance:              100,
+				QuoteBalanceType:         Percentage,
+				QuoteBalance:             100,
+				QuoteFeeAssetBalanceType: Amount,
+				QuoteFeeAssetBalance:     2000,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    42,
+				Quote:   60001,
+				Sell:    false,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     1000,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:                   id,
+				Qty:                  5e6,
+				LockedAmt:            calc.BaseToQuote(5e7, 5e6),
+				ParentAssetLockedAmt: 1000,
+				RefundLockedAmt:      500,
+				Sell:                 false,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			postTradeBalances: map[uint32]*botBalance{
+				60001: {
+					Available:    1e7 - calc.BaseToQuote(5e7, 5e6),
+					FundingOrder: calc.BaseToQuote(5e7, 5e6),
+				},
+				60: {
+					Available:    100,
+					FundingOrder: 1500,
+				},
+				42: {
+					Available: 1e7,
+				},
+			},
+			notifications: []*noteAndBalances{
+				{
+					note: &core.OrderNote{
+						Order: &core.Order{
+							ID:               id,
+							Status:           order.OrderStatusExecuted,
+							BaseID:           42,
+							QuoteID:          60001,
+							Qty:              5e6,
+							Sell:             false,
+							Filled:           5e6,
+							AllFeesConfirmed: true,
+							FeesPaid: &core.FeeBreakdown{
+								Swap:       800,
+								Redemption: 300,
+							},
+							Matches: []*core.Match{
+								{
+									MatchID: matchIDs[0][:],
+									Qty:     5e6,
+									Rate:    5e7,
+									Status:  order.MatchConfirmed,
+									Swap:    &core.Coin{},
+									Redeem:  &core.Coin{},
+								},
+							},
+						},
+					},
+					balance: map[uint32]*botBalance{
+						60001: {
+							Available: 1e7 - calc.BaseToQuote(5e7, 5e6),
+						},
+						60: {
+							Available: 800,
+						},
+						42: {
+							Available: 1e7 + 5e6 - 300,
+						},
+					},
+				},
+			},
+		},
+		// "not enough balance for single buy, token fee asset"
+		{
+			name: "edge enough balance for single buy, token fee asset",
+			cfg: &BotConfig{
+				Host:                     "host1",
+				BaseAsset:                42,
+				QuoteAsset:               60001,
+				BaseBalanceType:          Percentage,
+				BaseBalance:              100,
+				QuoteBalanceType:         Percentage,
+				QuoteBalance:             100,
+				QuoteFeeAssetBalanceType: Amount,
+				QuoteFeeAssetBalance:     1999,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    42,
+				Quote:   60001,
+				Sell:    false,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     1000,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:                   id,
+				LockedAmt:            calc.BaseToQuote(5e7, 5e6),
+				ParentAssetLockedAmt: 1000,
+				RefundLockedAmt:      500,
+				Sell:                 false,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			wantErr: true,
+		},
+		// "edge enough balance for single sell, token fee asset"
+		{
+			name: "edge enough balance for single sell, token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             100,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            100,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     2000,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    true,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     1000,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:                   id,
+				LockedAmt:            5e6,
+				ParentAssetLockedAmt: 1000,
+				RefundLockedAmt:      500,
+				Sell:                 true,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			postTradeBalances: map[uint32]*botBalance{
+				60001: {
+					Available:    1e7 - 5e6,
+					FundingOrder: 5e6,
+				},
+				60: {
+					Available:    100,
+					FundingOrder: 1500,
+				},
+				42: {
+					Available: 1e7,
+				},
+			},
+			notifications: []*noteAndBalances{
+				{
+					note: &core.OrderNote{
+						Order: &core.Order{
+							ID:               id,
+							Status:           order.OrderStatusExecuted,
+							BaseID:           60001,
+							QuoteID:          42,
+							Qty:              5e6,
+							Sell:             true,
+							Filled:           5e6,
+							AllFeesConfirmed: true,
+							FeesPaid: &core.FeeBreakdown{
+								Swap:       800,
+								Redemption: 300,
+							},
+							Matches: []*core.Match{
+								{
+									MatchID: matchIDs[0][:],
+									Qty:     5e6,
+									Rate:    5e7,
+									Status:  order.MatchConfirmed,
+									Swap:    &core.Coin{},
+									Redeem:  &core.Coin{},
+								},
+							},
+						},
+					},
+					balance: map[uint32]*botBalance{
+						60001: {
+							Available: 1e7 - 5e6,
+						},
+						60: {
+							Available: 800,
+						},
+						42: {
+							Available: 1e7 + calc.BaseToQuote(5e7, 5e6) - 300,
+						},
+					},
+				},
+			},
+		},
+		// "edge not enough balance for single sell, token fee asset"
+		{
+			name: "edge enough balance for single sell, token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             100,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            100,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     2000,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    true,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     1000,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:                   id,
+				LockedAmt:            5e6,
+				ParentAssetLockedAmt: 1000,
+				RefundLockedAmt:      500,
+				Sell:                 false,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			postTradeBalances: map[uint32]*botBalance{
+				60001: {
+					Available:    1e7 - 5e6,
+					FundingOrder: 5e6,
+				},
+				60: {
+					Available:    100,
+					FundingOrder: 1500,
+				},
+				42: {
+					Available: 1e7,
+				},
+			},
+		},
+		// "edge enough balance for single buy with redeem fees, token fee asset"
+		{
+			name: "edge enough balance for single buy with redeem fees, token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             100,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            100,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     500,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    false,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     500,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:              id,
+				LockedAmt:       calc.BaseToQuote(5e7, 5e6) + 1000,
+				RedeemLockedAmt: 500,
+				Sell:            false,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			postTradeBalances: map[uint32]*botBalance{
+				60001: {
+					Available: 1e7,
+				},
+				60: {
+					Available:    0,
+					FundingOrder: 500,
+				},
+				42: {
+					Available:    1e7 - calc.BaseToQuote(5e7, 5e6) - 1000 - 400,
+					FundingOrder: calc.BaseToQuote(5e7, 5e6) + 1000,
+				},
+			},
+			notifications: []*noteAndBalances{
+				{
+					note: &core.OrderNote{
+						Order: &core.Order{
+							ID:               id,
+							Status:           order.OrderStatusExecuted,
+							BaseID:           60001,
+							QuoteID:          42,
+							Qty:              5e6,
+							Sell:             false,
+							Filled:           5e6,
+							AllFeesConfirmed: true,
+							FeesPaid: &core.FeeBreakdown{
+								Swap:       800,
+								Redemption: 300,
+							},
+							Matches: []*core.Match{
+								{
+									MatchID: matchIDs[0][:],
+									Qty:     5e6,
+									Rate:    5e7,
+									Status:  order.MatchConfirmed,
+									Swap:    &core.Coin{},
+									Redeem:  &core.Coin{},
+								},
+							},
+						},
+					},
+					balance: map[uint32]*botBalance{
+						60001: {
+							Available: 1e7 + 5e6,
+						},
+						60: {
+							Available: 200,
+						},
+						42: {
+							Available: 1e7 - calc.BaseToQuote(5e7, 5e6) - 800 - 400,
+						},
+					},
+				},
+			},
+		},
+		// "not enough balance for single buy with redeem fees, token fee asset"
+		{
+			name: "not enough balance for single buy with redeem fees, token fee asset",
+			cfg: &BotConfig{
+				Host:                    "host1",
+				BaseAsset:               60001,
+				QuoteAsset:              42,
+				BaseBalanceType:         Percentage,
+				BaseBalance:             100,
+				QuoteBalanceType:        Percentage,
+				QuoteBalance:            100,
+				BaseFeeAssetBalanceType: Amount,
+				BaseFeeAssetBalance:     499,
+			},
+			assetBalances: map[uint32]uint64{
+				42:    1e7,
+				60001: 1e7,
+				60:    3000,
+			},
+			trade: &core.TradeForm{
+				Host:    "host1",
+				IsLimit: true,
+				Base:    60001,
+				Quote:   42,
+				Sell:    false,
+				Qty:     5e6,
+				Rate:    5e7,
+			},
+			market: &core.Market{
+				LotSize: 5e6,
+			},
+			swapFees:       1000,
+			redeemFees:     500,
+			refundFees:     500,
+			maxFundingFees: 500,
+			tradeRes: &core.Order{
+				ID:              id,
+				LockedAmt:       calc.BaseToQuote(5e7, 5e6) + 1000,
+				RedeemLockedAmt: 500,
+				Sell:            false,
+				FeesPaid: &core.FeeBreakdown{
+					Funding: 400,
+				},
+			},
+			isAccountLocker: map[uint32]bool{
+				60001: true,
+			},
+			wantErr: true,
 		},
 		// "edge enough balance for single sell"
 		{

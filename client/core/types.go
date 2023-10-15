@@ -376,36 +376,39 @@ func matchFromMetaMatchWithConfs(ord order.Order, metaMatch *db.MetaMatch, swapC
 // Order is core's general type for an order. An order may be a market, limit,
 // or cancel order. Some fields are only relevant to particular order types.
 type Order struct {
-	Host              string            `json:"host"`
-	BaseID            uint32            `json:"baseID"`
-	BaseSymbol        string            `json:"baseSymbol"`
-	QuoteID           uint32            `json:"quoteID"`
-	QuoteSymbol       string            `json:"quoteSymbol"`
-	MarketID          string            `json:"market"`
-	Type              order.OrderType   `json:"type"`
-	ID                dex.Bytes         `json:"id"`    // Can be empty if part of an InFlightOrder
-	Stamp             uint64            `json:"stamp"` // Server's time stamp
-	SubmitTime        uint64            `json:"submitTime"`
-	Sig               dex.Bytes         `json:"sig"`
-	Status            order.OrderStatus `json:"status"`
-	Epoch             uint64            `json:"epoch"`
-	Qty               uint64            `json:"qty"`
-	Sell              bool              `json:"sell"`
-	Filled            uint64            `json:"filled"`
-	Matches           []*Match          `json:"matches"`
-	Cancelling        bool              `json:"cancelling"`
-	Canceled          bool              `json:"canceled"`
-	FeesPaid          *FeeBreakdown     `json:"feesPaid"`
-	AllFeesConfirmed  bool              `json:"allFeesConfirmed"`
-	FundingCoins      []*Coin           `json:"fundingCoins"`
-	LockedAmt         uint64            `json:"lockedamt"`
-	RedeemLockedAmt   uint64            `json:"redeemLockedAmt"`
-	RefundLockedAmt   uint64            `json:"refundLockedAmt"`
-	AccelerationCoins []*Coin           `json:"accelerationCoins"`
-	Rate              uint64            `json:"rate"`          // limit only
-	TimeInForce       order.TimeInForce `json:"tif"`           // limit only
-	TargetOrderID     dex.Bytes         `json:"targetOrderID"` // cancel only
-	ReadyToTick       bool              `json:"readyToTick"`
+	Host             string            `json:"host"`
+	BaseID           uint32            `json:"baseID"`
+	BaseSymbol       string            `json:"baseSymbol"`
+	QuoteID          uint32            `json:"quoteID"`
+	QuoteSymbol      string            `json:"quoteSymbol"`
+	MarketID         string            `json:"market"`
+	Type             order.OrderType   `json:"type"`
+	ID               dex.Bytes         `json:"id"`    // Can be empty if part of an InFlightOrder
+	Stamp            uint64            `json:"stamp"` // Server's time stamp
+	SubmitTime       uint64            `json:"submitTime"`
+	Sig              dex.Bytes         `json:"sig"`
+	Status           order.OrderStatus `json:"status"`
+	Epoch            uint64            `json:"epoch"`
+	Qty              uint64            `json:"qty"`
+	Sell             bool              `json:"sell"`
+	Filled           uint64            `json:"filled"`
+	Matches          []*Match          `json:"matches"`
+	Cancelling       bool              `json:"cancelling"`
+	Canceled         bool              `json:"canceled"`
+	FeesPaid         *FeeBreakdown     `json:"feesPaid"`
+	AllFeesConfirmed bool              `json:"allFeesConfirmed"`
+	FundingCoins     []*Coin           `json:"fundingCoins"`
+	LockedAmt        uint64            `json:"lockedamt"`
+	// ParentAssetLockedAmt is the swap fees locked when the "from asset" of a
+	// trade is a token. This wil be 0 if the "from asset" is not a token.
+	ParentAssetLockedAmt uint64            `json:"parentAssetLockedAmt"`
+	RedeemLockedAmt      uint64            `json:"redeemLockedAmt"`
+	RefundLockedAmt      uint64            `json:"refundLockedAmt"`
+	AccelerationCoins    []*Coin           `json:"accelerationCoins"`
+	Rate                 uint64            `json:"rate"`          // limit only
+	TimeInForce          order.TimeInForce `json:"tif"`           // limit only
+	TargetOrderID        dex.Bytes         `json:"targetOrderID"` // cancel only
+	ReadyToTick          bool              `json:"readyToTick"`
 }
 
 // InFlightOrder is an Order that is not stamped yet, but has a temporary ID

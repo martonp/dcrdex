@@ -1172,6 +1172,13 @@ type Coin interface {
 	Value() uint64
 }
 
+// TokenCoin is extends to Coin interface to include the amount locked
+// of the parent asset to be used for fees.
+type TokenCoin interface {
+	Coin
+	ParentValue() uint64
+}
+
 type RecoveryCoin interface {
 	// RecoveryID is an ID that can be used to re-establish funding state during
 	// startup. If a Coin implements RecoveryCoin, the RecoveryID will be used

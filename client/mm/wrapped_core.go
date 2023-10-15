@@ -28,46 +28,83 @@ type wrappedCore struct {
 
 var _ clientCore = (*wrappedCore)(nil)
 
-func (c *wrappedCore) maxBuyQty(host string, base, quote uint32, rate uint64, options map[string]string) (uint64, error) {
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
+func feeAsset(assetID uint32) uint32 {
+	if token := asset.TokenInfo(assetID); token != nil {
+		return token.ParentID
+	}
+	return assetID
+}
 
-	mkt, err := c.ExchangeMarket(host, base, quote)
+// parentAssetBalance returns the balance of a parent asset if the specified
+// asset is a token, and nil otherwise.
+func (c *wrappedCore) parentAssetBalance(assetID uint32) *uint64 {
+	fa := feeAsset(assetID)
+	if fa == assetID {
+		return nil
+	}
+	bal := c.mm.botBalance(c.botID, fa)
+	return &bal
+}
+
+func (c *wrappedCore) maxBuyQty(host string, baseID, quoteID uint32, rate uint64, options map[string]string) (uint64, error) {
+	mkt, err := c.ExchangeMarket(host, baseID, quoteID)
 	if err != nil {
 		return 0, err
 	}
 
-	fundingFees, err := c.MaxFundingFees(quote, host, 1, options)
+	fundingFees, err := c.MaxFundingFees(quoteID, host, 1, options)
 	if err != nil {
 		return 0, err
 	}
 
 	swapFees, redeemFees, refundFees, err := c.SingleLotFees(&core.SingleLotFeesForm{
 		Host:          host,
-		Base:          base,
-		Quote:         quote,
+		Base:          baseID,
+		Quote:         quoteID,
 		UseMaxFeeRate: true,
 	})
 	if err != nil {
 		return 0, err
 	}
 
-	if quoteBalance > fundingFees {
-		quoteBalance -= fundingFees
+	quoteBalance := c.mm.botBalance(c.botID, quoteID)
+	quoteParentBalance := c.parentAssetBalance(quoteID)
+	isToken := quoteParentBalance != nil
+	if isToken {
+		if *quoteParentBalance > fundingFees {
+			*quoteParentBalance -= fundingFees
+		} else {
+			*quoteParentBalance = 0
+		}
 	} else {
-		quoteBalance = 0
+		if quoteBalance > fundingFees {
+			quoteBalance -= fundingFees
+		} else {
+			quoteBalance = 0
+		}
 	}
 
 	// Account based coins require the refund fees to be reserved as well.
-	if !c.mm.isAccountLocker(quote) {
+	if !c.mm.isAccountLocker(quoteID) {
 		refundFees = 0
 	}
 
 	lotSizeQuote := calc.BaseToQuote(rate, mkt.LotSize)
-	maxLots := quoteBalance / (lotSizeQuote + swapFees + refundFees)
 
-	if redeemFees > 0 && c.mm.isAccountLocker(base) {
-		maxBaseLots := baseBalance / redeemFees
+	var maxLots uint64
+	if isToken {
+		maxLots = quoteBalance / lotSizeQuote
+		maxFeeLots := *quoteParentBalance / (swapFees + refundFees)
+		if maxLots > maxFeeLots {
+			maxLots = maxFeeLots
+		}
+	} else {
+		maxLots = quoteBalance / (lotSizeQuote + swapFees + refundFees)
+	}
+
+	if redeemFees > 0 && c.mm.isAccountLocker(baseID) {
+		baseFeeBalance := c.mm.botBalance(c.botID, feeAsset(baseID))
+		maxBaseLots := baseFeeBalance / redeemFees
 		if maxLots > maxBaseLots {
 			maxLots = maxBaseLots
 		}
@@ -76,24 +113,21 @@ func (c *wrappedCore) maxBuyQty(host string, base, quote uint32, rate uint64, op
 	return maxLots * mkt.LotSize, nil
 }
 
-func (c *wrappedCore) maxSellQty(host string, base, quote, numTrades uint32, options map[string]string) (uint64, error) {
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
-
-	mkt, err := c.ExchangeMarket(host, base, quote)
+func (c *wrappedCore) maxSellQty(host string, baseID, quoteID, numTrades uint32, options map[string]string) (uint64, error) {
+	mkt, err := c.ExchangeMarket(host, baseID, quoteID)
 	if err != nil {
 		return 0, err
 	}
 
-	fundingFees, err := c.MaxFundingFees(base, host, numTrades, options)
+	fundingFees, err := c.MaxFundingFees(baseID, host, numTrades, options)
 	if err != nil {
 		return 0, err
 	}
 
 	swapFees, redeemFees, refundFees, err := c.SingleLotFees(&core.SingleLotFeesForm{
 		Host:          host,
-		Base:          base,
-		Quote:         quote,
+		Base:          baseID,
+		Quote:         quoteID,
 		Sell:          true,
 		UseMaxFeeRate: true,
 	})
@@ -101,20 +135,42 @@ func (c *wrappedCore) maxSellQty(host string, base, quote, numTrades uint32, opt
 		return 0, err
 	}
 
-	if baseBalance > fundingFees {
-		baseBalance -= fundingFees
+	baseBalance := c.mm.botBalance(c.botID, baseID)
+	baseParentBalance := c.parentAssetBalance(baseID)
+	isToken := baseParentBalance != nil
+	if isToken {
+		if *baseParentBalance > fundingFees {
+			*baseParentBalance -= fundingFees
+		} else {
+			*baseParentBalance = 0
+		}
 	} else {
-		baseBalance = 0
+		if baseBalance > fundingFees {
+			baseBalance -= fundingFees
+		} else {
+			baseBalance = 0
+		}
 	}
 
 	// Account based coins require the refund fees to be reserved as well.
-	if !c.mm.isAccountLocker(base) {
+	if !c.mm.isAccountLocker(baseID) {
 		refundFees = 0
 	}
 
-	maxLots := baseBalance / (mkt.LotSize + swapFees + refundFees)
-	if c.mm.isAccountLocker(quote) && redeemFees > 0 {
-		maxQuoteLots := quoteBalance / redeemFees
+	var maxLots uint64
+	if isToken {
+		maxLots = baseBalance / mkt.LotSize
+		maxFeeLots := *baseParentBalance / (swapFees + refundFees)
+		if maxLots > maxFeeLots {
+			maxLots = maxFeeLots
+		}
+	} else {
+		maxLots = baseBalance / (mkt.LotSize + swapFees + refundFees)
+	}
+
+	if c.mm.isAccountLocker(quoteID) && redeemFees > 0 {
+		quoteFeeBalance := c.mm.botBalance(c.botID, feeAsset(quoteID))
+		maxQuoteLots := quoteFeeBalance / redeemFees
 		if maxLots > maxQuoteLots {
 			maxLots = maxQuoteLots
 		}
@@ -155,9 +211,6 @@ func (c *wrappedCore) sufficientBalanceForMultiSell(host string, base, quote uin
 }
 
 func (c *wrappedCore) sufficientBalanceForMultiBuy(host string, base, quote uint32, placements []*core.QtyRate, options map[string]string) (bool, error) {
-	baseBalance := c.mm.botBalance(c.botID, base)
-	quoteBalance := c.mm.botBalance(c.botID, quote)
-
 	mkt, err := c.ExchangeMarket(host, base, quote)
 	if err != nil {
 		return false, err
@@ -177,29 +230,58 @@ func (c *wrappedCore) sufficientBalanceForMultiBuy(host string, base, quote uint
 		refundFees = 0
 	}
 
+	quoteBalance := c.mm.botBalance(c.botID, quote)
+	quoteParentBalance := c.parentAssetBalance(quote)
+	isToken := quoteParentBalance != nil
+
 	fundingFees, err := c.MaxFundingFees(quote, host, uint32(len(placements)), options)
 	if err != nil {
 		return false, err
 	}
-	if quoteBalance < fundingFees {
+	if !isToken && quoteBalance < fundingFees {
+		return false, nil
+	}
+	if isToken && *quoteParentBalance < fundingFees {
 		return false, nil
 	}
 
 	var totalLots uint64
-	remainingBalance := quoteBalance - fundingFees
+
+	remainingBalance := quoteBalance
+	var remainingParentBalance uint64
+	if isToken {
+		remainingParentBalance = *quoteParentBalance - fundingFees
+	} else {
+		remainingBalance = quoteBalance - fundingFees
+	}
+
 	for _, placement := range placements {
 		quoteQty := calc.BaseToQuote(placement.Rate, placement.Qty)
 		numLots := placement.Qty / mkt.LotSize
 		totalLots += numLots
-		req := quoteQty + (numLots * (swapFees + refundFees))
+
+		var req, reqParent uint64
+		if isToken {
+			req = quoteQty
+			reqParent = numLots * (swapFees + refundFees)
+		} else {
+			req = quoteQty + (numLots * (swapFees + refundFees))
+		}
+
 		if remainingBalance < req {
 			return false, nil
 		}
+		if remainingParentBalance < reqParent {
+			return false, nil
+		}
+
 		remainingBalance -= req
+		remainingParentBalance -= reqParent
 	}
 
-	if c.mm.isAccountLocker(base) && baseBalance < redeemFees*totalLots {
-		return false, nil
+	if c.mm.isAccountLocker(base) {
+		baseFeeBalance := c.mm.botBalance(c.botID, feeAsset(base))
+		return baseFeeBalance >= redeemFees*totalLots, nil
 	}
 
 	return true, nil
@@ -280,15 +362,16 @@ func (c *wrappedCore) Trade(pw []byte, form *core.TradeForm) (*core.Order, error
 		fundingFees = o.FeesPaid.Funding
 	}
 
+	fromFeeAsset := feeAsset(fromAsset)
+	toFeeAsset := feeAsset(toAsset)
 	balMods := []*balanceMod{
-		{balanceModDecrease, fromAsset, balTypeAvailable, o.LockedAmt + o.RefundLockedAmt + fundingFees},
-		{balanceModIncrease, fromAsset, balTypeFundingOrder, o.LockedAmt + o.RefundLockedAmt},
+		{balanceModDecrease, fromAsset, balTypeAvailable, o.LockedAmt},
+		{balanceModIncrease, fromAsset, balTypeFundingOrder, o.LockedAmt},
+		{balanceModDecrease, fromFeeAsset, balTypeAvailable, fundingFees + o.ParentAssetLockedAmt + o.RefundLockedAmt},
+		{balanceModIncrease, fromFeeAsset, balTypeFundingOrder, o.ParentAssetLockedAmt + o.RefundLockedAmt},
+		{balanceModDecrease, toFeeAsset, balTypeAvailable, o.RedeemLockedAmt},
+		{balanceModIncrease, toFeeAsset, balTypeFundingOrder, o.RedeemLockedAmt},
 	}
-	if o.RedeemLockedAmt > 0 {
-		balMods = append(balMods, &balanceMod{balanceModDecrease, toAsset, balTypeAvailable, o.RedeemLockedAmt})
-		balMods = append(balMods, &balanceMod{balanceModIncrease, toAsset, balTypeFundingOrder, o.RedeemLockedAmt})
-	}
-
 	c.mm.modifyBotBalance(c.botID, balMods)
 
 	return o, nil
@@ -332,7 +415,7 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 		return nil, err
 	}
 
-	var totalFromLocked, totalToLocked, fundingFeesPaid uint64
+	var fromAssetLocked, fromFeeAssetLocked, toFeeAssetLocked, fundingFeesPaid uint64
 	for _, o := range orders {
 		var orderID order.OrderID
 		copy(orderID[:], o.ID)
@@ -353,21 +436,25 @@ func (c *wrappedCore) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.
 		}
 		c.mm.ordersMtx.Unlock()
 
-		totalFromLocked += o.LockedAmt
-		totalFromLocked += o.RefundLockedAmt
-		totalToLocked += o.RedeemLockedAmt
+		fromAssetLocked += o.LockedAmt
+		fromFeeAssetLocked += o.ParentAssetLockedAmt
+		fromFeeAssetLocked += o.RefundLockedAmt
+		toFeeAssetLocked += o.RedeemLockedAmt
 		if o.FeesPaid != nil {
 			fundingFeesPaid += o.FeesPaid.Funding
 		}
 	}
 
+	fromFeeAsset := feeAsset(fromAsset)
+	toFeeAsset := feeAsset(toAsset)
+
 	balMods := []*balanceMod{
-		{balanceModDecrease, fromAsset, balTypeAvailable, totalFromLocked + fundingFeesPaid},
-		{balanceModIncrease, fromAsset, balTypeFundingOrder, totalFromLocked},
-	}
-	if totalToLocked > 0 {
-		balMods = append(balMods, &balanceMod{balanceModDecrease, toAsset, balTypeAvailable, totalToLocked})
-		balMods = append(balMods, &balanceMod{balanceModIncrease, toAsset, balTypeFundingOrder, totalToLocked})
+		{balanceModDecrease, fromAsset, balTypeAvailable, fromAssetLocked},
+		{balanceModIncrease, fromAsset, balTypeFundingOrder, fromAssetLocked},
+		{balanceModDecrease, fromFeeAsset, balTypeAvailable, fundingFeesPaid + fromFeeAssetLocked},
+		{balanceModIncrease, fromFeeAsset, balTypeFundingOrder, fromFeeAssetLocked},
+		{balanceModDecrease, toFeeAsset, balTypeAvailable, toFeeAssetLocked},
+		{balanceModIncrease, toFeeAsset, balTypeFundingOrder, toFeeAssetLocked},
 	}
 	c.mm.modifyBotBalance(c.botID, balMods)
 

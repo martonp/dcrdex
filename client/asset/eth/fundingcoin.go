@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/dex"
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -78,6 +79,8 @@ type tokenFundingCoin struct {
 	fees uint64
 }
 
+var _ asset.TokenCoin = (*tokenFundingCoin)(nil)
+
 // String creates a human readable string.
 func (c *tokenFundingCoin) String() string {
 	return fmt.Sprintf("address: %s, amount:%v, fees:%v", c.addr, c.amt, c.fees)
@@ -100,6 +103,10 @@ func (c *tokenFundingCoin) RecoveryID() dex.Bytes {
 
 func (c *tokenFundingCoin) Value() uint64 {
 	return c.amt
+}
+
+func (c *tokenFundingCoin) ParentValue() uint64 {
+	return c.fees
 }
 
 // decodeTokenFundingCoin decodes a byte slice into an tokenFundingCoinID.

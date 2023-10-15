@@ -487,6 +487,49 @@ func (m *MarketMaker) setupBalances(cfgs []*BotConfig, cexes map[string]libxc.CE
 			},
 		}
 
+		trackTokenFeeAsset := func(base bool) error {
+			assetID := cfg.QuoteAsset
+			balType := cfg.QuoteFeeAssetBalanceType
+			balAmount := cfg.QuoteFeeAssetBalance
+			baseOrQuote := "quote"
+			if base {
+				assetID = cfg.BaseAsset
+				balType = cfg.BaseFeeAssetBalanceType
+				balAmount = cfg.BaseFeeAssetBalance
+				baseOrQuote = "base"
+			}
+			token := asset.TokenInfo(assetID)
+			if token == nil {
+				return nil
+			}
+			err := trackAssetOnDEX(token.ParentID)
+			if err != nil {
+				return err
+			}
+			tokenFeeAsset := dexBalanceTracker[token.ParentID]
+			tokenFeeAssetRequired := calcBalance(balType, balAmount, tokenFeeAsset.available)
+			if tokenFeeAssetRequired == 0 {
+				return fmt.Errorf("%s fee asset balance is zero for market %s", baseOrQuote, mktID)
+			}
+			if tokenFeeAssetRequired > tokenFeeAsset.available-tokenFeeAsset.reserved {
+				return fmt.Errorf("insufficient balance for asset %d", token.ParentID)
+			}
+			tokenFeeAsset.reserved += tokenFeeAssetRequired
+			if _, found := m.botBalances[mktID].balances[token.ParentID]; !found {
+				m.botBalances[mktID].balances[token.ParentID] = &botBalance{}
+			}
+			m.botBalances[mktID].balances[token.ParentID].Available += tokenFeeAssetRequired
+			return nil
+		}
+		err = trackTokenFeeAsset(true)
+		if err != nil {
+			return err
+		}
+		err = trackTokenFeeAsset(false)
+		if err != nil {
+			return err
+		}
+
 		// Calculate CEX balances
 		if cfg.CEXCfg != nil {
 			baseSymbol := dex.BipIDSymbol(cfg.BaseAsset)
@@ -897,12 +940,15 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 	}
 
 	if !orderInfo.excessFeesReturned && o.AllFeesConfirmed {
+		fromFeeAsset := feeAsset(fromAsset)
+		toFeeAsset := feeAsset(toAsset)
+
 		// Return excess swap fees
 		maxSwapFees := swappedMatches * orderInfo.singleLotSwapFees
 		if maxSwapFees > o.FeesPaid.Swap {
 			balanceMods := []*balanceMod{
-				{balanceModIncrease, fromAsset, balTypeAvailable, maxSwapFees - o.FeesPaid.Swap},
-				{balanceModDecrease, fromAsset, balTypeFundingOrder, maxSwapFees},
+				{balanceModIncrease, fromFeeAsset, balTypeAvailable, maxSwapFees - o.FeesPaid.Swap},
+				{balanceModDecrease, fromFeeAsset, balTypeFundingOrder, maxSwapFees},
 			}
 			m.modifyBotBalance(orderInfo.bot, balanceMods)
 		} else if maxSwapFees < o.FeesPaid.Swap {
@@ -913,8 +959,8 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 		if orderInfo.initialRedeemFeesLocked > 0 { // AccountLocker
 			if orderInfo.initialRedeemFeesLocked > o.FeesPaid.Redemption {
 				balanceMods := []*balanceMod{
-					{balanceModIncrease, toAsset, balTypeAvailable, orderInfo.initialRedeemFeesLocked - o.FeesPaid.Redemption},
-					{balanceModDecrease, toAsset, balTypeFundingOrder, orderInfo.initialRedeemFeesLocked},
+					{balanceModIncrease, toFeeAsset, balTypeAvailable, orderInfo.initialRedeemFeesLocked - o.FeesPaid.Redemption},
+					{balanceModDecrease, toFeeAsset, balTypeFundingOrder, orderInfo.initialRedeemFeesLocked},
 				}
 				m.modifyBotBalance(orderInfo.bot, balanceMods)
 			} else {
@@ -925,7 +971,7 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 			maxRedeemFees := redeemedLots * orderInfo.singleLotRedeemFees
 			if maxRedeemFees > o.FeesPaid.Redemption {
 				balanceMods := []*balanceMod{
-					{balanceModIncrease, toAsset, balTypeAvailable, maxRedeemFees - o.FeesPaid.Redemption},
+					{balanceModIncrease, toFeeAsset, balTypeAvailable, maxRedeemFees - o.FeesPaid.Redemption},
 				}
 				m.modifyBotBalance(orderInfo.bot, balanceMods)
 			} else if maxRedeemFees < o.FeesPaid.Redemption {
@@ -938,8 +984,8 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 		if orderInfo.initialRefundFeesLocked > 0 { // AccountLocker
 			if orderInfo.initialRefundFeesLocked > o.FeesPaid.Refund {
 				balanceMods := []*balanceMod{
-					{balanceModIncrease, fromAsset, balTypeAvailable, orderInfo.initialRefundFeesLocked - o.FeesPaid.Refund},
-					{balanceModDecrease, fromAsset, balTypeFundingOrder, orderInfo.initialRefundFeesLocked},
+					{balanceModIncrease, fromFeeAsset, balTypeAvailable, orderInfo.initialRefundFeesLocked - o.FeesPaid.Refund},
+					{balanceModDecrease, fromFeeAsset, balTypeFundingOrder, orderInfo.initialRefundFeesLocked},
 				}
 				m.modifyBotBalance(orderInfo.bot, balanceMods)
 			}
@@ -947,7 +993,7 @@ func (m *MarketMaker) handleOrderUpdate(o *core.Order) {
 			maxRefundFees := refundedMatches * orderInfo.singleLotRefundFees
 			if maxRefundFees > o.FeesPaid.Refund {
 				balanceMods := []*balanceMod{
-					{balanceModIncrease, fromAsset, balTypeAvailable, maxRefundFees - o.FeesPaid.Refund},
+					{balanceModIncrease, fromFeeAsset, balTypeAvailable, maxRefundFees - o.FeesPaid.Refund},
 				}
 				m.modifyBotBalance(orderInfo.bot, balanceMods)
 			} else if maxRefundFees < o.FeesPaid.Refund {
