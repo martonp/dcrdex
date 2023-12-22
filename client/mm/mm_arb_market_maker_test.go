@@ -6,6 +6,7 @@ package mm
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"decred.org/dcrdex/client/core"
@@ -1702,4 +1703,23 @@ func TestArbMarketMakerAutoRebalance(t *testing.T) {
 	for _, test := range tests {
 		runTest(test)
 	}
+}
+
+func TestRateAdjustment(t *testing.T) {
+	lotSize := uint64(40e8)
+	baseFee := uint64(5e7)
+	quoteFee := uint64(6e4)
+
+	originalRate := uint64(5e4)
+	updatedRate := calcAdjustedRateForFees(originalRate, baseFee, quoteFee, lotSize, false, 1e8, 1e8)
+
+	fmt.Printf("original Rate %d updatedRate %d\n", originalRate, updatedRate)
+
+	quoteAmtOriginal := calc.BaseToQuote(originalRate, lotSize)
+	quoteAmtUpdated := calc.BaseToQuote(updatedRate, lotSize)
+	diff := quoteAmtOriginal - quoteAmtUpdated
+
+	fmt.Printf("diff quote %d\n", diff)
+	fmt.Printf("amt quote remaining %d\n", diff-quoteFee)
+	fmt.Printf("amt base %d\n", baseFee-calc.QuoteToBase(originalRate, diff-quoteFee))
 }

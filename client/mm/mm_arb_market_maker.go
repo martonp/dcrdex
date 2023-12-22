@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/core"
 	"decred.org/dcrdex/client/mm/libxc"
 	"decred.org/dcrdex/dex"
@@ -334,6 +335,32 @@ func (a *arbMarketMaker) cancelExpiredCEXTrades() {
 	}
 }
 
+func adjustedRateForFees(originalRate, baseFee, quoteFee, lotSize uint64, sell bool, baseID, quoteID uint32) (uint64, error) {
+	baseUnitInfo, err := asset.UnitInfo(baseID)
+	if err != nil {
+		return 0, err
+	}
+
+	quoteUnitInfo, err := asset.UnitInfo(quoteID)
+	if err != nil {
+		return 0, err
+	}
+
+	quoteForBaseFees := calc.BaseToQuote(originalRate, baseFee)
+	rateAdjustment := float64(quoteForBaseFees+quoteFee) / float64(lotSize)
+	originalConvRate := calc.ConventionalRate(originalRate, baseUnitInfo, quoteUnitInfo)
+
+	if sell {
+		return calc.MessageRate(originalConvRate+rateAdjustment, baseUnitInfo, quoteUnitInfo), nil
+	}
+
+	if rateAdjustment > originalConvRate {
+		return 0, fmt.Errorf("rate adjustment required for fees %v > rate %v", rateAdjustment, originalConvRate)
+	}
+
+	return calc.MessageRate(originalConvRate-rateAdjustment, baseUnitInfo, quoteUnitInfo), nil
+}
+
 func arbMarketMakerRebalance(newEpoch uint64, a arbMMRebalancer, c clientCore, cex cex, cfg *ArbMarketMakerConfig, mkt *core.Market, buyFees,
 	sellFees *orderFees, reserves *autoRebalanceReserves, log dex.Logger) (cancels []dex.Bytes, buyOrders, sellOrders []*rateLots) {
 
@@ -382,19 +409,23 @@ func arbMarketMakerRebalance(newEpoch uint64, a arbMMRebalancer, c clientCore, c
 	processSide := func(sell bool) []*rateLots {
 		var cfgPlacements []*ArbMarketMakingPlacement
 		var existingOrders map[int][]*groupedOrder
-		var remainingDEXBalance, remainingCEXBalance, fundingFees uint64
+		var remainingDEXBalance, remainingCEXBalance, fundingFees, baseFees, quoteFees uint64
 		if sell {
 			cfgPlacements = cfg.SellPlacements
 			existingOrders = existingSells
 			remainingDEXBalance = baseDEXBalance.Available
 			remainingCEXBalance = quoteCEXBalance.Available
 			fundingFees = sellFees.funding
+			baseFees = sellFees.swap
+			quoteFees = sellFees.redemption
 		} else {
 			cfgPlacements = cfg.BuyPlacements
 			existingOrders = existingBuys
 			remainingDEXBalance = quoteDEXBalance.Available
 			remainingCEXBalance = baseCEXBalance.Available
 			fundingFees = buyFees.funding
+			baseFees = buyFees.redemption
+			quoteFees = buyFees.swap
 		}
 
 		cexReserves := reserves.get(!sell, true)
@@ -463,12 +494,20 @@ func arbMarketMakerRebalance(newEpoch uint64, a arbMMRebalancer, c clientCore, c
 				break
 			}
 
-			var placementRate uint64
+			var profitableRate uint64
 			if sell {
-				placementRate = steppedRate(uint64(float64(extrema)*(1+cfg.Profit)), mkt.RateStep)
+				profitableRate = uint64(float64(extrema) * (1 + cfg.Profit))
 			} else {
-				placementRate = steppedRate(uint64(float64(extrema)/(1+cfg.Profit)), mkt.RateStep)
+				profitableRate = uint64(float64(extrema) / (1 + cfg.Profit))
 			}
+
+			adjustedRate, err := adjustedRateForFees(profitableRate, baseFees, quoteFees, mkt.LotSize, sell, mkt.BaseID, mkt.QuoteID)
+			if err != nil {
+				log.Errorf("Error calculating adjusted rate for fees: %v", adjustedRate)
+				continue
+			}
+
+			placementRate := steppedRate(adjustedRate, mkt.RateStep)
 
 			ordersForPlacement := existingOrders[i]
 			var existingLots uint64
