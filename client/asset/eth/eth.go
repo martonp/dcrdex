@@ -3350,13 +3350,6 @@ func (eth *baseWallet) swapOrRedemptionFeesPaid(ctx context.Context, coinID, con
 	return dexeth.WeiToGwei(bigFees), secretHashes, nil
 }
 
-// TransactionConfirmations gets the number of confirmations for the specified
-// transaction.
-func (eth *baseWallet) TransactionConfirmations(ctx context.Context, txID string) (confs uint32, err error) {
-	txHash := common.HexToHash(txID)
-	return eth.node.transactionConfirmations(ctx, txHash)
-}
-
 // RegFeeConfirmations gets the number of confirmations for the specified
 // transaction.
 func (eth *baseWallet) RegFeeConfirmations(ctx context.Context, coinID dex.Bytes) (confs uint32, err error) {
@@ -4111,7 +4104,6 @@ func (w *assetWallet) sumPendingTxs(bal *big.Int) (out, in uint64) {
 }
 
 func (w *assetWallet) getConfirmedBalance() (*big.Int, error) {
-
 	now := time.Now()
 	w.tipMtx.RLock()
 	tipHeight := w.currentTip.Number.Uint64()
@@ -4758,6 +4750,156 @@ func (w *baseWallet) TxHistory(n int, refID *dex.Bytes, past bool) ([]*asset.Wal
 	}
 
 	return w.txDB.getTxs(n, refID, past)
+}
+
+func (w *ETHWallet) getReceivingTransaction(ctx context.Context, id dex.Bytes) (*asset.WalletTransaction, error) {
+	txHash, err := dexeth.DecodeCoinID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, blockHeight, err := w.node.getTransaction(ctx, txHash)
+	if err != nil {
+		return nil, err
+	}
+
+	if *tx.To() != w.addr {
+		return nil, asset.CoinNotFoundError
+	}
+
+	w.tipMtx.RLock()
+	tipHeight := w.currentTip.Number.Uint64()
+	w.tipMtx.RUnlock()
+
+	var partOfActiveBalance bool
+	if blockHeight < 0 {
+		blockHeight = 0
+		// TODO: check when this stops being pending
+	} else if tipHeight-txConfsNeededToConfirm+1 >= uint64(blockHeight) {
+		partOfActiveBalance = true
+	}
+
+	return &asset.WalletTransaction{
+		Type:                asset.Receive,
+		ID:                  txHash[:],
+		BalanceDelta:        int64(dexeth.WeiToGwei(tx.Value())),
+		BlockNumber:         uint64(blockHeight),
+		PartOfActiveBalance: partOfActiveBalance,
+		AdditionalData: map[string]string{
+			txHistoryNonceKey: strconv.FormatUint(tx.Nonce(), 10),
+		},
+	}, nil
+}
+
+// WalletTransaction returns a transaction that either the wallet has made or
+// one in which the wallet has received funds.
+func (w *ETHWallet) WalletTransaction(ctx context.Context, id dex.Bytes) (*asset.WalletTransaction, error) {
+	txs, err := w.TxHistory(1, &id, false)
+	if errors.Is(err, asset.CoinNotFoundError) {
+		return w.getReceivingTransaction(ctx, id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(txs) == 0 {
+		return nil, asset.CoinNotFoundError
+	}
+
+	tx := txs[0]
+	nonceStr, found := tx.AdditionalData[txHistoryNonceKey]
+	if !found {
+		return nil, fmt.Errorf("nonce not found in additional data")
+	}
+
+	nonce, err := strconv.ParseUint(nonceStr, 10, 64)
+
+	w.pendingTxsMtx.Lock()
+	_, txIsPending := w.pendingTxs[nonce]
+	w.pendingTxsMtx.Unlock()
+
+	tx.PartOfActiveBalance = !txIsPending
+
+	return tx, err
+}
+
+func (w *TokenWallet) getReceivingTransaction(ctx context.Context, id dex.Bytes) (*asset.WalletTransaction, error) {
+	txHash, err := dexeth.DecodeCoinID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	tx, blockHeight, err := w.node.getTransaction(ctx, txHash)
+	if err != nil {
+		w.log.Infof("tx not found")
+		return nil, err
+	}
+	if *tx.To() != w.netToken.Address {
+		w.log.Infof("from token address")
+		return nil, asset.CoinNotFoundError
+	}
+
+	receivingAddr, value, err := erc20.ParseTransferData(tx.Data())
+	if err != nil {
+		w.log.Infof("unable to parse transfer")
+		return nil, asset.CoinNotFoundError
+	}
+
+	if receivingAddr != w.addr {
+		w.log.Infof("not to our address")
+		return nil, asset.CoinNotFoundError
+	}
+
+	w.tipMtx.RLock()
+	tipHeight := w.currentTip.Number.Uint64()
+	w.tipMtx.RUnlock()
+
+	var partOfActiveBalance bool
+	if blockHeight < 0 {
+		blockHeight = 0
+		// TODO: check when this stops being pending
+	} else if tipHeight-txConfsNeededToConfirm+1 >= uint64(blockHeight) {
+		partOfActiveBalance = true
+	}
+
+	return &asset.WalletTransaction{
+		Type:                asset.Receive,
+		ID:                  txHash[:],
+		BalanceDelta:        int64(w.atomize(value)),
+		BlockNumber:         uint64(blockHeight),
+		PartOfActiveBalance: partOfActiveBalance,
+		AdditionalData: map[string]string{
+			txHistoryNonceKey: strconv.FormatUint(tx.Nonce(), 10),
+		},
+	}, nil
+}
+
+func (w *TokenWallet) WalletTransaction(ctx context.Context, id dex.Bytes) (*asset.WalletTransaction, error) {
+	txs, err := w.TxHistory(1, &id, false)
+	if errors.Is(err, asset.CoinNotFoundError) {
+		return w.getReceivingTransaction(ctx, id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(txs) == 0 {
+		return nil, asset.CoinNotFoundError
+	}
+
+	tx := txs[0]
+	nonceStr, found := tx.AdditionalData[txHistoryNonceKey]
+	if !found {
+		return nil, fmt.Errorf("nonce not found in additional data")
+	}
+
+	nonce, err := strconv.ParseUint(nonceStr, 10, 64)
+
+	w.pendingTxsMtx.Lock()
+	_, txIsPending := w.pendingTxs[nonce]
+	w.pendingTxsMtx.Unlock()
+
+	tx.PartOfActiveBalance = !txIsPending
+
+	return tx, err
 }
 
 // providersFile reads a file located at ~/dextest/credentials.json.
