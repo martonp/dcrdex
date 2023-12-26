@@ -153,6 +153,15 @@ if [ $ETH_ON -eq 0 ]; then
             "parcelSize": 4
         },
         {
+            "base": "BTC_simnet",
+            "quote": "USDC_simnet",
+            "lotSize": 1000000,
+            "rateStep": 10000,
+            "epochDuration": ${EPOCH_DURATION},
+            "marketBuyBuffer": 1.2,
+            "parcelSize": 4
+        },
+        {
             "base": "DCR_simnet",
             "quote": "DEXTT_simnet",
             "lotSize": 100000000,
@@ -386,6 +395,12 @@ cat << EOF >> "./markets.json"
             "maxFeeRate": 200,
             "swapConf": 2,
             "configPath": "$ETH_CONFIG_PATH"
+        },
+        "USDC_simnet": {
+            "bip44symbol": "usdc.eth",
+            "network": "simnet",
+            "maxFeeRate": 200,
+            "swapConf": 2
         },
         "DEXTT_simnet": {
             "bip44symbol": "dextt.eth",

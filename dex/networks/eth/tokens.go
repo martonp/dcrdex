@@ -226,9 +226,21 @@ var Tokens = map[uint32]*Token{
 					},
 				},
 			},
-			dex.Simnet: { // no usdc on simnet, dextt instead
-				Address:       common.Address{},
-				SwapContracts: map[uint32]*SwapContract{},
+			dex.Simnet: {
+				Address: common.Address{},
+				SwapContracts: map[uint32]*SwapContract{
+					0: {
+						Address: common.Address{},
+						Gas: Gases{
+							Swap:      242_000,
+							SwapAdd:   146_400,
+							Redeem:    109_000,
+							RedeemAdd: 31_600,
+							Refund:    77_000,
+							Approve:   78_400,
+							Transfer:  85_100,
+						}},
+				},
 			},
 		},
 	},
@@ -238,14 +250,15 @@ var Tokens = map[uint32]*Token{
 // simnet harness to populate swap contract and token addresses in
 // ContractAddresses and Tokens.
 func MaybeReadSimnetAddrs() {
-	MaybeReadSimnetAddrsDir("eth", ContractAddresses, MultiBalanceAddresses, Tokens[testTokenID].NetTokens[dex.Simnet])
+	MaybeReadSimnetAddrsDir("eth", ContractAddresses, MultiBalanceAddresses, Tokens[testTokenID].NetTokens[dex.Simnet], Tokens[usdcTokenID].NetTokens[dex.Simnet])
 }
 
 func MaybeReadSimnetAddrsDir(
 	dir string,
 	contractsAddrs map[uint32]map[dex.Network]common.Address,
 	multiBalandAddresses map[dex.Network]common.Address,
-	token *NetToken,
+	testToken *NetToken,
+	usdcToken *NetToken,
 ) {
 
 	usr, err := user.Current()
@@ -265,13 +278,18 @@ func MaybeReadSimnetAddrsDir(
 	ethSwapContractAddrFile := filepath.Join(harnessDir, "eth_swap_contract_address.txt")
 	tokenSwapContractAddrFile := filepath.Join(harnessDir, "erc20_swap_contract_address.txt")
 	testTokenContractAddrFile := filepath.Join(harnessDir, "test_token_contract_address.txt")
+	testUSDCSwapContractAddrFile := filepath.Join(harnessDir, "usdc_swap_contract_address.txt")
+	testUSDCContractAddrFile := filepath.Join(harnessDir, "test_usdc_contract_address.txt")
 	multiBalanceContractAddrFile := filepath.Join(harnessDir, "multibalance_address.txt")
 
 	contractsAddrs[0][dex.Simnet] = getContractAddrFromFile(ethSwapContractAddrFile)
 	multiBalandAddresses[dex.Simnet] = getContractAddrFromFile(multiBalanceContractAddrFile)
 
-	token.SwapContracts[0].Address = getContractAddrFromFile(tokenSwapContractAddrFile)
-	token.Address = getContractAddrFromFile(testTokenContractAddrFile)
+	testToken.SwapContracts[0].Address = getContractAddrFromFile(tokenSwapContractAddrFile)
+	testToken.Address = getContractAddrFromFile(testTokenContractAddrFile)
+
+	usdcToken.SwapContracts[0].Address = getContractAddrFromFile(testUSDCSwapContractAddrFile)
+	usdcToken.Address = getContractAddrFromFile(testUSDCContractAddrFile)
 }
 
 func getContractAddrFromFile(fileName string) (addr common.Address) {
