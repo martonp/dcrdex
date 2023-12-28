@@ -4,8 +4,6 @@ package mm
 
 import (
 	"errors"
-	"reflect"
-	"sort"
 	"testing"
 
 	"decred.org/dcrdex/client/core"
@@ -24,8 +22,8 @@ type tRebalancer struct {
 	basis        uint64
 	breakEven    uint64
 	breakEvenErr error
-	sortedBuys   map[int][]*groupedOrder
-	sortedSells  map[int][]*groupedOrder
+	sortedBuys   map[uint64][]*core.Order
+	sortedSells  map[uint64][]*core.Order
 }
 
 var _ rebalancer = (*tRebalancer)(nil)
@@ -33,12 +31,11 @@ var _ rebalancer = (*tRebalancer)(nil)
 func (r *tRebalancer) basisPrice() uint64 {
 	return r.basis
 }
-
 func (r *tRebalancer) halfSpread(basisPrice uint64) (uint64, error) {
 	return r.breakEven, r.breakEvenErr
 }
 
-func (r *tRebalancer) groupedOrders() (buys, sells map[int][]*groupedOrder) {
+func (r *tRebalancer) groupedOrders() (buys, sells map[uint64][]*core.Order) {
 	return r.sortedBuys, r.sortedSells
 }
 
@@ -75,7 +72,7 @@ func TestRebalance(t *testing.T) {
 		QuoteID:    btcBipID,
 	}
 
-	newBalancer := func(existingBuys, existingSells map[int][]*groupedOrder) *tRebalancer {
+	newBalancer := func(existingBuys, existingSells map[uint64][]*core.Order) *tRebalancer {
 		return &tRebalancer{
 			basis:       midGap,
 			breakEven:   breakEven,
@@ -93,23 +90,23 @@ func TestRebalance(t *testing.T) {
 		rebalancer *tRebalancer
 
 		isAccountLocker map[uint32]bool
-		balances        map[uint32]uint64
+		balances        map[uint32]*botBalance
 
 		expectedBuys    []rateLots
 		expectedSells   []rateLots
 		expectedCancels []order.OrderID
 	}
 
-	newgroupedOrder := func(id order.OrderID, lots, rate uint64, sell bool, freeCancel bool) *groupedOrder {
+	newOrder := func(id order.OrderID, lots, rate uint64, sell bool, freeCancel bool) *core.Order {
 		var epoch uint64 = newEpoch
 		if freeCancel {
 			epoch = newEpoch - 2
 		}
-		return &groupedOrder{
-			id:    id,
-			epoch: epoch,
-			rate:  rate,
-			lots:  lots,
+		return &core.Order{
+			ID:    id[:],
+			Epoch: epoch,
+			Rate:  rate,
+			Qty:   lots * lotSize,
 		}
 	}
 
@@ -153,9 +150,13 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -184,11 +185,14 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
-
 			expectedBuys: []rateLots{
 				{
 					rate: midGap - (breakEven * 3),
@@ -211,11 +215,14 @@ func TestRebalance(t *testing.T) {
 				BuyPlacements: []*OrderPlacement{},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
-
 			expectedBuys: []rateLots{},
 			expectedSells: []rateLots{
 				{
@@ -251,11 +258,14 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
-
 			expectedBuys: []rateLots{
 				{
 					rate:           midGap - (breakEven * 2),
@@ -308,27 +318,31 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: requiredForOrder(true, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding,
-				btcBipID: requiredForOrder(false, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: requiredForOrder(true, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      1,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding,
+				},
+				btcBipID: {
+					Available: requiredForOrder(false, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      1,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -382,27 +396,31 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: requiredForOrder(true, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding - 1,
-				btcBipID: requiredForOrder(false, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding - 1,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: requiredForOrder(true, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      1,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding - 1,
+				},
+				btcBipID: {
+					Available: requiredForOrder(false, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      1,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding - 1,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -444,29 +462,32 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: requiredForOrder(true, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding,
-				btcBipID: requiredForOrder(false, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: requiredForOrder(true, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      2,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding,
+				},
+				btcBipID: {
+					Available: requiredForOrder(false, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      2,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding,
+				},
 			},
-
 			expectedBuys: []rateLots{
 				{
 					rate:           midGap - (breakEven * 2),
@@ -519,27 +540,31 @@ func TestRebalance(t *testing.T) {
 				},
 			},
 			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]uint64{
-				dcrBipID: requiredForOrder(true, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding - 1,
-				btcBipID: requiredForOrder(false, []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding - 1,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: requiredForOrder(true, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      2,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding - 1,
+				},
+				btcBipID: {
+					Available: requiredForOrder(false, []*OrderPlacement{
+						{
+							Lots:      1,
+							GapFactor: 2,
+						},
+						{
+							Lots:      2,
+							GapFactor: 3,
+						},
+					}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding - 1,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -592,19 +617,23 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
+						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
 					},
 				},
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					1: {
-						newgroupedOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
+						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedCancels: []order.OrderID{
 				orderIDs[0],
@@ -653,19 +682,23 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
+						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
 					},
 				},
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					1: {
-						newgroupedOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
+						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -709,19 +742,23 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
+						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
 					},
 				},
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					1: {
-						newgroupedOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
+						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -774,19 +811,23 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
+						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
 					},
 				},
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					1: {
-						newgroupedOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
+						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedBuys: []rateLots{
 				{
@@ -844,14 +885,18 @@ func TestRebalance(t *testing.T) {
 			},
 			rebalancer: newBalancer(
 				nil,
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, true),
+						newOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, true),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedCancels: []order.OrderID{
 				orderIDs[1],
@@ -899,15 +944,19 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[1], 1, midGap+(breakEven*2), true, true),
+						newOrder(orderIDs[1], 1, midGap+(breakEven*2), true, true),
 					},
 				},
 				nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedCancels: []order.OrderID{
 				orderIDs[1],
@@ -956,14 +1005,18 @@ func TestRebalance(t *testing.T) {
 			},
 			rebalancer: newBalancer(
 				nil,
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, false),
+						newOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, false),
 					},
 				}),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedCancels: []order.OrderID{},
 			expectedBuys: []rateLots{
@@ -1009,15 +1062,19 @@ func TestRebalance(t *testing.T) {
 				DriftTolerance: driftTolerance,
 			},
 			rebalancer: newBalancer(
-				map[int][]*groupedOrder{
+				map[uint64][]*core.Order{
 					0: {
-						newgroupedOrder(orderIDs[1], 1, midGap+(breakEven*2), true, false),
+						newOrder(orderIDs[1], 1, midGap+(breakEven*2), true, false),
 					},
 				},
 				nil),
-			balances: map[uint32]uint64{
-				dcrBipID: 1e13,
-				btcBipID: 1e13,
+			balances: map[uint32]*botBalance{
+				dcrBipID: {
+					Available: 1e13,
+				},
+				btcBipID: {
+					Available: 1e13,
+				},
 			},
 			expectedCancels: []order.OrderID{},
 			expectedBuys: []rateLots{
@@ -1043,15 +1100,15 @@ func TestRebalance(t *testing.T) {
 		} else {
 			tCore.isAccountLocker = map[uint32]bool{}
 		}
-
-		tCore.setAssetBalances(tt.balances)
+		coreAdaptor := newTBotCoreAdaptor(tCore)
+		coreAdaptor.balances = tt.balances
 
 		epoch := tt.epoch
 		if epoch == 0 {
 			epoch = newEpoch
 		}
 
-		cancels, buys, sells := basicMMRebalance(epoch, tt.rebalancer, newTBotCoreAdaptor(tCore), tt.cfg, mkt, buyFees, sellFees, log)
+		cancels, buys, sells := basicMMRebalance(epoch, tt.rebalancer, coreAdaptor, tt.cfg, mkt, buyFees, sellFees, log)
 
 		if len(cancels) != len(tt.expectedCancels) {
 			t.Fatalf("%s: cancel count mismatch. expected %d, got %d", tt.name, len(tt.expectedCancels), len(cancels))
@@ -1258,117 +1315,5 @@ func TestBreakEvenHalfSpread(t *testing.T) {
 		if halfSpread != tt.exp {
 			t.Fatalf("%s: %d != %d", tt.name, halfSpread, tt.exp)
 		}
-	}
-}
-
-func TestGroupedOrders(t *testing.T) {
-	const rateStep uint64 = 1e3
-	const lotSize uint64 = 50e8
-	mkt := &core.Market{
-		RateStep:   rateStep,
-		AtomToConv: 1,
-		LotSize:    lotSize,
-		BaseID:     dcrBipID,
-		QuoteID:    btcBipID,
-	}
-
-	orderIDs := make([]order.OrderID, 5)
-	for i := range orderIDs {
-		copy(orderIDs[i][:], encode.RandomBytes(32))
-	}
-
-	orders := map[order.OrderID]*core.Order{
-		orderIDs[0]: {
-			ID:     orderIDs[0][:],
-			Sell:   true,
-			Rate:   100e8,
-			Qty:    2 * lotSize,
-			Filled: lotSize,
-		},
-		orderIDs[1]: {
-			ID:     orderIDs[1][:],
-			Sell:   false,
-			Rate:   200e8,
-			Qty:    2 * lotSize,
-			Filled: lotSize,
-		},
-		orderIDs[2]: {
-			ID:   orderIDs[2][:],
-			Sell: true,
-			Rate: 300e8,
-			Qty:  2 * lotSize,
-		},
-		orderIDs[3]: {
-			ID:   orderIDs[3][:],
-			Sell: false,
-			Rate: 400e8,
-			Qty:  1 * lotSize,
-		},
-		orderIDs[4]: {
-			ID:   orderIDs[4][:],
-			Sell: false,
-			Rate: 402e8,
-			Qty:  1 * lotSize,
-		},
-	}
-
-	ordToPlacementIndex := map[order.OrderID]int{
-		orderIDs[0]: 0,
-		orderIDs[1]: 0,
-		orderIDs[2]: 1,
-		orderIDs[3]: 1,
-		orderIDs[4]: 1,
-	}
-
-	mm := &basicMarketMaker{
-		mkt:            mkt,
-		ords:           orders,
-		oidToPlacement: ordToPlacementIndex,
-	}
-
-	expectedBuys := map[int][]*groupedOrder{
-		0: {{
-			id:   orderIDs[1],
-			rate: 200e8,
-			lots: 1,
-		}},
-		1: {{
-			id:   orderIDs[3],
-			rate: 400e8,
-			lots: 1,
-		}, {
-			id:   orderIDs[4],
-			rate: 402e8,
-			lots: 1,
-		}},
-	}
-
-	expectedSells := map[int][]*groupedOrder{
-		0: {{
-			id:   orderIDs[0],
-			rate: 100e8,
-			lots: 1,
-		}},
-		1: {{
-			id:   orderIDs[2],
-			rate: 300e8,
-			lots: 2,
-		}},
-	}
-
-	buys, sells := mm.groupedOrders()
-
-	for i, buy := range buys {
-		sort.Slice(buy, func(i, j int) bool {
-			return buy[i].rate < buy[j].rate
-		})
-		reflect.DeepEqual(buy, expectedBuys[i])
-	}
-
-	for i, sell := range sells {
-		sort.Slice(sell, func(i, j int) bool {
-			return sell[i].rate < sell[j].rate
-		})
-		reflect.DeepEqual(sell, expectedSells[i])
 	}
 }

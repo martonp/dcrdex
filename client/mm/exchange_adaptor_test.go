@@ -1,6 +1,7 @@
 package mm
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -10,12 +11,13 @@ import (
 	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/core"
 	"decred.org/dcrdex/client/mm/libxc"
+	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/calc"
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/order"
 )
 
-func TestExchangeAdaptorMaxSell(t *testing.T) {
+func TestMaxSell(t *testing.T) {
 	tCore := newTCore()
 	tCore.isAccountLocker[60] = true
 	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
@@ -227,8 +229,19 @@ func TestExchangeAdaptorMaxSell(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		adaptor := unifiedExchangeAdaptorForBot(botID, test.assetBalances, nil, tCore, nil, tLogger)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: test.assetBalances,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
+
 		res, err := adaptor.MaxSell("host1", test.market.BaseID, test.market.QuoteID)
 		if test.wantErr {
 			if err == nil {
@@ -250,7 +263,7 @@ func TestExchangeAdaptorMaxSell(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorMaxBuy(t *testing.T) {
+func TestMaxBuy(t *testing.T) {
 	tCore := newTCore()
 
 	tCore.isAccountLocker[60] = true
@@ -473,7 +486,17 @@ func TestExchangeAdaptorMaxBuy(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		adaptor := unifiedExchangeAdaptorForBot(botID, test.dexBalances, nil, tCore, nil, tLogger)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: test.dexBalances,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
 
 		res, err := adaptor.MaxBuy("host1", test.market.BaseID, test.market.QuoteID, test.rate)
@@ -497,7 +520,7 @@ func TestExchangeAdaptorMaxBuy(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorDEXTrade(t *testing.T) {
+func TestDEXTrade(t *testing.T) {
 	host := "dex.com"
 
 	orderIDs := make([]order.OrderID, 5)
@@ -531,7 +554,7 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 		name               string
 		isDynamicSwapper   map[uint32]bool
 		balances           map[uint32]uint64
-		multiTrade         *core.MultiTradeForm
+		multiTrade         *multiTradeForm
 		multiTradeResponse []*core.Order
 		wantErr            bool
 		postTradeBalances  map[uint32]*botBalance
@@ -545,19 +568,19 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 				42: 1e8,
 				0:  1e8,
 			},
-			multiTrade: &core.MultiTradeForm{
-				Host:  host,
-				Sell:  true,
-				Base:  42,
-				Quote: 0,
-				Placements: []*core.QtyRate{
+			multiTrade: &multiTradeForm{
+				host:  host,
+				sell:  true,
+				base:  42,
+				quote: 0,
+				placements: []*multiTradePlacement{
 					{
-						Qty:  5e6,
-						Rate: 5e7,
+						qty:  5e6,
+						rate: 5e7,
 					},
 					{
-						Qty:  5e6,
-						Rate: 6e7,
+						qty:  5e6,
+						rate: 6e7,
 					},
 				},
 			},
@@ -920,19 +943,19 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 				42: 1e8,
 				0:  1e8,
 			},
-			multiTrade: &core.MultiTradeForm{
-				Host:  host,
-				Sell:  false,
-				Base:  42,
-				Quote: 0,
-				Placements: []*core.QtyRate{
+			multiTrade: &multiTradeForm{
+				host:  host,
+				sell:  false,
+				base:  42,
+				quote: 0,
+				placements: []*multiTradePlacement{
 					{
-						Qty:  5e6,
-						Rate: 5e7,
+						qty:  5e6,
+						rate: 5e7,
 					},
 					{
-						Qty:  5e6,
-						Rate: 6e7,
+						qty:  5e6,
+						rate: 6e7,
 					},
 				},
 			},
@@ -1301,19 +1324,19 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 				966:    1e8,
 				60:     1e8,
 			},
-			multiTrade: &core.MultiTradeForm{
-				Host:  host,
-				Sell:  true,
-				Base:  60,
-				Quote: 966001,
-				Placements: []*core.QtyRate{
+			multiTrade: &multiTradeForm{
+				host:  host,
+				sell:  true,
+				base:  60,
+				quote: 966001,
+				placements: []*multiTradePlacement{
 					{
-						Qty:  5e6,
-						Rate: 5e7,
+						qty:  5e6,
+						rate: 5e7,
 					},
 					{
-						Qty:  5e6,
-						Rate: 6e7,
+						qty:  5e6,
+						rate: 6e7,
 					},
 				},
 			},
@@ -1728,19 +1751,19 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 				966:    1e8,
 				60:     1e8,
 			},
-			multiTrade: &core.MultiTradeForm{
-				Host:  host,
-				Sell:  false,
-				Base:  60,
-				Quote: 966001,
-				Placements: []*core.QtyRate{
+			multiTrade: &multiTradeForm{
+				host:  host,
+				sell:  false,
+				base:  60,
+				quote: 966001,
+				placements: []*multiTradePlacement{
 					{
-						Qty:  5e6,
-						Rate: 5e7,
+						qty:  5e6,
+						rate: 5e7,
 					},
 					{
-						Qty:  5e6,
-						Rate: 6e7,
+						qty:  5e6,
+						rate: 6e7,
 					},
 				},
 			},
@@ -2170,10 +2193,21 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		botID := dexMarketID(test.multiTrade.Host, test.multiTrade.Base, test.multiTrade.Quote)
-		adaptor := unifiedExchangeAdaptorForBot(botID, test.balances, nil, tCore, nil, tLogger)
+		botID := dexMarketID(test.multiTrade.host, test.multiTrade.base, test.multiTrade.quote)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: test.balances,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
-		_, err := adaptor.MultiTrade([]byte{}, test.multiTrade)
+
+		_, err := adaptor.MultiTrade(test.multiTrade)
 		if test.wantErr {
 			if err == nil {
 				t.Fatalf("%s: expected error but did not get", test.name)
@@ -2221,7 +2255,7 @@ func TestExchangeAdaptorDEXTrade(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorDeposit(t *testing.T) {
+func TestDeposit(t *testing.T) {
 	type test struct {
 		name              string
 		isWithdrawer      bool
@@ -2430,7 +2464,19 @@ func TestExchangeAdaptorDeposit(t *testing.T) {
 		defer cancel()
 
 		botID := dexMarketID("host1", test.assetID, 0)
-		adaptor := unifiedExchangeAdaptorForBot(botID, dexBalances, cexBalances, tCore, tCEX, tLogger)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: dexBalances,
+			baseCexBalances: cexBalances,
+			cex:             tCEX,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
 
 		err := adaptor.Deposit(ctx, test.assetID, test.depositAmt, func() {})
@@ -2489,7 +2535,7 @@ func TestExchangeAdaptorDeposit(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorWithdraw(t *testing.T) {
+func TestWithdraw(t *testing.T) {
 	assetID := uint32(42)
 	id := encode.RandomBytes(32)
 
@@ -2553,7 +2599,19 @@ func TestExchangeAdaptorWithdraw(t *testing.T) {
 		defer cancel()
 
 		botID := dexMarketID("host1", assetID, 0)
-		adaptor := unifiedExchangeAdaptorForBot(botID, dexBalances, cexBalances, tCore, tCEX, tLogger)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: dexBalances,
+			baseCexBalances: cexBalances,
+			cex:             tCEX,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
 
 		err := adaptor.Withdraw(ctx, assetID, test.withdrawAmt, func() {})
@@ -2591,7 +2649,7 @@ func TestExchangeAdaptorWithdraw(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorTrade(t *testing.T) {
+func TestTrade(t *testing.T) {
 	baseID := uint32(42)
 	quoteID := uint32(0)
 	tradeID := "123"
@@ -2894,7 +2952,19 @@ func TestExchangeAdaptorTrade(t *testing.T) {
 		defer cancel()
 
 		botID := dexMarketID(botCfg.Host, botCfg.BaseAsset, botCfg.QuoteAsset)
-		adaptor := unifiedExchangeAdaptorForBot(botID, test.balances, test.balances, tCore, tCEX, tLogger)
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			baseDexBalances: test.balances,
+			baseCexBalances: test.balances,
+			cex:             tCEX,
+			log:             tLogger,
+			market: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		})
 		adaptor.run(ctx)
 
 		adaptor.SubscribeTradeUpdates()
@@ -2940,4 +3010,192 @@ func TestExchangeAdaptorTrade(t *testing.T) {
 	for _, test := range tests {
 		runTest(test)
 	}
+}
+
+func TestGroupedBookedOrders(t *testing.T) {
+	orderIDs := make([]dex.Bytes, 10)
+	for i := range orderIDs {
+		orderIDs[i] = encode.RandomBytes(32)
+	}
+
+	tCore := newTCore()
+	tCore.market = &core.Market{
+		BaseID:  42,
+		QuoteID: 0,
+		LotSize: 5e6,
+	}
+
+	bals := map[uint32]uint64{
+		42: 1e9,
+		0:  1e9,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+		botID:           "host1",
+		core:            tCore,
+		baseDexBalances: bals,
+		baseCexBalances: bals,
+		log:             tLogger,
+		market: &MarketWithHost{
+			Host:    "host1",
+			BaseID:  42,
+			QuoteID: 0,
+		},
+	})
+	adaptor.run(ctx)
+
+	form := &multiTradeForm{
+		host:  "host1",
+		base:  42,
+		quote: 0,
+		sell:  true,
+		placements: []*multiTradePlacement{
+			{
+				rate:     5e7,
+				qty:      5e6,
+				grouping: 0,
+			},
+			{
+				rate:     6e7,
+				qty:      5e6,
+				grouping: 1,
+			},
+			{
+				rate:     7e7,
+				qty:      5e6,
+				grouping: 2,
+			},
+		},
+	}
+
+	tCore.multiTradeResult = []*core.Order{
+		{
+			ID:     orderIDs[0],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   5e7,
+			Sell:   true,
+		},
+		{
+			ID:     orderIDs[1],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   6e7,
+			Sell:   true,
+		},
+		{
+			ID:     orderIDs[2],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   7e7,
+			Sell:   true,
+		},
+	}
+
+	_, err := adaptor.MultiTrade(form)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkGroupedOrders := func(groupedOrders map[uint64][]*core.Order, expected map[uint64][]dex.Bytes) {
+		t.Helper()
+		if len(groupedOrders) != len(expected) {
+			t.Fatalf("unexpected number of grouped orders. want %d, got %d", len(expected), len(groupedOrders))
+		}
+		for groupID, orders := range groupedOrders {
+			expectedIDs := expected[groupID]
+			if len(orders) != len(expectedIDs) {
+				t.Fatalf("unexpected number of orders for group %d. want %d, got %d", groupID, len(expectedIDs), len(orders))
+			}
+			for i, order := range orders {
+				if !bytes.Equal(order.ID, expectedIDs[i]) {
+					t.Fatalf("unexpected order ID for group %d at index %d. want %s, got %s", groupID, i, expectedIDs[i], order.ID)
+				}
+			}
+		}
+	}
+
+	groupedBuys, groupedSells := adaptor.GroupedBookedOrders()
+	expectedBuyIDs := map[uint64][]dex.Bytes{}
+	expectedSellIDs := map[uint64][]dex.Bytes{
+		0: {orderIDs[0]},
+		1: {orderIDs[1]},
+		2: {orderIDs[2]},
+	}
+	checkGroupedOrders(groupedBuys, expectedBuyIDs)
+	checkGroupedOrders(groupedSells, expectedSellIDs)
+
+	tCore.multiTradeResult = []*core.Order{
+		{
+			ID:     orderIDs[3],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   5e7,
+			Sell:   false,
+		},
+		{
+			ID:     orderIDs[4],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   6e7,
+			Sell:   false,
+		},
+		{
+			ID:     orderIDs[5],
+			Status: order.OrderStatusBooked,
+			Qty:    5e6,
+			Rate:   7e7,
+			Sell:   false,
+		},
+	}
+	form.sell = false
+
+	_, err = adaptor.MultiTrade(form)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	groupedBuys, groupedSells = adaptor.GroupedBookedOrders()
+	expectedBuyIDs = map[uint64][]dex.Bytes{
+		0: {orderIDs[3]},
+		1: {orderIDs[4]},
+		2: {orderIDs[5]},
+	}
+	checkGroupedOrders(groupedBuys, expectedBuyIDs)
+	checkGroupedOrders(groupedSells, expectedSellIDs)
+
+	tCore.noteFeed <- &core.OrderNote{
+		Order: &core.Order{
+			ID:     orderIDs[2],
+			Status: order.OrderStatusCanceled,
+			Qty:    5e6,
+			Rate:   6e7,
+			Sell:   true,
+		},
+	}
+	tCore.noteFeed <- &core.OrderNote{
+		Order: &core.Order{
+			ID:     orderIDs[4],
+			Status: order.OrderStatusExecuted,
+			Qty:    5e6,
+			Rate:   6e7,
+			Sell:   false,
+		},
+	}
+	tCore.noteFeed <- &core.BondPostNote{} // dummy note
+
+	expectedBuyIDs = map[uint64][]dex.Bytes{
+		0: {orderIDs[3]},
+		2: {orderIDs[5]},
+	}
+	expectedSellIDs = map[uint64][]dex.Bytes{
+		0: {orderIDs[0]},
+		1: {orderIDs[1]},
+	}
+
+	groupedBuys, groupedSells = adaptor.GroupedBookedOrders()
+	checkGroupedOrders(groupedBuys, expectedBuyIDs)
+	checkGroupedOrders(groupedSells, expectedSellIDs)
 }

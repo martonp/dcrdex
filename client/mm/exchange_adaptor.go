@@ -30,23 +30,76 @@ type botBalance struct {
 	Pending   uint64 `json:"pending"`
 }
 
+// multiTradePlacement is equivalent to core.QtyRate, but with the grouping
+// field added. The grouping field is used by the botCoreAdaptor's
+// GroupedBookedOrders to place orders in groups.
+type multiTradePlacement struct {
+	qty      uint64
+	rate     uint64
+	grouping uint64
+}
+
+// multiTradeForm is equivalent to core.MultiTradeForm, but with the
+// placements field replaced with a []*multiTradePlacement. This is
+// in order to support the botCoreAdaptor's GroupedBookedOrders method.
+type multiTradeForm struct {
+	host       string
+	sell       bool
+	base       uint32
+	quote      uint32
+	placements []*multiTradePlacement
+	options    map[string]string
+	maxLock    uint64
+}
+
+func (m *multiTradeForm) toCore() *core.MultiTradeForm {
+	placements := make([]*core.QtyRate, 0, len(m.placements))
+	for _, placement := range m.placements {
+		placements = append(placements, &core.QtyRate{
+			Qty:  placement.qty,
+			Rate: placement.rate,
+		})
+	}
+
+	return &core.MultiTradeForm{
+		Host:       m.host,
+		Sell:       m.sell,
+		Base:       m.base,
+		Quote:      m.quote,
+		Placements: placements,
+		Options:    m.options,
+		MaxLock:    m.maxLock,
+	}
+}
+
+type orderFees struct {
+	swap       uint64
+	redemption uint64
+	refund     uint64
+	funding    uint64
+}
+
 // botCoreAdaptor is an interface used by bots to access functionality
 // implemented by client.Core. There are slight differences with the methods
 // of client.Core. One example is AssetBalance returns a botBalance instead of
 // a *core.WalletBalance.
 type botCoreAdaptor interface {
-	NotificationFeed() *core.NoteFeed
 	SyncBook(host string, base, quote uint32) (*orderbook.OrderBook, core.BookFeed, error)
 	SingleLotFees(form *core.SingleLotFeesForm) (uint64, uint64, uint64, error)
 	Cancel(oidB dex.Bytes) error
 	MaxBuy(host string, base, quote uint32, rate uint64) (*core.MaxOrderEstimate, error)
 	MaxSell(host string, base, quote uint32) (*core.MaxOrderEstimate, error)
 	AssetBalance(assetID uint32) (*botBalance, error)
-	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error)
+	MultiTrade(form *multiTradeForm) ([]*core.Order, error)
 	MaxFundingFees(fromAsset uint32, host string, numTrades uint32, fromSettings map[string]string) (uint64, error)
 	FiatConversionRates() map[uint32]float64
 	ExchangeMarket(host string, base, quote uint32) (*core.Market, error)
 	Broadcast(core.Notification)
+	GroupedBookedOrders() (buys, sells map[uint64][]*core.Order)
+	CancelAllOrders() bool
+	FiatRate(assetID uint32) float64
+	OrderFees() (buyFees, sellFees *orderFees, err error)
+	SubscribeOrderUpdates() (updates <-chan *core.Order)
 }
 
 // botCexAdaptor is an interface used by bots to access functionality
@@ -100,6 +153,7 @@ type pendingDEXOrder struct {
 	availableDiff map[uint32]int64
 	locked        map[uint32]uint64
 	pending       map[uint32]uint64
+	order         *core.Order
 
 	// swaps, redeems, and refunds are caches of transactions. This avoids
 	// having to query the wallet for transactions that are already confirmed.
@@ -107,6 +161,9 @@ type pendingDEXOrder struct {
 	swaps   map[string]*asset.WalletTransaction
 	redeems map[string]*asset.WalletTransaction
 	refunds map[string]*asset.WalletTransaction
+
+	// Used to group orders in the GroupedBookedOrders method.
+	grouping uint64
 }
 
 // unifiedExchangeAdaptor implements both botCoreAdaptor and botCexAdaptor.
@@ -114,14 +171,25 @@ type unifiedExchangeAdaptor struct {
 	clientCore
 	libxc.CEX
 
-	botID string
-	log   dex.Logger
+	botID              string
+	log                dex.Logger
+	fiatRates          atomic.Value // map[uint32]float64
+	orderUpdates       atomic.Value // chan *core.Order
+	market             *MarketWithHost
+	baseWalletOptions  map[string]string
+	quoteWalletOptions map[string]string
+	maxBuyPlacements   uint32
+	maxSellPlacements  uint32
 
 	subscriptionIDMtx sync.RWMutex
 	subscriptionID    *int
 
 	withdrawalNoncePrefix string
 	withdrawalNonce       atomic.Uint64
+
+	feesMtx  sync.RWMutex
+	buyFees  *orderFees
+	sellFees *orderFees
 
 	balancesMtx sync.RWMutex
 	// baseDEXBalance/baseCEXBalance are the balances the bots have before
@@ -300,10 +368,10 @@ func (u *unifiedExchangeAdaptor) maxSellQty(host string, baseID, quoteID, numTra
 	return maxLots * mkt.LotSize, nil
 }
 
-func (c *unifiedExchangeAdaptor) sufficientBalanceForMultiSell(host string, base, quote uint32, placements []*core.QtyRate, options map[string]string) (bool, error) {
+func (c *unifiedExchangeAdaptor) sufficientBalanceForMultiSell(host string, base, quote uint32, placements []*multiTradePlacement, options map[string]string) (bool, error) {
 	var totalQty uint64
 	for _, placement := range placements {
-		totalQty += placement.Qty
+		totalQty += placement.qty
 	}
 	maxQty, err := c.maxSellQty(host, base, quote, uint32(len(placements)), options)
 	if err != nil {
@@ -312,7 +380,7 @@ func (c *unifiedExchangeAdaptor) sufficientBalanceForMultiSell(host string, base
 	return maxQty >= totalQty, nil
 }
 
-func (u *unifiedExchangeAdaptor) sufficientBalanceForMultiBuy(host string, baseID, quoteID uint32, placements []*core.QtyRate, options map[string]string) (bool, error) {
+func (u *unifiedExchangeAdaptor) sufficientBalanceForMultiBuy(host string, baseID, quoteID uint32, placements []*multiTradePlacement, options map[string]string) (bool, error) {
 	baseBalance, err := u.AssetBalance(baseID)
 	if err != nil {
 		return false, err
@@ -353,8 +421,8 @@ func (u *unifiedExchangeAdaptor) sufficientBalanceForMultiBuy(host string, baseI
 	var totalLots uint64
 	remainingBalance := availQuoteBal - fundingFees
 	for _, placement := range placements {
-		quoteQty := calc.BaseToQuote(placement.Rate, placement.Qty)
-		numLots := placement.Qty / mkt.LotSize
+		quoteQty := calc.BaseToQuote(placement.rate, placement.qty)
+		numLots := placement.qty / mkt.LotSize
 		totalLots += numLots
 		req := quoteQty + (numLots * (swapFees + refundFees))
 		if remainingBalance < req {
@@ -370,18 +438,17 @@ func (u *unifiedExchangeAdaptor) sufficientBalanceForMultiBuy(host string, baseI
 	return true, nil
 }
 
-func (c *unifiedExchangeAdaptor) sufficientBalanceForMultiTrade(host string, base, quote uint32, sell bool, placements []*core.QtyRate, options map[string]string) (bool, error) {
+func (c *unifiedExchangeAdaptor) sufficientBalanceForMultiTrade(host string, base, quote uint32, sell bool, placements []*multiTradePlacement, options map[string]string) (bool, error) {
 	if sell {
 		return c.sufficientBalanceForMultiSell(host, base, quote, placements, options)
 	}
 	return c.sufficientBalanceForMultiBuy(host, base, quote, placements, options)
 }
 
-func (u *unifiedExchangeAdaptor) addPendingDexOrders(orders []*core.Order) {
-	u.balancesMtx.Lock()
-	defer u.balancesMtx.Unlock()
-
-	for _, o := range orders {
+// addPendingDexOrders adds new orders to the pendingDEXOrders map. balancesMtx
+// must be locked before calling this method.
+func (u *unifiedExchangeAdaptor) addPendingDexOrders(orders []*core.Order, placements []*multiTradePlacement) {
+	for i, o := range orders {
 		var orderID order.OrderID
 		copy(orderID[:], o.ID)
 
@@ -400,6 +467,14 @@ func (u *unifiedExchangeAdaptor) addPendingDexOrders(orders []*core.Order) {
 		locked[fromFeeAsset] += o.ParentAssetLockedAmt + o.RefundLockedAmt
 		locked[toFeeAsset] += o.RedeemLockedAmt
 
+		var grouping uint64
+		if len(placements) > i {
+			grouping = placements[i].grouping
+		} else {
+			// indicates a bug in MultiTrade
+			u.log.Errorf("# of placements %d < # of orders %d", len(placements), len(orders))
+		}
+
 		u.pendingDEXOrders[orderID] = &pendingDEXOrder{
 			swaps:         make(map[string]*asset.WalletTransaction),
 			redeems:       make(map[string]*asset.WalletTransaction),
@@ -407,14 +482,16 @@ func (u *unifiedExchangeAdaptor) addPendingDexOrders(orders []*core.Order) {
 			availableDiff: availableDiff,
 			locked:        locked,
 			pending:       map[uint32]uint64{},
+			order:         o,
+			grouping:      grouping,
 		}
 	}
 }
 
 // MultiTrade is used to place multiple standing limit orders on the same
 // side of the same market simultaneously.
-func (u *unifiedExchangeAdaptor) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error) {
-	enough, err := u.sufficientBalanceForMultiTrade(form.Host, form.Base, form.Quote, form.Sell, form.Placements, form.Options)
+func (u *unifiedExchangeAdaptor) MultiTrade(form *multiTradeForm) ([]*core.Order, error) {
+	enough, err := u.sufficientBalanceForMultiTrade(form.host, form.base, form.quote, form.sell, form.placements, form.options)
 	if err != nil {
 		return nil, err
 	}
@@ -422,24 +499,66 @@ func (u *unifiedExchangeAdaptor) MultiTrade(pw []byte, form *core.MultiTradeForm
 		return nil, fmt.Errorf("insufficient balance")
 	}
 
-	fromAsset := form.Quote
-	if form.Sell {
-		fromAsset = form.Base
+	fromAsset := form.quote
+	if form.sell {
+		fromAsset = form.base
 	}
 	fromBalance, err := u.AssetBalance(fromAsset)
 	if err != nil {
 		return nil, err
 	}
-	form.MaxLock = fromBalance.Available
+	form.maxLock = fromBalance.Available
 
-	orders, err := u.clientCore.MultiTrade(pw, form)
+	u.balancesMtx.Lock()
+	defer u.balancesMtx.Unlock()
+
+	orders, err := u.clientCore.MultiTrade([]byte{}, form.toCore())
 	if err != nil {
 		return nil, err
 	}
 
-	u.addPendingDexOrders(orders)
+	u.addPendingDexOrders(orders, form.placements)
 
 	return orders, nil
+}
+
+// GroupedBookedOrders returns the buy and sell orders created by this adaptor
+// that are still on the books. The orders are grouped by the grouping field
+// of the multiTradePlacement that was used to create them.
+func (u *unifiedExchangeAdaptor) GroupedBookedOrders() (buys, sells map[uint64][]*core.Order) {
+	buys = make(map[uint64][]*core.Order)
+	sells = make(map[uint64][]*core.Order)
+
+	groupPendingOrder := func(pendingOrder *pendingDEXOrder) {
+		pendingOrder.balancesMtx.RLock()
+		defer pendingOrder.balancesMtx.RUnlock()
+
+		if pendingOrder.order.Status > order.OrderStatusBooked {
+			return
+		}
+
+		grouping := pendingOrder.grouping
+		if pendingOrder.order.Sell {
+			if sells[grouping] == nil {
+				sells[grouping] = []*core.Order{}
+			}
+			sells[grouping] = append(sells[grouping], pendingOrder.order)
+		} else {
+			if buys[grouping] == nil {
+				buys[grouping] = []*core.Order{}
+			}
+			buys[grouping] = append(buys[grouping], pendingOrder.order)
+		}
+	}
+
+	u.balancesMtx.RLock()
+	defer u.balancesMtx.RUnlock()
+
+	for _, pendingOrder := range u.pendingDEXOrders {
+		groupPendingOrder(pendingOrder)
+	}
+
+	return
 }
 
 // MayBuy returns the maximum quantity of the base asset that the bot can
@@ -889,17 +1008,18 @@ func (u *unifiedExchangeAdaptor) Withdraw(ctx context.Context, assetID uint32, a
 		}
 	}
 
+	u.balancesMtx.Lock()
+	defer u.balancesMtx.Unlock()
+
 	err = u.CEX.Withdraw(ctx, assetID, amount, addr, confirmWithdrawal)
 	if err != nil {
 		return err
 	}
 
-	u.balancesMtx.Lock()
 	u.pendingWithdrawals[withdrawalID] = &pendingWithdrawal{
 		assetID:      assetID,
 		amtWithdrawn: amount,
 	}
-	u.balancesMtx.Unlock()
 
 	return nil
 }
@@ -1020,27 +1140,89 @@ func (u *unifiedExchangeAdaptor) Trade(ctx context.Context, baseID, quoteID uint
 		return nil, fmt.Errorf("Trade called before SubscribeTradeUpdates")
 	}
 
+	u.balancesMtx.Lock()
+	defer u.balancesMtx.Unlock()
+
 	trade, err := u.CEX.Trade(ctx, baseID, quoteID, sell, rate, qty, *subscriptionID)
 	if err != nil {
 		return nil, err
 	}
 
-	u.balancesMtx.Lock()
-	defer u.balancesMtx.Unlock()
-
 	if trade.Complete {
+		diffs := make(map[uint32]int64)
 		if trade.Sell {
 			u.baseCexBalances[trade.BaseID] -= trade.BaseFilled
 			u.baseCexBalances[trade.QuoteID] += trade.QuoteFilled
+			diffs[trade.BaseID] = -int64(trade.BaseFilled)
+			diffs[trade.QuoteID] = int64(trade.QuoteFilled)
 		} else {
 			u.baseCexBalances[trade.BaseID] += trade.BaseFilled
 			u.baseCexBalances[trade.QuoteID] -= trade.QuoteFilled
+			diffs[trade.BaseID] = int64(trade.BaseFilled)
+			diffs[trade.QuoteID] = -int64(trade.QuoteFilled)
 		}
+		u.logBalanceAdjustments(nil, diffs, fmt.Sprintf("CEX trade %s completed.", trade.ID))
 	} else {
 		u.pendingCEXOrders[trade.ID] = trade
 	}
 
 	return trade, nil
+}
+
+// FiatRate returns the current exchange rate for the specified asset.
+// 0 is returned if the rate is not available.
+func (u *unifiedExchangeAdaptor) FiatRate(assetID uint32) float64 {
+	rates := u.fiatRates.Load()
+	if rates == nil {
+		return 0
+	}
+
+	return rates.(map[uint32]float64)[assetID]
+}
+
+// OrderFees returns the fees for a buy and sell order. The order fees are for
+// placing orders on the market specified by the exchangeAdaptorCfg used to
+// create the unifiedExchangeAdaptor.
+func (u *unifiedExchangeAdaptor) OrderFees() (buyFees, sellFees *orderFees, err error) {
+	u.feesMtx.RLock()
+	defer u.feesMtx.RUnlock()
+
+	if u.buyFees == nil || u.sellFees == nil {
+		return nil, nil, fmt.Errorf("order fees not available")
+	}
+
+	return u.buyFees, u.sellFees, nil
+}
+
+// CancelAllOrders cancels all booked orders. True is returned no orders
+// needed to be cancelled.
+func (u *unifiedExchangeAdaptor) CancelAllOrders() bool {
+	u.balancesMtx.RLock()
+	defer u.balancesMtx.RUnlock()
+
+	noCancels := true
+
+	for _, pendingOrder := range u.pendingDEXOrders {
+		pendingOrder.balancesMtx.RLock()
+		if pendingOrder.order.Status <= order.OrderStatusBooked {
+			err := u.clientCore.Cancel(pendingOrder.order.ID)
+			if err != nil {
+				u.log.Errorf("Error canceling order %s: %v", pendingOrder.order.ID, err)
+			}
+			noCancels = false
+		}
+		pendingOrder.balancesMtx.RUnlock()
+	}
+
+	return noCancels
+}
+
+// SubscribeOrderUpdates returns a channel that sends updates for orders placed
+// on the DEX. This function should be called only once.
+func (u *unifiedExchangeAdaptor) SubscribeOrderUpdates() <-chan *core.Order {
+	orderUpdates := make(chan *core.Order, 128)
+	u.orderUpdates.Store(orderUpdates)
+	return orderUpdates
 }
 
 // isAccountLocker returns if the asset's wallet is an asset.AccountLocker.
@@ -1231,6 +1413,8 @@ func (u *unifiedExchangeAdaptor) updatePendingDEXOrder(o *core.Order) {
 	for _, tx := range pendingOrder.redeems {
 		isDynamicSwapper := u.isDynamicSwapper(toAsset)
 
+		u.log.Infof("~~~~ redeem %s: %v", tx.ID, tx.PartOfActiveBalance)
+
 		// For dynamic fee assets, the fees are paid from the active balance,
 		// and are not taken out of the redeem amount.
 		if isDynamicSwapper || tx.PartOfActiveBalance {
@@ -1269,7 +1453,13 @@ func (u *unifiedExchangeAdaptor) updatePendingDEXOrder(o *core.Order) {
 	pendingOrder.availableDiff = availableDiff
 	pendingOrder.locked = locked
 	pendingOrder.pending = pending
+	pendingOrder.order = o
 	pendingOrder.balancesMtx.Unlock()
+
+	orderUpdates := u.orderUpdates.Load()
+	if orderUpdates != nil {
+		orderUpdates.(chan *core.Order) <- o
+	}
 
 	// If complete, remove the order from the pending list, and update the
 	// bot's balance.
@@ -1311,10 +1501,75 @@ func (u *unifiedExchangeAdaptor) handleDEXNotification(n core.Notification) {
 			return
 		}
 		u.updatePendingDEXOrder(o)
+	case *core.FiatRatesNote:
+		u.fiatRates.Store(note.FiatRates)
 	}
 }
 
+// updateFeeRates updates the cached fee rates for placing orders on the market
+// specified by the exchangeAdaptorCfg used to create the unifiedExchangeAdaptor.
+func (u *unifiedExchangeAdaptor) updateFeeRates() error {
+	buySwapFees, buyRedeemFees, buyRefundFees, err := u.clientCore.SingleLotFees(&core.SingleLotFeesForm{
+		Host:          u.market.Host,
+		Base:          u.market.BaseID,
+		Quote:         u.market.QuoteID,
+		UseMaxFeeRate: true,
+		UseSafeTxSize: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get buy single lot fees: %v", err)
+	}
+
+	sellSwapFees, sellRedeemFees, sellRefundFees, err := u.clientCore.SingleLotFees(&core.SingleLotFeesForm{
+		Host:          u.market.Host,
+		Base:          u.market.BaseID,
+		Quote:         u.market.QuoteID,
+		UseMaxFeeRate: true,
+		UseSafeTxSize: true,
+		Sell:          true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get sell single lot fees: %v", err)
+	}
+
+	buyFundingFees, err := u.clientCore.MaxFundingFees(u.market.QuoteID, u.market.Host, u.maxBuyPlacements, u.baseWalletOptions)
+	if err != nil {
+		return fmt.Errorf("failed to get buy funding fees: %v", err)
+	}
+
+	sellFundingFees, err := u.clientCore.MaxFundingFees(u.market.BaseID, u.market.Host, u.maxSellPlacements, u.quoteWalletOptions)
+	if err != nil {
+		return fmt.Errorf("failed to get sell funding fees: %v", err)
+	}
+
+	u.feesMtx.Lock()
+	defer u.feesMtx.Unlock()
+
+	u.buyFees = &orderFees{
+		swap:       buySwapFees,
+		redemption: buyRedeemFees,
+		refund:     buyRefundFees,
+		funding:    buyFundingFees,
+	}
+	u.sellFees = &orderFees{
+		swap:       sellSwapFees,
+		redemption: sellRedeemFees,
+		refund:     sellRefundFees,
+		funding:    sellFundingFees,
+	}
+
+	return nil
+}
+
 func (u *unifiedExchangeAdaptor) run(ctx context.Context) {
+	u.fiatRates.Store(u.clientCore.FiatConversionRates())
+
+	err := u.updateFeeRates()
+	if err != nil {
+		u.log.Errorf("Error updating fee rates: %v", err)
+	}
+
+	// Listen for core notifications
 	go func() {
 		feed := u.clientCore.NotificationFeed()
 		defer feed.ReturnFeed()
@@ -1328,20 +1583,58 @@ func (u *unifiedExchangeAdaptor) run(ctx context.Context) {
 			}
 		}
 	}()
+
+	go func() {
+		refreshTime := time.Minute * 10
+		for {
+			select {
+			case <-time.NewTimer(refreshTime).C:
+				err := u.updateFeeRates()
+				if err != nil {
+					u.log.Error(err)
+					refreshTime = time.Minute
+				} else {
+					refreshTime = time.Minute * 10
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+type exchangeAdaptorCfg struct {
+	botID              string
+	market             *MarketWithHost
+	baseDexBalances    map[uint32]uint64
+	baseCexBalances    map[uint32]uint64
+	core               clientCore
+	cex                libxc.CEX
+	maxBuyPlacements   uint32
+	maxSellPlacements  uint32
+	baseWalletOptions  map[string]string
+	quoteWalletOptions map[string]string
+	log                dex.Logger
 }
 
 // unifiedExchangeAdaptorForBot returns a unifiedExchangeAdaptor for the specified bot.
-func unifiedExchangeAdaptorForBot(botID string, baseDexBalances, baseCexBalances map[uint32]uint64, core clientCore, cex libxc.CEX, log dex.Logger) *unifiedExchangeAdaptor {
+func unifiedExchangeAdaptorForBot(cfg *exchangeAdaptorCfg) *unifiedExchangeAdaptor {
 	return &unifiedExchangeAdaptor{
-		clientCore:         core,
-		CEX:                cex,
-		botID:              botID,
-		log:                log,
-		baseDexBalances:    baseDexBalances,
-		baseCexBalances:    baseCexBalances,
+		clientCore:         cfg.core,
+		CEX:                cfg.cex,
+		botID:              cfg.botID,
+		log:                cfg.log,
+		maxBuyPlacements:   cfg.maxBuyPlacements,
+		maxSellPlacements:  cfg.maxSellPlacements,
+		baseWalletOptions:  cfg.baseWalletOptions,
+		quoteWalletOptions: cfg.quoteWalletOptions,
+
+		baseDexBalances:    cfg.baseDexBalances,
+		baseCexBalances:    cfg.baseCexBalances,
 		pendingDEXOrders:   make(map[order.OrderID]*pendingDEXOrder),
 		pendingCEXOrders:   make(map[string]*libxc.Trade),
 		pendingDeposits:    make(map[string]*pendingDeposit),
 		pendingWithdrawals: make(map[string]*pendingWithdrawal),
+		market:             cfg.market,
 	}
 }
