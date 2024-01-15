@@ -57,19 +57,12 @@ BYTECODE=$(<./temp/${CONTRACT_NAME}.bin)
 solc --bin --optimize ${TEST_TOKEN} -o ./temp
 TEST_TOKEN_BYTECODE=$(<./temp/TestToken.bin)
 
-solc --bin --optimize ${TEST_USDC} -o ./temp
-TEST_USDC_BYTECODE=$(<./temp/TestUSDC.bin)
-
 for HARNESS_PATH in "$(realpath ../../../testing/eth/harness.sh)" "$(realpath ../../../testing/polygon/harness.sh)"; do
   sed -i.tmp "s/ERC20_SWAP_V${VERSION}=.*/ERC20_SWAP_V${VERSION}=\"${BYTECODE}\"/" "${HARNESS_PATH}"
   # mac needs a temp file specified above.
   rm "${HARNESS_PATH}.tmp"
 
   sed -i.tmp "s/TEST_TOKEN=.*/TEST_TOKEN=\"${TEST_TOKEN_BYTECODE}\"/" "${HARNESS_PATH}"
-  # mac needs a temp file specified above.
-  rm "${HARNESS_PATH}.tmp"
-
-  sed -i.tmp "s/TEST_USDC=.*/TEST_USDC=\"${TEST_USDC_BYTECODE}\"/" "${HARNESS_PATH}"
   # mac needs a temp file specified above.
   rm "${HARNESS_PATH}.tmp"
 done
