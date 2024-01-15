@@ -349,6 +349,7 @@ type tradeInfo struct {
 	updaterID int
 	baseID    uint32
 	quoteID   uint32
+	sell      bool
 }
 
 type binance struct {
@@ -379,7 +380,7 @@ type binance struct {
 
 	tradeUpdaterMtx    sync.RWMutex
 	tradeInfo          map[string]*tradeInfo
-	tradeUpdaters      map[int]chan *TradeUpdate
+	tradeUpdaters      map[int]chan *Trade
 	tradeUpdateCounter int
 
 	cexUpdatersMtx sync.RWMutex
@@ -414,7 +415,7 @@ func newBinance(apiKey, secretKey string, log dex.Logger, net dex.Network, binan
 		books:              make(map[string]*binanceOrderBook),
 		net:                net,
 		tradeInfo:          make(map[string]*tradeInfo),
-		tradeUpdaters:      make(map[int]chan *TradeUpdate),
+		tradeUpdaters:      make(map[int]chan *Trade),
 		cexUpdaters:        make(map[chan interface{}]struct{}, 0),
 		tradeIDNoncePrefix: encode.RandomBytes(10),
 	}
@@ -425,17 +426,43 @@ func newBinance(apiKey, secretKey string, log dex.Logger, net dex.Network, binan
 	return bnc
 }
 
-// setBalances stores the balances of the user.
-func (bnc *binance) setBalances(coinsData []*binanceCoinInfo) {
+// setBalances queries binance for the user's balances and stores them in the
+// balances map.
+func (bnc *binance) setBalances(ctx context.Context) error {
+	var resp struct {
+		Balances []struct {
+			Asset  string  `json:"asset"`
+			Free   float64 `json:"free,string"`
+			Locked float64 `json:"locked,string"`
+		} `json:"balances"`
+	}
+	err := bnc.getAPI(ctx, "/api/v3/account", nil, true, true, &resp)
+	if err != nil {
+		return err
+	}
+
 	bnc.balanceMtx.Lock()
 	defer bnc.balanceMtx.Unlock()
 
-	for _, nfo := range coinsData {
-		bnc.balances[nfo.Coin] = &bncBalance{
-			available: nfo.Free,
-			locked:    nfo.Locked,
+	for _, bal := range resp.Balances {
+		updatedBalance := &bncBalance{
+			available: bal.Free,
+			locked:    bal.Locked,
 		}
+
+		currBalance, found := bnc.balances[bal.Asset]
+		if found && *currBalance != *updatedBalance {
+			// This function is only called when the CEX is started up, and
+			// once every 10 minutes. The balance should be updated by the user
+			// data stream, so if it is updated here, it could mean there is an
+			// issue.
+			bnc.log.Warnf("%v balance was out of sync. Updating. %+v -> %+v", bal.Asset, currBalance, updatedBalance)
+		}
+
+		bnc.balances[bal.Asset] = updatedBalance
 	}
+
+	return nil
 }
 
 // setTokenIDs stores the token IDs for which deposits and withdrawals are
@@ -486,9 +513,7 @@ func (bnc *binance) getCoinInfo(ctx context.Context) error {
 		return fmt.Errorf("error getting binance coin info: %w", err)
 	}
 
-	bnc.setBalances(coins)
 	bnc.setTokenIDs(coins)
-
 	return nil
 }
 
@@ -531,9 +556,33 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		return nil, fmt.Errorf("error getting markets: %v", err)
 	}
 
+	if err := bnc.setBalances(ctx); err != nil {
+		return nil, err
+	}
+
 	if err := bnc.getUserDataStream(ctx); err != nil {
 		return nil, err
 	}
+
+	// Refresh balances periodically. This is just for safety as they should
+	// be updated based on the user data stream.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				err := bnc.setBalances(ctx)
+				if err != nil {
+					bnc.log.Errorf("Error fetching balances: %v", err)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Refresh the markets periodically.
 	wg.Add(1)
@@ -628,7 +677,7 @@ func (bnc *binance) generateTradeID() string {
 
 // Trade executes a trade on the CEX. subscriptionID takes an ID returned from
 // SubscribeTradeUpdates.
-func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int) (string, error) {
+func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int) (*Trade, error) {
 	side := "BUY"
 	if sell {
 		side = "SELL"
@@ -636,12 +685,12 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 
 	baseCfg, err := bncAssetCfg(baseID)
 	if err != nil {
-		return "", fmt.Errorf("error getting asset cfg for %d: %w", baseID, err)
+		return nil, fmt.Errorf("error getting asset cfg for %d: %w", baseID, err)
 	}
 
 	quoteCfg, err := bncAssetCfg(quoteID)
 	if err != nil {
-		return "", fmt.Errorf("error getting asset cfg for %d: %w", quoteID, err)
+		return nil, fmt.Errorf("error getting asset cfg for %d: %w", quoteID, err)
 	}
 
 	slug := baseCfg.coin + quoteCfg.coin
@@ -649,7 +698,7 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 	marketsMap := bnc.markets.Load().(map[string]*binanceMarket)
 	market, found := marketsMap[slug]
 	if !found {
-		return "", fmt.Errorf("market not found: %v", slug)
+		return nil, fmt.Errorf("market not found: %v", slug)
 	}
 
 	price := calc.ConventionalRateAlt(rate, baseCfg.conversionFactor, quoteCfg.conversionFactor)
@@ -665,28 +714,54 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 	v.Add("quantity", strconv.FormatFloat(amt, 'f', market.BaseAssetPrecision, 64))
 	v.Add("price", strconv.FormatFloat(price, 'f', market.QuoteAssetPrecision, 64))
 
-	bnc.tradeUpdaterMtx.RLock()
+	bnc.tradeUpdaterMtx.Lock()
 	_, found = bnc.tradeUpdaters[subscriptionID]
 	if !found {
-		bnc.tradeUpdaterMtx.RUnlock()
-		return "", fmt.Errorf("no trade updater with ID %v", subscriptionID)
+		bnc.tradeUpdaterMtx.Unlock()
+		return nil, fmt.Errorf("no trade updater with ID %v", subscriptionID)
 	}
-	bnc.tradeUpdaterMtx.RUnlock()
-
-	err = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &struct{}{})
-	if err != nil {
-		return "", err
-	}
-
-	bnc.tradeUpdaterMtx.Lock()
-	defer bnc.tradeUpdaterMtx.Unlock()
 	bnc.tradeInfo[tradeID] = &tradeInfo{
 		updaterID: subscriptionID,
 		baseID:    baseID,
 		quoteID:   quoteID,
+		sell:      sell,
+	}
+	bnc.tradeUpdaterMtx.Unlock()
+
+	var success bool
+	defer func() {
+		if !success {
+			bnc.tradeUpdaterMtx.Lock()
+			delete(bnc.tradeInfo, tradeID)
+			bnc.tradeUpdaterMtx.Unlock()
+		}
+	}()
+
+	var orderResponse struct {
+		Symbol             string  `json:"symbol"`
+		Price              float64 `json:"price,string"`
+		OrigQty            float64 `json:"origQty,string"`
+		OrigQuoteQty       float64 `json:"origQuoteOrderQty,string"`
+		ExecutedQty        float64 `json:"executedQty,string"`
+		CumulativeQuoteQty float64 `json:"cummulativeQuoteQty,string"`
+	}
+	err = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
+	if err != nil {
+		return nil, err
 	}
 
-	return tradeID, err
+	success = true
+
+	return &Trade{
+		ID:          tradeID,
+		Sell:        sell,
+		Rate:        rate,
+		Qty:         qty,
+		BaseID:      baseID,
+		QuoteID:     quoteID,
+		BaseFilled:  uint64(orderResponse.ExecutedQty * float64(baseCfg.conversionFactor)),
+		QuoteFilled: uint64(orderResponse.CumulativeQuoteQty * float64(quoteCfg.conversionFactor)),
+	}, err
 }
 
 func (bnc *binance) assetPrecision(coin string) (int, error) {
@@ -890,12 +965,12 @@ func (bnc *binance) ConfirmDeposit(ctx context.Context, txID string, onConfirm f
 // returned from this function is passed as the updaterID argument to
 // Trade, then updates to the trade will be sent on the updated channel
 // returned from this function.
-func (bnc *binance) SubscribeTradeUpdates() (<-chan *TradeUpdate, func(), int) {
+func (bnc *binance) SubscribeTradeUpdates() (<-chan *Trade, func(), int) {
 	bnc.tradeUpdaterMtx.Lock()
 	defer bnc.tradeUpdaterMtx.Unlock()
 	updaterID := bnc.tradeUpdateCounter
 	bnc.tradeUpdateCounter++
-	updater := make(chan *TradeUpdate, 256)
+	updater := make(chan *Trade, 256)
 	bnc.tradeUpdaters[updaterID] = updater
 
 	unsubscribe := func() {
@@ -1052,24 +1127,25 @@ func (bnc *binance) sendCexUpdateNotes() {
 }
 
 func (bnc *binance) handleOutboundAccountPosition(update *binanceStreamUpdate) {
-	bnc.log.Tracef("Received outboundAccountPosition: %+v", update)
+	bnc.log.Debugf("Received outboundAccountPosition: %+v", update)
 	for _, bal := range update.Balances {
-		bnc.log.Tracef("balance: %+v", bal)
+		bnc.log.Debugf("outboundAccountPosition balance: %+v", bal)
 	}
 
 	bnc.balanceMtx.Lock()
 	for _, bal := range update.Balances {
-		symbol := strings.ToLower(bal.Asset)
+		symbol := strings.ToUpper(bal.Asset)
 		bnc.balances[symbol] = &bncBalance{
 			available: bal.Free,
 			locked:    bal.Locked,
 		}
 	}
 	bnc.balanceMtx.Unlock()
+
 	bnc.sendCexUpdateNotes()
 }
 
-func (bnc *binance) getTradeUpdater(tradeID string) (chan *TradeUpdate, *tradeInfo, error) {
+func (bnc *binance) getTradeUpdater(tradeID string) (chan *Trade, *tradeInfo, error) {
 	bnc.tradeUpdaterMtx.RLock()
 	defer bnc.tradeUpdaterMtx.RUnlock()
 
@@ -1092,7 +1168,7 @@ func (bnc *binance) removeTradeUpdater(tradeID string) {
 }
 
 func (bnc *binance) handleExecutionReport(update *binanceStreamUpdate) {
-	bnc.log.Tracef("Received executionReport: %+v", update)
+	bnc.log.Debugf("Received executionReport: %+v", update)
 
 	status := update.CurrentOrderStatus
 	var id string
@@ -1108,7 +1184,7 @@ func (bnc *binance) handleExecutionReport(update *binanceStreamUpdate) {
 		return
 	}
 
-	complete := status == "FILLED" || status == "CANCELED" || status == "REJECTED" || status == "EXPIRED"
+	complete := status != "NEW" && status != "PARTIALLY_FILLED"
 
 	baseCfg, err := bncAssetCfg(tradeInfo.baseID)
 	if err != nil {
@@ -1122,11 +1198,14 @@ func (bnc *binance) handleExecutionReport(update *binanceStreamUpdate) {
 		return
 	}
 
-	updater <- &TradeUpdate{
-		TradeID:     id,
+	updater <- &Trade{
+		ID:          id,
 		Complete:    complete,
 		BaseFilled:  uint64(update.Filled * float64(baseCfg.conversionFactor)),
 		QuoteFilled: uint64(update.QuoteFilled * float64(quoteCfg.conversionFactor)),
+		BaseID:      tradeInfo.baseID,
+		QuoteID:     tradeInfo.quoteID,
+		Sell:        tradeInfo.sell,
 	}
 
 	if complete {
@@ -1555,6 +1634,44 @@ func (bnc *binance) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (avgPric
 	}
 
 	return book.vwap(!sell, qty)
+}
+
+func (bnc *binance) TradeStatus(ctx context.Context, id string, baseID, quoteID uint32) {
+	var resp struct {
+		Symbol             string `json:"symbol"`
+		OrderID            int64  `json:"orderId"`
+		ClientOrderID      string `json:"clientOrderId"`
+		Price              string `json:"price"`
+		OrigQty            string `json:"origQty"`
+		ExecutedQty        string `json:"executedQty"`
+		CumulativeQuoteQty string `json:"cumulativeQuoteQty"`
+		Status             string `json:"status"`
+		TimeInForce        string `json:"timeInForce"`
+	}
+
+	baseAsset, err := bncAssetCfg(baseID)
+	if err != nil {
+		bnc.log.Errorf("Error getting asset cfg for %d: %v", baseID, err)
+		return
+	}
+
+	quoteAsset, err := bncAssetCfg(quoteID)
+	if err != nil {
+		bnc.log.Errorf("Error getting asset cfg for %d: %v", quoteID, err)
+		return
+	}
+
+	v := make(url.Values)
+	v.Add("symbol", baseAsset.coin+quoteAsset.coin)
+	v.Add("origClientOrderId", id)
+
+	err = bnc.getAPI(ctx, "/api/v3/order", v, true, true, &resp)
+	if err != nil {
+		bnc.log.Errorf("Error getting trade status: %v", err)
+		return
+	}
+
+	bnc.log.Infof("Trade status: %+v", resp)
 }
 
 // dexMarkets returns all the possible dex markets for this binance market.
