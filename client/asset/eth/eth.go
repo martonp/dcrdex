@@ -4804,20 +4804,20 @@ func (w *ETHWallet) getReceivingTransaction(ctx context.Context, txHash common.H
 	tipHeight := w.currentTip.Number.Uint64()
 	w.tipMtx.RUnlock()
 
-	var partOfActiveBalance bool
+	var confirmed bool
 	if blockHeight < 0 {
 		blockHeight = 0
 		// TODO: check when this stops being pending
 	} else if tipHeight-txConfsNeededToConfirm+1 >= uint64(blockHeight) {
-		partOfActiveBalance = true
+		confirmed = true
 	}
 
 	return &asset.WalletTransaction{
-		Type:                asset.Receive,
-		ID:                  txHash.String(),
-		Amount:              dexeth.WeiToGwei(tx.Value()),
-		BlockNumber:         uint64(blockHeight),
-		PartOfActiveBalance: partOfActiveBalance,
+		Type:        asset.Receive,
+		ID:          txHash.String(),
+		Amount:      dexeth.WeiToGwei(tx.Value()),
+		BlockNumber: uint64(blockHeight),
+		Confirmed:   confirmed,
 		AdditionalData: map[string]string{
 			txHistoryNonceKey: strconv.FormatUint(tx.Nonce(), 10),
 		},
@@ -4843,21 +4843,7 @@ func (w *ETHWallet) WalletTransaction(ctx context.Context, coinID dex.Bytes) (*a
 		return nil, asset.CoinNotFoundError
 	}
 
-	tx := txs[0]
-	nonceStr, found := tx.AdditionalData[txHistoryNonceKey]
-	if !found {
-		return nil, fmt.Errorf("nonce not found in additional data")
-	}
-
-	nonce, err := strconv.ParseUint(nonceStr, 10, 64)
-
-	w.pendingTxsMtx.Lock()
-	_, txIsPending := w.pendingTxs[nonce]
-	w.pendingTxsMtx.Unlock()
-
-	tx.PartOfActiveBalance = !txIsPending
-
-	return tx, err
+	return txs[0], err
 }
 
 func (w *TokenWallet) getReceivingTransaction(ctx context.Context, txHash common.Hash) (*asset.WalletTransaction, error) {
@@ -4886,20 +4872,20 @@ func (w *TokenWallet) getReceivingTransaction(ctx context.Context, txHash common
 	tipHeight := w.currentTip.Number.Uint64()
 	w.tipMtx.RUnlock()
 
-	var partOfActiveBalance bool
+	var confirmed bool
 	if blockHeight < 0 {
 		blockHeight = 0
 		// TODO: check when this stops being pending
 	} else if tipHeight-txConfsNeededToConfirm+1 >= uint64(blockHeight) {
-		partOfActiveBalance = true
+		confirmed = true
 	}
 
 	return &asset.WalletTransaction{
-		Type:                asset.Receive,
-		ID:                  txHash.String(),
-		Amount:              w.atomize(value),
-		BlockNumber:         uint64(blockHeight),
-		PartOfActiveBalance: partOfActiveBalance,
+		Type:        asset.Receive,
+		ID:          txHash.String(),
+		Amount:      w.atomize(value),
+		BlockNumber: uint64(blockHeight),
+		Confirmed:   confirmed,
 		AdditionalData: map[string]string{
 			txHistoryNonceKey: strconv.FormatUint(tx.Nonce(), 10),
 		},
@@ -4923,21 +4909,7 @@ func (w *TokenWallet) WalletTransaction(ctx context.Context, coinID dex.Bytes) (
 		return nil, asset.CoinNotFoundError
 	}
 
-	tx := txs[0]
-	nonceStr, found := tx.AdditionalData[txHistoryNonceKey]
-	if !found {
-		return nil, fmt.Errorf("nonce not found in additional data")
-	}
-
-	nonce, err := strconv.ParseUint(nonceStr, 10, 64)
-
-	w.pendingTxsMtx.Lock()
-	_, txIsPending := w.pendingTxs[nonce]
-	w.pendingTxsMtx.Unlock()
-
-	tx.PartOfActiveBalance = !txIsPending
-
-	return tx, err
+	return txs[0], err
 }
 
 // providersFile reads a file located at ~/dextest/credentials.json.

@@ -1134,11 +1134,7 @@ type WalletTransaction struct {
 	// AdditionalData contains asset specific information, i.e. nonce
 	// for ETH.
 	AdditionalData map[string]string `json:"additionalData"`
-	// PartOfActiveBalance is only relevant for transactions in which the
-	// wallet received funds. If true, it means that the transaction in
-	// question has enough confirmations to be part of the wallet's active
-	// balance.
-	PartOfActiveBalance bool `json:"partOfActiveBalance"`
+	Confirmed      bool              `json:"confirmed"`
 }
 
 // WalletHistorian is a wallet that is able to retrieve the history of all
@@ -1153,7 +1149,7 @@ type WalletHistorian interface {
 	TxHistory(n int, refID *string, past bool) ([]*WalletTransaction, error)
 	// WalletTransaction returns a single transaction that either a wallet
 	// has made or in which the wallet has received funds. This function may
-	// support more transactions that is returned by TxHistory. For example,
+	// support more transactions than are returned by TxHistory. For example,
 	// ETH/token wallets do not return receiving transactions in TxHistory,
 	// but WalletTransaction will return them.
 	WalletTransaction(ctx context.Context, coinID dex.Bytes) (*WalletTransaction, error)
@@ -1271,7 +1267,7 @@ type Coin interface {
 	TxID() string
 }
 
-// TokenCoin is extends to Coin interface to include the amount locked
+// TokenCoin extends the Coin interface to include the amount locked
 // of the parent asset to be used for fees.
 type TokenCoin interface {
 	Coin

@@ -5385,7 +5385,7 @@ func (btc *ExchangeWalletSPV) TxHistory(n int, refID *string, past bool) ([]*ass
 
 	for _, tx := range txs {
 		if tx.BlockNumber != 0 {
-			tx.PartOfActiveBalance = true
+			tx.Confirmed = true
 			continue
 		}
 	}

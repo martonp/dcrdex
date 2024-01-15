@@ -20,7 +20,6 @@ import (
 
 type extendedWalletTx struct {
 	*asset.WalletTransaction
-	Confirmed bool `json:"confirmed"`
 	// Create bond transactions are added to the store before
 	// they are submitted.
 	Submitted bool `json:"submitted"`
