@@ -44,7 +44,7 @@ type clientCore interface {
 	Send(pw []byte, assetID uint32, value uint64, address string, subtract bool) (asset.Coin, error)
 	NewDepositAddress(assetID uint32) (string, error)
 	Order(oidB dex.Bytes) (*core.Order, error)
-	WalletTransaction(uint32, dex.Bytes) (*asset.WalletTransaction, error)
+	WalletTransaction(uint32, string) (*asset.WalletTransaction, error)
 }
 
 var _ clientCore = (*core.Core)(nil)
