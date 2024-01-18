@@ -154,7 +154,7 @@ func TestArbRebalance(t *testing.T) {
 		dexMaxBuyErr  error
 		// The strategy uses maxSell/maxBuy to determine how much it can trade.
 		// dexBalances is just used for auto rebalancing.
-		dexBalances           map[uint32]uint64
+		dexBalances           map[uint32]*botBalance
 		cexBalances           map[uint32]*botBalance
 		dexVWAPErr            error
 		cexVWAPErr            error
@@ -750,9 +750,9 @@ func TestArbRebalance(t *testing.T) {
 					Lots: 5,
 				},
 			},
-			dexBalances: map[uint32]uint64{
-				42: 1e14,
-				0:  1e17,
+			dexBalances: map[uint32]*botBalance{
+				42: {Available: 1e14},
+				0:  {Available: 1e17},
 			},
 			cexBalances: map[uint32]*botBalance{
 				42: {Available: 1e19},
@@ -785,9 +785,9 @@ func TestArbRebalance(t *testing.T) {
 					Lots: 5,
 				},
 			},
-			dexBalances: map[uint32]uint64{
-				42: 9.5e15,
-				0:  1.1e12,
+			dexBalances: map[uint32]*botBalance{
+				42: {Available: 9.5e15},
+				0:  {Available: 1.1e12},
 			},
 			cexBalances: map[uint32]*botBalance{
 				42: {Available: 1.1e16},
@@ -822,9 +822,9 @@ func TestArbRebalance(t *testing.T) {
 					Lots: 5,
 				},
 			},
-			dexBalances: map[uint32]uint64{
-				42: 9.5e15,
-				0:  1.1e12,
+			dexBalances: map[uint32]*botBalance{
+				42: {Available: 9.5e15},
+				0:  {Available: 1.1e12},
 			},
 			cexBalances: map[uint32]*botBalance{
 				42: {Available: 1.1e16},
@@ -851,9 +851,9 @@ func TestArbRebalance(t *testing.T) {
 					Lots: 5,
 				},
 			},
-			dexBalances: map[uint32]uint64{
-				42: 1e19,
-				0:  1e10,
+			dexBalances: map[uint32]*botBalance{
+				42: {Available: 1e19},
+				0:  {Available: 1e10},
 			},
 			cexBalances: map[uint32]*botBalance{
 				42: {Available: 1e14},
@@ -886,9 +886,9 @@ func TestArbRebalance(t *testing.T) {
 					Lots: 5,
 				},
 			},
-			dexBalances: map[uint32]uint64{
-				42: 1e19,
-				0:  1e10,
+			dexBalances: map[uint32]*botBalance{
+				42: {Available: 1e19},
+				0:  {Available: 1e10},
 			},
 			cexBalances: map[uint32]*botBalance{
 				42: {Available: 1e14},
@@ -914,7 +914,10 @@ func TestArbRebalance(t *testing.T) {
 		tCore.maxSellEstimate = test.dexMaxSell
 		tCore.maxSellErr = test.dexMaxSellErr
 		tCore.maxBuyErr = test.dexMaxBuyErr
-		tCore.setAssetBalances(test.dexBalances)
+
+		coreAdaptor := newTBotCoreAdaptor(tCore)
+		coreAdaptor.balances = test.dexBalances
+
 		if test.expectedDexOrder != nil {
 			tCore.multiTradeResult = []*core.Order{
 				{
@@ -935,10 +938,10 @@ func TestArbRebalance(t *testing.T) {
 			orderBook.asksVWAP[uint64(i+1)] = vwapResult{test.books.dexAsksAvg[i], test.books.dexAsksExtrema[i]}
 		}
 		for i := range test.books.cexBidsAvg {
-			cex.bidsVWAP[uint64(i+1)*mkt.LotSize] = vwapResult{test.books.cexBidsAvg[i], test.books.cexBidsExtrema[i]}
+			cex.bidsVWAP[uint64(i+1)*mkt.LotSize] = &vwapResult{test.books.cexBidsAvg[i], test.books.cexBidsExtrema[i]}
 		}
 		for i := range test.books.cexAsksAvg {
-			cex.asksVWAP[uint64(i+1)*mkt.LotSize] = vwapResult{test.books.cexAsksAvg[i], test.books.cexAsksExtrema[i]}
+			cex.asksVWAP[uint64(i+1)*mkt.LotSize] = &vwapResult{test.books.cexAsksAvg[i], test.books.cexAsksExtrema[i]}
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -951,7 +954,7 @@ func TestArbRebalance(t *testing.T) {
 			mkt:        mkt,
 			baseID:     42,
 			quoteID:    0,
-			core:       newTBotCoreAdaptor(tCore),
+			core:       coreAdaptor,
 			activeArbs: test.existingArbs,
 			cfg: &SimpleArbConfig{
 				ProfitTrigger:      profitTrigger,
@@ -1196,7 +1199,7 @@ func TestArbDexTradeUpdates(t *testing.T) {
 
 	runTest := func(test *test) {
 		cex := newTBotCEXAdaptor()
-		tCore := newTCore()
+		coreAdaptor := newTBotCoreAdaptor(newTCore())
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -1207,7 +1210,7 @@ func TestArbDexTradeUpdates(t *testing.T) {
 			cex:        cex,
 			baseID:     42,
 			quoteID:    0,
-			core:       newTBotCoreAdaptor(tCore),
+			core:       coreAdaptor,
 			activeArbs: test.activeArbs,
 			cfg: &SimpleArbConfig{
 				ProfitTrigger:      0.01,
@@ -1218,14 +1221,11 @@ func TestArbDexTradeUpdates(t *testing.T) {
 
 		go arbEngine.run()
 
-		tCore.noteFeed <- &core.OrderNote{
-			Order: &core.Order{
-				Status: test.updatedOrderStatus,
-				ID:     test.updatedOrderID,
-			},
+		coreAdaptor.orderUpdates <- &core.Order{
+			Status: test.updatedOrderStatus,
+			ID:     test.updatedOrderID,
 		}
-		dummyNote := &core.BondRefundNote{}
-		tCore.noteFeed <- dummyNote
+		coreAdaptor.orderUpdates <- &core.Order{}
 
 		if len(test.expectedActiveArbs) != len(arbEngine.activeArbs) {
 			t.Fatalf("%s: expected %d active arbs but got %d", test.name, len(test.expectedActiveArbs), len(arbEngine.activeArbs))

@@ -383,18 +383,18 @@ func (a *simpleArbMarketMaker) executeArb(sellOnDex bool, lotsToArb, dexRate, ce
 		options = a.cfg.QuoteOptions
 	}
 
-	dexOrders, err := a.core.MultiTrade(nil, &core.MultiTradeForm{
-		Host:  a.host,
-		Sell:  sellOnDex,
-		Base:  a.baseID,
-		Quote: a.quoteID,
-		Placements: []*core.QtyRate{
+	dexOrders, err := a.core.MultiTrade(&multiTradeForm{
+		host:    a.host,
+		sell:    sellOnDex,
+		baseID:  a.baseID,
+		quoteID: a.quoteID,
+		placements: []*multiTradePlacement{
 			{
-				Qty:  lotsToArb * a.mkt.LotSize,
-				Rate: dexRate,
+				qty:  lotsToArb * a.mkt.LotSize,
+				rate: dexRate,
 			},
 		},
-		Options: options,
+		options: options,
 	})
 	if err != nil || len(dexOrders) != 1 {
 		if err != nil {
@@ -527,17 +527,6 @@ func (a *simpleArbMarketMaker) handleDEXOrderUpdate(o *core.Order) {
 	}
 }
 
-func (m *simpleArbMarketMaker) handleNotification(note core.Notification) {
-	switch n := note.(type) {
-	case *core.OrderNote:
-		ord := n.Order
-		if ord == nil {
-			return
-		}
-		m.handleDEXOrderUpdate(ord)
-	}
-}
-
 func (a *simpleArbMarketMaker) run() {
 	book, bookFeed, err := a.core.SyncBook(a.host, a.baseID, a.quoteID)
 	if err != nil {
@@ -586,16 +575,14 @@ func (a *simpleArbMarketMaker) run() {
 		}
 	}()
 
-	noteFeed := a.core.NotificationFeed()
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer noteFeed.ReturnFeed()
+		orderUpdates := a.core.SubscribeOrderUpdates()
 		for {
 			select {
-			case n := <-noteFeed.C:
-				a.handleNotification(n)
+			case n := <-orderUpdates:
+				a.handleDEXOrderUpdate(n)
 			case <-a.ctx.Done():
 				return
 			}

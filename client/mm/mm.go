@@ -65,10 +65,6 @@ type MarketWithHost struct {
 	QuoteID uint32 `json:"quote"`
 }
 
-func (m *MarketWithHost) String() string {
-	return fmt.Sprintf("%s-%d-%d", m.Host, m.BaseID, m.QuoteID)
-}
-
 // MarketMaker handles the market making process. It supports running different
 // strategies on different markets.
 type MarketMaker struct {
@@ -581,7 +577,6 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 	}
 	m.logInitialBotBalances(dexBaseBalances, cexBaseBalances)
 
-	fiatRates := m.core.FiatConversionRates()
 	startedMarketMaking = true
 	m.core.Broadcast(newMMStartStopNote(true))
 
@@ -601,6 +596,7 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 			wg.Add(1)
 			go func(cfg *BotConfig) {
 				defer wg.Done()
+
 				mkt := MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
 				m.markBotAsRunning(mkt, true)
 				defer func() {
@@ -611,52 +607,98 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 				defer func() {
 					m.core.Broadcast(newBotStartStopNote(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset, false))
 				}()
-				logger := m.log.SubLogger(fmt.Sprintf("MarketMaker-%s-%d-%d", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset))
+
 				mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
-				baseFiatRate := fiatRates[cfg.BaseAsset]
-				quoteFiatRate := fiatRates[cfg.QuoteAsset]
-				exchangeAdaptor := unifiedExchangeAdaptorForBot(mktID, dexBaseBalances[mktID], cexBaseBalances[mktID], m.core, nil, logger)
+				logger := m.log.SubLogger(fmt.Sprintf("MarketMaker-%s", mktID))
+				exchangeAdaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+					botID:              mktID,
+					market:             &mkt,
+					baseDexBalances:    dexBaseBalances[mktID],
+					baseCexBalances:    cexBaseBalances[mktID],
+					core:               m.core,
+					cex:                nil,
+					maxBuyPlacements:   uint32(len(cfg.BasicMMConfig.BuyPlacements)),
+					maxSellPlacements:  uint32(len(cfg.BasicMMConfig.SellPlacements)),
+					baseWalletOptions:  cfg.BasicMMConfig.BaseOptions,
+					quoteWalletOptions: cfg.BasicMMConfig.QuoteOptions,
+					log:                logger,
+				})
 				exchangeAdaptor.run(ctx)
-				RunBasicMarketMaker(m.ctx, cfg, exchangeAdaptor, oracle, baseFiatRate, quoteFiatRate, logger)
+
+				RunBasicMarketMaker(m.ctx, cfg, exchangeAdaptor, oracle, logger)
 			}(cfg)
 		case cfg.SimpleArbConfig != nil:
 			wg.Add(1)
 			go func(cfg *BotConfig) {
 				defer wg.Done()
-				logger := m.log.SubLogger(fmt.Sprintf("SimpleArbitrage-%s-%d-%d", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset))
+
 				mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+				logger := m.log.SubLogger(fmt.Sprintf("SimpleArbitrage-%s", mktID))
+
 				cex, found := cexes[cfg.CEXCfg.Name]
 				if !found {
 					logger.Errorf("Cannot start %s bot due to CEX not starting", mktID)
 					return
 				}
+
 				mkt := MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
 				m.markBotAsRunning(mkt, true)
 				defer func() {
 					m.markBotAsRunning(mkt, false)
 				}()
-				exchangeAdaptor := unifiedExchangeAdaptorForBot(mktID, dexBaseBalances[mktID], cexBaseBalances[mktID], m.core, cex, logger)
+
+				exchangeAdaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+					botID:              mktID,
+					market:             &mkt,
+					baseDexBalances:    dexBaseBalances[mktID],
+					baseCexBalances:    cexBaseBalances[mktID],
+					core:               m.core,
+					cex:                cex,
+					maxBuyPlacements:   1,
+					maxSellPlacements:  1,
+					baseWalletOptions:  cfg.SimpleArbConfig.BaseOptions,
+					quoteWalletOptions: cfg.SimpleArbConfig.QuoteOptions,
+					log:                logger,
+				})
 				exchangeAdaptor.run(ctx)
+
 				RunSimpleArbBot(m.ctx, cfg, exchangeAdaptor, exchangeAdaptor, logger)
 			}(cfg)
 		case cfg.ArbMarketMakerConfig != nil:
 			wg.Add(1)
 			go func(cfg *BotConfig) {
 				defer wg.Done()
-				logger := m.log.SubLogger(fmt.Sprintf("ArbMarketMaker-%s-%d-%d", cfg.Host, cfg.BaseAsset, cfg.QuoteAsset))
-				cex, found := cexes[cfg.CEXCfg.Name]
+
 				mktID := dexMarketID(cfg.Host, cfg.BaseAsset, cfg.QuoteAsset)
+				logger := m.log.SubLogger(fmt.Sprintf("ArbMarketMaker-%s", mktID))
+
+				cex, found := cexes[cfg.CEXCfg.Name]
 				if !found {
 					logger.Errorf("Cannot start %s bot due to CEX not starting", mktID)
 					return
 				}
+
 				mkt := MarketWithHost{cfg.Host, cfg.BaseAsset, cfg.QuoteAsset}
 				m.markBotAsRunning(mkt, true)
 				defer func() {
 					m.markBotAsRunning(mkt, false)
 				}()
-				exchangeAdaptor := unifiedExchangeAdaptorForBot(mktID, dexBaseBalances[mktID], cexBaseBalances[mktID], m.core, cex, logger)
+
+				exchangeAdaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+					botID:              mktID,
+					market:             &mkt,
+					baseDexBalances:    dexBaseBalances[mktID],
+					baseCexBalances:    cexBaseBalances[mktID],
+					core:               m.core,
+					cex:                cex,
+					maxBuyPlacements:   uint32(len(cfg.ArbMarketMakerConfig.BuyPlacements)),
+					maxSellPlacements:  uint32(len(cfg.ArbMarketMakerConfig.SellPlacements)),
+					baseWalletOptions:  cfg.ArbMarketMakerConfig.BaseOptions,
+					quoteWalletOptions: cfg.ArbMarketMakerConfig.QuoteOptions,
+					log:                logger,
+				})
 				exchangeAdaptor.run(ctx)
+
 				RunArbMarketMaker(m.ctx, cfg, exchangeAdaptor, exchangeAdaptor, logger)
 			}(cfg)
 		default:

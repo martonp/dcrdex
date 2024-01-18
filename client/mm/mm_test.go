@@ -365,26 +365,50 @@ func (c *tCore) setAssetBalances(balances map[uint32]uint64) {
 type tBotCoreAdaptor struct {
 	clientCore
 	tCore *tCore
+
+	balances     map[uint32]*botBalance
+	groupedBuys  map[uint64][]*core.Order
+	groupedSells map[uint64][]*core.Order
+	orderUpdates chan *core.Order
+	buyFees      *orderFees
+	sellFees     *orderFees
 }
 
 func (c *tBotCoreAdaptor) DEXBalance(assetID uint32) (*botBalance, error) {
 	if c.tCore.assetBalanceErr != nil {
 		return nil, c.tCore.assetBalanceErr
 	}
-	return &botBalance{
-		Available: c.tCore.assetBalances[assetID].Available,
-	}, nil
+	return c.balances[assetID], nil
 }
 
-func (c *tBotCoreAdaptor) MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error) {
-	c.tCore.multiTradesPlaced = append(c.tCore.multiTradesPlaced, form)
+func (c *tBotCoreAdaptor) MultiTrade(form *multiTradeForm) ([]*core.Order, error) {
+	c.tCore.multiTradesPlaced = append(c.tCore.multiTradesPlaced, form.toCore())
 	return c.tCore.multiTradeResult, nil
+}
+
+func (c *tBotCoreAdaptor) GroupedBookedOrders() (buys, sells map[uint64][]*core.Order) {
+	return c.groupedBuys, c.groupedSells
+}
+
+func (c *tBotCoreAdaptor) CancelAllOrders() bool { return false }
+
+func (c *tBotCoreAdaptor) FiatRate(assetID uint32) float64 {
+	return 0
+}
+
+func (c *tBotCoreAdaptor) OrderFees() (buyFees, sellFees *orderFees, err error) {
+	return c.buyFees, c.sellFees, nil
+}
+
+func (c *tBotCoreAdaptor) SubscribeOrderUpdates() (updates <-chan *core.Order) {
+	return c.orderUpdates
 }
 
 func newTBotCoreAdaptor(c *tCore) *tBotCoreAdaptor {
 	return &tBotCoreAdaptor{
-		clientCore: c,
-		tCore:      c,
+		clientCore:   c,
+		tCore:        c,
+		orderUpdates: make(chan *core.Order),
 	}
 }
 
@@ -1095,7 +1119,6 @@ func TestInitialBaseBalances(t *testing.T) {
 					QuoteBalance:            50,
 					BaseFeeAssetBalanceType: Amount,
 					BaseFeeAssetBalance:     500,
-
 					CEXCfg: &BotCEXCfg{
 						Name:             "Binance",
 						BaseBalanceType:  Percentage,
@@ -1414,8 +1437,8 @@ func (c *tCEX) ConfirmDeposit(ctx context.Context, txID string, onConfirm func(b
 }
 
 type tBotCexAdaptor struct {
-	bidsVWAP         map[uint64]vwapResult
-	asksVWAP         map[uint64]vwapResult
+	bidsVWAP         map[uint64]*vwapResult
+	asksVWAP         map[uint64]*vwapResult
 	vwapErr          error
 	balances         map[uint32]*botBalance
 	balanceErr       error
@@ -1433,8 +1456,8 @@ type tBotCexAdaptor struct {
 
 func newTBotCEXAdaptor() *tBotCexAdaptor {
 	return &tBotCexAdaptor{
-		bidsVWAP:        make(map[uint64]vwapResult),
-		asksVWAP:        make(map[uint64]vwapResult),
+		bidsVWAP:        make(map[uint64]*vwapResult),
+		asksVWAP:        make(map[uint64]*vwapResult),
 		balances:        make(map[uint32]*botBalance),
 		cancelledTrades: make([]string, 0),
 		tradeUpdates:    make(chan *libxc.Trade),
