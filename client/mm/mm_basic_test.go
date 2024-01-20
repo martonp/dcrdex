@@ -3,1160 +3,27 @@
 package mm
 
 import (
-	"errors"
+	"math"
+	"reflect"
 	"testing"
 
 	"decred.org/dcrdex/client/core"
-	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/calc"
-	"decred.org/dcrdex/dex/encode"
-	"decred.org/dcrdex/dex/order"
+	"github.com/davecgh/go-spew/spew"
 )
 
-var (
-	dcrBipID uint32 = 42
-	btcBipID uint32 = 0
-)
-
-type tRebalancer struct {
-	basis        uint64
-	breakEven    uint64
-	breakEvenErr error
-	sortedBuys   map[uint64][]*core.Order
-	sortedSells  map[uint64][]*core.Order
+type tBasicMMCalculator struct {
+	bp uint64
+	hs uint64
 }
 
-var _ rebalancer = (*tRebalancer)(nil)
+var _ basicMMCalculator = (*tBasicMMCalculator)(nil)
 
-func (r *tRebalancer) basisPrice() uint64 {
-	return r.basis
+func (r *tBasicMMCalculator) basisPrice() uint64 {
+	return r.bp
 }
-func (r *tRebalancer) halfSpread(basisPrice uint64) (uint64, error) {
-	return r.breakEven, r.breakEvenErr
-}
-
-func (r *tRebalancer) groupedOrders() (buys, sells map[uint64][]*core.Order) {
-	return r.sortedBuys, r.sortedSells
-}
-
-func TestRebalance(t *testing.T) {
-	const rateStep uint64 = 1e3
-	const midGap uint64 = 5e8
-	const lotSize uint64 = 50e8
-	const breakEven uint64 = 200 * rateStep
-	const newEpoch = 123_456_789
-	const driftTolerance = 0.001
-	buyFees := &orderFees{
-		swap:       1e4,
-		redemption: 2e4,
-		funding:    3e4,
-	}
-	sellFees := &orderFees{
-		swap:       2e4,
-		redemption: 1e4,
-		funding:    4e4,
-	}
-
-	tCore := newTCore()
-
-	orderIDs := make([]order.OrderID, 5)
-	for i := range orderIDs {
-		copy(orderIDs[i][:], encode.RandomBytes(32))
-	}
-
-	mkt := &core.Market{
-		RateStep:   rateStep,
-		AtomToConv: 1,
-		LotSize:    lotSize,
-		BaseID:     dcrBipID,
-		QuoteID:    btcBipID,
-	}
-
-	newBalancer := func(existingBuys, existingSells map[uint64][]*core.Order) *tRebalancer {
-		return &tRebalancer{
-			basis:       midGap,
-			breakEven:   breakEven,
-			sortedBuys:  existingBuys,
-			sortedSells: existingSells,
-		}
-	}
-
-	log := dex.StdOutLogger("T", dex.LevelTrace)
-
-	type test struct {
-		name       string
-		cfg        *BasicMarketMakingConfig
-		epoch      uint64
-		rebalancer *tRebalancer
-
-		isAccountLocker map[uint32]bool
-		balances        map[uint32]*botBalance
-
-		expectedBuys    []rateLots
-		expectedSells   []rateLots
-		expectedCancels []order.OrderID
-	}
-
-	newOrder := func(id order.OrderID, lots, rate uint64, sell bool, freeCancel bool) *core.Order {
-		var epoch uint64 = newEpoch
-		if freeCancel {
-			epoch = newEpoch - 2
-		}
-		return &core.Order{
-			ID:    id[:],
-			Epoch: epoch,
-			Rate:  rate,
-			Qty:   lots * lotSize,
-		}
-	}
-
-	driftToleranceEdge := func(rate uint64, within bool) uint64 {
-		edge := rate + uint64(float64(rate)*driftTolerance)
-		if within {
-			return edge - rateStep
-		}
-		return edge + rateStep
-	}
-
-	requiredForOrder := func(sell bool, placements []*OrderPlacement, strategy GapStrategy) (req uint64) {
-		for _, placement := range placements {
-			if sell {
-				req += placement.Lots * mkt.LotSize
-			} else {
-				rate := orderPrice(midGap, breakEven, strategy, placement.GapFactor, sell, mkt)
-				req += calc.BaseToQuote(rate, placement.Lots*mkt.LotSize)
-			}
-		}
-		return
-	}
-
-	tests := []*test{
-		// "no existing orders, one order per side"
-		{
-			name: "no existing orders, one order per side",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 3),
-					lots: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 3),
-					lots: 1,
-				},
-			},
-		},
-		// "no existing orders, no sell placements"
-		{
-			name: "no existing orders, no sell placements",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy:    GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 3),
-					lots: 1,
-				},
-			},
-			expectedSells: []rateLots{},
-		},
-		// "no existing orders, no buy placements"
-		{
-			name: "no existing orders, no buy placements",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 3),
-					lots: 1,
-				},
-			},
-		},
-		//  "no existing orders, multiple placements per side"
-		{
-			name: "no existing orders, multiple placements per side",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "test balances edge, enough for orders"
-		{
-			name: "test balances edge, enough for orders",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: requiredForOrder(true, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      1,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding,
-				},
-				btcBipID: {
-					Available: requiredForOrder(false, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      1,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "test balances edge, not enough for orders"
-		{
-			name: "test balances edge, not enough for orders",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: requiredForOrder(true, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      1,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 2*sellFees.swap + sellFees.funding - 1,
-				},
-				btcBipID: {
-					Available: requiredForOrder(false, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      1,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 2*buyFees.swap + buyFees.funding - 1,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
-				},
-			},
-		},
-		// "test balances edge, enough for 2 lot orders"
-		{
-			name: "test balances edge, enough for 2 lot orders",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: requiredForOrder(true, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      2,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding,
-				},
-				btcBipID: {
-					Available: requiredForOrder(false, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      2,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           2,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           2,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "test balances edge, not enough for 2 lot orders, place 1 lot"
-		{
-			name: "test balances edge, not enough for 2 lot orders, place 1 lot",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-			},
-			rebalancer: newBalancer(nil, nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: requiredForOrder(true, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      2,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 3*sellFees.swap + sellFees.funding - 1,
-				},
-				btcBipID: {
-					Available: requiredForOrder(false, []*OrderPlacement{
-						{
-							Lots:      1,
-							GapFactor: 2,
-						},
-						{
-							Lots:      2,
-							GapFactor: 3,
-						},
-					}, GapStrategyMultiplier) + 3*buyFees.swap + buyFees.funding - 1,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		//  "existing orders outside edge of drift tolerance"
-		{
-			name: "existing orders outside edge of drift tolerance",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
-					},
-				},
-				map[uint64][]*core.Order{
-					1: {
-						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedCancels: []order.OrderID{
-				orderIDs[0],
-				orderIDs[1],
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 2),
-					lots:           1,
-					placementIndex: 0,
-				},
-			},
-		},
-		//  "existing orders within edge of drift tolerance"
-		{
-			name: "existing orders within edge of drift tolerance",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
-					},
-				},
-				map[uint64][]*core.Order{
-					1: {
-						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
-				},
-			},
-		},
-		//  "existing partially filled orders within drift tolerance"
-		{
-			name: "existing partially filled orders within drift tolerance",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      2,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), true), false, true),
-					},
-				},
-				map[uint64][]*core.Order{
-					1: {
-						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), true), true, true),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		//  "existing partially filled orders outside drift tolerance"
-		{
-			name: "existing partially filled orders outside drift tolerance",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      2,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      2,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[0], 1, driftToleranceEdge(midGap-(breakEven*2), false), false, true),
-					},
-				},
-				map[uint64][]*core.Order{
-					1: {
-						newOrder(orderIDs[1], 1, driftToleranceEdge(midGap+(breakEven*3), false), true, true),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedBuys: []rateLots{
-				{
-					rate: midGap - (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate: midGap + (breakEven * 2),
-					lots: 1,
-				},
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedCancels: []order.OrderID{
-				orderIDs[0],
-				orderIDs[1],
-			},
-		},
-		// "cannot place buy order due to self matching"
-		{
-			name: "cannot place buy order due to self matching",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				nil,
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, true),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedCancels: []order.OrderID{
-				orderIDs[1],
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "cannot place sell order due to self matching"
-		{
-			name: "cannot place sell order due to self matching",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[1], 1, midGap+(breakEven*2), true, true),
-					},
-				},
-				nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedCancels: []order.OrderID{
-				orderIDs[1],
-			},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "cannot place buy order due to self matching, can't cancel because too soon"
-		{
-			name: "cannot place buy order due to self matching, can't cancel because too soon",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				nil,
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[1], 1, midGap-(breakEven*2)-1, true, false),
-					},
-				}),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedCancels: []order.OrderID{},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-		// "cannot place sell order due to self matching, can't cancel because too soon"
-		{
-			name: "cannot place sell order due to self matching, can't cancel because too soon",
-			cfg: &BasicMarketMakingConfig{
-				GapStrategy: GapStrategyMultiplier,
-				SellPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{
-						Lots:      1,
-						GapFactor: 2,
-					},
-					{
-						Lots:      1,
-						GapFactor: 3,
-					},
-				},
-				DriftTolerance: driftTolerance,
-			},
-			rebalancer: newBalancer(
-				map[uint64][]*core.Order{
-					0: {
-						newOrder(orderIDs[1], 1, midGap+(breakEven*2), true, false),
-					},
-				},
-				nil),
-			balances: map[uint32]*botBalance{
-				dcrBipID: {
-					Available: 1e13,
-				},
-				btcBipID: {
-					Available: 1e13,
-				},
-			},
-			expectedCancels: []order.OrderID{},
-			expectedBuys: []rateLots{
-				{
-					rate:           midGap - (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-			expectedSells: []rateLots{
-				{
-					rate:           midGap + (breakEven * 3),
-					lots:           1,
-					placementIndex: 1,
-				},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		if tt.isAccountLocker != nil {
-			tCore.isAccountLocker = tt.isAccountLocker
-		} else {
-			tCore.isAccountLocker = map[uint32]bool{}
-		}
-		coreAdaptor := newTBotCoreAdaptor(tCore)
-		coreAdaptor.balances = tt.balances
-
-		epoch := tt.epoch
-		if epoch == 0 {
-			epoch = newEpoch
-		}
-
-		cancels, buys, sells := basicMMRebalance(epoch, tt.rebalancer, coreAdaptor, tt.cfg, mkt, buyFees, sellFees, log)
-
-		if len(cancels) != len(tt.expectedCancels) {
-			t.Fatalf("%s: cancel count mismatch. expected %d, got %d", tt.name, len(tt.expectedCancels), len(cancels))
-		}
-
-		expectedCancels := make(map[order.OrderID]bool)
-		for _, id := range tt.expectedCancels {
-			expectedCancels[id] = true
-		}
-		for _, cancel := range cancels {
-			var id order.OrderID
-			copy(id[:], cancel)
-			if !expectedCancels[id] {
-				t.Fatalf("%s: unexpected cancel order ID %s", tt.name, id)
-			}
-		}
-
-		if len(buys) != len(tt.expectedBuys) {
-			t.Fatalf("%s: buy count mismatch. expected %d, got %d", tt.name, len(tt.expectedBuys), len(buys))
-		}
-		if len(sells) != len(tt.expectedSells) {
-			t.Fatalf("%s: sell count mismatch. expected %d, got %d", tt.name, len(tt.expectedSells), len(sells))
-		}
-
-		for i, buy := range buys {
-			if buy.rate != tt.expectedBuys[i].rate {
-				t.Fatalf("%s: buy rate mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].rate, buy.rate)
-			}
-			if buy.lots != tt.expectedBuys[i].lots {
-				t.Fatalf("%s: buy lots mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].lots, buy.lots)
-			}
-			if buy.placementIndex != tt.expectedBuys[i].placementIndex {
-				t.Fatalf("%s: buy placement index mismatch. expected %d, got %d", tt.name, tt.expectedBuys[i].placementIndex, buy.placementIndex)
-			}
-		}
-
-		for i, sell := range sells {
-			if sell.rate != tt.expectedSells[i].rate {
-				t.Fatalf("%s: sell rate mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].rate, sell.rate)
-			}
-			if sell.lots != tt.expectedSells[i].lots {
-				t.Fatalf("%s: sell lots mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].lots, sell.lots)
-			}
-			if sell.placementIndex != tt.expectedSells[i].placementIndex {
-				t.Fatalf("%s: sell placement index mismatch. expected %d, got %d", tt.name, tt.expectedSells[i].placementIndex, sell.placementIndex)
-			}
-		}
-	}
+func (r *tBasicMMCalculator) halfSpread(basisPrice uint64) (uint64, error) {
+	return r.hs, nil
 }
 
 func TestBasisPrice(t *testing.T) {
@@ -1166,8 +33,6 @@ func TestBasisPrice(t *testing.T) {
 		QuoteID:    0,
 		AtomToConv: 1,
 	}
-
-	log := dex.StdOutLogger("T", dex.LevelTrace)
 
 	tests := []*struct {
 		name         string
@@ -1241,7 +106,21 @@ func TestBasisPrice(t *testing.T) {
 			OracleWeighting: &tt.oracleWeight,
 			OracleBias:      tt.oracleBias,
 		}
-		rate := basisPrice(ob, oracle, cfg, mkt, tt.fiatRate, log)
+
+		tCore := newTCore()
+		adaptor := newTBotCoreAdaptor(tCore)
+		adaptor.fiatExchangeRate = tt.fiatRate
+
+		calculator := &basicMMCalculatorImpl{
+			book:   ob,
+			oracle: oracle,
+			mkt:    mkt,
+			cfg:    cfg,
+			log:    tLogger,
+			core:   adaptor,
+		}
+
+		rate := calculator.basisPrice()
 		if rate != tt.exp {
 			t.Fatalf("%s: %d != %d", tt.name, rate, tt.exp)
 		}
@@ -1249,71 +128,258 @@ func TestBasisPrice(t *testing.T) {
 }
 
 func TestBreakEvenHalfSpread(t *testing.T) {
-	mkt := &core.Market{
-		LotSize:    20e8, // 20 DCR
-		BaseID:     dcrBipID,
-		QuoteID:    btcBipID,
-		AtomToConv: 1,
-	}
-
-	tCore := newTCore()
-	log := dex.StdOutLogger("T", dex.LevelTrace)
-
 	tests := []*struct {
-		name             string
-		basisPrice       uint64
-		sellSwapFees     uint64
-		sellRedeemFees   uint64
-		buySwapFees      uint64
-		buyRedeemFees    uint64
-		exp              uint64
-		singleLotFeesErr error
-		expErr           bool
+		name                 string
+		basisPrice           uint64
+		mkt                  *core.Market
+		buyFeesInBaseUnits   uint64
+		sellFeesInBaseUnits  uint64
+		buyFeesInQuoteUnits  uint64
+		sellFeesInQuoteUnits uint64
+		singleLotFeesErr     error
+		expErr               bool
 	}{
 		{
 			name:   "basis price = 0 not allowed",
 			expErr: true,
+			mkt: &core.Market{
+				LotSize: 20e8,
+				BaseID:  42,
+				QuoteID: 0,
+			},
 		},
 		{
-			name:             "swap fees error propagates",
-			singleLotFeesErr: errors.New("t"),
-			expErr:           true,
+			name:       "dcr/btc",
+			basisPrice: 5e7, // 0.4 BTC/DCR, quote lot = 8 BTC
+			mkt: &core.Market{
+				LotSize: 20e8,
+				BaseID:  42,
+				QuoteID: 0,
+			},
+			buyFeesInBaseUnits:   2.2e6,
+			sellFeesInBaseUnits:  2e6,
+			buyFeesInQuoteUnits:  calc.BaseToQuote(2.2e6, 5e7),
+			sellFeesInQuoteUnits: calc.BaseToQuote(2e6, 5e7),
 		},
 		{
-			name:           "simple",
-			basisPrice:     4e7, // 0.4 BTC/DCR, quote lot = 8 BTC
-			buySwapFees:    200, // BTC
-			buyRedeemFees:  100, // DCR
-			sellSwapFees:   300, // DCR
-			sellRedeemFees: 50,  // BTC
-			// total btc (quote) fees, Q = 250
-			// total dcr (base) fees, B = 400
-			// g = (pB + Q) / (B + 2L)
-			// g = (0.4*400 + 250) / (400 + 40e8) = 1.02e-7 // atomic units
-			// g = 10 // msg-rate units
-			exp: 10,
+			name:       "btc/usdc.eth",
+			basisPrice: calc.MessageRateAlt(43000, 1e8, 1e6),
+			mkt: &core.Market{
+				BaseID:  0,
+				QuoteID: 60001,
+				LotSize: 1e7,
+			},
+			buyFeesInBaseUnits:   1e6,
+			sellFeesInBaseUnits:  2e6,
+			buyFeesInQuoteUnits:  calc.BaseToQuote(calc.MessageRateAlt(43000, 1e8, 1e6), 1e6),
+			sellFeesInQuoteUnits: calc.BaseToQuote(calc.MessageRateAlt(43000, 1e8, 1e6), 2e6),
 		},
 	}
 
 	for _, tt := range tests {
-		tCore.sellSwapFees = tt.sellSwapFees
-		tCore.sellRedeemFees = tt.sellRedeemFees
-		tCore.buySwapFees = tt.buySwapFees
-		tCore.buyRedeemFees = tt.buyRedeemFees
-		tCore.singleLotFeesErr = tt.singleLotFeesErr
+		tCore := newTCore()
+		coreAdaptor := newTBotCoreAdaptor(tCore)
+		coreAdaptor.buyFeesInBase = tt.buyFeesInBaseUnits
+		coreAdaptor.sellFeesInBase = tt.sellFeesInBaseUnits
+		coreAdaptor.buyFeesInQuote = tt.buyFeesInQuoteUnits
+		coreAdaptor.sellFeesInQuote = tt.sellFeesInQuoteUnits
 
-		basicMM := &basicMarketMaker{
-			core: newTBotCoreAdaptor(tCore),
-			mkt:  mkt,
-			log:  log,
+		calculator := &basicMMCalculatorImpl{
+			core: coreAdaptor,
+			mkt:  tt.mkt,
+			log:  tLogger,
 		}
 
-		halfSpread, err := basicMM.halfSpread(tt.basisPrice)
+		halfSpread, err := calculator.halfSpread(tt.basisPrice)
 		if (err != nil) != tt.expErr {
 			t.Fatalf("expErr = %t, err = %v", tt.expErr, err)
 		}
-		if halfSpread != tt.exp {
-			t.Fatalf("%s: %d != %d", tt.name, halfSpread, tt.exp)
+		if tt.expErr {
+			continue
 		}
+
+		afterSell := calc.BaseToQuote(tt.basisPrice+halfSpread, tt.mkt.LotSize)
+		afterBuy := calc.QuoteToBase(tt.basisPrice-halfSpread, afterSell)
+		fees := afterBuy - tt.mkt.LotSize
+		expectedFees := tt.buyFeesInBaseUnits + tt.sellFeesInBaseUnits
+
+		if expectedFees > fees*10001/10000 || expectedFees < fees*9999/10000 {
+			t.Fatalf("%s: expected fees %d, got %d", tt.name, expectedFees, fees)
+		}
+
+	}
+}
+
+func TestBasicMMRebalance(t *testing.T) {
+	const basisPrice uint64 = 5e6
+	const halfSpread uint64 = 2e5
+	const rateStep uint64 = 1e3
+	const atomToConv float64 = 1
+
+	calculator := &tBasicMMCalculator{
+		bp: basisPrice,
+		hs: halfSpread,
+	}
+
+	type test struct {
+		name              string
+		strategy          GapStrategy
+		cfgBuyPlacements  []*OrderPlacement
+		cfgSellPlacements []*OrderPlacement
+
+		expBuyPlacements  []*multiTradePlacement
+		expSellPlacements []*multiTradePlacement
+	}
+	tests := []*test{
+		{
+			name:     "multiplier",
+			strategy: GapStrategyMultiplier,
+			cfgBuyPlacements: []*OrderPlacement{
+				{Lots: 1, GapFactor: 3},
+				{Lots: 2, GapFactor: 2},
+				{Lots: 3, GapFactor: 1},
+			},
+			cfgSellPlacements: []*OrderPlacement{
+				{Lots: 3, GapFactor: 1},
+				{Lots: 2, GapFactor: 2},
+				{Lots: 1, GapFactor: 3},
+			},
+			expBuyPlacements: []*multiTradePlacement{
+				{lots: 1, rate: steppedRate(basisPrice-3*halfSpread, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice-2*halfSpread, rateStep)},
+				{lots: 3, rate: steppedRate(basisPrice-1*halfSpread, rateStep)},
+			},
+			expSellPlacements: []*multiTradePlacement{
+				{lots: 3, rate: steppedRate(basisPrice+1*halfSpread, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice+2*halfSpread, rateStep)},
+				{lots: 1, rate: steppedRate(basisPrice+3*halfSpread, rateStep)},
+			},
+		},
+		{
+			name:     "percent",
+			strategy: GapStrategyPercent,
+			cfgBuyPlacements: []*OrderPlacement{
+				{Lots: 1, GapFactor: 0.05},
+				{Lots: 2, GapFactor: 0.1},
+				{Lots: 3, GapFactor: 0.15},
+			},
+			cfgSellPlacements: []*OrderPlacement{
+				{Lots: 3, GapFactor: 0.15},
+				{Lots: 2, GapFactor: 0.1},
+				{Lots: 1, GapFactor: 0.05},
+			},
+			expBuyPlacements: []*multiTradePlacement{
+				{lots: 1, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{lots: 3, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+			},
+			expSellPlacements: []*multiTradePlacement{
+				{lots: 3, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{lots: 1, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+			},
+		},
+		{
+			name:     "percent-plus",
+			strategy: GapStrategyPercentPlus,
+			cfgBuyPlacements: []*OrderPlacement{
+				{Lots: 1, GapFactor: 0.05},
+				{Lots: 2, GapFactor: 0.1},
+				{Lots: 3, GapFactor: 0.15},
+			},
+			cfgSellPlacements: []*OrderPlacement{
+				{Lots: 3, GapFactor: 0.15},
+				{Lots: 2, GapFactor: 0.1},
+				{Lots: 1, GapFactor: 0.05},
+			},
+			expBuyPlacements: []*multiTradePlacement{
+				{lots: 1, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{lots: 3, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+			},
+			expSellPlacements: []*multiTradePlacement{
+				{lots: 3, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{lots: 1, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+			},
+		},
+		{
+			name:     "absolute",
+			strategy: GapStrategyAbsolute,
+			cfgBuyPlacements: []*OrderPlacement{
+				{Lots: 1, GapFactor: .01},
+				{Lots: 2, GapFactor: .03},
+				{Lots: 3, GapFactor: .06},
+			},
+			cfgSellPlacements: []*OrderPlacement{
+				{Lots: 3, GapFactor: .06},
+				{Lots: 2, GapFactor: .03},
+				{Lots: 1, GapFactor: .01},
+			},
+			expBuyPlacements: []*multiTradePlacement{
+				{lots: 1, rate: steppedRate(basisPrice-1e6, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice-3e6, rateStep)},
+				{lots: 0, rate: 0}, // 5e6 - 6e6 < 0
+			},
+			expSellPlacements: []*multiTradePlacement{
+				{lots: 3, rate: steppedRate(basisPrice+6e6, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice+3e6, rateStep)},
+				{lots: 1, rate: steppedRate(basisPrice+1e6, rateStep)},
+			},
+		},
+		{
+			name:     "absolute-plus",
+			strategy: GapStrategyAbsolutePlus,
+			cfgBuyPlacements: []*OrderPlacement{
+				{Lots: 1, GapFactor: .01},
+				{Lots: 2, GapFactor: .03},
+				{Lots: 3, GapFactor: .06},
+			},
+			cfgSellPlacements: []*OrderPlacement{
+				{Lots: 3, GapFactor: .06},
+				{Lots: 2, GapFactor: .03},
+				{Lots: 1, GapFactor: .01},
+			},
+			expBuyPlacements: []*multiTradePlacement{
+				{lots: 1, rate: steppedRate(basisPrice-halfSpread-1e6, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice-halfSpread-3e6, rateStep)},
+				{lots: 0, rate: 0},
+			},
+			expSellPlacements: []*multiTradePlacement{
+				{lots: 3, rate: steppedRate(basisPrice+halfSpread+6e6, rateStep)},
+				{lots: 2, rate: steppedRate(basisPrice+halfSpread+3e6, rateStep)},
+				{lots: 1, rate: steppedRate(basisPrice+halfSpread+1e6, rateStep)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adaptor := newTBotCoreAdaptor(newTCore())
+			cfg := &BasicMarketMakingConfig{
+				GapStrategy:    tt.strategy,
+				BuyPlacements:  tt.cfgBuyPlacements,
+				SellPlacements: tt.cfgSellPlacements,
+			}
+			mm := &basicMarketMaker{
+				cfg:        cfg,
+				calculator: calculator,
+				core:       adaptor,
+				log:        tLogger,
+				mkt: &core.Market{
+					RateStep:   rateStep,
+					AtomToConv: atomToConv,
+				},
+			}
+
+			mm.rebalance(100)
+
+			if !reflect.DeepEqual(tt.expBuyPlacements, adaptor.lastMultiTradeBuys) {
+				t.Fatal(spew.Sprintf("expected buy placements:\n%#+v\ngot:\n%#+v", tt.expBuyPlacements, adaptor.lastMultiTradeBuys))
+			}
+			if !reflect.DeepEqual(tt.expSellPlacements, adaptor.lastMultiTradeSells) {
+				t.Fatal(spew.Sprintf("expected sell placements:\n%#+v\ngot:\n%#+v", tt.expSellPlacements, adaptor.lastMultiTradeSells))
+			}
+		})
 	}
 }

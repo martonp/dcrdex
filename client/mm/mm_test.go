@@ -16,130 +16,15 @@ import (
 	"decred.org/dcrdex/client/orderbook"
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/order"
-)
 
-var (
-	tUTXOAssetA = &dex.Asset{
-		ID:           42,
-		Symbol:       "dcr",
-		Version:      0, // match the stubbed (*TXCWallet).Info result
-		SwapSize:     251,
-		SwapSizeBase: 85,
-		RedeemSize:   200,
-		MaxFeeRate:   10,
-		SwapConf:     1,
-	}
-
-	tUTXOAssetB = &dex.Asset{
-		ID:           0,
-		Symbol:       "btc",
-		Version:      0, // match the stubbed (*TXCWallet).Info result
-		SwapSize:     225,
-		SwapSizeBase: 76,
-		RedeemSize:   260,
-		MaxFeeRate:   2,
-		SwapConf:     1,
-	}
-
-	tACCTAsset = &dex.Asset{
-		ID:           60,
-		Symbol:       "eth",
-		Version:      0, // match the stubbed (*TXCWallet).Info result
-		SwapSize:     135000,
-		SwapSizeBase: 135000,
-		RedeemSize:   68000,
-		MaxFeeRate:   20,
-		SwapConf:     1,
-	}
-
-	tACCTAssetB = &dex.Asset{
-		ID:           966,
-		Symbol:       "polygon",
-		Version:      0, // match the stubbed (*TXCWallet).Info result
-		SwapSize:     135000,
-		SwapSizeBase: 135000,
-		RedeemSize:   68000,
-		MaxFeeRate:   20,
-		SwapConf:     1,
-	}
-
-	tWalletInfo = &asset.WalletInfo{
-		Version:           0,
-		SupportedVersions: []uint32{0},
-		UnitInfo: dex.UnitInfo{
-			Conventional: dex.Denomination{
-				ConversionFactor: 1e8,
-			},
-		},
-		AvailableWallets: []*asset.WalletDefinition{{
-			Type: "type",
-		}},
-	}
+	_ "decred.org/dcrdex/client/asset/btc"     // register btc asset
+	_ "decred.org/dcrdex/client/asset/dcr"     // register dcr asset
+	_ "decred.org/dcrdex/client/asset/eth"     // register eth asset
+	_ "decred.org/dcrdex/client/asset/polygon" // register polygon asset
 )
 
 func init() {
-	asset.Register(tUTXOAssetA.ID, &tDriver{
-		decodedCoinID: tUTXOAssetA.Symbol + "-coin",
-		winfo:         tWalletInfo,
-	})
-	asset.Register(tUTXOAssetB.ID, &tCreator{
-		tDriver: &tDriver{
-			decodedCoinID: tUTXOAssetB.Symbol + "-coin",
-			winfo:         tWalletInfo,
-		},
-	})
-	asset.Register(tACCTAsset.ID, &tCreator{
-		tDriver: &tDriver{
-			decodedCoinID: tACCTAsset.Symbol + "-coin",
-			winfo:         tWalletInfo,
-		},
-	})
-	asset.Register(tACCTAssetB.ID, &tCreator{
-		tDriver: &tDriver{
-			decodedCoinID: tACCTAssetB.Symbol + "-coin",
-			winfo:         tWalletInfo,
-		},
-	})
-	asset.RegisterToken(60001, &dex.Token{
-		ParentID: 60,
-	}, &asset.WalletDefinition{}, nil)
-	asset.RegisterToken(966001, &dex.Token{
-		ParentID: 966,
-	}, nil, nil)
 	rand.Seed(time.Now().UnixNano())
-}
-
-type tCreator struct {
-	*tDriver
-	doesntExist bool
-	existsErr   error
-	createErr   error
-}
-
-func (ctr *tCreator) Exists(walletType, dataDir string, settings map[string]string, net dex.Network) (bool, error) {
-	return !ctr.doesntExist, ctr.existsErr
-}
-
-func (ctr *tCreator) Create(*asset.CreateWalletParams) error {
-	return ctr.createErr
-}
-
-type tDriver struct {
-	wallet        asset.Wallet
-	decodedCoinID string
-	winfo         *asset.WalletInfo
-}
-
-func (drv *tDriver) Open(cfg *asset.WalletConfig, logger dex.Logger, net dex.Network) (asset.Wallet, error) {
-	return drv.wallet, nil
-}
-
-func (drv *tDriver) DecodeCoinID(coinID []byte) (string, error) {
-	return drv.decodedCoinID, nil
-}
-
-func (drv *tDriver) Info() *asset.WalletInfo {
-	return drv.winfo
 }
 
 type tBookFeed struct {
@@ -183,25 +68,14 @@ type tCore struct {
 	assetBalances     map[uint32]*core.WalletBalance
 	assetBalanceErr   error
 	market            *core.Market
-	orderEstimate     *core.OrderEstimate
-	sellSwapFees      uint64
-	sellRedeemFees    uint64
-	sellRefundFees    uint64
-	buySwapFees       uint64
-	buyRedeemFees     uint64
-	buyRefundFees     uint64
+	singleLotSellFees *orderFees
+	singleLotBuyFees  *orderFees
 	singleLotFeesErr  error
-	preOrderParam     *core.TradeForm
-	tradeResult       *core.Order
 	multiTradeResult  []*core.Order
 	noteFeed          chan core.Notification
 	isAccountLocker   map[uint32]bool
 	isWithdrawer      map[uint32]bool
 	isDynamicSwapper  map[uint32]bool
-	maxBuyEstimate    *core.MaxOrderEstimate
-	maxBuyErr         error
-	maxSellEstimate   *core.MaxOrderEstimate
-	maxSellErr        error
 	cancelsPlaced     []dex.Bytes
 	buysPlaced        []*core.TradeForm
 	sellsPlaced       []*core.TradeForm
@@ -215,6 +89,7 @@ type tCore struct {
 	orders            map[order.OrderID]*core.Order
 	walletTxsMtx      sync.Mutex
 	walletTxs         map[string]*asset.WalletTransaction
+	fiatRates         map[uint32]float64
 }
 
 func newTCore() *tCore {
@@ -225,8 +100,6 @@ func newTCore() *tCore {
 		isWithdrawer:     make(map[uint32]bool),
 		isDynamicSwapper: make(map[uint32]bool),
 		cancelsPlaced:    make([]dex.Bytes, 0),
-		buysPlaced:       make([]*core.TradeForm, 0),
-		sellsPlaced:      make([]*core.TradeForm, 0),
 		bookFeed: &tBookFeed{
 			c: make(chan *core.BookUpdate, 1),
 		},
@@ -253,33 +126,21 @@ func (c *tCore) SingleLotFees(form *core.SingleLotFeesForm) (uint64, uint64, uin
 	if c.singleLotFeesErr != nil {
 		return 0, 0, 0, c.singleLotFeesErr
 	}
-	if form.Sell {
-		return c.sellSwapFees, c.sellRedeemFees, c.sellRefundFees, nil
+	if c.singleLotSellFees == nil && c.singleLotBuyFees == nil {
+		return 0, 0, 0, fmt.Errorf("no fees set")
 	}
-	return c.buySwapFees, c.buyRedeemFees, c.buyRefundFees, nil
+
+	if form.Sell {
+		return c.singleLotSellFees.swap, c.singleLotSellFees.redemption, c.singleLotSellFees.refund, nil
+	}
+	return c.singleLotBuyFees.swap, c.singleLotBuyFees.redemption, c.singleLotBuyFees.refund, nil
 }
 func (c *tCore) Cancel(oidB dex.Bytes) error {
 	c.cancelsPlaced = append(c.cancelsPlaced, oidB)
 	return nil
 }
-func (c *tCore) MaxBuy(host string, base, quote uint32, rate uint64) (*core.MaxOrderEstimate, error) {
-	if c.maxBuyErr != nil {
-		return nil, c.maxBuyErr
-	}
-	return c.maxBuyEstimate, nil
-}
-func (c *tCore) MaxSell(host string, base, quote uint32) (*core.MaxOrderEstimate, error) {
-	if c.maxSellErr != nil {
-		return nil, c.maxSellErr
-	}
-	return c.maxSellEstimate, nil
-}
 func (c *tCore) AssetBalance(assetID uint32) (*core.WalletBalance, error) {
 	return c.assetBalances[assetID], c.assetBalanceErr
-}
-func (c *tCore) PreOrder(form *core.TradeForm) (*core.OrderEstimate, error) {
-	c.preOrderParam = form
-	return c.orderEstimate, nil
 }
 func (c *tCore) MultiTrade(pw []byte, forms *core.MultiTradeForm) ([]*core.Order, error) {
 	c.multiTradesPlaced = append(c.multiTradesPlaced, forms)
@@ -325,7 +186,7 @@ func (c *tCore) WalletTransaction(assetID uint32, txID string) (*asset.WalletTra
 
 func (c *tCore) Broadcast(core.Notification) {}
 func (c *tCore) FiatConversionRates() map[uint32]float64 {
-	return nil
+	return c.fiatRates
 }
 
 func (c *tCore) Send(pw []byte, assetID uint32, value uint64, address string, subtract bool) (asset.Coin, error) {
@@ -362,16 +223,38 @@ func (c *tCore) setAssetBalances(balances map[uint32]uint64) {
 	}
 }
 
+type dexOrder struct {
+	rate uint64
+	qty  uint64
+	sell bool
+}
+
 type tBotCoreAdaptor struct {
 	clientCore
 	tCore *tCore
 
-	balances     map[uint32]*botBalance
-	groupedBuys  map[uint64][]*core.Order
-	groupedSells map[uint64][]*core.Order
-	orderUpdates chan *core.Order
-	buyFees      *orderFees
-	sellFees     *orderFees
+	balances            map[uint32]*botBalance
+	groupedBuys         map[uint64][]*core.Order
+	groupedSells        map[uint64][]*core.Order
+	orderUpdates        chan *core.Order
+	buyFees             *orderFees
+	sellFees            *orderFees
+	fiatExchangeRate    uint64
+	buyFeesInBase       uint64
+	sellFeesInBase      uint64
+	buyFeesInQuote      uint64
+	sellFeesInQuote     uint64
+	lastMultiTradeSells []*multiTradePlacement
+	lastMultiTradeBuys  []*multiTradePlacement
+	multiTradeResults   [][]*core.Order
+	sellsDEXReserves    map[uint32]uint64
+	sellsCEXReserves    map[uint32]uint64
+	buysDEXReserves     map[uint32]uint64
+	buysCEXReserves     map[uint32]uint64
+	maxBuyQty           uint64
+	maxSellQty          uint64
+	lastTradePlaced     *dexOrder
+	tradeResult         *core.Order
 }
 
 func (c *tBotCoreAdaptor) DEXBalance(assetID uint32) (*botBalance, error) {
@@ -381,19 +264,14 @@ func (c *tBotCoreAdaptor) DEXBalance(assetID uint32) (*botBalance, error) {
 	return c.balances[assetID], nil
 }
 
-func (c *tBotCoreAdaptor) MultiTrade(form *multiTradeForm) ([]*core.Order, error) {
-	c.tCore.multiTradesPlaced = append(c.tCore.multiTradesPlaced, form.toCore())
-	return c.tCore.multiTradeResult, nil
-}
-
 func (c *tBotCoreAdaptor) GroupedBookedOrders() (buys, sells map[uint64][]*core.Order) {
 	return c.groupedBuys, c.groupedSells
 }
 
 func (c *tBotCoreAdaptor) CancelAllOrders() bool { return false }
 
-func (c *tBotCoreAdaptor) FiatRate(assetID uint32) float64 {
-	return 0
+func (c *tBotCoreAdaptor) ExchangeRateFromFiatSources() uint64 {
+	return c.fiatExchangeRate
 }
 
 func (c *tBotCoreAdaptor) OrderFees() (buyFees, sellFees *orderFees, err error) {
@@ -404,11 +282,66 @@ func (c *tBotCoreAdaptor) SubscribeOrderUpdates() (updates <-chan *core.Order) {
 	return c.orderUpdates
 }
 
+func (c *tBotCoreAdaptor) OrderFeesInUnits(sell, base bool, rate uint64) (uint64, error) {
+	if sell && base {
+		return c.sellFeesInBase, nil
+	}
+	if sell && !base {
+		return c.sellFeesInQuote, nil
+	}
+	if !sell && base {
+		return c.buyFeesInBase, nil
+	}
+	return c.buyFeesInQuote, nil
+}
+
+func (c *tBotCoreAdaptor) SufficientBalanceForDEXTrade(rate, qty uint64, sell bool) (bool, error) {
+	if sell {
+		return qty <= c.maxSellQty, nil
+	}
+	return qty <= c.maxBuyQty, nil
+}
+
+func (c *tBotCoreAdaptor) MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) []*order.OrderID {
+	if sell {
+		c.lastMultiTradeSells = placements
+		for assetID, reserve := range cexReserves {
+			c.sellsCEXReserves[assetID] = reserve
+		}
+		for assetID, reserve := range dexReserves {
+			c.sellsDEXReserves[assetID] = reserve
+		}
+	} else {
+		c.lastMultiTradeBuys = placements
+		for assetID, reserve := range cexReserves {
+			c.buysCEXReserves[assetID] = reserve
+		}
+		for assetID, reserve := range dexReserves {
+			c.buysDEXReserves[assetID] = reserve
+		}
+	}
+	return nil
+}
+
+func (c *tBotCoreAdaptor) DEXTrade(rate, qty uint64, sell bool) (*core.Order, error) {
+	c.lastTradePlaced = &dexOrder{
+		rate: rate,
+		qty:  qty,
+		sell: sell,
+	}
+	return c.tradeResult, nil
+}
+
 func newTBotCoreAdaptor(c *tCore) *tBotCoreAdaptor {
 	return &tBotCoreAdaptor{
-		clientCore:   c,
-		tCore:        c,
-		orderUpdates: make(chan *core.Order),
+		clientCore:        c,
+		tCore:             c,
+		orderUpdates:      make(chan *core.Order),
+		multiTradeResults: make([][]*core.Order, 0),
+		buysCEXReserves:   make(map[uint32]uint64),
+		buysDEXReserves:   make(map[uint32]uint64),
+		sellsCEXReserves:  make(map[uint32]uint64),
+		sellsDEXReserves:  make(map[uint32]uint64),
 	}
 }
 
@@ -1292,11 +1225,6 @@ type vwapResult struct {
 	extrema uint64
 }
 
-type dexOrder struct {
-	lots, rate uint64
-	sell       bool
-}
-
 type withdrawArgs struct {
 	address string
 	amt     uint64
@@ -1436,31 +1364,39 @@ func (c *tCEX) ConfirmDeposit(ctx context.Context, txID string, onConfirm func(b
 	}()
 }
 
+type prepareRebalanceResult struct {
+	rebalance   int64
+	cexReserves uint64
+	dexReserves uint64
+}
+
 type tBotCexAdaptor struct {
-	bidsVWAP         map[uint64]*vwapResult
-	asksVWAP         map[uint64]*vwapResult
-	vwapErr          error
-	balances         map[uint32]*botBalance
-	balanceErr       error
-	tradeID          string
-	tradeErr         error
-	lastTrade        *libxc.Trade
-	cancelledTrades  []string
-	cancelTradeErr   error
-	tradeUpdates     chan *libxc.Trade
-	lastWithdrawArgs *withdrawArgs
-	lastDepositArgs  *withdrawArgs
-	confirmDeposit   func()
-	confirmWithdraw  func()
+	bidsVWAP                map[uint64]*vwapResult
+	asksVWAP                map[uint64]*vwapResult
+	vwapErr                 error
+	balances                map[uint32]*botBalance
+	balanceErr              error
+	tradeID                 string
+	tradeErr                error
+	lastTrade               *libxc.Trade
+	cancelledTrades         []string
+	cancelTradeErr          error
+	tradeUpdates            chan *libxc.Trade
+	lastWithdrawArgs        *withdrawArgs
+	lastDepositArgs         *withdrawArgs
+	prepareRebalanceResults map[uint32]*prepareRebalanceResult
+	maxBuyQty               uint64
+	maxSellQty              uint64
 }
 
 func newTBotCEXAdaptor() *tBotCexAdaptor {
 	return &tBotCexAdaptor{
-		bidsVWAP:        make(map[uint64]*vwapResult),
-		asksVWAP:        make(map[uint64]*vwapResult),
-		balances:        make(map[uint32]*botBalance),
-		cancelledTrades: make([]string, 0),
-		tradeUpdates:    make(chan *libxc.Trade),
+		bidsVWAP:                make(map[uint64]*vwapResult),
+		asksVWAP:                make(map[uint64]*vwapResult),
+		balances:                make(map[uint32]*botBalance),
+		cancelledTrades:         make([]string, 0),
+		tradeUpdates:            make(chan *libxc.Trade),
+		prepareRebalanceResults: make(map[uint32]*prepareRebalanceResult),
 	}
 }
 
@@ -1484,7 +1420,7 @@ func (c *tBotCexAdaptor) SubscribeMarket(ctx context.Context, baseID, quoteID ui
 func (c *tBotCexAdaptor) SubscribeTradeUpdates() (updates <-chan *libxc.Trade, unsubscribe func()) {
 	return c.tradeUpdates, func() {}
 }
-func (c *tBotCexAdaptor) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64) (*libxc.Trade, error) {
+func (c *tBotCexAdaptor) CEXTrade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64) (*libxc.Trade, error) {
 	if c.tradeErr != nil {
 		return nil, c.tradeErr
 	}
@@ -1499,6 +1435,9 @@ func (c *tBotCexAdaptor) Trade(ctx context.Context, baseID, quoteID uint32, sell
 	}
 	return c.lastTrade, nil
 }
+func (c *tBotCexAdaptor) FreeUpFunds(assetID uint32, cex bool, amt uint64, currEpoch uint64) {
+}
+
 func (c *tBotCexAdaptor) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
 	if c.vwapErr != nil {
 		return 0, 0, false, c.vwapErr
@@ -1518,19 +1457,28 @@ func (c *tBotCexAdaptor) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vw
 	}
 	return res.avg, res.extrema, true, nil
 }
-func (c *tBotCexAdaptor) Deposit(ctx context.Context, assetID uint32, amount uint64, onConfirm func()) error {
+func (c *tBotCexAdaptor) Deposit(ctx context.Context, assetID uint32, amount uint64) error {
 	c.lastDepositArgs = &withdrawArgs{
 		assetID: assetID,
 		amt:     amount,
 	}
-	c.confirmDeposit = onConfirm
 	return nil
 }
-func (c *tBotCexAdaptor) Withdraw(ctx context.Context, assetID uint32, amount uint64, onConfirm func()) error {
+func (c *tBotCexAdaptor) Withdraw(ctx context.Context, assetID uint32, amount uint64) error {
 	c.lastWithdrawArgs = &withdrawArgs{
 		assetID: assetID,
 		amt:     amount,
 	}
-	c.confirmWithdraw = onConfirm
 	return nil
+}
+func (c *tBotCexAdaptor) SufficientBalanceForCEXTrade(baseID, quoteID uint32, sell bool, rate, qty uint64) (bool, error) {
+	if sell {
+		return qty <= c.maxSellQty, nil
+	}
+	return qty <= c.maxBuyQty, nil
+}
+
+func (c *tBotCexAdaptor) PrepareRebalance(ctx context.Context, assetID uint32) (rebalance int64, dexReserves, cexReserves uint64) {
+	res := c.prepareRebalanceResults[assetID]
+	return res.rebalance, res.dexReserves, res.cexReserves
 }

@@ -29,10 +29,7 @@ type clientCore interface {
 	SupportedAssets() map[uint32]*core.SupportedAsset
 	SingleLotFees(form *core.SingleLotFeesForm) (uint64, uint64, uint64, error)
 	Cancel(oidB dex.Bytes) error
-	MaxBuy(host string, base, quote uint32, rate uint64) (*core.MaxOrderEstimate, error)
-	MaxSell(host string, base, quote uint32) (*core.MaxOrderEstimate, error)
 	AssetBalance(assetID uint32) (*core.WalletBalance, error)
-	PreOrder(form *core.TradeForm) (*core.OrderEstimate, error)
 	WalletState(assetID uint32) *core.WalletState
 	MultiTrade(pw []byte, form *core.MultiTradeForm) ([]*core.Order, error)
 	MaxFundingFees(fromAsset uint32, host string, numTrades uint32, fromSettings map[string]string) (uint64, error)
@@ -619,8 +616,8 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 					cex:                nil,
 					maxBuyPlacements:   uint32(len(cfg.BasicMMConfig.BuyPlacements)),
 					maxSellPlacements:  uint32(len(cfg.BasicMMConfig.SellPlacements)),
-					baseWalletOptions:  cfg.BasicMMConfig.BaseOptions,
-					quoteWalletOptions: cfg.BasicMMConfig.QuoteOptions,
+					baseWalletOptions:  cfg.BaseWalletOptions,
+					quoteWalletOptions: cfg.QuoteWalletOptions,
 					log:                logger,
 				})
 				exchangeAdaptor.run(ctx)
@@ -656,8 +653,9 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 					cex:                cex,
 					maxBuyPlacements:   1,
 					maxSellPlacements:  1,
-					baseWalletOptions:  cfg.SimpleArbConfig.BaseOptions,
-					quoteWalletOptions: cfg.SimpleArbConfig.QuoteOptions,
+					baseWalletOptions:  cfg.BaseWalletOptions,
+					quoteWalletOptions: cfg.QuoteWalletOptions,
+					rebalanceCfg:       cfg.CEXCfg.AutoRebalance,
 					log:                logger,
 				})
 				exchangeAdaptor.run(ctx)
@@ -693,8 +691,9 @@ func (m *MarketMaker) Run(ctx context.Context, pw []byte, alternateConfigPath *s
 					cex:                cex,
 					maxBuyPlacements:   uint32(len(cfg.ArbMarketMakerConfig.BuyPlacements)),
 					maxSellPlacements:  uint32(len(cfg.ArbMarketMakerConfig.SellPlacements)),
-					baseWalletOptions:  cfg.ArbMarketMakerConfig.BaseOptions,
-					quoteWalletOptions: cfg.ArbMarketMakerConfig.QuoteOptions,
+					baseWalletOptions:  cfg.BaseWalletOptions,
+					quoteWalletOptions: cfg.QuoteWalletOptions,
+					rebalanceCfg:       cfg.CEXCfg.AutoRebalance,
 					log:                logger,
 				})
 				exchangeAdaptor.run(ctx)

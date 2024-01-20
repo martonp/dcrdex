@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -16,512 +17,1400 @@ import (
 	"decred.org/dcrdex/dex/calc"
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/order"
+	"github.com/davecgh/go-spew/spew"
 )
 
-func TestMaxSell(t *testing.T) {
-	tCore := newTCore()
-	tCore.isAccountLocker[60] = true
-	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
-	dcrEthID := fmt.Sprintf("%s-%d-%d", "host1", 42, 60)
-
-	// Whatever is returned from PreOrder is returned from this function.
-	// What we need to test is what is passed to PreOrder.
-	orderEstimate := &core.OrderEstimate{
-		Swap: &asset.PreSwap{
-			Estimate: &asset.SwapEstimate{
-				Lots:               5,
-				Value:              5e8,
-				MaxFees:            1600,
-				RealisticWorstCase: 12010,
-				RealisticBestCase:  6008,
-			},
-		},
-		Redeem: &asset.PreRedeem{
-			Estimate: &asset.RedeemEstimate{
-				RealisticBestCase:  2800,
-				RealisticWorstCase: 6500,
-			},
-		},
+func TestSufficientBalanceForDEXTrade(t *testing.T) {
+	lotSize := uint64(1e8)
+	sellFees := &orderFees{
+		swap:       1e5,
+		redemption: 2e5,
+		refund:     3e5,
 	}
-	tCore.orderEstimate = orderEstimate
-
-	expectedResult := &core.MaxOrderEstimate{
-		Swap: &asset.SwapEstimate{
-			Lots:               5,
-			Value:              5e8,
-			MaxFees:            1600,
-			RealisticWorstCase: 12010,
-			RealisticBestCase:  6008,
-		},
-		Redeem: &asset.RedeemEstimate{
-			RealisticBestCase:  2800,
-			RealisticWorstCase: 6500,
-		},
+	buyFees := &orderFees{
+		swap:       5e5,
+		redemption: 6e5,
+		refund:     7e5,
 	}
 
-	tests := []struct {
-		name          string
-		assetBalances map[uint32]uint64
-		market        *core.Market
-		swapFees      uint64
-		redeemFees    uint64
-		refundFees    uint64
+	fundingFees := uint64(8e5)
 
-		expectPreOrderParam *core.TradeForm
-		wantErr             bool
-	}{
+	type test struct {
+		name            string
+		baseID, quoteID uint32
+		balances        map[uint32]uint64
+		isAccountLocker map[uint32]bool
+		sell            bool
+		rate, qty       uint64
+	}
+
+	b2q := calc.BaseToQuote
+
+	tests := []*test{
 		{
-			name: "ok",
-			assetBalances: map[uint32]uint64{
-				0:  5e6,
-				42: 5e6,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    true,
-				Qty:     4 * 1e6,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-		},
-		{
-			name: "1 lot",
-			assetBalances: map[uint32]uint64{
-				42: 1e6 + 1000,
-				0:  1000,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    true,
-				Qty:     1e6,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-		},
-		{
-			name: "not enough for 1 swap",
-			assetBalances: map[uint32]uint64{
-				0:  1e6 + 999,
-				42: 1000,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			wantErr:    true,
-		},
-		{
-			name: "not enough for 1 lot of redeem fees",
-			assetBalances: map[uint32]uint64{
-				42: 1e6 + 1000,
-				60: 999,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 60,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			wantErr:    true,
-		},
-		{
-			name: "redeem fees don't matter if not account locker",
-			assetBalances: map[uint32]uint64{
-				42: 1e6 + 1000,
-				0:  999,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    true,
-				Qty:     1e6,
+			name:    "sell, non account locker",
+			baseID:  42,
+			quoteID: 0,
+			sell:    true,
+			rate:    1e7,
+			qty:     3 * lotSize,
+			balances: map[uint32]uint64{
+				42: 3*lotSize + 3*sellFees.swap + fundingFees,
+				0:  0,
 			},
 		},
 		{
-			name: "2 lots with refund fees, not account locker",
-			assetBalances: map[uint32]uint64{
-				42: 2e6 + 2000,
-				0:  1000,
+			name:    "buy, non account locker",
+			baseID:  42,
+			quoteID: 0,
+			rate:    2e7,
+			qty:     2 * lotSize,
+			sell:    false,
+			balances: map[uint32]uint64{
+				42: 0,
+				0:  b2q(2e7, 2*lotSize) + 2*buyFees.swap + fundingFees,
 			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    true,
-				Qty:     2e6,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			refundFees: 1000,
 		},
 		{
-			name: "1 lot with refund fees, account locker",
-			assetBalances: map[uint32]uint64{
-				60: 1000,
-				42: 2e6 + 2000,
+			name:    "sell, account locker/token",
+			baseID:  966001,
+			quoteID: 60,
+			sell:    true,
+			rate:    2e7,
+			qty:     3 * lotSize,
+			isAccountLocker: map[uint32]bool{
+				966001: true,
+				966:    true,
+				60:     true,
 			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 60,
+			balances: map[uint32]uint64{
+				966001: 3 * lotSize,
+				966:    3*sellFees.swap + 3*sellFees.refund + fundingFees,
+				60:     3 * sellFees.redemption,
 			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   60,
-				Sell:    true,
-				Qty:     1e6,
+		},
+		{
+			name:    "buy, account locker/token",
+			baseID:  966001,
+			quoteID: 60,
+			sell:    false,
+			rate:    2e7,
+			qty:     3 * lotSize,
+			isAccountLocker: map[uint32]bool{
+				966001: true,
+				966:    true,
+				60:     true,
 			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			refundFees: 1000,
+			balances: map[uint32]uint64{
+				966: 3 * buyFees.redemption,
+				60:  b2q(2e7, 3*lotSize) + 3*buyFees.swap + 3*buyFees.refund + fundingFees,
+			},
 		},
 	}
 
 	for _, test := range tests {
-		tCore.setAssetBalances(test.assetBalances)
-		tCore.market = test.market
-		tCore.sellSwapFees = test.swapFees
-		tCore.sellRedeemFees = test.redeemFees
-		tCore.sellRefundFees = test.refundFees
-		tCore.isAccountLocker[60] = true
+		t.Run(test.name, func(t *testing.T) {
+			tCore := newTCore()
+			tCore.singleLotSellFees = sellFees
+			tCore.singleLotBuyFees = buyFees
+			tCore.maxFundingFees = fundingFees
 
-		botID := dcrBtcID
-		if test.market.QuoteID == 60 {
-			botID = dcrEthID
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
-			botID:           botID,
-			core:            tCore,
-			baseDexBalances: test.assetBalances,
-			log:             tLogger,
-			market: &MarketWithHost{
-				Host:    "host1",
-				BaseID:  42,
-				QuoteID: 0,
-			},
-		})
-		adaptor.run(ctx)
-		res, err := adaptor.MaxSell("host1", test.market.BaseID, test.market.QuoteID)
-		if test.wantErr {
-			if err == nil {
-				t.Fatalf("%s: expected error but did not get", test.name)
+			tCore.market = &core.Market{
+				BaseID:  test.baseID,
+				QuoteID: test.quoteID,
+				LotSize: lotSize,
 			}
-			continue
-		}
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
+			mkt := &MarketWithHost{
+				BaseID:  test.baseID,
+				QuoteID: test.quoteID,
+			}
 
-		if !reflect.DeepEqual(tCore.preOrderParam, test.expectPreOrderParam) {
-			t.Fatalf("%s: expected pre order param %+v != actual %+v", test.name, test.expectPreOrderParam, tCore.preOrderParam)
-		}
+			tCore.isAccountLocker = test.isAccountLocker
 
-		if !reflect.DeepEqual(res, expectedResult) {
-			t.Fatalf("%s: expected max sell result %+v != actual %+v", test.name, expectedResult, res)
-		}
+			checkBalanceSufficient := func(expSufficient bool) {
+				t.Helper()
+				adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+					core:            tCore,
+					baseDexBalances: test.balances,
+					market:          mkt,
+					log:             tLogger,
+				})
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				adaptor.run(ctx)
+				sufficient, err := adaptor.SufficientBalanceForDEXTrade(test.rate, test.qty, test.sell)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if sufficient != expSufficient {
+					t.Fatalf("expected sufficient=%v, got %v", expSufficient, sufficient)
+				}
+			}
+
+			checkBalanceSufficient(true)
+
+			for assetID, bal := range test.balances {
+				if bal == 0 {
+					continue
+				}
+				test.balances[assetID]--
+				checkBalanceSufficient(false)
+				test.balances[assetID]++
+			}
+		})
 	}
 }
 
-func TestMaxBuy(t *testing.T) {
-	tCore := newTCore()
+func TestSufficientBalanceForCEXTrade(t *testing.T) {
+	const baseID uint32 = 42
+	const quoteID uint32 = 0
 
-	tCore.isAccountLocker[60] = true
-	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
-	ethBtcID := fmt.Sprintf("%s-%d-%d", "host1", 60, 0)
-
-	// Whatever is returned from PreOrder is returned from this function.
-	// What we need to test is what is passed to PreOrder.
-	orderEstimate := &core.OrderEstimate{
-		Swap: &asset.PreSwap{
-			Estimate: &asset.SwapEstimate{
-				Lots:               5,
-				Value:              5e8,
-				MaxFees:            1600,
-				RealisticWorstCase: 12010,
-				RealisticBestCase:  6008,
-			},
-		},
-		Redeem: &asset.PreRedeem{
-			Estimate: &asset.RedeemEstimate{
-				RealisticBestCase:  2800,
-				RealisticWorstCase: 6500,
-			},
-		},
-	}
-	tCore.orderEstimate = orderEstimate
-
-	expectedResult := &core.MaxOrderEstimate{
-		Swap: &asset.SwapEstimate{
-			Lots:               5,
-			Value:              5e8,
-			MaxFees:            1600,
-			RealisticWorstCase: 12010,
-			RealisticBestCase:  6008,
-		},
-		Redeem: &asset.RedeemEstimate{
-			RealisticBestCase:  2800,
-			RealisticWorstCase: 6500,
-		},
-	}
-
-	tests := []struct {
+	type test struct {
 		name        string
-		dexBalances map[uint32]uint64
-		market      *core.Market
-		rate        uint64
-		swapFees    uint64
-		redeemFees  uint64
-		refundFees  uint64
+		cexBalances map[uint32]uint64
+		sell        bool
+		rate, qty   uint64
+	}
 
-		expectPreOrderParam *core.TradeForm
-		wantErr             bool
-	}{
+	tests := []*test{
 		{
-			name: "ok",
+			name: "sell",
+			sell: true,
 			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  5e6,
-				42: 5e6,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    false,
-				Rate:    5e7,
-				Qty:     9 * 1e6,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-		},
-		{
-			name: "1 lot",
-			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				42: 1000,
-				0:  calc.BaseToQuote(5e7, 1e6) + 1000,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    false,
-				Qty:     1e6,
-				Rate:    5e7,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-		},
-		{
-			name: "not enough for 1 swap",
-			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  1000,
-				42: calc.BaseToQuote(5e7, 1e6) + 999,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			wantErr:    true,
-		},
-		{
-			name: "not enough for 1 lot of redeem fees",
-			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  calc.BaseToQuote(5e7, 1e6) + 1000,
-				60: 999,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  60,
-				QuoteID: 0,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			wantErr:    true,
-		},
-		{
-			name: "only account locker affected by redeem fees",
-			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  calc.BaseToQuote(5e7, 1e6) + 1000,
-				42: 999,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    false,
-				Qty:     1e6,
-				Rate:    5e7,
+			qty:  1e8,
+			cexBalances: map[uint32]uint64{
+				baseID: 1e8,
 			},
 		},
 		{
-			name: "2 lots with refund fees, not account locker",
+			name: "buy",
+			sell: false,
 			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  calc.BaseToQuote(5e7, 2e6) + 2000,
-				42: 1000,
+			qty:  1e8,
+			cexBalances: map[uint32]uint64{
+				quoteID: calc.BaseToQuote(5e7, 1e8),
 			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  42,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    42,
-				Quote:   0,
-				Sell:    false,
-				Qty:     2e6,
-				Rate:    5e7,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			refundFees: 1000,
-		},
-		{
-			name: "1 lot with refund fees, account locker",
-			rate: 5e7,
-			dexBalances: map[uint32]uint64{
-				0:  calc.BaseToQuote(5e7, 2e6) + 2000,
-				60: 1000,
-			},
-			market: &core.Market{
-				LotSize: 1e6,
-				BaseID:  60,
-				QuoteID: 0,
-			},
-			expectPreOrderParam: &core.TradeForm{
-				Host:    "host1",
-				IsLimit: true,
-				Base:    60,
-				Quote:   0,
-				Sell:    false,
-				Qty:     1e6,
-				Rate:    5e7,
-			},
-			swapFees:   1000,
-			redeemFees: 1000,
-			refundFees: 1000,
 		},
 	}
 
 	for _, test := range tests {
-		tCore.market = test.market
-		tCore.buySwapFees = test.swapFees
-		tCore.buyRedeemFees = test.redeemFees
-
-		botID := dcrBtcID
-		if test.market.BaseID != 42 {
-			botID = ethBtcID
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
-			botID:           botID,
-			core:            tCore,
-			baseDexBalances: test.dexBalances,
-			log:             tLogger,
-			market: &MarketWithHost{
-				Host:    "host1",
-				BaseID:  42,
-				QuoteID: 0,
-			},
-		})
-		adaptor.run(ctx)
-
-		res, err := adaptor.MaxBuy("host1", test.market.BaseID, test.market.QuoteID, test.rate)
-		if test.wantErr {
-			if err == nil {
-				t.Fatalf("%s: expected error but did not get", test.name)
+		t.Run(test.name, func(t *testing.T) {
+			checkBalanceSufficient := func(expSufficient bool) {
+				tCore := newTCore()
+				adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+					core:            tCore,
+					baseCexBalances: test.cexBalances,
+					market: &MarketWithHost{
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+					log: tLogger,
+				})
+				sufficient, err := adaptor.SufficientBalanceForCEXTrade(baseID, quoteID, test.sell, test.rate, test.qty)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if sufficient != expSufficient {
+					t.Fatalf("expected sufficient=%v, got %v", expSufficient, sufficient)
+				}
 			}
-			continue
+
+			checkBalanceSufficient(true)
+
+			for assetID := range test.cexBalances {
+				test.cexBalances[assetID]--
+				checkBalanceSufficient(false)
+				test.cexBalances[assetID]++
+			}
+		})
+	}
+}
+
+func TestPrepareRebalance(t *testing.T) {
+	baseID := uint32(42)
+	quoteID := uint32(0)
+	cfg := &AutoRebalanceConfig{
+		MinBaseAmt:       120e8,
+		MinBaseTransfer:  50e8,
+		MinQuoteAmt:      0.5e8,
+		MinQuoteTransfer: 0.1e8,
+	}
+	orderIDs := make([]order.OrderID, 5)
+	for i := range orderIDs {
+		var id order.OrderID
+		copy(id[:], encode.RandomBytes(order.OrderIDSize))
+		orderIDs[i] = id
+	}
+
+	type test struct {
+		name                  string
+		assetID               uint32
+		dexBalances           map[uint32]uint64
+		cexBalances           map[uint32]uint64
+		baseRebalancePending  bool
+		quoteRebalancePending bool
+
+		pendingDEXOrders    map[order.OrderID]*pendingDEXOrder
+		expectedRebalance   int64
+		expectedDEXReserves uint64
+		expectedCEXReserves uint64
+	}
+
+	tests := []*test{
+		{
+			name:    "no pending orders, no rebalance required",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  120e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  120e8,
+				quoteID: 0,
+			},
+		},
+		{
+			name:    "no pending orders, base deposit required",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			expectedRebalance: 50e8,
+		},
+		{
+			name:    "no pending orders, quote deposit required",
+			assetID: 0,
+			dexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			expectedRebalance: 1e8,
+		},
+		{
+			name:    "no pending orders, base withdrawal required",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			expectedRebalance: -50e8,
+		},
+		{
+			name:    "no pending orders, quote withdrawal required",
+			assetID: 0,
+			dexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			expectedRebalance: -1e8,
+		},
+		{
+			name:    "no pending orders, base deposit required, already pending",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			baseRebalancePending: true,
+		},
+		{
+			name:    "no pending orders, quote withdrawal required, already pending",
+			assetID: 0,
+			dexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			quoteRebalancePending: true,
+		},
+		{
+			name:    "no pending orders, deposit < min base transfer",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  71e8,
+				quoteID: 0,
+			},
+		},
+		{
+			name:    "base deposit required, pending orders",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  40e8,
+				quoteID: 2e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					locked: map[uint32]uint64{
+						baseID: 130e8,
+					},
+					order: &core.Order{
+						Qty:  130e8,
+						Rate: 5e7,
+						Sell: true,
+					},
+					counterTradeRate: 6e7,
+				},
+			},
+			expectedRebalance:   0,
+			expectedDEXReserves: 50e8,
+		},
+		{
+			name:    "base withdrawal required, pending buy order",
+			assetID: 42,
+			dexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 2e8,
+			},
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					locked: map[uint32]uint64{
+						quoteID: 130e8,
+					},
+					order: &core.Order{
+						Qty:    150e8,
+						Filled: 20e8,
+						Rate:   5e7,
+						Sell:   false,
+					},
+					counterTradeRate: 5e7, // sell with 20e8 remaining
+				},
+			},
+			expectedRebalance:   0,
+			expectedCEXReserves: 50e8,
+		},
+		{
+			name:    "quote withdrawal required, pending sell order",
+			assetID: 0,
+			dexBalances: map[uint32]uint64{
+				baseID:  70e8,
+				quoteID: 0.25e8,
+			},
+			cexBalances: map[uint32]uint64{
+				baseID:  170e8,
+				quoteID: 0.75e8,
+			},
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					locked: map[uint32]uint64{
+						baseID: 100e8,
+					},
+					order: &core.Order{
+						Qty:    140e8,
+						Filled: 20e8,
+						Rate:   6e5,
+						Sell:   true,
+					},
+					counterTradeRate: 5e5, // 0.6e8 required to counter-trade 120e8 @ 5e5
+				},
+			},
+			expectedRebalance:   0,
+			expectedCEXReserves: 0.25e8,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tCore := newTCore()
+			adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+				core:            tCore,
+				baseDexBalances: test.dexBalances,
+				baseCexBalances: test.cexBalances,
+				rebalanceCfg:    cfg,
+				market: &MarketWithHost{
+					Host:    "dex.com",
+					BaseID:  baseID,
+					QuoteID: quoteID,
+				},
+				log: tLogger,
+			})
+			adaptor.pendingBaseRebalance.Store(test.baseRebalancePending)
+			adaptor.pendingQuoteRebalance.Store(test.quoteRebalancePending)
+			adaptor.pendingDEXOrders = test.pendingDEXOrders
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			rebalance, dexReserves, cexReserves := adaptor.PrepareRebalance(ctx, test.assetID)
+			if rebalance != test.expectedRebalance {
+				t.Fatalf("expected rebalance=%d, got %d", test.expectedRebalance, rebalance)
+			}
+			if dexReserves != test.expectedDEXReserves {
+				t.Fatalf("expected dexReserves=%d, got %d", test.expectedDEXReserves, dexReserves)
+			}
+			if cexReserves != test.expectedCEXReserves {
+				t.Fatalf("expected cexReserves=%d, got %d", test.expectedCEXReserves, cexReserves)
+			}
+		})
+	}
+}
+
+func TestFreeUpFunds(t *testing.T) {
+	var currEpoch uint64 = 100
+	baseID := uint32(42)
+	quoteID := uint32(0)
+	orderIDs := make([]order.OrderID, 5)
+	for i := range orderIDs {
+		var id order.OrderID
+		copy(id[:], encode.RandomBytes(order.OrderIDSize))
+		orderIDs[i] = id
+	}
+
+	type test struct {
+		name             string
+		dexBalances      map[uint32]uint64
+		cexBalances      map[uint32]uint64
+		assetID          uint32
+		cex              bool
+		amt              uint64
+		pendingDEXOrders map[order.OrderID]*pendingDEXOrder
+
+		expectedCancels []*order.OrderID
+	}
+
+	tests := []*test{
+		{
+			name: "base, dex",
+			dexBalances: map[uint32]uint64{
+				baseID: 10e8,
+			},
+			assetID: baseID,
+			amt:     50e8,
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					locked: map[uint32]uint64{
+						baseID: 20e8,
+					},
+					order: &core.Order{
+						ID:   orderIDs[0][:],
+						Sell: true,
+					},
+					placementIndex: 1,
+				},
+				orderIDs[1]: {
+					locked: map[uint32]uint64{
+						baseID: 20e8,
+					},
+					order: &core.Order{
+						ID:   orderIDs[1][:],
+						Sell: true,
+					},
+					placementIndex: 0,
+				},
+				orderIDs[2]: {
+					locked: map[uint32]uint64{
+						baseID: 20e8,
+					},
+					order: &core.Order{
+						ID:   orderIDs[2][:],
+						Sell: true,
+					},
+					placementIndex: 2,
+				},
+			},
+			expectedCancels: []*order.OrderID{
+				&orderIDs[2], // placementIndex 2
+				&orderIDs[0], // placementIndex 1
+			},
+		},
+		{
+			name: "base, cex",
+			cexBalances: map[uint32]uint64{
+				baseID: 70e8,
+			},
+			assetID: baseID,
+			cex:     true,
+			amt:     50e8,
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[0][:],
+						Sell: false,
+					},
+					placementIndex:   1,
+					counterTradeRate: 5e5,
+				},
+				orderIDs[1]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[1][:],
+						Sell: false,
+					},
+					placementIndex:   0,
+					counterTradeRate: 5e5,
+				},
+				orderIDs[2]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[2][:],
+						Sell: false,
+					},
+					placementIndex:   2,
+					counterTradeRate: 5e5,
+				},
+			},
+			expectedCancels: []*order.OrderID{
+				&orderIDs[2], // placementIndex 2
+				&orderIDs[0], // placementIndex 1
+			},
+		},
+		{
+			name: "quote, cex",
+			cexBalances: map[uint32]uint64{
+				quoteID: 0.6e8,
+			},
+			assetID: quoteID,
+			cex:     true,
+			amt:     0.5e8,
+			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
+				orderIDs[0]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[0][:],
+						Sell: true,
+					},
+					placementIndex:   1,
+					counterTradeRate: 5e5, // 0.1e8 required to counter-trade 20e8 @ 5e5
+				},
+				orderIDs[1]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[1][:],
+						Sell: true,
+					},
+					placementIndex:   0,
+					counterTradeRate: 5e5,
+				},
+				orderIDs[2]: {
+					order: &core.Order{
+						Qty:  20e8,
+						ID:   orderIDs[2][:],
+						Sell: true,
+					},
+					placementIndex:   2,
+					counterTradeRate: 5e5,
+				},
+			},
+			expectedCancels: []*order.OrderID{
+				&orderIDs[2], // placementIndex 2
+				&orderIDs[0], // placementIndex 1
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tCore := newTCore()
+			adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+				core:            tCore,
+				baseDexBalances: test.dexBalances,
+				baseCexBalances: test.cexBalances,
+				market: &MarketWithHost{
+					Host:    "dex.com",
+					BaseID:  baseID,
+					QuoteID: quoteID,
+				},
+				log: tLogger,
+			})
+			adaptor.pendingDEXOrders = test.pendingDEXOrders
+			adaptor.FreeUpFunds(test.assetID, test.cex, test.amt, currEpoch)
+
+			if len(tCore.cancelsPlaced) != len(test.expectedCancels) {
+				t.Fatalf("%s: expected %d cancels, got %d", test.name, len(test.expectedCancels), len(tCore.cancelsPlaced))
+			}
+
+			for i, cancel := range tCore.cancelsPlaced {
+				if !bytes.Equal(cancel, test.expectedCancels[i][:]) {
+					t.Fatalf("%s: expected cancel %d to be %v, got %v", test.name, i, test.expectedCancels[i], cancel)
+				}
+			}
+		})
+	}
+}
+
+func TestMultiTrade(t *testing.T) {
+	const lotSize uint64 = 50e8
+	const rateStep uint64 = 1e3
+	const currEpoch = 100
+	const driftTolerance = 0.001
+	sellFees := &orderFees{
+		swap:       1e5,
+		redemption: 2e5,
+		refund:     3e5,
+		funding:    4e5,
+	}
+	buyFees := &orderFees{
+		swap:       5e5,
+		redemption: 6e5,
+		refund:     7e5,
+		funding:    8e5,
+	}
+	orderIDs := make([]order.OrderID, 10)
+	for i := range orderIDs {
+		var id order.OrderID
+		copy(id[:], encode.RandomBytes(order.OrderIDSize))
+		orderIDs[i] = id
+	}
+
+	driftToleranceEdge := func(rate uint64, within bool) uint64 {
+		edge := rate + uint64(float64(rate)*driftTolerance)
+		if within {
+			return edge - rateStep
 		}
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
+		return edge + rateStep
+	}
+
+	sellPlacements := []*multiTradePlacement{
+		{lots: 1, rate: 1e7, counterTradeRate: 0.9e7},
+		{lots: 2, rate: 2e7, counterTradeRate: 1.9e7},
+		{lots: 3, rate: 3e7, counterTradeRate: 2.9e7},
+		{lots: 2, rate: 4e7, counterTradeRate: 3.9e7},
+	}
+
+	buyPlacements := []*multiTradePlacement{
+		{lots: 1, rate: 4e7, counterTradeRate: 4.1e7},
+		{lots: 2, rate: 3e7, counterTradeRate: 3.1e7},
+		{lots: 3, rate: 2e7, counterTradeRate: 2.1e7},
+		{lots: 2, rate: 1e7, counterTradeRate: 1.1e7},
+	}
+
+	// cancelLastPlacement is the same as placements, but with the rate
+	// and lots of the last order set to zero, which should cause pending
+	// orders at that placementIndex to be cancelled.
+	cancelLastPlacement := func(sell bool) []*multiTradePlacement {
+		placements := make([]*multiTradePlacement, len(sellPlacements))
+		if sell {
+			copy(placements, sellPlacements)
+		} else {
+			copy(placements, buyPlacements)
+		}
+		placements[len(placements)-1] = &multiTradePlacement{}
+		return placements
+
+	}
+
+	pendingOrders := func(sell bool) map[order.OrderID]*pendingDEXOrder {
+		var placements []*multiTradePlacement
+		if sell {
+			placements = sellPlacements
+		} else {
+			placements = buyPlacements
 		}
 
-		if !reflect.DeepEqual(tCore.preOrderParam, test.expectPreOrderParam) {
-			t.Fatalf("%s: expected pre order param %+v != actual %+v", test.name, test.expectPreOrderParam, tCore.preOrderParam)
+		return map[order.OrderID]*pendingDEXOrder{
+			orderIDs[0]: { // Should cancel, but cannot due to epoch > currEpoch - 2
+				order: &core.Order{
+					Qty:   1 * lotSize,
+					Sell:  sell,
+					ID:    orderIDs[0][:],
+					Rate:  driftToleranceEdge(placements[0].rate, true),
+					Epoch: currEpoch - 1,
+				},
+				placementIndex:   0,
+				counterTradeRate: placements[0].counterTradeRate,
+			},
+			orderIDs[1]: {
+				order: &core.Order{ // Within tolerance, don't cancel
+					Qty:    2 * lotSize,
+					Filled: lotSize,
+					Sell:   sell,
+					ID:     orderIDs[1][:],
+					Rate:   driftToleranceEdge(placements[1].rate, true),
+					Epoch:  currEpoch - 2,
+				},
+				placementIndex:   1,
+				counterTradeRate: placements[1].counterTradeRate,
+			},
+			orderIDs[2]: {
+				order: &core.Order{ // Cancel
+					Qty:   lotSize,
+					Sell:  sell,
+					ID:    orderIDs[2][:],
+					Rate:  driftToleranceEdge(placements[2].rate, false),
+					Epoch: currEpoch - 2,
+				},
+				placementIndex:   2,
+				counterTradeRate: placements[2].counterTradeRate,
+			},
+			orderIDs[3]: {
+				order: &core.Order{ // Within tolerance, don't cancel
+					Qty:   lotSize,
+					Sell:  sell,
+					ID:    orderIDs[3][:],
+					Rate:  driftToleranceEdge(placements[3].rate, true),
+					Epoch: currEpoch - 2,
+				},
+				placementIndex:   3,
+				counterTradeRate: placements[3].counterTradeRate,
+			},
 		}
+	}
 
-		if !reflect.DeepEqual(res, expectedResult) {
-			t.Fatalf("%s: expected max buy result %+v != actual %+v", test.name, expectedResult, res)
+	// pendingWithSelfMatch returns the same pending orders as pendingOrders,
+	// but with an additional order on the other side of the market that
+	// would cause a self-match.
+	pendingOrdersSelfMatch := func(sell bool) map[order.OrderID]*pendingDEXOrder {
+		orders := pendingOrders(sell)
+		var rate uint64
+		if sell {
+			rate = driftToleranceEdge(2e7, true) // 2e7 is the rate of the lowest sell placement
+		} else {
+			rate = 3e7 // 3e7 is the rate of the highest buy placement
 		}
+		orders[orderIDs[4]] = &pendingDEXOrder{
+			order: &core.Order{ // Within tolerance, don't cancel
+				Qty:   lotSize,
+				Sell:  !sell,
+				ID:    orderIDs[4][:],
+				Rate:  rate,
+				Epoch: currEpoch - 2,
+			},
+			placementIndex: 0,
+		}
+		return orders
+	}
+
+	b2q := calc.BaseToQuote
+
+	/*
+	 * The dexBalance and cexBalances fields of this test are set so that they
+	 * are at an edge. If any non-zero balance is decreased by 1, the behavior
+	 * of the function should change. Each of the "WithDecrement" fields are
+	 * the expected result if any of the non-zero balances are decreased by 1.
+	 */
+	type test struct {
+		name    string
+		baseID  uint32
+		quoteID uint32
+
+		sellDexBalances   map[uint32]uint64
+		sellCexBalances   map[uint32]uint64
+		sellPlacements    []*multiTradePlacement
+		sellPendingOrders map[order.OrderID]*pendingDEXOrder
+		sellDexReserves   map[uint32]uint64
+		sellCexReserves   map[uint32]uint64
+
+		buyCexBalances   map[uint32]uint64
+		buyDexBalances   map[uint32]uint64
+		buyPlacements    []*multiTradePlacement
+		buyPendingOrders map[order.OrderID]*pendingDEXOrder
+		buyDexReserves   map[uint32]uint64
+		buyCexReserves   map[uint32]uint64
+
+		isAccountLocker               map[uint32]bool
+		multiTradeResult              []*core.Order
+		multiTradeResultWithDecrement []*core.Order
+
+		expectedOrderIDs              []*order.OrderID
+		expectedOrderIDsWithDecrement []*order.OrderID
+
+		expectedSellPlacements              []*core.QtyRate
+		expectedSellPlacementsWithDecrement []*core.QtyRate
+
+		expectedBuyPlacements              []*core.QtyRate
+		expectedBuyPlacementsWithDecrement []*core.QtyRate
+
+		expectedCancels              []dex.Bytes
+		expectedCancelsWithDecrement []dex.Bytes
+	}
+
+	tests := []*test{
+		{
+			name:    "non account locker",
+			baseID:  42,
+			quoteID: 0,
+
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 4*lotSize + 4*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
+			},
+			sellPlacements:    sellPlacements,
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+				{Qty: lotSize, Rate: sellPlacements[3].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[1].rate, lotSize) +
+					b2q(buyPlacements[2].rate, 2*lotSize) +
+					b2q(buyPlacements[3].rate, lotSize) +
+					4*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 8 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    buyPlacements,
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+				{Qty: lotSize, Rate: buyPlacements[3].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+				{ID: orderIDs[6][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5], &orderIDs[6],
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5], nil,
+			},
+		},
+		{
+			name:    "non account locker, self-match",
+			baseID:  42,
+			quoteID: 0,
+
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 3*lotSize + 3*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
+			},
+			sellPlacements:    sellPlacements,
+			sellPendingOrders: pendingOrdersSelfMatch(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+				{Qty: lotSize, Rate: sellPlacements[3].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[2].rate, 2*lotSize) +
+					b2q(buyPlacements[3].rate, lotSize) +
+					3*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 7 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    buyPlacements,
+			buyPendingOrders: pendingOrdersSelfMatch(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+				{Qty: lotSize, Rate: buyPlacements[3].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[5][:]},
+				{ID: orderIDs[6][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[5][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, nil, &orderIDs[5], &orderIDs[6],
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, nil, &orderIDs[5], nil,
+			},
+		},
+		{
+			name:    "non account locker, cancel last placement",
+			baseID:  42,
+			quoteID: 0,
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 3*lotSize + 3*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, lotSize),
+			},
+			sellPlacements:    cancelLastPlacement(true),
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[1].rate, lotSize) +
+					b2q(buyPlacements[2].rate, 2*lotSize) +
+					3*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 7 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    cancelLastPlacement(false),
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[3][:], orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[3][:], orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5], nil,
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5], nil,
+			},
+		},
+		{
+			name:    "non account locker, cex reserves",
+			baseID:  42,
+			quoteID: 0,
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 2*lotSize + 2*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
+			},
+			sellPlacements:    sellPlacements,
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: lotSize, Rate: sellPlacements[2].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+			},
+			sellCexReserves: map[uint32]uint64{
+				0: b2q(3.9e7, lotSize) + b2q(2.9e7, lotSize),
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[1].rate, lotSize) +
+					b2q(buyPlacements[2].rate, lotSize) +
+					2*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 8 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    buyPlacements,
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: lotSize, Rate: buyPlacements[2].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+			},
+			buyCexReserves: map[uint32]uint64{
+				42: 2 * lotSize,
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[2][:], orderIDs[3][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[2][:], orderIDs[3][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[3][:]},
+				{ID: orderIDs[4][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[3][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[3], &orderIDs[4], nil,
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[3], nil, nil,
+			},
+		},
+		{
+			name:    "non account locker, dex reserves",
+			baseID:  42,
+			quoteID: 0,
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 4*lotSize + 2*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, lotSize),
+			},
+			sellPlacements:    sellPlacements,
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: lotSize, Rate: sellPlacements[2].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+			},
+			sellDexReserves: map[uint32]uint64{
+				42: 2 * lotSize,
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[1].rate, 2*lotSize) +
+					b2q(buyPlacements[2].rate, 2*lotSize) +
+					2*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 6 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    buyPlacements,
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: lotSize, Rate: buyPlacements[2].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+			},
+			buyDexReserves: map[uint32]uint64{
+				0: b2q(buyPlacements[1].rate, lotSize) + b2q(buyPlacements[2].rate, lotSize),
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[2][:], orderIDs[3][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[2][:], orderIDs[3][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[3][:]},
+				{ID: orderIDs[4][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[3][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[3], &orderIDs[4], nil,
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[3], nil, nil,
+			},
+		},
+		{
+			name:    "account locker token",
+			baseID:  966001,
+			quoteID: 60,
+			isAccountLocker: map[uint32]bool{
+				966001: true,
+				60:     true,
+			},
+
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				966001: 4 * lotSize,
+				966:    4*(sellFees.swap+sellFees.refund) + sellFees.funding,
+				60:     4 * sellFees.redemption,
+			},
+			sellCexBalances: map[uint32]uint64{
+				96601: 0,
+				60: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
+			},
+			sellPlacements:    sellPlacements,
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+				{Qty: lotSize, Rate: sellPlacements[3].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				966: 4 * buyFees.redemption,
+				60: b2q(buyPlacements[1].rate, lotSize) +
+					b2q(buyPlacements[2].rate, 2*lotSize) +
+					b2q(buyPlacements[3].rate, lotSize) +
+					4*buyFees.swap + 4*buyFees.refund + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				966001: 8 * lotSize,
+				0:      0,
+			},
+			buyPlacements:    buyPlacements,
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+				{Qty: lotSize, Rate: buyPlacements[3].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[3][:]},
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[3][:]},
+				{ID: orderIDs[4][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[3], &orderIDs[4], &orderIDs[5],
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[3], &orderIDs[4], nil,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testWithDecrement := func(sell, decrement, cex bool, assetID uint32) {
+				t.Run(fmt.Sprintf("sell=%v, decrement=%v, cex=%v, assetID=%d", sell, decrement, cex, assetID), func(t *testing.T) {
+					tCore := newTCore()
+					tCore.isAccountLocker = test.isAccountLocker
+					tCore.market = &core.Market{
+						BaseID:  test.baseID,
+						QuoteID: test.quoteID,
+						LotSize: lotSize,
+					}
+					tCore.multiTradeResult = test.multiTradeResult
+					if decrement {
+						tCore.multiTradeResult = test.multiTradeResultWithDecrement
+					}
+
+					var dexBalances, cexBalances map[uint32]uint64
+					if sell {
+						dexBalances = test.sellDexBalances
+						cexBalances = test.sellCexBalances
+					} else {
+						dexBalances = test.buyDexBalances
+						cexBalances = test.buyCexBalances
+					}
+					adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+						core:            tCore,
+						baseDexBalances: dexBalances,
+						baseCexBalances: cexBalances,
+						market: &MarketWithHost{
+							Host:    "dex.com",
+							BaseID:  test.baseID,
+							QuoteID: test.quoteID,
+						},
+						log: tLogger,
+					})
+
+					var pendingOrders map[order.OrderID]*pendingDEXOrder
+					if sell {
+						pendingOrders = test.sellPendingOrders
+					} else {
+						pendingOrders = test.buyPendingOrders
+					}
+					pendingOrdersCopy := make(map[order.OrderID]*pendingDEXOrder)
+					for id, order := range pendingOrders {
+						pendingOrdersCopy[id] = order
+					}
+					adaptor.pendingDEXOrders = pendingOrdersCopy
+					adaptor.buyFees = buyFees
+					adaptor.sellFees = sellFees
+
+					var placements []*multiTradePlacement
+					var dexReserves, cexReserves map[uint32]uint64
+					if sell {
+						placements = test.sellPlacements
+						dexReserves = test.sellDexReserves
+						cexReserves = test.sellCexReserves
+					} else {
+						placements = test.buyPlacements
+						dexReserves = test.buyDexReserves
+						cexReserves = test.buyCexReserves
+					}
+					res := adaptor.MultiTrade(placements, sell, driftTolerance, currEpoch, dexReserves, cexReserves)
+
+					expectedOrderIDs := test.expectedOrderIDs
+					if decrement {
+						expectedOrderIDs = test.expectedOrderIDsWithDecrement
+					}
+					if !reflect.DeepEqual(res, expectedOrderIDs) {
+						t.Fatalf("expected orderIDs %v, got %v", expectedOrderIDs, res)
+					}
+
+					var expectedPlacements []*core.QtyRate
+					if sell {
+						expectedPlacements = test.expectedSellPlacements
+						if decrement {
+							expectedPlacements = test.expectedSellPlacementsWithDecrement
+						}
+					} else {
+						expectedPlacements = test.expectedBuyPlacements
+						if decrement {
+							expectedPlacements = test.expectedBuyPlacementsWithDecrement
+						}
+					}
+					if len(expectedPlacements) > 0 != (len(tCore.multiTradesPlaced) > 0) {
+						t.Fatalf("%s: expected placements %v, got %v", test.name, len(expectedPlacements) > 0, len(tCore.multiTradesPlaced) > 0)
+					}
+					if len(expectedPlacements) > 0 {
+						placements := tCore.multiTradesPlaced[0].Placements
+						if !reflect.DeepEqual(placements, expectedPlacements) {
+							t.Fatal(spew.Sprintf("%s: expected placements:\n%#+v\ngot:\n%+#v", test.name, expectedPlacements, placements))
+						}
+					}
+
+					expectedCancels := test.expectedCancels
+					if decrement {
+						expectedCancels = test.expectedCancelsWithDecrement
+					}
+					sort.Slice(tCore.cancelsPlaced, func(i, j int) bool {
+						return bytes.Compare(tCore.cancelsPlaced[i], tCore.cancelsPlaced[j]) < 0
+					})
+					sort.Slice(expectedCancels, func(i, j int) bool {
+						return bytes.Compare(expectedCancels[i], expectedCancels[j]) < 0
+					})
+					if !reflect.DeepEqual(tCore.cancelsPlaced, expectedCancels) {
+						t.Fatalf("expected cancels %v, got %v", expectedCancels, tCore.cancelsPlaced)
+					}
+				})
+			}
+
+			for _, sell := range []bool{true, false} {
+				var dexBalances, cexBalances map[uint32]uint64
+				if sell {
+					dexBalances = test.sellDexBalances
+					cexBalances = test.sellCexBalances
+				} else {
+					dexBalances = test.buyDexBalances
+					cexBalances = test.buyCexBalances
+				}
+
+				testWithDecrement(sell, false, false, 0)
+				for assetID, bal := range dexBalances {
+					if bal == 0 {
+						continue
+					}
+					dexBalances[assetID]--
+					testWithDecrement(sell, true, false, assetID)
+					dexBalances[assetID]++
+				}
+				for assetID, bal := range cexBalances {
+					if bal == 0 {
+						continue
+					}
+					cexBalances[assetID]--
+					testWithDecrement(sell, true, true, assetID)
+					cexBalances[assetID]++
+				}
+			}
+		})
 	}
 }
 
 func TestDEXTrade(t *testing.T) {
 	host := "dex.com"
+	lotSize := uint64(1e6)
 
 	orderIDs := make([]order.OrderID, 5)
 	for i := range orderIDs {
@@ -625,10 +1514,12 @@ func TestDEXTrade(t *testing.T) {
 		name               string
 		isDynamicSwapper   map[uint32]bool
 		initialBalances    map[uint32]uint64
-		multiTrade         *multiTradeForm
+		baseID             uint32
+		quoteID            uint32
+		sell               bool
+		placements         []*multiTradePlacement
 		initialLockedFunds []*orderLockedFunds
 
-		wantErr            bool
 		postTradeBalances  map[uint32]*botBalance
 		updatesAndBalances []*updatesAndBalances
 	}
@@ -640,15 +1531,12 @@ func TestDEXTrade(t *testing.T) {
 				42: 1e8,
 				0:  1e8,
 			},
-			multiTrade: &multiTradeForm{
-				host:    host,
-				sell:    true,
-				baseID:  42,
-				quoteID: 0,
-				placements: []*multiTradePlacement{
-					{qty: 5e6, rate: 5e7},
-					{qty: 5e6, rate: 6e7},
-				},
+			sell:    true,
+			baseID:  42,
+			quoteID: 0,
+			placements: []*multiTradePlacement{
+				{lots: 5, rate: 5e7},
+				{lots: 5, rate: 6e7},
 			},
 			initialLockedFunds: []*orderLockedFunds{
 				newOrderLockedFunds(orderIDs[0], 5e6+2000, 0, 0, 0),
@@ -752,15 +1640,11 @@ func TestDEXTrade(t *testing.T) {
 				42: 1e8,
 				0:  1e8,
 			},
-			multiTrade: &multiTradeForm{
-				host:    host,
-				sell:    false,
-				baseID:  42,
-				quoteID: 0,
-				placements: []*multiTradePlacement{
-					{qty: 5e6, rate: 5e7},
-					{qty: 5e6, rate: 6e7},
-				},
+			baseID:  42,
+			quoteID: 0,
+			placements: []*multiTradePlacement{
+				{lots: 5, rate: 5e7},
+				{lots: 5, rate: 6e7},
 			},
 			initialLockedFunds: []*orderLockedFunds{
 				newOrderLockedFunds(orderIDs[0], b2q(5e7, 5e6)+2000, 0, 0, 0),
@@ -870,15 +1754,12 @@ func TestDEXTrade(t *testing.T) {
 				966:    true,
 				60:     true,
 			},
-			multiTrade: &multiTradeForm{
-				host:    host,
-				sell:    true,
-				baseID:  60,
-				quoteID: 966001,
-				placements: []*multiTradePlacement{
-					{qty: 5e6, rate: 5e7},
-					{qty: 5e6, rate: 6e7},
-				},
+			sell:    true,
+			baseID:  60,
+			quoteID: 966001,
+			placements: []*multiTradePlacement{
+				{lots: 5, rate: 5e7},
+				{lots: 5, rate: 6e7},
 			},
 			initialLockedFunds: []*orderLockedFunds{
 				newOrderLockedFunds(orderIDs[0], 5e6+2000, 0, 4000, 3000),
@@ -996,15 +1877,11 @@ func TestDEXTrade(t *testing.T) {
 				966:    true,
 				60:     true,
 			},
-			multiTrade: &multiTradeForm{
-				host:    host,
-				sell:    false,
-				baseID:  60,
-				quoteID: 966001,
-				placements: []*multiTradePlacement{
-					{qty: 5e6, rate: 5e7},
-					{qty: 5e6, rate: 6e7},
-				},
+			baseID:  60,
+			quoteID: 966001,
+			placements: []*multiTradePlacement{
+				{lots: 5, rate: 5e7},
+				{lots: 5, rate: 6e7},
 			},
 			initialLockedFunds: []*orderLockedFunds{
 				newOrderLockedFunds(orderIDs[0], b2q(5e7, 5e6), 2000, 3000, 4000),
@@ -1112,22 +1989,22 @@ func TestDEXTrade(t *testing.T) {
 		},
 	}
 
-	mkt := &core.Market{
-		LotSize: 1e6,
-	}
-
 	runTest := func(test *test) {
 		tCore := newTCore()
-		tCore.market = mkt
+		tCore.market = &core.Market{
+			BaseID:  test.baseID,
+			QuoteID: test.quoteID,
+			LotSize: lotSize,
+		}
 		tCore.isDynamicSwapper = test.isDynamicSwapper
 
 		multiTradeResult := make([]*core.Order, 0, len(test.initialLockedFunds))
 		for _, o := range test.initialLockedFunds {
 			multiTradeResult = append(multiTradeResult, &core.Order{
-				Host:                 test.multiTrade.host,
-				BaseID:               test.multiTrade.baseID,
-				QuoteID:              test.multiTrade.quoteID,
-				Sell:                 test.multiTrade.sell,
+				Host:                 host,
+				BaseID:               test.baseID,
+				QuoteID:              test.quoteID,
+				Sell:                 test.sell,
 				LockedAmt:            o.lockedAmt,
 				ID:                   o.id[:],
 				ParentAssetLockedAmt: o.parentAssetLockedAmt,
@@ -1137,31 +2014,29 @@ func TestDEXTrade(t *testing.T) {
 		}
 		tCore.multiTradeResult = multiTradeResult
 
+		// These don't effect the test, but need to be non-nil.
+		tCore.singleLotBuyFees = &orderFees{}
+		tCore.singleLotSellFees = &orderFees{}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		botID := dexMarketID(test.multiTrade.host, test.multiTrade.baseID, test.multiTrade.quoteID)
+		botID := dexMarketID(host, test.baseID, test.quoteID)
 		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
 			botID:           botID,
 			core:            tCore,
 			baseDexBalances: test.initialBalances,
 			log:             tLogger,
 			market: &MarketWithHost{
-				Host:    test.multiTrade.host,
-				BaseID:  test.multiTrade.baseID,
-				QuoteID: test.multiTrade.quoteID,
+				Host:    host,
+				BaseID:  test.baseID,
+				QuoteID: test.quoteID,
 			},
 		})
 		adaptor.run(ctx)
-		_, err := adaptor.MultiTrade(test.multiTrade)
-		if test.wantErr {
-			if err == nil {
-				t.Fatalf("%s: expected error but did not get", test.name)
-			}
-			return
-		}
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
+		orders := adaptor.MultiTrade(test.placements, test.sell, 0.01, 100, nil, nil)
+		if len(orders) == 0 {
+			t.Fatalf("%s: multi trade did not place orders", test.name)
 		}
 
 		checkBalances := func(expected map[uint32]*botBalance, updateNum int) {
@@ -1194,10 +2069,10 @@ func TestDEXTrade(t *testing.T) {
 			tCore.walletTxsMtx.Unlock()
 
 			o := &core.Order{
-				Host:                 test.multiTrade.host,
-				BaseID:               test.multiTrade.baseID,
-				QuoteID:              test.multiTrade.quoteID,
-				Sell:                 test.multiTrade.sell,
+				Host:                 host,
+				BaseID:               test.baseID,
+				QuoteID:              test.quoteID,
+				Sell:                 test.sell,
 				LockedAmt:            update.orderUpdate.lockedAmt,
 				ID:                   update.orderUpdate.id[:],
 				ParentAssetLockedAmt: update.orderUpdate.parentAssetLockedAmt,
@@ -1423,7 +2298,6 @@ func TestDeposit(t *testing.T) {
 	}
 
 	runTest := func(test *test) {
-		fmt.Println("running test ", test.name)
 		tCore := newTCore()
 		tCore.isWithdrawer[test.assetID] = test.isWithdrawer
 		tCore.isDynamicSwapper[test.assetID] = test.isDynamicSwapper
@@ -1472,7 +2346,7 @@ func TestDeposit(t *testing.T) {
 			},
 		})
 		adaptor.run(ctx)
-		err := adaptor.Deposit(ctx, test.assetID, test.depositAmt, func() {})
+		err := adaptor.Deposit(ctx, test.assetID, test.depositAmt)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
@@ -1614,7 +2488,7 @@ func TestWithdraw(t *testing.T) {
 		})
 		adaptor.run(ctx)
 
-		err := adaptor.Withdraw(ctx, assetID, test.withdrawAmt, func() {})
+		err := adaptor.Withdraw(ctx, assetID, test.withdrawAmt)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
@@ -1649,7 +2523,7 @@ func TestWithdraw(t *testing.T) {
 	}
 }
 
-func TestExchangeAdaptorTrade(t *testing.T) {
+func TestCEXTrade(t *testing.T) {
 	baseID := uint32(42)
 	quoteID := uint32(0)
 	tradeID := "123"
@@ -1938,7 +2812,7 @@ func TestExchangeAdaptorTrade(t *testing.T) {
 
 		adaptor.SubscribeTradeUpdates()
 
-		_, err := adaptor.Trade(ctx, baseID, quoteID, test.sell, test.rate, test.qty)
+		_, err := adaptor.CEXTrade(ctx, baseID, quoteID, test.sell, test.rate, test.qty)
 		if test.wantErr {
 			if err == nil {
 				t.Fatalf("%s: expected error but did not get", test.name)
@@ -1986,190 +2860,143 @@ func TestExchangeAdaptorTrade(t *testing.T) {
 	}
 }
 
-func TestGroupedBookedOrders(t *testing.T) {
-	orderIDs := make([]dex.Bytes, 10)
-	for i := range orderIDs {
-		orderIDs[i] = encode.RandomBytes(32)
+func TestOrderFeesInUnits(t *testing.T) {
+	type test struct {
+		name      string
+		buyFees   *orderFees
+		sellFees  *orderFees
+		rate      uint64
+		market    *MarketWithHost
+		fiatRates map[uint32]float64
+
+		expectedSellBase  uint64
+		expectedSellQuote uint64
+		expectedBuyBase   uint64
+		expectedBuyQuote  uint64
 	}
 
-	tCore := newTCore()
-	tCore.market = &core.Market{
-		BaseID:  42,
-		QuoteID: 0,
-		LotSize: 5e6,
-	}
-
-	bals := map[uint32]uint64{
-		42: 1e9,
-		0:  1e9,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
-		botID:           "host1",
-		core:            tCore,
-		baseDexBalances: bals,
-		baseCexBalances: bals,
-		log:             tLogger,
-		market: &MarketWithHost{
-			Host:    "host1",
-			BaseID:  42,
-			QuoteID: 0,
-		},
-	})
-	adaptor.run(ctx)
-
-	form := &multiTradeForm{
-		host:    "host1",
-		baseID:  42,
-		quoteID: 0,
-		sell:    true,
-		placements: []*multiTradePlacement{
-			{
-				rate:     5e7,
-				qty:      5e6,
-				grouping: 0,
-			},
-			{
-				rate:     6e7,
-				qty:      5e6,
-				grouping: 1,
-			},
-			{
-				rate:     7e7,
-				qty:      5e6,
-				grouping: 2,
-			},
-		},
-	}
-
-	tCore.multiTradeResult = []*core.Order{
+	tests := []*test{
 		{
-			ID:     orderIDs[0],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   5e7,
-			Sell:   true,
+			name: "dcr/btc",
+			market: &MarketWithHost{
+				BaseID:  42,
+				QuoteID: 0,
+			},
+			buyFees: &orderFees{
+				swap:       5e5,
+				redemption: 1.1e4,
+			},
+			sellFees: &orderFees{
+				swap:       1.085e4,
+				redemption: 4e5,
+			},
+			rate:              5e7,
+			expectedSellBase:  810850,
+			expectedBuyBase:   1011000,
+			expectedSellQuote: 405425,
+			expectedBuyQuote:  505500,
 		},
 		{
-			ID:     orderIDs[1],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   6e7,
-			Sell:   true,
+			name: "btc/usdc.eth",
+			market: &MarketWithHost{
+				BaseID:  0,
+				QuoteID: 60001,
+			},
+			buyFees: &orderFees{
+				swap:       1e7,
+				redemption: 4e4,
+			},
+			sellFees: &orderFees{
+				swap:       5e4,
+				redemption: 1.1e7,
+			},
+			fiatRates: map[uint32]float64{
+				60001: 0.99,
+				60:    2300,
+				0:     42999,
+			},
+			rate:              calc.MessageRateAlt(43000, 1e8, 1e6),
+			expectedSellBase:  108838,
+			expectedBuyBase:   93489,
+			expectedSellQuote: 47055555,
+			expectedBuyQuote:  40432323,
 		},
 		{
-			ID:     orderIDs[2],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   7e7,
-			Sell:   true,
+			name: "wbtc.polygon/usdc.eth",
+			market: &MarketWithHost{
+				BaseID:  966003,
+				QuoteID: 60001,
+			},
+			buyFees: &orderFees{
+				swap:       1e7,
+				redemption: 4e4,
+			},
+			sellFees: &orderFees{
+				swap:       5e4,
+				redemption: 1.1e7,
+			},
+			fiatRates: map[uint32]float64{
+				60001:  0.99,
+				60:     2300,
+				966003: 42500,
+				966:    0.8,
+			},
+			rate:              calc.MessageRateAlt(43000, 1e8, 1e6),
+			expectedSellBase:  59529,
+			expectedBuyBase:   54117,
+			expectedSellQuote: 25555595,
+			expectedBuyQuote:  23232355,
 		},
 	}
 
-	_, err := adaptor.MultiTrade(form)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	runTest := func(tt *test) {
+		tCore := newTCore()
+		tCore.fiatRates = tt.fiatRates
+		tCore.singleLotBuyFees = tt.buyFees
+		tCore.singleLotSellFees = tt.sellFees
+		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+			core:   tCore,
+			log:    tLogger,
+			market: tt.market,
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		adaptor.run(ctx)
 
-	checkGroupedOrders := func(groupedOrders map[uint64][]*core.Order, expected map[uint64][]dex.Bytes) {
-		t.Helper()
-		if len(groupedOrders) != len(expected) {
-			t.Fatalf("unexpected number of grouped orders. want %d, got %d", len(expected), len(groupedOrders))
+		sellBase, err := adaptor.OrderFeesInUnits(true, true, tt.rate)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
 		}
-		for groupID, orders := range groupedOrders {
-			expectedIDs := expected[groupID]
-			if len(orders) != len(expectedIDs) {
-				t.Fatalf("unexpected number of orders for group %d. want %d, got %d", groupID, len(expectedIDs), len(orders))
-			}
-			for i, order := range orders {
-				if !bytes.Equal(order.ID, expectedIDs[i]) {
-					t.Fatalf("unexpected order ID for group %d at index %d. want %s, got %s", groupID, i, expectedIDs[i], order.ID)
-				}
-			}
+		if sellBase != tt.expectedSellBase {
+			t.Fatalf("%s: unexpected sell base fee. want %d, got %d", tt.name, tt.expectedSellBase, sellBase)
+		}
+
+		sellQuote, err := adaptor.OrderFeesInUnits(true, false, tt.rate)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if sellQuote != tt.expectedSellQuote {
+			t.Fatalf("%s: unexpected sell quote fee. want %d, got %d", tt.name, tt.expectedSellQuote, sellQuote)
+		}
+
+		buyBase, err := adaptor.OrderFeesInUnits(false, true, tt.rate)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if buyBase != tt.expectedBuyBase {
+			t.Fatalf("%s: unexpected buy base fee. want %d, got %d", tt.name, tt.expectedBuyBase, buyBase)
+		}
+
+		buyQuote, err := adaptor.OrderFeesInUnits(false, false, tt.rate)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tt.name, err)
+		}
+		if buyQuote != tt.expectedBuyQuote {
+			t.Fatalf("%s: unexpected buy quote fee. want %d, got %d", tt.name, tt.expectedBuyQuote, buyQuote)
 		}
 	}
 
-	groupedBuys, groupedSells := adaptor.GroupedBookedOrders()
-	expectedBuyIDs := map[uint64][]dex.Bytes{}
-	expectedSellIDs := map[uint64][]dex.Bytes{
-		0: {orderIDs[0]},
-		1: {orderIDs[1]},
-		2: {orderIDs[2]},
+	for _, test := range tests {
+		runTest(test)
 	}
-	checkGroupedOrders(groupedBuys, expectedBuyIDs)
-	checkGroupedOrders(groupedSells, expectedSellIDs)
-
-	tCore.multiTradeResult = []*core.Order{
-		{
-			ID:     orderIDs[3],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   5e7,
-			Sell:   false,
-		},
-		{
-			ID:     orderIDs[4],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   6e7,
-			Sell:   false,
-		},
-		{
-			ID:     orderIDs[5],
-			Status: order.OrderStatusBooked,
-			Qty:    5e6,
-			Rate:   7e7,
-			Sell:   false,
-		},
-	}
-	form.sell = false
-
-	_, err = adaptor.MultiTrade(form)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	groupedBuys, groupedSells = adaptor.GroupedBookedOrders()
-	expectedBuyIDs = map[uint64][]dex.Bytes{
-		0: {orderIDs[3]},
-		1: {orderIDs[4]},
-		2: {orderIDs[5]},
-	}
-	checkGroupedOrders(groupedBuys, expectedBuyIDs)
-	checkGroupedOrders(groupedSells, expectedSellIDs)
-
-	tCore.noteFeed <- &core.OrderNote{
-		Order: &core.Order{
-			ID:     orderIDs[2],
-			Status: order.OrderStatusCanceled,
-			Qty:    5e6,
-			Rate:   6e7,
-			Sell:   true,
-		},
-	}
-	tCore.noteFeed <- &core.OrderNote{
-		Order: &core.Order{
-			ID:     orderIDs[4],
-			Status: order.OrderStatusExecuted,
-			Qty:    5e6,
-			Rate:   6e7,
-			Sell:   false,
-		},
-	}
-	tCore.noteFeed <- &core.BondPostNote{} // dummy note
-
-	expectedBuyIDs = map[uint64][]dex.Bytes{
-		0: {orderIDs[3]},
-		2: {orderIDs[5]},
-	}
-	expectedSellIDs = map[uint64][]dex.Bytes{
-		0: {orderIDs[0]},
-		1: {orderIDs[1]},
-	}
-
-	groupedBuys, groupedSells = adaptor.GroupedBookedOrders()
-	checkGroupedOrders(groupedBuys, expectedBuyIDs)
-	checkGroupedOrders(groupedSells, expectedSellIDs)
 }
