@@ -9646,6 +9646,23 @@ func (c *Core) handleWalletNotification(ni asset.WalletNotification) {
 			c.log.Errorf("Error storing and sending emitted balance: %v", err)
 		}
 		return // Notification sent already.
+	case *asset.TransactionNote:
+		if n.Transaction.Type != asset.Receive || n.Transaction.Recipient == nil {
+			break
+		}
+		w, ok := c.wallet(n.AssetID)
+		if !ok {
+			return
+		}
+		currentAddress := w.currentDepositAddress()
+		if currentAddress == *n.Transaction.Recipient {
+			updatedAddr, err := c.NewDepositAddress(n.AssetID)
+			if err != nil {
+				c.log.Errorf("Error getting new deposit address for %s: %v", unbip(n.AssetID), err)
+				break
+			}
+			c.log.Debugf("Deposit address for %s has changed from %s to %s", unbip(n.AssetID), currentAddress, updatedAddr)
+		}
 	}
 	c.notify(newWalletNote(ni))
 }
