@@ -2,6 +2,9 @@
 // pragma should be as specific as possible to allow easier validation.
 pragma solidity = 0.8.18;
 
+import "@account-abstraction/contracts/interfaces/IAccount.sol";
+import "@account-abstraction/contracts/core/EntryPoint.sol";
+
 // ETHSwap creates a contract to be deployed on an ethereum network. After
 // deployed, it keeps a map of swaps that facilitates atomic swapping of
 // ethereum with other crypto currencies that support time locks.
@@ -24,7 +27,7 @@ pragma solidity = 0.8.18;
 // This code should be verifiable as resulting in a certain on-chain contract
 // by compiling with the correct version of solidity and comparing the
 // resulting byte code to the data in the original transaction.
-contract ETHSwap {
+contract ETHSwap is IAccount {
     // State is a type that hold's a contract's state. Empty is the uninitiated
     // or null value.
     enum State { Empty, Filled, Redeemed, Refunded }
@@ -43,14 +46,20 @@ contract ETHSwap {
         State state;
     }
 
+    address payable entryPoint;
+
     // swaps is a map of swap secret hashes to swaps. It can be read by anyone
     // for free.
     mapping(bytes32 => Swap) public swaps;
 
+    mapping(bytes32 => uint256) redeemPrepayments;
+
     // constructor is empty. This contract has no connection to the original
     // sender after deployed. It can only be interacted with by users
     // initiating, redeeming, and refunding swaps.
-    constructor() {}
+    constructor(address payable _entryPoint) {
+        entryPoint = _entryPoint;
+    }
 
     // isRefundable checks that a swap can be refunded. The requirements are
     // the state is Filled, and the block timestamp be after the swap's stored
@@ -65,6 +74,11 @@ contract ETHSwap {
     // contracts, which reduces possible attack vectors.
     modifier senderIsOrigin() {
         require(tx.origin == msg.sender, "sender != origin");
+        _;
+    }
+
+    modifier senderIsEntryPoint() {
+        require(entryPoint == msg.sender, "sender != entryPoint");
         _;
     }
 
@@ -156,6 +170,89 @@ contract ETHSwap {
         require(ok == true, "transfer failed");
     }
 
+    function validateUserOp(UserOperation calldata userOp, bytes32, uint256 missingAccountFunds) 
+        external
+        senderIsEntryPoint()
+        returns (uint256 validationData) {
+
+        if (userOp.callData.length < 4) {
+            return 1;
+        }
+
+        if (bytes4(userOp.callData[0:4]) != bytes4(0x76696f51)) {
+            return 2;
+        }
+
+        (Redemption[] memory redemptions) = abi.decode(userOp.callData[4:], (Redemption[]));
+        address participant;
+        uint256 amountToRedeem;
+        for (uint i = 0; i < redemptions.length; i++) {
+            Redemption memory redemption = redemptions[i];
+            Swap storage swapToRedeem = swaps[redemption.secretHash];
+            if (i == 0) {
+                participant = swapToRedeem.participant;
+                redeemPrepayments[redemption.secretHash] = missingAccountFunds;
+            } else if (swapToRedeem.participant != participant) {
+                return 3;
+            }
+            if (swapToRedeem.state != State.Filled) {
+                return 4;
+            }
+            if (sha256(abi.encodePacked(redemption.secret)) != redemption.secretHash) {
+                return 5;
+            }
+            amountToRedeem += swapToRedeem.value;
+        }
+
+        if (missingAccountFunds > amountToRedeem) {
+            return 6;
+        }
+
+        _payPrefund(missingAccountFunds);
+
+        return 0;
+    }
+
+    function _payPrefund(uint256 missingAccountFunds) internal {
+        if (missingAccountFunds != 0) {
+            (bool success, ) = payable(msg.sender).call{
+                value: missingAccountFunds,
+                gas: type(uint256).max
+            }("");
+            (success);
+            //ignore failure (its EntryPoint's job to verify, not account.)
+        }
+    }
+
+    function redeemAA(Redemption[] calldata redemptions)
+        public
+        senderIsEntryPoint() {
+
+        uint amountToRedeem = 0;
+        address recipient;
+
+        for (uint i = 0; i < redemptions.length; i++) {
+            Redemption calldata redemption = redemptions[i];
+            Swap storage swapToRedeem = swaps[redemption.secretHash];
+            if (i == 0) {
+                recipient = swapToRedeem.participant;
+            } else {
+                require(swapToRedeem.participant == recipient, "bad participant");
+            }
+            require(swapToRedeem.state == State.Filled, "bad state");
+            require(sha256(abi.encodePacked(redemption.secret)) == redemption.secretHash,
+                "bad secret");
+
+            swapToRedeem.state = State.Redeemed;
+            swapToRedeem.secret = redemption.secret;
+            amountToRedeem += swapToRedeem.value;
+        }
+
+        uint256 fees = redeemPrepayments[redemptions[0].secretHash];
+        (bool ok, ) = payable(recipient).call{value: amountToRedeem - fees}("");
+        require(ok == true, "transfer failed");
+    }
+
     // refund refunds a contract. It checks that the sender is not a contract,
     // and that the refund time has passed. msg.value is transferred from the
     // contract to the initiator.
@@ -173,3 +270,4 @@ contract ETHSwap {
         require(ok == true, "transfer failed");
     }
 }
+
