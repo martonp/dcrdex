@@ -17,7 +17,6 @@ PKG_NAME=v${VERSION}
 CONTRACT_NAME=ERC20Swap
 SOLIDITY_FILE=./${CONTRACT_NAME}V${VERSION}.sol
 TEST_TOKEN=./TestToken.sol
-TEST_USDC=./TestUSDC.sol
 if [ ! -f ${SOLIDITY_FILE} ]
 then
     echo "${SOLIDITY_FILE} does not exist" >&2
