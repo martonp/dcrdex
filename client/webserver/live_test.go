@@ -316,7 +316,7 @@ var dexAssets = map[uint32]*dex.Asset{
 	3:                  mkDexAsset("doge"),
 	145:                mkDexAsset("bch"),
 	60:                 mkDexAsset("eth"),
-	60000:              mkDexAsset("dextt.eth"),
+	60001:              mkDexAsset("usdc.eth"),
 }
 
 var tExchanges = map[string]*core.Exchange{
@@ -333,7 +333,7 @@ var tExchanges = map[string]*core.Exchange{
 			mkid(3, 42):     mkMrkt("doge", "dcr"),
 			mkid(22, 42):    mkMrkt("mona", "dcr"),
 			mkid(28, 0):     mkMrkt("vtc", "btc"),
-			mkid(60000, 42): mkMrkt("dextt.eth", "dcr"),
+			mkid(60001, 42): mkMrkt("usdc.eth", "dcr"),
 		},
 		ConnectionStatus: comms.Connected,
 		RegFees: map[string]*core.FeeAsset{
@@ -367,8 +367,8 @@ var tExchanges = map[string]*core.Exchange{
 				Confs: 10,
 				Amt:   1e12,
 			},
-			"dextt.eth": {
-				ID:    60000,
+			"usdc.eth": {
+				ID:    60001,
 				Confs: 10,
 				Amt:   1e11,
 			},
@@ -700,7 +700,7 @@ func (c *TCore) Notifications(n int) ([]*db.Notification, error) {
 	return nil, nil
 }
 
-var orderAssets = []string{"dcr", "btc", "ltc", "doge", "mona", "vtc", "dextt.eth"}
+var orderAssets = []string{"dcr", "btc", "ltc", "doge", "mona", "vtc", "usdc.eth"}
 
 func (c *TCore) Orders(filter *core.OrderFilter) ([]*core.Order, error) {
 	var spacing uint64 = 60 * 60 * 1000 / 2 // half an hour
@@ -1765,7 +1765,7 @@ func (c *TCore) SupportedAssets() map[uint32]*core.SupportedAsset {
 		28:    mkSupportedAsset("vtc", c.walletState(28)),
 		60:    mkSupportedAsset("eth", c.walletState(60)),
 		145:   mkSupportedAsset("bch", c.walletState(145)),
-		60000: mkSupportedAsset("dextt.eth", c.walletState(60000)),
+		60000: mkSupportedAsset("usdc.eth", c.walletState(60000)),
 	}
 }
 

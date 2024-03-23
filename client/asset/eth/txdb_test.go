@@ -39,7 +39,7 @@ func TestTxDB(t *testing.T) {
 			AdditionalData: map[string]string{
 				"Nonce": "1",
 			},
-			TokenID: &simnetTokenID,
+			TokenID: &usdcTokenID,
 		},
 		Confirmed: true,
 	}

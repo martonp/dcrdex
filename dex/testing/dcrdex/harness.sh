@@ -163,7 +163,7 @@ if [ $ETH_ON -eq 0 ]; then
         },
         {
             "base": "DCR_simnet",
-            "quote": "DEXTT_simnet",
+            "quote": "USDC_simnet",
             "lotSize": 100000000,
             "rateStep": 100000,
             "epochDuration": ${EPOCH_DURATION},
@@ -186,13 +186,13 @@ if [ $POLYGON_ON -eq 0 ]; then
             "parcelSize": 2500
         },
         {
-            "base": "DEXTT_POLYGON_simnet",
-            "quote": "DCR_simnet",
-            "lotSize": 100000000,
-            "rateStep": 1000,
+            "base": "DCR_simnet",
+            "quote": "USDC_POLYGON_simnet",
+            "lotSize": 1000000,
+            "rateStep": 10000,
             "epochDuration": ${EPOCH_DURATION},
             "marketBuyBuffer": 1.2,
-            "parcelSize": 500
+            "parcelSize": 4
 EOF
 else echo "Polygon is not running. Configuring dcrdex markets without Polygon."
 fi
@@ -402,8 +402,8 @@ cat << EOF >> "./markets.json"
             "maxFeeRate": 200,
             "swapConf": 2
         },
-        "DEXTT_simnet": {
-            "bip44symbol": "dextt.eth",
+        "USDC_simnet": {
+            "bip44symbol": "usdc.eth",
             "network": "simnet",
             "maxFeeRate": 200,
             "swapConf": 2
@@ -430,8 +430,8 @@ cat << EOF >> "./markets.json"
             "swapConf": 2,
             "configPath": "$POLYGON_CONFIG_PATH"
         },
-        "DEXTT_POLYGON_simnet": {
-            "bip44symbol": "dextt.polygon",
+        "USDC_POLYGON_simnet": {
+            "bip44symbol": "usdc.polygon",
             "network": "simnet",
             "maxFeeRate": 200,
             "swapConf": 2

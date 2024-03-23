@@ -24,10 +24,10 @@ contract TestToken {
      * All two of these values are immutable: they can only be set once during
      * construction.
      */
-    constructor(uint8 dec) {
+    constructor() {
         _name = "TestToken";
         _symbol = "TST";
-        _decimals = dec;
+        _decimals = 6;
 
         _totalSupply = 44000000000000000000000;
         _balances[0x18D65FB8d60c1199bb1Ad381bE47aA692b482605] = 11000000000000000000000; // alpha

@@ -145,9 +145,6 @@ func FetchCoinpaprikaRates(ctx context.Context, log dex.Logger, assets map[uint3
 	slugAssets := make(map[string]uint32)
 	for _, sa := range assets {
 		symbol := dex.TokenSymbol(sa.Symbol)
-		if symbol == "dextt" {
-			continue
-		}
 		name := sa.Name
 		// TODO: Store these within the *SupportedAsset.
 		switch symbol {
@@ -245,10 +242,6 @@ func FetchMessariRates(ctx context.Context, log dex.Logger, assets map[uint32]*S
 		})
 
 		slug := dex.TokenSymbol(sa.Symbol)
-		if slug == "dextt" {
-			return
-		}
-
 		reqStr := fmt.Sprintf(messariURL, slug)
 
 		ctx, cancel := context.WithTimeout(ctx, fiatRequestTimeout)

@@ -45,7 +45,7 @@ var (
 	testAddressC = common.HexToAddress("2b84C791b79Ee37De042AD2ffF1A253c3ce9bc27")
 
 	ethGases   = dexeth.VersionedGases[0]
-	tokenGases = dexeth.Tokens[simnetTokenID].NetTokens[dex.Simnet].SwapContracts[0].Gas
+	tokenGases = dexeth.Tokens[usdcTokenID].NetTokens[dex.Simnet].SwapContracts[0].Gas
 
 	tETH = &dex.Asset{
 		// Version meaning?
@@ -69,8 +69,8 @@ var (
 	}
 
 	tToken = &dex.Asset{
-		ID:           simnetTokenID,
-		Symbol:       "dextt.eth",
+		ID:           usdcTokenID,
+		Symbol:       "usdc.eth",
 		Version:      0,
 		SwapSize:     tokenGases.Swap,
 		SwapSizeBase: tokenGases.Swap,
@@ -936,12 +936,12 @@ func tassetWallet(assetID uint32) (asset.Wallet, *assetWallet, *tMempoolNode, co
 			assetWallet: aw,
 			cfg:         &tokenWalletConfig{},
 			parent:      node.tokenParent,
-			token:       dexeth.Tokens[simnetTokenID],
-			netToken:    dexeth.Tokens[simnetTokenID].NetTokens[dex.Simnet],
+			token:       dexeth.Tokens[usdcTokenID],
+			netToken:    dexeth.Tokens[usdcTokenID].NetTokens[dex.Simnet],
 		}
 		aw.wallets = map[uint32]*assetWallet{
-			simnetTokenID: aw,
-			BipID:         node.tokenParent,
+			usdcTokenID: aw,
+			BipID:       node.tokenParent,
 		}
 	}
 
@@ -1035,7 +1035,7 @@ func TestBalanceWithMempool(t *testing.T) {
 	for _, test := range tests {
 		var assetID uint32 = BipID
 		if test.token {
-			assetID = simnetTokenID
+			assetID = usdcTokenID
 		}
 
 		_, eth, node, shutdown := tassetWallet(assetID)
@@ -1165,26 +1165,26 @@ func TestBalanceNoMempool(t *testing.T) {
 			name:    "eth with token fees",
 			assetID: BipID,
 			unconfirmedTxs: map[uint64]*tExtendedWalletTx{
-				0: newExtendedWalletTx(simnetTokenID, 4, 0, 5, 0, 0),
+				0: newExtendedWalletTx(usdcTokenID, 4, 0, 5, 0, 0),
 			},
 			expPendingOut: 5,
 			expCountAfter: 1,
 		},
 		{
 			name:    "token with 1 tx and other ignored assets",
-			assetID: simnetTokenID,
+			assetID: usdcTokenID,
 			unconfirmedTxs: map[uint64]*tExtendedWalletTx{
-				0: newExtendedWalletTx(simnetTokenID, 4, 0, 5, 0, 0),
-				1: newExtendedWalletTx(simnetTokenID+1, 8, 0, 9, 0, 0),
+				0: newExtendedWalletTx(usdcTokenID, 4, 0, 5, 0, 0),
+				1: newExtendedWalletTx(usdcTokenID+1, 8, 0, 9, 0, 0),
 			},
 			expPendingOut: 4,
 			expCountAfter: 2,
 		},
 		{
 			name:    "token with 1 tx incoming",
-			assetID: simnetTokenID,
+			assetID: usdcTokenID,
 			unconfirmedTxs: map[uint64]*tExtendedWalletTx{
-				0: newExtendedWalletTx(simnetTokenID, 0, 15, 5, 0, 0),
+				0: newExtendedWalletTx(usdcTokenID, 0, 15, 5, 0, 0),
 			},
 			expPendingIn:  15,
 			expCountAfter: 1,
@@ -1193,10 +1193,10 @@ func TestBalanceNoMempool(t *testing.T) {
 			name:    "eth mixed txs",
 			assetID: BipID,
 			unconfirmedTxs: map[uint64]*tExtendedWalletTx{
-				0: newExtendedWalletTx(BipID, 1, 0, 2, 0, 0),                              // 3 eth out
-				1: newExtendedWalletTx(simnetTokenID, 3, 0, 4, 0, txConfsNeededToConfirm), // confirmed
-				2: newExtendedWalletTx(simnetTokenID, 5, 0, 6, 0, 0),                      // 6 eth out
-				3: newExtendedWalletTx(BipID, 0, 7, 1, 0, 0),                              // 1 eth out, 7 eth in
+				0: newExtendedWalletTx(BipID, 1, 0, 2, 0, 0),                            // 3 eth out
+				1: newExtendedWalletTx(usdcTokenID, 3, 0, 4, 0, txConfsNeededToConfirm), // confirmed
+				2: newExtendedWalletTx(usdcTokenID, 5, 0, 6, 0, 0),                      // 6 eth out
+				3: newExtendedWalletTx(BipID, 0, 7, 1, 0, 0),                            // 1 eth out, 7 eth in
 			},
 			expPendingOut: 10,
 			expPendingIn:  7,
@@ -1204,9 +1204,9 @@ func TestBalanceNoMempool(t *testing.T) {
 		},
 		{
 			name:    "already confirmed, but still waiting for txConfsNeededToConfirm",
-			assetID: simnetTokenID,
+			assetID: usdcTokenID,
 			unconfirmedTxs: map[uint64]*tExtendedWalletTx{
-				0: newExtendedWalletTx(simnetTokenID, 0, 15, 5, tipHeight, 1),
+				0: newExtendedWalletTx(usdcTokenID, 0, 15, 5, tipHeight, 1),
 			},
 			expCountAfter: 1,
 		},
@@ -1311,7 +1311,7 @@ func TestFeeRate(t *testing.T) {
 
 func TestRefund(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testRefund(t, BipID) })
-	t.Run("token", func(t *testing.T) { testRefund(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testRefund(t, usdcTokenID) })
 }
 
 func testRefund(t *testing.T, assetID uint32) {
@@ -1333,7 +1333,7 @@ func testRefund(t *testing.T, assetID uint32) {
 	if assetID == BipID {
 		eth.versionedGases[1] = gasesV1
 	} else {
-		eth.versionedGases[1] = &dexeth.Tokens[simnetTokenID].NetTokens[dex.Simnet].SwapContracts[0].Gas
+		eth.versionedGases[1] = &dexeth.Tokens[usdcTokenID].NetTokens[dex.Simnet].SwapContracts[0].Gas
 		v1c = &tTokenContractor{tContractor: v1Contractor}
 	}
 
@@ -1492,7 +1492,7 @@ func (b *badCoin) Value() uint64 {
 
 func TestFundOrderReturnCoinsFundingCoins(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testFundOrderReturnCoinsFundingCoins(t, BipID) })
-	t.Run("token", func(t *testing.T) { testFundOrderReturnCoinsFundingCoins(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testFundOrderReturnCoinsFundingCoins(t, usdcTokenID) })
 }
 
 func testFundOrderReturnCoinsFundingCoins(t *testing.T, assetID uint32) {
@@ -1786,7 +1786,7 @@ func testFundOrderReturnCoinsFundingCoins(t *testing.T, assetID uint32) {
 
 func TestFundMultiOrder(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testFundMultiOrder(t, BipID) })
-	t.Run("token", func(t *testing.T) { testFundMultiOrder(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testFundMultiOrder(t, usdcTokenID) })
 }
 
 func testFundMultiOrder(t *testing.T, assetID uint32) {
@@ -1799,7 +1799,7 @@ func testFundMultiOrder(t *testing.T, assetID uint32) {
 	if assetID != BipID {
 		fromAsset = tToken
 		node.tokenContractor.allow = unlimitedAllowance
-		swapGas = dexeth.Tokens[simnetTokenID].NetTokens[dex.Simnet].
+		swapGas = dexeth.Tokens[usdcTokenID].NetTokens[dex.Simnet].
 			SwapContracts[fromAsset.Version].Gas.Swap
 	}
 
@@ -2176,7 +2176,7 @@ func TestPreSwap(t *testing.T) {
 		var assetID uint32 = BipID
 		assetCfg := tETH
 		if test.token {
-			assetID = simnetTokenID
+			assetID = usdcTokenID
 			assetCfg = tToken
 		}
 
@@ -2242,7 +2242,7 @@ func TestPreSwap(t *testing.T) {
 
 func TestSwap(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testSwap(t, BipID) })
-	t.Run("token", func(t *testing.T) { testSwap(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testSwap(t, usdcTokenID) })
 }
 
 func testSwap(t *testing.T, assetID uint32) {
@@ -2520,7 +2520,7 @@ func TestPreRedeem(t *testing.T) {
 	}
 
 	// Token
-	w, _, _, shutdown2 := tassetWallet(simnetTokenID)
+	w, _, _, shutdown2 := tassetWallet(usdcTokenID)
 	defer shutdown2()
 
 	form.Version = tToken.Version
@@ -2537,7 +2537,7 @@ func TestPreRedeem(t *testing.T) {
 
 func TestRedeem(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testRedeem(t, BipID) })
-	t.Run("token", func(t *testing.T) { testRedeem(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testRedeem(t, usdcTokenID) })
 }
 
 func testRedeem(t *testing.T, assetID uint32) {
@@ -2552,7 +2552,7 @@ func testRedeem(t *testing.T, assetID uint32) {
 		eth.versionedGases[1] = &tokenGases
 	}
 
-	tokenContracts := eth.tokens[simnetTokenID].NetTokens[dex.Simnet].SwapContracts
+	tokenContracts := eth.tokens[usdcTokenID].NetTokens[dex.Simnet].SwapContracts
 	tokenContracts[1] = tokenContracts[0]
 	defer delete(tokenContracts, 1)
 
@@ -3232,7 +3232,7 @@ func TestMaxOrder(t *testing.T) {
 		var assetID uint32 = BipID
 		assetCfg := tETH
 		if test.token {
-			assetID = simnetTokenID
+			assetID = usdcTokenID
 			assetCfg = tToken
 		}
 
@@ -3328,7 +3328,7 @@ func packRedeemDataV0(redemptions []*dexeth.Redemption) ([]byte, error) {
 
 func TestAuditContract(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testAuditContract(t, BipID) })
-	t.Run("token", func(t *testing.T) { testAuditContract(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testAuditContract(t, usdcTokenID) })
 }
 
 func testAuditContract(t *testing.T, assetID uint32) {
@@ -3914,7 +3914,7 @@ func TestLocktimeExpired(t *testing.T) {
 
 func TestFindRedemption(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testFindRedemption(t, BipID) })
-	t.Run("token", func(t *testing.T) { testFindRedemption(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testFindRedemption(t, usdcTokenID) })
 }
 
 func testFindRedemption(t *testing.T, assetID uint32) {
@@ -4056,7 +4056,7 @@ func testFindRedemption(t *testing.T, assetID uint32) {
 
 func TestRefundReserves(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testRefundReserves(t, BipID) })
-	t.Run("token", func(t *testing.T) { testRefundReserves(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testRefundReserves(t, usdcTokenID) })
 }
 
 func testRefundReserves(t *testing.T, assetID uint32) {
@@ -4084,7 +4084,7 @@ func testRefundReserves(t *testing.T, assetID uint32) {
 		feeWallet = node.tokenParent
 		assetV0 = *tToken
 		assetV1 = *tToken
-		tokenContracts := eth.tokens[simnetTokenID].NetTokens[dex.Simnet].SwapContracts
+		tokenContracts := eth.tokens[usdcTokenID].NetTokens[dex.Simnet].SwapContracts
 		tc := *tokenContracts[0]
 		tc.Gas = *gasesV1
 		tokenContracts[1] = &tc
@@ -4153,7 +4153,7 @@ func testRefundReserves(t *testing.T, assetID uint32) {
 
 func TestRedemptionReserves(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testRedemptionReserves(t, BipID) })
-	t.Run("token", func(t *testing.T) { testRedemptionReserves(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testRedemptionReserves(t, usdcTokenID) })
 }
 
 func testRedemptionReserves(t *testing.T, assetID uint32) {
@@ -4278,7 +4278,7 @@ func TestReconfigure(t *testing.T) {
 
 func TestSend(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testSend(t, BipID) })
-	t.Run("token", func(t *testing.T) { testSend(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testSend(t, usdcTokenID) })
 }
 
 func testSend(t *testing.T, assetID uint32) {
@@ -4361,7 +4361,7 @@ func testSend(t *testing.T, assetID uint32) {
 
 func TestConfirmRedemption(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testConfirmRedemption(t, BipID) })
-	t.Run("token", func(t *testing.T) { testConfirmRedemption(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testConfirmRedemption(t, usdcTokenID) })
 }
 
 func testConfirmRedemption(t *testing.T, assetID uint32) {
@@ -5226,7 +5226,7 @@ func TestMarshalMonitoredTx(t *testing.T) {
 // and sending will not cause a failure.
 func TestEstimateVsActualSendFees(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testEstimateVsActualSendFees(t, BipID) })
-	t.Run("token", func(t *testing.T) { testEstimateVsActualSendFees(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testEstimateVsActualSendFees(t, usdcTokenID) })
 }
 
 func testEstimateVsActualSendFees(t *testing.T, assetID uint32) {
@@ -5273,7 +5273,7 @@ func testEstimateVsActualSendFees(t *testing.T, assetID uint32) {
 
 func TestEstimateSendTxFee(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testEstimateSendTxFee(t, BipID) })
-	t.Run("token", func(t *testing.T) { testEstimateSendTxFee(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testEstimateSendTxFee(t, usdcTokenID) })
 }
 
 func testEstimateSendTxFee(t *testing.T, assetID uint32) {
@@ -5360,7 +5360,7 @@ func testEstimateSendTxFee(t *testing.T, assetID uint32) {
 // contract (that require more gas) are added.
 func TestMaxSwapRedeemLots(t *testing.T) {
 	t.Run("eth", func(t *testing.T) { testMaxSwapRedeemLots(t, BipID) })
-	t.Run("token", func(t *testing.T) { testMaxSwapRedeemLots(t, simnetTokenID) })
+	t.Run("token", func(t *testing.T) { testMaxSwapRedeemLots(t, usdcTokenID) })
 }
 
 func testMaxSwapRedeemLots(t *testing.T, assetID uint32) {
@@ -5411,11 +5411,11 @@ func testMaxSwapRedeemLots(t *testing.T, assetID uint32) {
 			t.Fatalf("expected 63 for max redemptions but got %d", info.MaxRedeemsInTx)
 		}
 	} else {
-		if info.MaxSwapsInTx != 28 {
-			t.Fatalf("expected 28 for max swaps but got %d", info.MaxSwapsInTx)
+		if info.MaxSwapsInTx != 20 {
+			t.Fatalf("expected 20 for max swaps but got %d", info.MaxSwapsInTx)
 		}
-		if info.MaxRedeemsInTx != 71 {
-			t.Fatalf("expected 71 for max redemptions but got %d", info.MaxRedeemsInTx)
+		if info.MaxRedeemsInTx != 45 {
+			t.Fatalf("expected 45 for max redemptions but got %d", info.MaxRedeemsInTx)
 		}
 	}
 }
