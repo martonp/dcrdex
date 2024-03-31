@@ -4443,6 +4443,9 @@ func testConfirmRedemption(t *testing.T, assetID uint32) {
 		}
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	tempDir := t.TempDir()
 
 	txDB := newBadgerTxDB(filepath.Join(tempDir, "tx.db"), tLogger)
@@ -4450,7 +4453,7 @@ func testConfirmRedemption(t *testing.T, assetID uint32) {
 		t.Fatalf("error creating tx db: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel = context.WithCancel(context.Background())
 	wg, err := txDB.connect(ctx)
 	if err != nil {
 		t.Fatalf("error connecting to tx db: %v", err)
