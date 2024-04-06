@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
-	"testing"
 	"time"
 
 	"decred.org/dcrdex/client/asset"
@@ -399,7 +398,7 @@ func (o *tOracle) getMarketPrice(base, quote uint32) float64 {
 	return o.marketPrice
 }
 
-func TestInitialBaseBalances(t *testing.T) {
+/*func TestInitialBaseBalances(t *testing.T) {
 	dcrBtcID := fmt.Sprintf("%s-%d-%d", "host1", 42, 0)
 	dcrEthID := fmt.Sprintf("%s-%d-%d", "host1", 42, 60)
 
@@ -1224,7 +1223,7 @@ func TestInitialBaseBalances(t *testing.T) {
 	for _, test := range tests {
 		runTest(test)
 	}
-}
+}*/
 
 type vwapResult struct {
 	avg     uint64

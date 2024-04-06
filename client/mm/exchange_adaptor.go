@@ -144,24 +144,53 @@ type pendingCEXOrder struct {
 	trade      *libxc.Trade
 }
 
+// botCfgUpdateManager is a struct that is passed to bots in order to manage
+// updates to the bot configuration. When the bot receives an update on the
+// updateBot channel, it should pause all actions and send a message on the
+// botPaused channel. Then it should update all configurations, and not resume
+// any activity until it receives a message on the resumeBot channel.
+type botCfgUpdateManager struct {
+	updateBot <-chan *BotConfig
+	botPaused chan<- interface{}
+	resumeBot <-chan interface{}
+}
+
+// adaptorCfgUpdateManager is a struct held by the unifiedExchangeAdaptor that
+// is used to manage updates to the bot configuration. To initiate an update,
+// the adaptor first sends a message on the updateBot channel, then waits for
+// the bot to pause and send a message on the botPaused channel. The adaptor
+// then updates the bot configuration and balances, and then sends a message
+// on the resumeBot channel to allow the bot to resume.
+type adaptorCfgUpdateManager struct {
+	updateBot chan<- *BotConfig
+	botPaused <-chan interface{}
+	resumeBot chan<- interface{}
+}
+
+// cfgUpdateManagerPair returns a pair of adaptorCfgUpdateManager and
+// botCfgUpdateManager that are used to manage updates to the bot config.
+func cfgUpdateManagerPair() (*adaptorCfgUpdateManager, *botCfgUpdateManager) {
+	updateBot := make(chan *BotConfig, 1)
+	botPaused := make(chan interface{}, 1)
+	resumeBot := make(chan interface{}, 1)
+	return &adaptorCfgUpdateManager{updateBot, botPaused, resumeBot},
+		&botCfgUpdateManager{updateBot, botPaused, resumeBot}
+}
+
 // unifiedExchangeAdaptor implements both botCoreAdaptor and botCexAdaptor.
 type unifiedExchangeAdaptor struct {
 	clientCore
 	libxc.CEX
 
-	botID              string
-	log                dex.Logger
-	fiatRates          atomic.Value // map[uint32]float64
-	orderUpdates       atomic.Value // chan *core.Order
-	market             *MarketWithHost
-	baseWalletOptions  map[string]string
-	quoteWalletOptions map[string]string
-	maxBuyPlacements   uint32
-	maxSellPlacements  uint32
-	rebalanceCfg       *AutoRebalanceConfig
-	eventLogDB         eventLogDB
-	botCfg             *BotConfig
-	initialBalances    map[uint32]uint64
+	botID            string
+	log              dex.Logger
+	fiatRates        atomic.Value // map[uint32]float64
+	orderUpdates     atomic.Value // chan *core.Order
+	market           *MarketWithHost
+	eventLogDB       eventLogDB
+	cfgUpdateManager *adaptorCfgUpdateManager
+	botCfg           atomic.Value // *BotConfig
+	initialBalances  map[uint32]uint64
 
 	subscriptionIDMtx sync.RWMutex
 	subscriptionID    *int
@@ -565,11 +594,12 @@ func (u *unifiedExchangeAdaptor) placeMultiTrade(placements []*dexOrderInfo, sel
 		corePlacements = append(corePlacements, p.placement)
 	}
 
+	botCfg := u.botCfg.Load().(*BotConfig)
 	var walletOptions map[string]string
 	if sell {
-		walletOptions = u.baseWalletOptions
+		walletOptions = botCfg.BaseWalletOptions
 	} else {
-		walletOptions = u.quoteWalletOptions
+		walletOptions = botCfg.QuoteWalletOptions
 	}
 
 	fromAsset, fromFeeAsset, _, toFeeAsset := orderAssets(u.market.BaseID, u.market.QuoteID, sell)
@@ -700,10 +730,6 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 	for _, assetID := range []uint32{fromAsset, fromFeeAsset, toAsset, toFeeAsset} {
 		if _, found := remainingBalances[assetID]; !found {
 			bal := u.DEXBalance(assetID)
-			if err != nil {
-				u.log.Errorf("MultiTrade: error getting dex balance: %v", err)
-				return nil
-			}
 			availableBalance := bal.Available
 			if dexReserves != nil {
 				if dexReserves[assetID] > availableBalance {
@@ -727,10 +753,6 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 	var remainingCEXBal uint64
 	if accountForCEXBal {
 		cexBal := u.CEXBalance(toAsset)
-		if err != nil {
-			u.log.Errorf("MultiTrade: error getting cex balance: %v", err)
-			return nil
-		}
 		remainingCEXBal = cexBal.Available
 		reserves := cexReserves[toAsset]
 		if remainingCEXBal < reserves {
@@ -757,28 +779,38 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 	// adjusted to take into account pending orders that are already on
 	// the books.
 	requiredPlacements := make([]*multiTradePlacement, 0, len(placements))
-	// ordersWithinTolerance is a list of pending orders that are within
-	// tolerance of their currently expected rate, in decreasing order
-	// by placementIndex. If the bot doesn't have enough balance to place
-	// an order with a higher priority (lower placementIndex) then the
-	// lower priority orders will be cancelled.
-	ordersWithinTolerance := make([]*pendingDEXOrder, 0, len(placements))
+	// keptOrders is a list of pending orders that are not being cancelled, in
+	// decreasing order of placementIndex. If the bot doesn't have enough
+	// balance to place an order with a higher priority (lower placementIndex)
+	// then the lower priority orders in this list will be cancelled.
+	keptOrders := make([]*pendingDEXOrder, 0, len(placements))
 	for _, p := range placements {
 		pCopy := *p
 		requiredPlacements = append(requiredPlacements, &pCopy)
 	}
 	for _, groupedOrders := range pendingOrders {
 		for _, o := range groupedOrders {
-			if !withinTolerance(o.order.Rate, placements[o.placementIndex].rate, driftTolerance) {
+			if o.placementIndex >= uint64(len(requiredPlacements)) {
+				// This will happen if there is a reconfig in which there are
+				// now less placements than before.
 				addCancel(o.order)
-			} else {
-				ordersWithinTolerance = append([]*pendingDEXOrder{o}, ordersWithinTolerance...)
+				continue
 			}
 
-			if requiredPlacements[o.placementIndex].lots > (o.order.Qty-o.order.Filled)/mkt.LotSize {
+			mustCancel := !withinTolerance(o.order.Rate, placements[o.placementIndex].rate, driftTolerance)
+			if requiredPlacements[o.placementIndex].lots >= (o.order.Qty-o.order.Filled)/mkt.LotSize {
 				requiredPlacements[o.placementIndex].lots -= (o.order.Qty - o.order.Filled) / mkt.LotSize
 			} else {
+				// This will happen if there is a reconfig in which this
+				// placement index now requires less lots than before.
+				mustCancel = true
 				requiredPlacements[o.placementIndex].lots = 0
+			}
+
+			if mustCancel {
+				addCancel(o.order)
+			} else {
+				keptOrders = append([]*pendingDEXOrder{o}, keptOrders...)
 			}
 		}
 	}
@@ -863,7 +895,7 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 		// If there is insufficient balance to place a higher priority order,
 		// cancel the lower priority orders.
 		if lotsToPlace < placement.lots {
-			for _, o := range ordersWithinTolerance {
+			for _, o := range keptOrders {
 				if o.placementIndex > uint64(i) {
 					addCancel(o.order)
 				}
@@ -1374,6 +1406,14 @@ func (u *unifiedExchangeAdaptor) Withdraw(ctx context.Context, assetID uint32, a
 	return nil
 }
 
+func (u *unifiedExchangeAdaptor) autoRebalanceConfig() *AutoRebalanceConfig {
+	cexCfg := u.botCfg.Load().(*BotConfig).CEXCfg
+	if cexCfg != nil {
+		return cexCfg.AutoRebalance
+	}
+	return nil
+}
+
 // FreeUpFunds cancels active orders to free up the specified amount of funds
 // for a rebalance between the dex and the cex. If the cex parameter is true,
 // it means we are freeing up funds for withdrawal. DEX orders that require a
@@ -1381,6 +1421,11 @@ func (u *unifiedExchangeAdaptor) Withdraw(ctx context.Context, assetID uint32, a
 // order of priority (determined by the order in which they were passed into
 // MultiTrade).
 func (u *unifiedExchangeAdaptor) FreeUpFunds(assetID uint32, cex bool, amt uint64, currEpoch uint64) {
+	autoRebalanceCfg := u.autoRebalanceConfig()
+	if autoRebalanceCfg == nil {
+		return
+	}
+
 	var base bool
 	if assetID == u.market.BaseID {
 		base = true
@@ -1461,7 +1506,7 @@ func (u *unifiedExchangeAdaptor) FreeUpFunds(assetID uint32, cex bool, amt uint6
 	}
 
 	u.log.Warnf("Could not free up enough funds for %s %s rebalance. Freed %d, needed %d",
-		dex.BipIDSymbol(assetID), dex.BipIDSymbol(u.market.QuoteID), amt, amt+u.rebalanceCfg.MinQuoteTransfer)
+		dex.BipIDSymbol(assetID), dex.BipIDSymbol(u.market.QuoteID), amt, amt+autoRebalanceCfg.MinQuoteTransfer)
 }
 
 func (u *unifiedExchangeAdaptor) cexBalanceBackingDexOrders(assetID uint32) uint64 {
@@ -1570,7 +1615,8 @@ func (u *unifiedExchangeAdaptor) rebalanceAsset(ctx context.Context, assetID uin
 // calls to MultiTrade to make sure the funds needed for rebalancing are not
 // used to place orders.
 func (u *unifiedExchangeAdaptor) PrepareRebalance(ctx context.Context, assetID uint32) (rebalance int64, dexReserves, cexReserves uint64) {
-	if u.rebalanceCfg == nil {
+	autoRebalanceCfg := u.autoRebalanceConfig()
+	if autoRebalanceCfg == nil {
 		return
 	}
 
@@ -1580,8 +1626,8 @@ func (u *unifiedExchangeAdaptor) PrepareRebalance(ctx context.Context, assetID u
 		if u.pendingBaseRebalance.Load() {
 			return
 		}
-		minAmount = u.rebalanceCfg.MinBaseAmt
-		minTransferAmount = u.rebalanceCfg.MinBaseTransfer
+		minAmount = autoRebalanceCfg.MinBaseAmt
+		minTransferAmount = autoRebalanceCfg.MinBaseTransfer
 	} else {
 		if assetID != u.market.QuoteID {
 			u.log.Errorf("assetID %d is not the base or quote asset ID of the market", assetID)
@@ -1590,8 +1636,8 @@ func (u *unifiedExchangeAdaptor) PrepareRebalance(ctx context.Context, assetID u
 		if u.pendingQuoteRebalance.Load() {
 			return
 		}
-		minAmount = u.rebalanceCfg.MinQuoteAmt
-		minTransferAmount = u.rebalanceCfg.MinQuoteTransfer
+		minAmount = autoRebalanceCfg.MinQuoteAmt
+		minTransferAmount = autoRebalanceCfg.MinQuoteTransfer
 	}
 
 	return u.rebalanceAsset(ctx, assetID, minAmount, minTransferAmount)
@@ -2262,12 +2308,15 @@ func (u *unifiedExchangeAdaptor) updateFeeRates() error {
 		return fmt.Errorf("failed to get sell single lot fees: %v", err)
 	}
 
-	buyFundingFees, err := u.clientCore.MaxFundingFees(u.market.QuoteID, u.market.Host, u.maxBuyPlacements, u.baseWalletOptions)
+	botCfg := u.botCfg.Load().(*BotConfig)
+	maxBuyPlacements, maxSellPlacements := botCfg.maxPlacements()
+
+	buyFundingFees, err := u.clientCore.MaxFundingFees(u.market.QuoteID, u.market.Host, maxBuyPlacements, botCfg.BaseWalletOptions)
 	if err != nil {
 		return fmt.Errorf("failed to get buy funding fees: %v", err)
 	}
 
-	sellFundingFees, err := u.clientCore.MaxFundingFees(u.market.BaseID, u.market.Host, u.maxSellPlacements, u.quoteWalletOptions)
+	sellFundingFees, err := u.clientCore.MaxFundingFees(u.market.BaseID, u.market.Host, maxSellPlacements, botCfg.QuoteWalletOptions)
 	if err != nil {
 		return fmt.Errorf("failed to get sell funding fees: %v", err)
 	}
@@ -2304,7 +2353,8 @@ func (u *unifiedExchangeAdaptor) run(ctx context.Context) error {
 	startTime := time.Now().Unix()
 	u.startTime.Store(startTime)
 
-	err = u.eventLogDB.storeNewRun(startTime, u.market, u.botCfg, u.balanceState())
+	botCfg := u.botCfg.Load().(*BotConfig)
+	err = u.eventLogDB.storeNewRun(startTime, u.market, botCfg, u.balanceState())
 	if err != nil {
 		return fmt.Errorf("failed to store new run in event log db: %v", err)
 	}
@@ -2400,7 +2450,7 @@ func calcRunProfitLoss(initialBalances, finalBalances map[uint32]uint64, fiatRat
 	return profitLoss
 }
 
-func (u *unifiedExchangeAdaptor) stats() (*RunStats, error) {
+func (u *unifiedExchangeAdaptor) stats() *RunStats {
 	u.balancesMtx.RLock()
 	defer u.balancesMtx.RUnlock()
 
@@ -2428,38 +2478,69 @@ func (u *unifiedExchangeAdaptor) stats() (*RunStats, error) {
 		CEXBalances:     cexBalances,
 		ProfitLoss:      calcRunProfitLoss(u.initialBalances, totalBalances, fiatRates),
 		StartTime:       u.startTime.Load(),
-	}, nil
+	}
 }
 
 func (u *unifiedExchangeAdaptor) sendStatsUpdate() {
-	stats, err := u.stats()
-	if err != nil {
-		u.log.Errorf("Error getting stats: %v", err)
-		return
-	}
-
-	u.clientCore.Broadcast(newRunStatsNote(u.market.Host, u.market.BaseID, u.market.QuoteID, stats))
+	u.clientCore.Broadcast(newRunStatsNote(u.market.Host, u.market.BaseID, u.market.QuoteID, u.stats()))
 }
 
 func (u *unifiedExchangeAdaptor) notifyEvent(e *MarketMakingEvent) {
 	u.clientCore.Broadcast(newRunEventNote(u.market.Host, u.market.BaseID, u.market.QuoteID, u.startTime.Load(), e))
 }
 
+func (u *unifiedExchangeAdaptor) updateBalances(balanceDiffs *BotBalanceDiffs) {
+	u.balancesMtx.Lock()
+	defer u.balancesMtx.Unlock()
+
+	for assetID, diff := range balanceDiffs.DEX {
+		if diff == 0 {
+			continue
+		}
+		if diff < 0 && u.baseDexBalances[assetID] < uint64(-diff) {
+			u.log.Errorf("bot %s diff %d exceeds available balance %d. Setting balance to 0.", u.botID, diff, u.baseDexBalances[assetID])
+			u.baseDexBalances[assetID] = 0
+		} else {
+			u.baseDexBalances[assetID] += uint64(diff)
+		}
+	}
+
+	for assetID, diff := range balanceDiffs.CEX {
+		if diff == 0 {
+			return
+		}
+		if diff < 0 && u.baseCexBalances[assetID] < uint64(-diff) {
+			u.log.Errorf("bot %s diff %d exceeds available balance %d. Setting balance to 0.", u.botID, diff, u.baseCexBalances[assetID])
+			u.baseCexBalances[assetID] = 0
+		} else {
+			u.baseCexBalances[assetID] += uint64(diff)
+		}
+	}
+}
+
+func (u *unifiedExchangeAdaptor) updateConfig(cfg *BotConfig, balanceDiffs *BotBalanceDiffs) {
+	u.log.Infof("~~~In updateConfig~~~")
+	u.cfgUpdateManager.updateBot <- cfg
+	u.log.Infof("~~~Waiting for bot to pause~~~")
+	<-u.cfgUpdateManager.botPaused
+	u.log.Infof("~~~ Bot Paused ~~~")
+	u.botCfg.Store(cfg)
+	u.updateBalances(balanceDiffs)
+	u.log.Infof("~~~ Resuming bot ~~~")
+	u.cfgUpdateManager.resumeBot <- struct{}{}
+}
+
 type exchangeAdaptorCfg struct {
-	botID              string
-	market             *MarketWithHost
-	baseDexBalances    map[uint32]uint64
-	baseCexBalances    map[uint32]uint64
-	core               clientCore
-	cex                libxc.CEX
-	maxBuyPlacements   uint32
-	maxSellPlacements  uint32
-	baseWalletOptions  map[string]string
-	quoteWalletOptions map[string]string
-	rebalanceCfg       *AutoRebalanceConfig
-	log                dex.Logger
-	eventLogDB         eventLogDB
-	botCfg             *BotConfig
+	botID            string
+	market           *MarketWithHost
+	baseDexBalances  map[uint32]uint64
+	baseCexBalances  map[uint32]uint64
+	core             clientCore
+	cex              libxc.CEX
+	log              dex.Logger
+	eventLogDB       eventLogDB
+	botCfg           *BotConfig
+	cfgUpdateManager *adaptorCfgUpdateManager
 }
 
 // unifiedExchangeAdaptorForBot returns a unifiedExchangeAdaptor for the specified bot.
@@ -2473,18 +2554,13 @@ func unifiedExchangeAdaptorForBot(cfg *exchangeAdaptorCfg) *unifiedExchangeAdapt
 	}
 
 	adaptor := &unifiedExchangeAdaptor{
-		clientCore:         cfg.core,
-		CEX:                cfg.cex,
-		botID:              cfg.botID,
-		log:                cfg.log,
-		maxBuyPlacements:   cfg.maxBuyPlacements,
-		maxSellPlacements:  cfg.maxSellPlacements,
-		baseWalletOptions:  cfg.baseWalletOptions,
-		quoteWalletOptions: cfg.quoteWalletOptions,
-		rebalanceCfg:       cfg.rebalanceCfg,
-		eventLogDB:         cfg.eventLogDB,
-		botCfg:             cfg.botCfg,
-		initialBalances:    initialBalances,
+		clientCore:       cfg.core,
+		CEX:              cfg.cex,
+		botID:            cfg.botID,
+		log:              cfg.log,
+		eventLogDB:       cfg.eventLogDB,
+		cfgUpdateManager: cfg.cfgUpdateManager,
+		initialBalances:  initialBalances,
 
 		baseDexBalances:    cfg.baseDexBalances,
 		baseCexBalances:    cfg.baseCexBalances,
@@ -2496,6 +2572,7 @@ func unifiedExchangeAdaptorForBot(cfg *exchangeAdaptorCfg) *unifiedExchangeAdapt
 	}
 
 	adaptor.fiatRates.Store(map[uint32]float64{})
+	adaptor.botCfg.Store(cfg.botCfg)
 
 	return adaptor
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"decred.org/dcrdex/client/core"
+	"decred.org/dcrdex/client/mm"
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/config"
 	"decred.org/dcrdex/dex/encode"
@@ -193,9 +194,22 @@ type addRemovePeerForm struct {
 	address string
 }
 
-type startMarketMakingForm struct {
+type mmAvailableBalancesForm struct {
+	cfgFilePath string
+	mkt         *mm.MarketWithHost
+}
+
+type startBotForm struct {
 	appPass     encode.PassBytes
 	cfgFilePath string
+	mkt         *mm.MarketWithHost
+	balances    *mm.BotBalanceAllocation
+}
+
+type updateRunningBotForm struct {
+	cfgFilePath string
+	mkt         *mm.MarketWithHost
+	balances    *mm.BotBalanceDiffs
 }
 
 type setVSPForm struct {
@@ -863,13 +877,111 @@ func parseNotificationsArgs(params *RawParams) (int, error) {
 	return int(num), nil
 }
 
-func parseStartMarketMakingArgs(params *RawParams) (*startMarketMakingForm, error) {
-	if err := checkNArgs(params, []int{1}, []int{1}); err != nil {
+func parseMktWithHost(host, baseID, quoteID string) (*mm.MarketWithHost, error) {
+	mkt := new(mm.MarketWithHost)
+	mkt.Host = host
+	base, err := checkUIntArg(baseID, "baseID", 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid baseID: %v", err)
+	}
+	mkt.BaseID = uint32(base)
+	quote, err := checkUIntArg(quoteID, "quoteID", 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid quoteID: %v", err)
+	}
+	mkt.QuoteID = uint32(quote)
+	return mkt, nil
+}
+
+func parseMMAvailableBalancesArgs(params *RawParams) (*mmAvailableBalancesForm, error) {
+	if err := checkNArgs(params, []int{0}, []int{4}); err != nil {
 		return nil, err
 	}
-	form := new(startMarketMakingForm)
+	form := new(mmAvailableBalancesForm)
+	form.cfgFilePath = params.Args[0]
+	mkt, err := parseMktWithHost(params.Args[1], params.Args[2], params.Args[3])
+	if err != nil {
+		return nil, err
+	}
+	form.mkt = mkt
+	return form, nil
+}
+
+func parseStartBotArgs(params *RawParams) (*startBotForm, error) {
+	if err := checkNArgs(params, []int{1}, []int{6}); err != nil {
+		return nil, err
+	}
+	form := new(startBotForm)
 	form.appPass = params.PWArgs[0]
 	form.cfgFilePath = params.Args[0]
+
+	mkt, err := parseMktWithHost(params.Args[1], params.Args[2], params.Args[3])
+	if err != nil {
+		return nil, err
+	}
+	form.mkt = mkt
+
+	dexBals := make(map[uint32]uint64)
+	err = json.Unmarshal([]byte(params.Args[4]), &dexBals)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal dex balances: %v", err)
+	}
+
+	cexBals := make(map[uint32]uint64)
+	err = json.Unmarshal([]byte(params.Args[5]), &cexBals)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cex balances: %v", err)
+	}
+
+	form.balances = &mm.BotBalanceAllocation{
+		DEX: dexBals,
+		CEX: cexBals,
+	}
+
+	return form, nil
+}
+
+func parseStopBotArgs(params *RawParams) (*mm.MarketWithHost, error) {
+	if err := checkNArgs(params, []int{0}, []int{3}); err != nil {
+		return nil, err
+	}
+	return parseMktWithHost(params.Args[0], params.Args[1], params.Args[2])
+}
+
+func parseUpdateRunningBotArgs(params *RawParams) (*updateRunningBotForm, error) {
+	if err := checkNArgs(params, []int{0}, []int{4, 6}); err != nil {
+		return nil, err
+	}
+
+	form := new(updateRunningBotForm)
+
+	form.cfgFilePath = params.Args[0]
+
+	mkt, err := parseMktWithHost(params.Args[1], params.Args[2], params.Args[3])
+	if err != nil {
+		return nil, err
+	}
+	form.mkt = mkt
+
+	if len(params.Args) > 4 {
+		dexBals := make(map[uint32]int64)
+		err = json.Unmarshal([]byte(params.Args[4]), &dexBals)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal dex balance diffs: %v", err)
+		}
+
+		cexBals := make(map[uint32]int64)
+		err = json.Unmarshal([]byte(params.Args[5]), &cexBals)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal cex balance diffs: %v", err)
+		}
+
+		form.balances = &mm.BotBalanceDiffs{
+			DEX: dexBals,
+			CEX: cexBals,
+		}
+	}
+
 	return form, nil
 }
 

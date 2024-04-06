@@ -95,6 +95,8 @@ const (
 	RPCStakeStatusError                  // 76
 	RPCSetVotingPreferencesError         // 77
 	RPCTxHistoryError                    // 78
+	RPCMMAvailableBalancesError          // 79
+	RPCUpdateRunningBotError             // 80
 )
 
 // Routes are destinations for a "payload" of data. The type of data being

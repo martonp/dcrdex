@@ -37,19 +37,11 @@ func TestEventLogDB(t *testing.T) {
 	}
 
 	cfg := &BotConfig{
-		Host:             "dex.com",
-		BaseID:           42,
-		QuoteID:          60,
-		BaseBalanceType:  Percentage,
-		BaseBalance:      50,
-		QuoteBalanceType: Percentage,
-		QuoteBalance:     50,
+		Host:    "dex.com",
+		BaseID:  42,
+		QuoteID: 60,
 		CEXCfg: &BotCEXCfg{
-			Name:             "Binance",
-			BaseBalanceType:  Percentage,
-			BaseBalance:      50,
-			QuoteBalanceType: Percentage,
-			QuoteBalance:     50,
+			Name: "Binance",
 		},
 		ArbMarketMakerConfig: &ArbMarketMakerConfig{
 			BuyPlacements: []*ArbMarketMakingPlacement{

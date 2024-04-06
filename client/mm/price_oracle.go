@@ -22,11 +22,6 @@ import (
 const (
 	oraclePriceExpiration = time.Minute * 10
 	oracleRecheckInterval = time.Minute * 3
-
-	errNoMarkets = dex.ErrorKind("no markets")
-	// an autosync oracle will return errUnsyncedMarket if the price oracle
-	// was not initialized with the market that it was queried for.
-	errUnsyncedMarket = dex.ErrorKind("market not synced")
 )
 
 // MarketReport contains a market's rates on various exchanges and the fiat
@@ -48,27 +43,54 @@ type OracleReport struct {
 
 // stampedPrice is used for caching price data that can expire.
 type cachedPrice struct {
-	mtx     sync.RWMutex
 	stamp   time.Time
 	price   float64
 	oracles []*OracleReport
-
-	base  *asset.RegisteredAsset
-	quote *asset.RegisteredAsset
 }
 
-// priceOracle periodically fetches market prices from a set of oracles.
-// The priceOracle may be synced or unsynced. A synced priceOracle will
-// periodically fetch market prices for all markets that it was initialized
-// with. An unsynced priceOracle will only fetch market prices when they are
-// requested.
+type marketPair struct {
+	baseID, quoteID uint32
+}
+
+func (m marketPair) String() string {
+	return fmt.Sprintf("%s-%s", dex.BipIDSymbol(m.baseID), dex.BipIDSymbol(m.quoteID))
+}
+
+type syncedMarket struct {
+	numSubscribers uint32
+	stopSync       context.CancelFunc
+}
+
 type priceOracle struct {
-	ctx      context.Context
-	log      dex.Logger
-	autoSync bool
+	ctx context.Context
+	log dex.Logger
+
+	syncedMarketsMtx sync.RWMutex
+	syncedMarkets    map[marketPair]*syncedMarket
 
 	cachedPricesMtx sync.RWMutex
-	cachedPrices    map[string]*cachedPrice
+	cachedPrices    map[marketPair]*cachedPrice
+}
+
+func newPriceOracle(ctx context.Context, log dex.Logger) *priceOracle {
+	oracle := &priceOracle{
+		ctx:           ctx,
+		cachedPrices:  make(map[marketPair]*cachedPrice),
+		syncedMarkets: make(map[marketPair]*syncedMarket),
+		log:           log,
+	}
+
+	go func() {
+		<-ctx.Done()
+		oracle.syncedMarketsMtx.Lock()
+		defer oracle.syncedMarketsMtx.Unlock()
+		for mkt, syncedMarket := range oracle.syncedMarkets {
+			syncedMarket.stopSync()
+			delete(oracle.syncedMarkets, mkt)
+		}
+	}()
+
+	return oracle
 }
 
 type oracle interface {
@@ -77,76 +99,21 @@ type oracle interface {
 
 var _ oracle = (*priceOracle)(nil)
 
-func (o *priceOracle) getOracleDataAutoSync(base, quote uint32) (float64, []*OracleReport, error) {
-	mktStr := (&mkt{base, quote}).String()
-
-	o.cachedPricesMtx.RLock()
-	price, ok := o.cachedPrices[mktStr]
-	o.cachedPricesMtx.RUnlock()
-
-	if !ok {
-		return 0, nil, errUnsyncedMarket
-	}
-
-	price.mtx.RLock()
-	defer price.mtx.RUnlock()
-
-	if time.Since(price.stamp) < oraclePriceExpiration {
-		return price.price, price.oracles, nil
-	}
-
-	return 0, nil, fmt.Errorf("expired price data for %s", mktStr)
-}
-
-func (o *priceOracle) getOracleDataNoAutoSync(base, quote uint32) (float64, []*OracleReport, error) {
-	mktStr := (&mkt{base, quote}).String()
-
-	o.cachedPricesMtx.Lock()
-	price, ok := o.cachedPrices[mktStr]
-	if !ok {
-		cp, err := newCachedPrice(base, quote, asset.Assets())
-		if err != nil {
-			o.cachedPricesMtx.Unlock()
-			return 0, nil, err
-		}
-		o.cachedPrices[mktStr] = cp
-		price = cp
-	}
-	o.cachedPricesMtx.Unlock()
-
-	price.mtx.RLock()
-	if time.Since(price.stamp) < oracleRecheckInterval {
-		defer price.mtx.RUnlock()
-		return price.price, price.oracles, nil
-	}
-	price.mtx.RUnlock()
-
-	err := o.syncMarket(mktStr)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	price.mtx.RLock()
-	defer price.mtx.RUnlock()
-	return price.price, price.oracles, nil
-}
-
 // getMarketPrice returns the volume weighted market rate for the specified
 // base/quote pair. This market rate is used as the "oracleRate" in the
 // basic market making strategy.
 func (o *priceOracle) getMarketPrice(base, quote uint32) float64 {
-	var price float64
-	var err error
-	if o.autoSync {
-		price, _, err = o.getOracleDataAutoSync(base, quote)
-	} else {
-		price, _, err = o.getOracleDataNoAutoSync(base, quote)
-	}
+	price, _, err := o.getOracleInfo(base, quote)
 	if err != nil {
-		o.log.Errorf("error fetching market price for %d-%d: %v", base, quote, err)
 		return 0
 	}
 	return price
+}
+
+func (o *priceOracle) getCachedPrice(base, quote uint32) *cachedPrice {
+	o.cachedPricesMtx.RLock()
+	defer o.cachedPricesMtx.RUnlock()
+	return o.cachedPrices[marketPair{base, quote}]
 }
 
 // getOracleInfo returns the volume weighted market rate for a given base/quote pair
@@ -154,165 +121,126 @@ func (o *priceOracle) getMarketPrice(base, quote uint32) float64 {
 // the market rate. This market rate is used as the "oracleRate" in the basic market
 // making strategy.
 func (o *priceOracle) getOracleInfo(base, quote uint32) (float64, []*OracleReport, error) {
-	var price float64
-	var oracles []*OracleReport
-	var err error
-	if o.autoSync {
-		price, oracles, err = o.getOracleDataAutoSync(base, quote)
-	} else {
-		price, oracles, err = o.getOracleDataNoAutoSync(base, quote)
+	cachedPrice := o.getCachedPrice(base, quote)
+	isAutoSyncing := o.marketIsAutoSyncing(base, quote)
+
+	if isAutoSyncing {
+		if cachedPrice == nil || time.Since(cachedPrice.stamp) > oraclePriceExpiration {
+			return 0, nil, fmt.Errorf("auto-synced market has an expired price")
+		}
+		o.log.Tracef("Returning cached price of synced market %s", marketPair{base, quote})
+		return cachedPrice.price, cachedPrice.oracles, nil
 	}
+
+	if cachedPrice != nil && time.Since(cachedPrice.stamp) < oracleRecheckInterval {
+		o.log.Tracef("Returning cached price of non synced market %s", marketPair{base, quote})
+		return cachedPrice.price, cachedPrice.oracles, nil
+	}
+
+	return o.syncMarket(base, quote)
+}
+
+func (o *priceOracle) marketIsAutoSyncing(baseID, quoteID uint32) bool {
+	o.syncedMarketsMtx.RLock()
+	defer o.syncedMarketsMtx.RUnlock()
+	_, found := o.syncedMarkets[marketPair{baseID, quoteID}]
+	return found
+}
+
+func (o *priceOracle) startAutoSyncingMarket(baseID, quoteID uint32) error {
+	mkt := marketPair{baseID, quoteID}
+
+	o.syncedMarketsMtx.Lock()
+	defer o.syncedMarketsMtx.Unlock()
+
+	if syncedMarket, found := o.syncedMarkets[mkt]; found {
+		syncedMarket.numSubscribers++
+		return nil
+	}
+
+	_, _, err := o.syncMarket(baseID, quoteID)
 	if err != nil {
-		o.log.Errorf("error fetching market report for %d-%d: %v", base, quote, err)
-		return 0, nil, err
-	}
-	return price, oracles, nil
-}
-
-type mkt struct {
-	baseID, quoteID uint32
-}
-
-func (mkt *mkt) String() string {
-	return fmt.Sprintf("%d-%d", mkt.baseID, mkt.quoteID)
-}
-
-func newCachedPrice(baseID, quoteID uint32, registeredAssets map[uint32]*asset.RegisteredAsset) (*cachedPrice, error) {
-	baseAsset, ok := registeredAssets[baseID]
-	if !ok {
-		return nil, fmt.Errorf("base asset %d (%s) not supported", baseID, dex.BipIDSymbol(baseID))
+		return err
 	}
 
-	quoteAsset, ok := registeredAssets[quoteID]
-	if !ok {
-		return nil, fmt.Errorf("quote asset %d (%s) not supported", quoteID, dex.BipIDSymbol(quoteID))
-	}
-
-	return &cachedPrice{
-		base:  baseAsset,
-		quote: quoteAsset,
-	}, nil
-}
-
-// newAutoSyncPriceOracle creates a new priceOracle that periodically fetches
-// market prices from a set of oracles. Only the provided markets will be synced
-// and only those markets will be available for querying.
-func newAutoSyncPriceOracle(ctx context.Context, markets []*mkt, log dex.Logger) (*priceOracle, error) {
-	cachedPrices := make(map[string]*cachedPrice)
-
-	registeredAssets := asset.Assets()
-	for _, mkt := range markets {
-		if _, ok := cachedPrices[mkt.String()]; ok {
-			log.Warnf("duplicate market: %s", mkt.String())
-			continue
-		}
-
-		cachedPrice, err := newCachedPrice(mkt.baseID, mkt.quoteID, registeredAssets)
-		if err != nil {
-			return nil, err
-		}
-		cachedPrices[mkt.String()] = cachedPrice
-	}
-
-	oracle := &priceOracle{
-		ctx:          ctx,
-		cachedPrices: cachedPrices,
-		log:          log,
-		autoSync:     true,
-	}
-
-	// Sync all markets on startup
-	oracle.syncAllMarkets()
-
+	ctx, stopSync := context.WithCancel(o.ctx)
 	go func() {
-		ticker := time.NewTicker(oracleRecheckInterval)
-		defer ticker.Stop()
-
+		timer := time.After(0)
 		for {
 			select {
-			case <-ticker.C:
-				oracle.syncAllMarkets()
+			case <-timer:
+				_, _, err := o.syncMarket(baseID, quoteID)
+				if err != nil {
+					o.log.Errorf("Error syncing market %s: %v", mkt, err)
+					timer = time.After(30 * time.Second)
+				} else {
+					timer = time.After(oracleRecheckInterval)
+				}
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	return oracle, nil
-}
-
-// newUnsyncedPriceOracle creates a new priceOracle that only fetches market prices
-// when they are requested. Prices will be cached for a short time.
-func newUnsyncedPriceOracle(log dex.Logger) *priceOracle {
-	return &priceOracle{
-		ctx:          context.Background(),
-		cachedPrices: make(map[string]*cachedPrice),
-		log:          log,
+	o.syncedMarkets[mkt] = &syncedMarket{
+		numSubscribers: 1,
+		stopSync:       stopSync,
 	}
-}
-
-// syncMarket fetches the latest price for a market. There must
-// be an entry for the market cachedPrices before this function
-// is called.
-func (o *priceOracle) syncMarket(mkt string) error {
-	o.cachedPricesMtx.RLock()
-	cachedPrice := o.cachedPrices[mkt]
-	o.cachedPricesMtx.RUnlock()
-	if cachedPrice == nil {
-		return fmt.Errorf("market %s not found", mkt)
-	}
-
-	cachedPrice.mtx.RLock()
-	baseAsset := cachedPrice.base
-	quoteAsset := cachedPrice.quote
-	cachedPrice.mtx.RUnlock()
-
-	price, oracles, err := fetchMarketPrice(o.ctx, baseAsset, quoteAsset, o.log)
-	if err != nil {
-		return fmt.Errorf("error fetching market price for %s: %v", mkt, err)
-	}
-
-	o.log.Debugf("fetched market price for %s: %f (%d oracles)", mkt, price, len(oracles))
-
-	cachedPrice.mtx.Lock()
-	defer cachedPrice.mtx.Unlock()
-	cachedPrice.price = price
-	cachedPrice.oracles = oracles
-	cachedPrice.stamp = time.Now()
 
 	return nil
 }
 
-// syncAllMarkets fetches the latest prices for all markets.
-func (o *priceOracle) syncAllMarkets() {
-	wg := new(sync.WaitGroup)
+func (o *priceOracle) stopAutoSyncingMarket(baseID, quoteID uint32) {
+	mkt := marketPair{baseID, quoteID}
 
-	for mktName := range o.cachedPrices {
-		wg.Add(1)
+	o.syncedMarketsMtx.Lock()
+	defer o.syncedMarketsMtx.Unlock()
 
-		go func(mkt string) {
-			defer wg.Done()
-			err := o.syncMarket(mkt)
-			if err != nil {
-				o.log.Error(err)
-			}
-		}(mktName)
+	if syncedMarket, found := o.syncedMarkets[mkt]; found {
+		syncedMarket.numSubscribers--
+		if syncedMarket.numSubscribers == 0 {
+			syncedMarket.stopSync()
+			delete(o.syncedMarkets, mkt)
+		}
 	}
-
-	wg.Wait()
 }
 
-func fetchMarketPrice(ctx context.Context, b, q *asset.RegisteredAsset, log dex.Logger) (float64, []*OracleReport, error) {
+func (o *priceOracle) syncMarket(baseID, quoteID uint32) (float64, []*OracleReport, error) {
+	mkt := marketPair{baseID, quoteID}
+	price, oracles, err := fetchMarketPrice(o.ctx, baseID, quoteID, o.log)
+	if err != nil {
+		return 0, nil, fmt.Errorf("error fetching market price for %s: %v", mkt, err)
+	}
+
+	o.cachedPricesMtx.Lock()
+	defer o.cachedPricesMtx.Unlock()
+
+	o.cachedPrices[mkt] = &cachedPrice{
+		stamp:   time.Now(),
+		price:   price,
+		oracles: oracles,
+	}
+
+	return price, oracles, nil
+}
+
+func fetchMarketPrice(ctx context.Context, baseID, quoteID uint32, log dex.Logger) (float64, []*OracleReport, error) {
+	registeredAssets := asset.Assets()
+	b, q := registeredAssets[baseID], registeredAssets[quoteID]
+	if b == nil {
+		return 0, nil, fmt.Errorf("base asset %d not found", baseID)
+	}
+	if q == nil {
+		return 0, nil, fmt.Errorf("quote asset %d not found", quoteID)
+	}
+
 	oracles, err := oracleMarketReport(ctx, b, q, log)
 	if err != nil {
 		return 0, nil, err
 	}
-	price, err := oracleAverage(oracles, log)
-	if err != nil && !errors.Is(err, errNoMarkets) {
-		return 0, nil, err
-	}
 
-	return price, oracles, nil
+	price, err := oracleAverage(oracles, log)
+	return price, oracles, err
 }
 
 func oracleAverage(mkts []*OracleReport, log dex.Logger) (float64, error) {
@@ -324,8 +252,7 @@ func oracleAverage(mkts []*OracleReport, log dex.Logger) (float64, error) {
 		usdVolume += mkt.USDVol
 	}
 	if usdVolume == 0 {
-		log.Tracef("marketAveragedPrice: no markets")
-		return 0, errNoMarkets
+		return 0, fmt.Errorf("no markets to fetch oracle price")
 	}
 
 	rate := weightedSum / usdVolume

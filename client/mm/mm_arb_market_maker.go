@@ -381,7 +381,7 @@ func (a *arbMarketMaker) rebalance(epoch uint64) {
 	a.cancelExpiredCEXTrades()
 }
 
-func (a *arbMarketMaker) run() {
+func (a *arbMarketMaker) run(updateManager *botCfgUpdateManager) {
 	book, bookFeed, err := a.core.SyncBook(a.host, a.baseID, a.quoteID)
 	if err != nil {
 		a.log.Errorf("Failed to sync book: %v", err)
@@ -398,6 +398,8 @@ func (a *arbMarketMaker) run() {
 	tradeUpdates, unsubscribe := a.cex.SubscribeTradeUpdates()
 	defer unsubscribe()
 
+	pauseEpochs := make(chan interface{})
+	resumeEpochs := make(chan interface{})
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
@@ -409,12 +411,16 @@ func (a *arbMarketMaker) run() {
 					payload := n.Payload.(*core.EpochMatchSummaryPayload)
 					a.rebalance(payload.Epoch + 1)
 				}
+			case <-pauseEpochs:
+				<-resumeEpochs
 			case <-a.ctx.Done():
 				return
 			}
 		}
 	}()
 
+	pauseCEXUpdates := make(chan interface{})
+	resumeCEXUpdates := make(chan interface{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -422,12 +428,16 @@ func (a *arbMarketMaker) run() {
 			select {
 			case update := <-tradeUpdates:
 				a.handleCEXTradeUpdate(update)
+			case <-pauseCEXUpdates:
+				<-resumeCEXUpdates
 			case <-a.ctx.Done():
 				return
 			}
 		}
 	}()
 
+	pauseDEXUpdates := make(chan interface{})
+	resumeDEXUpdates := make(chan interface{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -436,6 +446,29 @@ func (a *arbMarketMaker) run() {
 			select {
 			case n := <-orderUpdates:
 				a.processDEXOrderUpdate(n)
+			case <-pauseDEXUpdates:
+				<-resumeDEXUpdates
+			case <-a.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case cfg := <-updateManager.updateBot:
+				pauseEpochs <- struct{}{}
+				pauseCEXUpdates <- struct{}{}
+				pauseDEXUpdates <- struct{}{}
+				updateManager.botPaused <- struct{}{}
+				a.cfg = cfg.ArbMarketMakerConfig
+				<-updateManager.resumeBot
+				resumeEpochs <- struct{}{}
+				resumeCEXUpdates <- struct{}{}
+				resumeDEXUpdates <- struct{}{}
 			case <-a.ctx.Done():
 				return
 			}
@@ -446,7 +479,7 @@ func (a *arbMarketMaker) run() {
 	a.core.CancelAllOrders()
 }
 
-func RunArbMarketMaker(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex botCexAdaptor, log dex.Logger) {
+func RunArbMarketMaker(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex botCexAdaptor, updateManager *botCfgUpdateManager, log dex.Logger) {
 	if cfg.ArbMarketMakerConfig == nil {
 		// implies bug in caller
 		log.Errorf("No arb market maker config provided. Exiting.")
@@ -467,13 +500,12 @@ func RunArbMarketMaker(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, ce
 		cex:           cex,
 		core:          c,
 		log:           log,
-		cfg:           cfg.ArbMarketMakerConfig,
 		mkt:           mkt,
 		matchesSeen:   make(map[order.MatchID]bool),
 		pendingOrders: make(map[order.OrderID]uint64),
 		cexTrades:     make(map[string]uint64),
 		dexReserves:   make(map[uint32]uint64),
 		cexReserves:   make(map[uint32]uint64),
-	}).run()
-
+		cfg:           cfg.ArbMarketMakerConfig,
+	}).run(updateManager)
 }

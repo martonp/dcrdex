@@ -425,7 +425,7 @@ func (a *simpleArbMarketMaker) rebalance(newEpoch uint64) {
 	}
 }
 
-func (a *simpleArbMarketMaker) run() {
+func (a *simpleArbMarketMaker) run(cfgUpdateManager *botCfgUpdateManager) {
 	book, bookFeed, err := a.core.SyncBook(a.host, a.baseID, a.quoteID)
 	if err != nil {
 		a.log.Errorf("Failed to sync book: %v", err)
@@ -442,8 +442,9 @@ func (a *simpleArbMarketMaker) run() {
 	tradeUpdates, unsubscribe := a.cex.SubscribeTradeUpdates()
 	defer unsubscribe()
 
+	pauseEpochs := make(chan interface{})
+	resumeEpochs := make(chan interface{})
 	wg := &sync.WaitGroup{}
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -454,12 +455,16 @@ func (a *simpleArbMarketMaker) run() {
 					payload := n.Payload.(*core.EpochMatchSummaryPayload)
 					a.rebalance(payload.Epoch + 1)
 				}
+			case <-pauseEpochs:
+				<-resumeEpochs
 			case <-a.ctx.Done():
 				return
 			}
 		}
 	}()
 
+	pauseCEXUpdates := make(chan interface{})
+	resumeCEXUpdates := make(chan interface{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -467,12 +472,16 @@ func (a *simpleArbMarketMaker) run() {
 			select {
 			case update := <-tradeUpdates:
 				a.handleCEXTradeUpdate(update)
+			case <-pauseCEXUpdates:
+				<-resumeCEXUpdates
 			case <-a.ctx.Done():
 				return
 			}
 		}
 	}()
 
+	pauseDEXUpdates := make(chan interface{})
+	resumeDEXUpdates := make(chan interface{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -481,6 +490,29 @@ func (a *simpleArbMarketMaker) run() {
 			select {
 			case n := <-orderUpdates:
 				a.handleDEXOrderUpdate(n)
+			case <-pauseDEXUpdates:
+				<-resumeDEXUpdates
+			case <-a.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case cfg := <-cfgUpdateManager.updateBot:
+				pauseEpochs <- struct{}{}
+				pauseCEXUpdates <- struct{}{}
+				pauseDEXUpdates <- struct{}{}
+				cfgUpdateManager.botPaused <- struct{}{}
+				a.cfg = cfg.SimpleArbConfig
+				<-cfgUpdateManager.resumeBot
+				resumeEpochs <- struct{}{}
+				resumeCEXUpdates <- struct{}{}
+				resumeDEXUpdates <- struct{}{}
 			case <-a.ctx.Done():
 				return
 			}
@@ -488,11 +520,10 @@ func (a *simpleArbMarketMaker) run() {
 	}()
 
 	wg.Wait()
-
 	a.cancelAllOrders()
 }
 
-func RunSimpleArbBot(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex botCexAdaptor, log dex.Logger) {
+func RunSimpleArbBot(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex botCexAdaptor, cfgUpdateManager *botCfgUpdateManager, log dex.Logger) {
 	if cfg.SimpleArbConfig == nil {
 		// implies bug in caller
 		log.Errorf("No arb config provided. Exiting.")
@@ -513,8 +544,8 @@ func RunSimpleArbBot(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex 
 		cex:        cex,
 		core:       c,
 		log:        log,
-		cfg:        cfg.SimpleArbConfig,
 		mkt:        mkt,
+		cfg:        cfg.SimpleArbConfig,
 		activeArbs: make([]*arbSequence, 0),
-	}).run()
+	}).run(cfgUpdateManager)
 }

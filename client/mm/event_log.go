@@ -214,7 +214,9 @@ func (db *boltEventLogDB) updateEvent(update *eventUpdate) {
 		}
 		return runBucket.Put(finalStateKey, versionedBytes(0).AddData(bsJSON))
 	})
-	db.log.Errorf("error storing event: %v", err)
+	if err != nil {
+		db.log.Errorf("error storing event: %v", err)
+	}
 }
 
 // listedForStoreEvents listens on the updateEvent channel and updates the

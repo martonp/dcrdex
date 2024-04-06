@@ -166,6 +166,7 @@ func TestSufficientBalanceForDEXTrade(t *testing.T) {
 					log:             tLogger,
 					eventLogDB:      &tEventLogDB{},
 				})
+				adaptor.botCfg.Store(&BotConfig{})
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				adaptor.run(ctx)
@@ -482,13 +483,17 @@ func TestPrepareRebalance(t *testing.T) {
 				core:            tCore,
 				baseDexBalances: test.dexBalances,
 				baseCexBalances: test.cexBalances,
-				rebalanceCfg:    cfg,
 				market: &MarketWithHost{
 					Host:    "dex.com",
 					BaseID:  baseID,
 					QuoteID: quoteID,
 				},
 				log: tLogger,
+			})
+			adaptor.botCfg.Store(&BotConfig{
+				CEXCfg: &BotCEXCfg{
+					AutoRebalance: cfg,
+				},
 			})
 			adaptor.pendingBaseRebalance.Store(test.baseRebalancePending)
 			adaptor.pendingQuoteRebalance.Store(test.quoteRebalancePending)
@@ -678,6 +683,11 @@ func TestFreeUpFunds(t *testing.T) {
 				},
 				log: tLogger,
 			})
+			adaptor.botCfg.Store(&BotConfig{
+				CEXCfg: &BotCEXCfg{
+					AutoRebalance: &AutoRebalanceConfig{},
+				},
+			})
 			adaptor.pendingDEXOrders = test.pendingDEXOrders
 			adaptor.FreeUpFunds(test.assetID, test.cex, test.amt, currEpoch)
 
@@ -752,7 +762,35 @@ func TestMultiTrade(t *testing.T) {
 		}
 		placements[len(placements)-1] = &multiTradePlacement{}
 		return placements
+	}
 
+	// removeLastPlacement simulates a reconfiguration is which the
+	// last placement is removed.
+	removeLastPlacement := func(sell bool) []*multiTradePlacement {
+		placements := make([]*multiTradePlacement, len(sellPlacements))
+		if sell {
+			copy(placements, sellPlacements)
+		} else {
+			copy(placements, buyPlacements)
+		}
+		return placements[:len(placements)-1]
+	}
+
+	// reconfigToMorePlacements simulates a reconfiguration in which
+	// the lots allocated to the placement at index 1 is reduced by 1.
+	reconfigToLessPlacements := func(sell bool) []*multiTradePlacement {
+		placements := make([]*multiTradePlacement, len(sellPlacements))
+		if sell {
+			copy(placements, sellPlacements)
+		} else {
+			copy(placements, buyPlacements)
+		}
+		placements[1] = &multiTradePlacement{
+			lots:             placements[1].lots - 1,
+			rate:             placements[1].rate,
+			counterTradeRate: placements[1].counterTradeRate,
+		}
+		return placements
 	}
 
 	pendingOrders := func(sell bool) map[order.OrderID]*pendingDEXOrder {
@@ -810,6 +848,14 @@ func TestMultiTrade(t *testing.T) {
 				counterTradeRate: placements[3].counterTradeRate,
 			},
 		}
+	}
+
+	// secondPendingOrderNotFilled returns the same pending orders as
+	// pendingOrders, but with the second order not filled.
+	secondPendingOrderNotFilled := func(sell bool) map[order.OrderID]*pendingDEXOrder {
+		orders := pendingOrders(sell)
+		orders[orderIDs[1]].order.Filled = 0
+		return orders
 	}
 
 	// pendingWithSelfMatch returns the same pending orders as pendingOrders,
@@ -953,6 +999,76 @@ func TestMultiTrade(t *testing.T) {
 			},
 		},
 		{
+			name:    "non account locker, reconfig to less placements",
+			baseID:  42,
+			quoteID: 0,
+
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 3*lotSize + 3*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
+			},
+			sellPlacements:    reconfigToLessPlacements(true),
+			sellPendingOrders: secondPendingOrderNotFilled(true),
+			expectedSellPlacements: []*core.QtyRate{
+				// {Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+				{Qty: lotSize, Rate: sellPlacements[3].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				// {Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[2].rate, 2*lotSize) +
+					b2q(buyPlacements[3].rate, lotSize) +
+					3*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 8 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    reconfigToLessPlacements(false),
+			buyPendingOrders: secondPendingOrderNotFilled(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				// {Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+				{Qty: lotSize, Rate: buyPlacements[3].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				// {Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[1][:], orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[1][:], orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+				// {ID: orderIDs[6][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[4][:]},
+				// {ID: orderIDs[5][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, nil, &orderIDs[4], &orderIDs[5],
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, nil, &orderIDs[4], nil,
+			},
+		},
+		{
 			name:    "non account locker, self-match",
 			baseID:  42,
 			quoteID: 0,
@@ -1080,6 +1196,72 @@ func TestMultiTrade(t *testing.T) {
 			},
 			expectedOrderIDsWithDecrement: []*order.OrderID{
 				nil, &orderIDs[4], &orderIDs[5], nil,
+			},
+		},
+		{
+			name:    "non account locker, remove last placement",
+			baseID:  42,
+			quoteID: 0,
+			// ---- Sell ----
+			sellDexBalances: map[uint32]uint64{
+				42: 3*lotSize + 3*sellFees.swap + sellFees.funding,
+				0:  0,
+			},
+			sellCexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(sellPlacements[0].counterTradeRate, lotSize) +
+					b2q(sellPlacements[1].counterTradeRate, 2*lotSize) +
+					b2q(sellPlacements[2].counterTradeRate, 3*lotSize) +
+					b2q(sellPlacements[3].counterTradeRate, lotSize),
+			},
+			sellPlacements:    removeLastPlacement(true),
+			sellPendingOrders: pendingOrders(true),
+			expectedSellPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
+			},
+			expectedSellPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: sellPlacements[1].rate},
+				{Qty: lotSize, Rate: sellPlacements[2].rate},
+			},
+
+			// ---- Buy ----
+			buyDexBalances: map[uint32]uint64{
+				42: 0,
+				0: b2q(buyPlacements[1].rate, lotSize) +
+					b2q(buyPlacements[2].rate, 2*lotSize) +
+					3*buyFees.swap + buyFees.funding,
+			},
+			buyCexBalances: map[uint32]uint64{
+				42: 7 * lotSize,
+				0:  0,
+			},
+			buyPlacements:    removeLastPlacement(false),
+			buyPendingOrders: pendingOrders(false),
+			expectedBuyPlacements: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
+			},
+			expectedBuyPlacementsWithDecrement: []*core.QtyRate{
+				{Qty: lotSize, Rate: buyPlacements[1].rate},
+				{Qty: lotSize, Rate: buyPlacements[2].rate},
+			},
+
+			expectedCancels:              []dex.Bytes{orderIDs[3][:], orderIDs[2][:]},
+			expectedCancelsWithDecrement: []dex.Bytes{orderIDs[3][:], orderIDs[2][:]},
+			multiTradeResult: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			multiTradeResultWithDecrement: []*core.Order{
+				{ID: orderIDs[4][:]},
+				{ID: orderIDs[5][:]},
+			},
+			expectedOrderIDs: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5],
+			},
+			expectedOrderIDsWithDecrement: []*order.OrderID{
+				nil, &orderIDs[4], &orderIDs[5],
 			},
 		},
 		{
@@ -1334,6 +1516,7 @@ func TestMultiTrade(t *testing.T) {
 						log:        tLogger,
 						eventLogDB: &tEventLogDB{},
 					})
+					adaptor.botCfg.Store(&BotConfig{})
 
 					var pendingOrders map[order.OrderID]*pendingDEXOrder
 					if sell {
@@ -2162,6 +2345,7 @@ func TestDEXTrade(t *testing.T) {
 			},
 			eventLogDB: eventLogDB,
 		})
+		adaptor.botCfg.Store(&BotConfig{})
 		adaptor.run(ctx)
 		orders := adaptor.MultiTrade(test.placements, test.sell, 0.01, 100, nil, nil)
 		if len(orders) == 0 {
@@ -2170,11 +2354,7 @@ func TestDEXTrade(t *testing.T) {
 
 		checkBalances := func(expected map[uint32]*BotBalance, updateNum int) {
 			t.Helper()
-			stats, err := adaptor.stats()
-			if err != nil {
-				t.Fatalf("%s: stats unexpected error: %v", test.name, err)
-			}
-
+			stats := adaptor.stats()
 			for assetID, expectedBal := range expected {
 				bal := adaptor.DEXBalance(assetID)
 				statsBal := stats.DEXBalances[assetID]
@@ -2269,11 +2449,7 @@ func TestDEXTrade(t *testing.T) {
 			tCore.noteFeed <- &core.BondPostNote{} // dummy note
 			checkBalances(update.stats.DEXBalances, i+1)
 
-			stats, err := adaptor.stats()
-			if err != nil {
-				t.Fatalf("%s: stats unexpected error: %v", test.name, err)
-			}
-
+			stats := adaptor.stats()
 			stats.CEXBalances = nil
 			stats.StartTime = 0
 			if !reflect.DeepEqual(stats.DEXBalances, update.stats.DEXBalances) {
@@ -3215,19 +3391,11 @@ func TestCEXTrade(t *testing.T) {
 	}
 
 	botCfg := &BotConfig{
-		Host:             "host1",
-		BaseID:           baseID,
-		QuoteID:          quoteID,
-		BaseBalanceType:  Percentage,
-		BaseBalance:      100,
-		QuoteBalanceType: Percentage,
-		QuoteBalance:     100,
+		Host:    "host1",
+		BaseID:  baseID,
+		QuoteID: quoteID,
 		CEXCfg: &BotCEXCfg{
-			Name:             "Binance",
-			BaseBalanceType:  Percentage,
-			BaseBalance:      100,
-			QuoteBalanceType: Percentage,
-			QuoteBalance:     100,
+			Name: "Binance",
 		},
 	}
 
@@ -3322,11 +3490,7 @@ func TestCEXTrade(t *testing.T) {
 			checkBalances(updateAndStats.stats.CEXBalances, i+1)
 			checkLatestEvent(updateAndStats.event, i+1)
 
-			stats, err := adaptor.stats()
-			if err != nil {
-				t.Fatalf("%s: stats unexpected error: %v", test.name, err)
-			}
-
+			stats := adaptor.stats()
 			stats.DEXBalances = nil
 			stats.StartTime = 0
 			if !reflect.DeepEqual(stats.CEXBalances, updateAndStats.stats.CEXBalances) {
@@ -3440,6 +3604,7 @@ func TestOrderFeesInUnits(t *testing.T) {
 			market:     tt.market,
 			eventLogDB: &tEventLogDB{},
 		})
+		adaptor.botCfg.Store(&BotConfig{})
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		adaptor.run(ctx)
