@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"sort"
 	"testing"
-	"time"
 
 	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/core"
@@ -258,6 +257,93 @@ func TestSufficientBalanceForCEXTrade(t *testing.T) {
 	}
 }
 
+func TestCEXBalanceCounterTrade(t *testing.T) {
+	// Tests that CEX locked balance is increased and available balance is
+	// decreased when CEX funds are required for a counter trade.
+	tCore := newTCore()
+	tCEX := newTCEX()
+
+	orderIDs := make([]order.OrderID, 5)
+	for i := range orderIDs {
+		var id order.OrderID
+		copy(id[:], encode.RandomBytes(order.OrderIDSize))
+		orderIDs[i] = id
+	}
+
+	dexBalances := map[uint32]uint64{
+		0:  1e8,
+		42: 1e8,
+	}
+	cexBalances := map[uint32]uint64{
+		42: 1e8,
+		0:  1e8,
+	}
+
+	botID := dexMarketID("host1", 42, 0)
+	eventLogDB := newTEventLogDB()
+	adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+		botID:           botID,
+		core:            tCore,
+		cex:             tCEX,
+		baseDexBalances: dexBalances,
+		baseCexBalances: cexBalances,
+		log:             tLogger,
+		market: &MarketWithHost{
+			Host:    "host1",
+			BaseID:  42,
+			QuoteID: 0,
+		},
+		eventLogDB: eventLogDB,
+	})
+
+	adaptor.pendingDEXOrders = map[order.OrderID]*pendingDEXOrder{
+		orderIDs[0]: {
+			counterTradeRate: 6e7,
+		},
+		orderIDs[1]: {
+			counterTradeRate: 5e7,
+		},
+	}
+
+	order0 := &core.Order{
+		Qty:     5e6,
+		Rate:    6.1e7,
+		Sell:    true,
+		BaseID:  42,
+		QuoteID: 0,
+	}
+
+	order1 := &core.Order{
+		Qty:     5e6,
+		Rate:    4.9e7,
+		Sell:    false,
+		BaseID:  42,
+		QuoteID: 0,
+	}
+
+	adaptor.pendingDEXOrders[orderIDs[0]].updateState(order0, &balanceEffects{})
+	adaptor.pendingDEXOrders[orderIDs[1]].updateState(order1, &balanceEffects{})
+
+	dcrBalance := adaptor.CEXBalance(42)
+	expDCR := &BotBalance{
+		Available: 1e8 - order1.Qty,
+		Reserved:  order1.Qty,
+	}
+	if !reflect.DeepEqual(dcrBalance, expDCR) {
+		t.Fatalf("unexpected DCR balance. wanted %+v, got %+v", expDCR, dcrBalance)
+	}
+
+	btcBalance := adaptor.CEXBalance(0)
+	expBTCReserved := calc.BaseToQuote(adaptor.pendingDEXOrders[orderIDs[0]].counterTradeRate, order0.Qty)
+	expBTC := &BotBalance{
+		Available: 1e8 - expBTCReserved,
+		Reserved:  expBTCReserved,
+	}
+	if !reflect.DeepEqual(btcBalance, expBTC) {
+		t.Fatalf("unexpected BTC balance. wanted %+v, got %+v", expBTC, btcBalance)
+	}
+}
+
 func TestPrepareRebalance(t *testing.T) {
 	baseID := uint32(42)
 	quoteID := uint32(0)
@@ -281,8 +367,9 @@ func TestPrepareRebalance(t *testing.T) {
 		cexBalances           map[uint32]uint64
 		baseRebalancePending  bool
 		quoteRebalancePending bool
+		pendingDEXOrders      map[order.OrderID]*pendingDEXOrder
+		dexOrdersState        map[order.OrderID]*dexOrderState
 
-		pendingDEXOrders    map[order.OrderID]*pendingDEXOrder
 		expectedRebalance   int64
 		expectedDEXReserves uint64
 		expectedCEXReserves uint64
@@ -404,15 +491,23 @@ func TestPrepareRebalance(t *testing.T) {
 			},
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					locked: map[uint32]uint64{
-						baseID: 130e8,
+					counterTradeRate: 6e7,
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							baseID: 130e8,
+						},
 					},
 					order: &core.Order{
-						Qty:  130e8,
-						Rate: 5e7,
-						Sell: true,
+						Qty:     130e8,
+						Rate:    5e7,
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
 					},
-					counterTradeRate: 6e7,
 				},
 			},
 			expectedRebalance:   0,
@@ -431,16 +526,24 @@ func TestPrepareRebalance(t *testing.T) {
 			},
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					locked: map[uint32]uint64{
-						quoteID: 130e8,
+					counterTradeRate: 5e7, // sell with 20e8 remaining
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							quoteID: 130e8,
+						},
 					},
 					order: &core.Order{
-						Qty:    150e8,
-						Filled: 20e8,
-						Rate:   5e7,
-						Sell:   false,
+						Qty:     150e8,
+						Filled:  20e8,
+						Rate:    5e7,
+						Sell:    false,
+						BaseID:  baseID,
+						QuoteID: quoteID,
 					},
-					counterTradeRate: 5e7, // sell with 20e8 remaining
 				},
 			},
 			expectedRebalance:   0,
@@ -459,16 +562,24 @@ func TestPrepareRebalance(t *testing.T) {
 			},
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					locked: map[uint32]uint64{
-						baseID: 100e8,
+					counterTradeRate: 5e5, // 0.6e8 required to counter-trade 120e8 @ 5e5
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							baseID: 100e8,
+						},
 					},
 					order: &core.Order{
-						Qty:    140e8,
-						Filled: 20e8,
-						Rate:   6e5,
-						Sell:   true,
+						Qty:     140e8,
+						Filled:  20e8,
+						Rate:    6e5,
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
 					},
-					counterTradeRate: 5e5, // 0.6e8 required to counter-trade 120e8 @ 5e5
 				},
 			},
 			expectedRebalance:   0,
@@ -497,6 +608,10 @@ func TestPrepareRebalance(t *testing.T) {
 			})
 			adaptor.pendingBaseRebalance.Store(test.baseRebalancePending)
 			adaptor.pendingQuoteRebalance.Store(test.quoteRebalancePending)
+
+			for id, state := range test.dexOrdersState {
+				test.pendingDEXOrders[id].updateState(state.order, state.balanceEffects)
+			}
 			adaptor.pendingDEXOrders = test.pendingDEXOrders
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -534,6 +649,7 @@ func TestFreeUpFunds(t *testing.T) {
 		cex              bool
 		amt              uint64
 		pendingDEXOrders map[order.OrderID]*pendingDEXOrder
+		dexOrdersState   map[order.OrderID]*dexOrderState
 
 		expectedCancels []*order.OrderID
 	}
@@ -548,34 +664,54 @@ func TestFreeUpFunds(t *testing.T) {
 			amt:     50e8,
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					locked: map[uint32]uint64{
-						baseID: 20e8,
-					},
-					order: &core.Order{
-						ID:   orderIDs[0][:],
-						Sell: true,
-					},
 					placementIndex: 1,
 				},
 				orderIDs[1]: {
-					locked: map[uint32]uint64{
-						baseID: 20e8,
-					},
-					order: &core.Order{
-						ID:   orderIDs[1][:],
-						Sell: true,
-					},
 					placementIndex: 0,
 				},
 				orderIDs[2]: {
-					locked: map[uint32]uint64{
-						baseID: 20e8,
+					placementIndex: 2,
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							baseID: 20e8,
+						},
 					},
 					order: &core.Order{
-						ID:   orderIDs[2][:],
-						Sell: true,
+						ID:      orderIDs[0][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
 					},
-					placementIndex: 2,
+				},
+				orderIDs[1]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							baseID: 20e8,
+						},
+					},
+					order: &core.Order{
+						ID:      orderIDs[1][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+				},
+				orderIDs[2]: {
+					balanceEffects: &balanceEffects{
+						locked: map[uint32]uint64{
+							baseID: 20e8,
+						},
+					},
+					order: &core.Order{
+						ID:      orderIDs[2][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
 				},
 			},
 			expectedCancels: []*order.OrderID{
@@ -593,31 +729,48 @@ func TestFreeUpFunds(t *testing.T) {
 			amt:     50e8,
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[0][:],
-						Sell: false,
-					},
 					placementIndex:   1,
 					counterTradeRate: 5e5,
 				},
 				orderIDs[1]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[1][:],
-						Sell: false,
-					},
 					placementIndex:   0,
 					counterTradeRate: 5e5,
 				},
 				orderIDs[2]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[2][:],
-						Sell: false,
-					},
 					placementIndex:   2,
 					counterTradeRate: 5e5,
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[0][:],
+						Sell:    false,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+				},
+				orderIDs[1]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[1][:],
+						Sell:    false,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+				},
+				orderIDs[2]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[2][:],
+						Sell:    false,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
 				},
 			},
 			expectedCancels: []*order.OrderID{
@@ -635,31 +788,48 @@ func TestFreeUpFunds(t *testing.T) {
 			amt:     0.5e8,
 			pendingDEXOrders: map[order.OrderID]*pendingDEXOrder{
 				orderIDs[0]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[0][:],
-						Sell: true,
-					},
 					placementIndex:   1,
 					counterTradeRate: 5e5, // 0.1e8 required to counter-trade 20e8 @ 5e5
 				},
 				orderIDs[1]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[1][:],
-						Sell: true,
-					},
 					placementIndex:   0,
 					counterTradeRate: 5e5,
 				},
 				orderIDs[2]: {
-					order: &core.Order{
-						Qty:  20e8,
-						ID:   orderIDs[2][:],
-						Sell: true,
-					},
 					placementIndex:   2,
 					counterTradeRate: 5e5,
+				},
+			},
+			dexOrdersState: map[order.OrderID]*dexOrderState{
+				orderIDs[0]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[0][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+				},
+				orderIDs[1]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[1][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
+				},
+				orderIDs[2]: {
+					balanceEffects: &balanceEffects{},
+					order: &core.Order{
+						Qty:     20e8,
+						ID:      orderIDs[2][:],
+						Sell:    true,
+						BaseID:  baseID,
+						QuoteID: quoteID,
+					},
 				},
 			},
 			expectedCancels: []*order.OrderID{
@@ -688,6 +858,9 @@ func TestFreeUpFunds(t *testing.T) {
 					AutoRebalance: &AutoRebalanceConfig{},
 				},
 			})
+			for id, state := range test.dexOrdersState {
+				test.pendingDEXOrders[id].updateState(state.order, state.balanceEffects)
+			}
 			adaptor.pendingDEXOrders = test.pendingDEXOrders
 			adaptor.FreeUpFunds(test.assetID, test.cex, test.amt, currEpoch)
 
@@ -793,7 +966,7 @@ func TestMultiTrade(t *testing.T) {
 		return placements
 	}
 
-	pendingOrders := func(sell bool) map[order.OrderID]*pendingDEXOrder {
+	pendingOrders := func(sell bool, baseID, quoteID uint32) map[order.OrderID]*pendingDEXOrder {
 		var placements []*multiTradePlacement
 		if sell {
 			placements = sellPlacements
@@ -801,84 +974,101 @@ func TestMultiTrade(t *testing.T) {
 			placements = buyPlacements
 		}
 
-		return map[order.OrderID]*pendingDEXOrder{
+		orders := map[order.OrderID]*core.Order{
 			orderIDs[0]: { // Should cancel, but cannot due to epoch > currEpoch - 2
-				order: &core.Order{
-					Qty:   1 * lotSize,
-					Sell:  sell,
-					ID:    orderIDs[0][:],
-					Rate:  driftToleranceEdge(placements[0].rate, true),
-					Epoch: currEpoch - 1,
-				},
+				Qty:     1 * lotSize,
+				Sell:    sell,
+				ID:      orderIDs[0][:],
+				Rate:    driftToleranceEdge(placements[0].rate, true),
+				Epoch:   currEpoch - 1,
+				BaseID:  baseID,
+				QuoteID: quoteID,
+			},
+			orderIDs[1]: { // Within tolerance, don't cancel
+				Qty:     2 * lotSize,
+				Filled:  lotSize,
+				Sell:    sell,
+				ID:      orderIDs[1][:],
+				Rate:    driftToleranceEdge(placements[1].rate, true),
+				Epoch:   currEpoch - 2,
+				BaseID:  baseID,
+				QuoteID: quoteID,
+			},
+			orderIDs[2]: { // Cancel
+				Qty:     lotSize,
+				Sell:    sell,
+				ID:      orderIDs[2][:],
+				Rate:    driftToleranceEdge(placements[2].rate, false),
+				Epoch:   currEpoch - 2,
+				BaseID:  baseID,
+				QuoteID: quoteID,
+			},
+			orderIDs[3]: { // Within tolerance, don't cancel
+				Qty:     lotSize,
+				Sell:    sell,
+				ID:      orderIDs[3][:],
+				Rate:    driftToleranceEdge(placements[3].rate, true),
+				Epoch:   currEpoch - 2,
+				BaseID:  baseID,
+				QuoteID: quoteID,
+			},
+		}
+
+		toReturn := map[order.OrderID]*pendingDEXOrder{
+			orderIDs[0]: { // Should cancel, but cannot due to epoch > currEpoch - 2
 				placementIndex:   0,
 				counterTradeRate: placements[0].counterTradeRate,
 			},
 			orderIDs[1]: {
-				order: &core.Order{ // Within tolerance, don't cancel
-					Qty:    2 * lotSize,
-					Filled: lotSize,
-					Sell:   sell,
-					ID:     orderIDs[1][:],
-					Rate:   driftToleranceEdge(placements[1].rate, true),
-					Epoch:  currEpoch - 2,
-				},
 				placementIndex:   1,
 				counterTradeRate: placements[1].counterTradeRate,
 			},
 			orderIDs[2]: {
-				order: &core.Order{ // Cancel
-					Qty:   lotSize,
-					Sell:  sell,
-					ID:    orderIDs[2][:],
-					Rate:  driftToleranceEdge(placements[2].rate, false),
-					Epoch: currEpoch - 2,
-				},
 				placementIndex:   2,
 				counterTradeRate: placements[2].counterTradeRate,
 			},
 			orderIDs[3]: {
-				order: &core.Order{ // Within tolerance, don't cancel
-					Qty:   lotSize,
-					Sell:  sell,
-					ID:    orderIDs[3][:],
-					Rate:  driftToleranceEdge(placements[3].rate, true),
-					Epoch: currEpoch - 2,
-				},
 				placementIndex:   3,
 				counterTradeRate: placements[3].counterTradeRate,
 			},
 		}
+
+		for id, order := range orders {
+			toReturn[id].updateState(order, &balanceEffects{})
+		}
+		return toReturn
 	}
 
 	// secondPendingOrderNotFilled returns the same pending orders as
 	// pendingOrders, but with the second order not filled.
-	secondPendingOrderNotFilled := func(sell bool) map[order.OrderID]*pendingDEXOrder {
-		orders := pendingOrders(sell)
-		orders[orderIDs[1]].order.Filled = 0
+	secondPendingOrderNotFilled := func(sell bool, baseID, quoteID uint32) map[order.OrderID]*pendingDEXOrder {
+		orders := pendingOrders(sell, baseID, quoteID)
+		orders[orderIDs[1]].currentState().order.Filled = 0
 		return orders
 	}
 
 	// pendingWithSelfMatch returns the same pending orders as pendingOrders,
 	// but with an additional order on the other side of the market that
 	// would cause a self-match.
-	pendingOrdersSelfMatch := func(sell bool) map[order.OrderID]*pendingDEXOrder {
-		orders := pendingOrders(sell)
+	pendingOrdersSelfMatch := func(sell bool, baseID, quoteID uint32) map[order.OrderID]*pendingDEXOrder {
+		orders := pendingOrders(sell, baseID, quoteID)
 		var rate uint64
 		if sell {
 			rate = driftToleranceEdge(2e7, true) // 2e7 is the rate of the lowest sell placement
 		} else {
 			rate = 3e7 // 3e7 is the rate of the highest buy placement
 		}
-		orders[orderIDs[4]] = &pendingDEXOrder{
-			order: &core.Order{ // Within tolerance, don't cancel
-				Qty:   lotSize,
-				Sell:  !sell,
-				ID:    orderIDs[4][:],
-				Rate:  rate,
-				Epoch: currEpoch - 2,
-			},
+		pendingOrder := &pendingDEXOrder{
 			placementIndex: 0,
 		}
+		pendingOrder.updateState(&core.Order{ // Within tolerance, don't cancel
+			Qty:   lotSize,
+			Sell:  !sell,
+			ID:    orderIDs[4][:],
+			Rate:  rate,
+			Epoch: currEpoch - 2,
+		}, &balanceEffects{})
+		orders[orderIDs[4]] = pendingOrder
 		return orders
 	}
 
@@ -945,7 +1135,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
 			},
 			sellPlacements:    sellPlacements,
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
@@ -969,7 +1159,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    buyPlacements,
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
@@ -1016,7 +1206,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
 			},
 			sellPlacements:    reconfigToLessPlacements(true),
-			sellPendingOrders: secondPendingOrderNotFilled(true),
+			sellPendingOrders: secondPendingOrderNotFilled(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				// {Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
@@ -1039,7 +1229,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    reconfigToLessPlacements(false),
-			buyPendingOrders: secondPendingOrderNotFilled(false),
+			buyPendingOrders: secondPendingOrderNotFilled(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				// {Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
@@ -1086,7 +1276,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
 			},
 			sellPlacements:    sellPlacements,
-			sellPendingOrders: pendingOrdersSelfMatch(true),
+			sellPendingOrders: pendingOrdersSelfMatch(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
 				{Qty: lotSize, Rate: sellPlacements[3].rate},
@@ -1107,7 +1297,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    buyPlacements,
-			buyPendingOrders: pendingOrdersSelfMatch(false),
+			buyPendingOrders: pendingOrdersSelfMatch(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
 				{Qty: lotSize, Rate: buyPlacements[3].rate},
@@ -1149,7 +1339,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, lotSize),
 			},
 			sellPlacements:    cancelLastPlacement(true),
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
@@ -1171,7 +1361,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    cancelLastPlacement(false),
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
@@ -1215,7 +1405,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, lotSize),
 			},
 			sellPlacements:    removeLastPlacement(true),
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
@@ -1237,7 +1427,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    removeLastPlacement(false),
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
@@ -1281,7 +1471,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
 			},
 			sellPlacements:    sellPlacements,
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: lotSize, Rate: sellPlacements[2].rate},
@@ -1305,7 +1495,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    buyPlacements,
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: lotSize, Rate: buyPlacements[2].rate},
@@ -1350,7 +1540,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, lotSize),
 			},
 			sellPlacements:    sellPlacements,
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 42, 0),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: lotSize, Rate: sellPlacements[2].rate},
@@ -1374,7 +1564,7 @@ func TestMultiTrade(t *testing.T) {
 				0:  0,
 			},
 			buyPlacements:    buyPlacements,
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 42, 0),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: lotSize, Rate: buyPlacements[2].rate},
@@ -1425,7 +1615,7 @@ func TestMultiTrade(t *testing.T) {
 					b2q(sellPlacements[3].counterTradeRate, 2*lotSize),
 			},
 			sellPlacements:    sellPlacements,
-			sellPendingOrders: pendingOrders(true),
+			sellPendingOrders: pendingOrders(true, 966001, 60),
 			expectedSellPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: sellPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: sellPlacements[2].rate},
@@ -1449,7 +1639,7 @@ func TestMultiTrade(t *testing.T) {
 				0:      0,
 			},
 			buyPlacements:    buyPlacements,
-			buyPendingOrders: pendingOrders(false),
+			buyPendingOrders: pendingOrders(false, 966001, 60),
 			expectedBuyPlacements: []*core.QtyRate{
 				{Qty: lotSize, Rate: buyPlacements[1].rate},
 				{Qty: 2 * lotSize, Rate: buyPlacements[2].rate},
@@ -1524,6 +1714,7 @@ func TestMultiTrade(t *testing.T) {
 					} else {
 						pendingOrders = test.buyPendingOrders
 					}
+
 					pendingOrdersCopy := make(map[order.OrderID]*pendingDEXOrder)
 					for id, order := range pendingOrders {
 						pendingOrdersCopy[id] = order
@@ -1761,8 +1952,8 @@ func TestDEXTrade(t *testing.T) {
 				newOrderLockedFunds(orderIDs[1], 5e6+2000, 0, 0, 0),
 			},
 			postTradeBalances: map[uint32]*BotBalance{
-				42: {1e8 - (5e6+2000)*2, (5e6 + 2000) * 2, 0},
-				0:  {1e8, 0, 0},
+				42: {1e8 - (5e6+2000)*2, (5e6 + 2000) * 2, 0, 0},
+				0:  {1e8, 0, 0, 0},
 			},
 			updatesAndBalances: []*updatesAndBalances{
 				// First order has a match and sends a swap tx
@@ -1774,8 +1965,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], nil, nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (5e6+2000)*2, 5e6 + 2000 + 3e6 + 1000, 0},
-							0:  {1e8, 0, 0},
+							42: {1e8 - (5e6+2000)*2, 5e6 + 2000 + 3e6 + 1000, 0, 0},
+							0:  {1e8, 0, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1789,8 +1980,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[1], nil, nil, 3e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0},
-							0:  {1e8, 0, 0},
+							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0, 0},
+							0:  {1e8, 0, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1805,8 +1996,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0},
-							0:  {1e8, 0, b2q(5e7, 2e6) - 1000},
+							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0, 0},
+							0:  {1e8, 0, b2q(5e7, 2e6) - 1000, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1820,8 +2011,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0},
-							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0},
+							42: {1e8 - (5e6+2000)*2, 5e6 + 2000, 0, 0},
+							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1832,8 +2023,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (7e6 + 2000 + 1000), 2e6 + 1000, 0},
-							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0},
+							42: {1e8 - (7e6 + 2000 + 1000), 2e6 + 1000, 0, 0},
+							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -1850,8 +2041,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], nil, nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (7e6 + 1800 + 1000), 0, 3e6 - 1200},
-							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0},
+							42: {1e8 - (7e6 + 1800 + 1000), 0, 3e6 - 1200, 0},
+							0:  {1e8 + b2q(5e7, 2e6) - 1000, 0, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -1868,8 +2059,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], &coinIDs[5], nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 - (4e6 + 1800 + 1000 + 1200), 0, 0},
-							0:  {1e8 + b2q(5e7, 2e6) + b2q(6e7, 2e6) - 1700, 0, 0},
+							42: {1e8 - (4e6 + 1800 + 1000 + 1200), 0, 0, 0},
+							0:  {1e8 + b2q(5e7, 2e6) + b2q(6e7, 2e6) - 1700, 0, 0, 0},
 						},
 					},
 				},
@@ -1892,8 +2083,8 @@ func TestDEXTrade(t *testing.T) {
 				newOrderLockedFunds(orderIDs[1], b2q(6e7, 5e6)+2000, 0, 0, 0),
 			},
 			postTradeBalances: map[uint32]*BotBalance{
-				42: {1e8, 0, 0},
-				0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000, 0},
+				42: {1e8, 0, 0, 0},
+				0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000, 0, 0},
 			},
 			updatesAndBalances: []*updatesAndBalances{
 				// First order has a match and sends a swap tx
@@ -1905,8 +2096,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], nil, nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8, 0, 0},
-							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 5e6) + 3000, 0},
+							42: {1e8, 0, 0, 0},
+							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 5e6) + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1920,8 +2111,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[1], nil, nil, 3e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8, 0, 0},
-							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0},
+							42: {1e8, 0, 0, 0},
+							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1936,8 +2127,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8, 0, 2e6 - 1000},
-							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0},
+							42: {1e8, 0, 2e6 - 1000, 0},
+							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1951,8 +2142,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 + 2e6 - 1000, 0, 0},
-							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0},
+							42: {1e8 + 2e6 - 1000, 0, 0, 0},
+							0:  {1e8 - (b2q(5e7, 5e6) + b2q(6e7, 5e6) + 4000), b2q(5e7, 3e6) + b2q(6e7, 2e6) + 2000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -1963,8 +2154,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 + 2e6 - 1000, 0, 0},
-							0:  {1e8 - (b2q(5e7, 2e6) + b2q(6e7, 5e6) + 3000), b2q(6e7, 2e6) + 1000, 0},
+							42: {1e8 + 2e6 - 1000, 0, 0, 0},
+							0:  {1e8 - (b2q(5e7, 2e6) + b2q(6e7, 5e6) + 3000), b2q(6e7, 2e6) + 1000, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -1981,8 +2172,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], nil, nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 + 2e6 - 1000, 0, 0},
-							0:  {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6) + 2800), 0, calc.BaseToQuote(6e7, 3e6) - 1200},
+							42: {1e8 + 2e6 - 1000, 0, 0, 0},
+							0:  {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6) + 2800), 0, calc.BaseToQuote(6e7, 3e6) - 1200, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -1999,8 +2190,8 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], &coinIDs[5], nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							42: {1e8 + 4e6 - 1700, 0, 0},
-							0:  {1e8 - (b2q(5e7, 2e6) + b2q(6e7, 2e6) + 2800 + 1200), 0, 0},
+							42: {1e8 + 4e6 - 1700, 0, 0, 0},
+							0:  {1e8 - (b2q(5e7, 2e6) + b2q(6e7, 2e6) + 2800 + 1200), 0, 0, 0},
 						},
 					},
 				},
@@ -2030,9 +2221,9 @@ func TestDEXTrade(t *testing.T) {
 				newOrderLockedFunds(orderIDs[1], 5e6+2000, 0, 4000, 3000),
 			},
 			postTradeBalances: map[uint32]*BotBalance{
-				966001: {1e8, 0, 0},
-				966:    {1e8 - 8000, 8000, 0},
-				60:     {1e8 - (5e6+2000+3000)*2, (5e6 + 2000 + 3000) * 2, 0},
+				966001: {1e8, 0, 0, 0},
+				966:    {1e8 - 8000, 8000, 0, 0},
+				60:     {1e8 - (5e6+2000+3000)*2, (5e6 + 2000 + 3000) * 2, 0, 0},
 			},
 			updatesAndBalances: []*updatesAndBalances{
 				// First order has a match and sends a swap tx
@@ -2044,9 +2235,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], nil, nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8, 0, 0},
-							966:    {1e8 - 8000, 8000, 0},
-							60:     {1e8 - (5e6+2000+3000)*2, 3e6 + 1000 + 5e6 + 2000 + 3000 + 3000, 0},
+							966001: {1e8, 0, 0, 0},
+							966:    {1e8 - 8000, 8000, 0, 0},
+							60:     {1e8 - (5e6+2000+3000)*2, 3e6 + 1000 + 5e6 + 2000 + 3000 + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2060,9 +2251,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[1], nil, nil, 3e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8, 0, 0},
-							966:    {1e8 - 8000, 8000, 0},
-							60:     {1e8 - (5e6+2000+3000)*2, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0},
+							966001: {1e8, 0, 0, 0},
+							966:    {1e8 - 8000, 8000, 0, 0},
+							60:     {1e8 - (5e6+2000+3000)*2, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2077,9 +2268,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8, 0, b2q(5e7, 2e6)},
-							966:    {1e8 - 8000, 7000, 0},
-							60:     {1e8 - (5e6+2000+3000)*2 + 100, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0},
+							966001: {1e8, 0, b2q(5e7, 2e6), 0},
+							966:    {1e8 - 8000, 7000, 0, 0},
+							60:     {1e8 - (5e6+2000+3000)*2 + 100, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2093,9 +2284,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 + b2q(5e7, 2e6), 0, 0},
-							966:    {1e8 - 7000 - 800, 7000, 0},
-							60:     {1e8 - (5e6+2000+3000)*2 + 100, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0},
+							966001: {1e8 + b2q(5e7, 2e6), 0, 0, 0},
+							966:    {1e8 - 7000 - 800, 7000, 0, 0},
+							60:     {1e8 - (5e6+2000+3000)*2 + 100, 3e6 + 1000 + 2e6 + 1000 + 3000 + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2106,9 +2297,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 + b2q(5e7, 2e6), 0, 0},
-							966:    {1e8 - 4000 - 800, 4000, 0},
-							60:     {1e8 - (7e6 + 900 + 2000 + 3000), 2e6 + 1000 + 3000, 0},
+							966001: {1e8 + b2q(5e7, 2e6), 0, 0, 0},
+							966:    {1e8 - 4000 - 800, 4000, 0, 0},
+							60:     {1e8 - (7e6 + 900 + 2000 + 3000), 2e6 + 1000 + 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -2125,9 +2316,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], nil, nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 + b2q(5e7, 2e6), 0, 0},
-							966:    {1e8 - 4000 - 800, 4000, 0},
-							60:     {1e8 - (7e6 + 900 + 2000 + 3000) + 200, 1800, 3e6},
+							966001: {1e8 + b2q(5e7, 2e6), 0, 0, 0},
+							966:    {1e8 - 4000 - 800, 4000, 0, 0},
+							60:     {1e8 - (7e6 + 900 + 2000 + 3000) + 200, 1800, 3e6, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -2142,9 +2333,9 @@ func TestDEXTrade(t *testing.T) {
 					orderUpdate: newOrderUpdate(orderIDs[1], 0, 0, 0, 0, order.OrderStatusExecuted, true, newMatchUpdate(&coinIDs[1], nil, &coinIDs[3], 0, 0), newMatchUpdate(&coinIDs[4], &coinIDs[5], nil, 0, 0)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 + calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 2e6), 0, 0},
-							966:    {1e8 - 1500, 0, 0},
-							60:     {1e8 - (4e6 + 3800), 0, 0},
+							966001: {1e8 + calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 2e6), 0, 0, 0},
+							966:    {1e8 - 1500, 0, 0, 0},
+							60:     {1e8 - (4e6 + 3800), 0, 0, 0},
 						},
 					},
 				},
@@ -2173,9 +2364,9 @@ func TestDEXTrade(t *testing.T) {
 				newOrderLockedFunds(orderIDs[1], b2q(6e7, 5e6), 2000, 3000, 4000),
 			},
 			postTradeBalances: map[uint32]*BotBalance{
-				966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6), 0},
-				966:    {1e8 - 12000, 12000, 0},
-				60:     {1e8 - 6000, 6000, 0},
+				966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6), 0, 0},
+				966:    {1e8 - 12000, 12000, 0, 0},
+				60:     {1e8 - 6000, 6000, 0, 0},
 			},
 			updatesAndBalances: []*updatesAndBalances{
 				// First order has a match and sends a swap tx
@@ -2187,9 +2378,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], nil, nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 5e6), 0},
-							966:    {1e8 - 12000, 11000, 0},
-							60:     {1e8 - 6000, 6000, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 5e6), 0, 0},
+							966:    {1e8 - 12000, 11000, 0, 0},
+							60:     {1e8 - 6000, 6000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2203,9 +2394,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[1], nil, nil, 3e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0},
-							966:    {1e8 - 12000, 10000, 0},
-							60:     {1e8 - 6000, 6000, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0, 0},
+							966:    {1e8 - 12000, 10000, 0, 0},
+							60:     {1e8 - 6000, 6000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2220,9 +2411,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0},
-							966:    {1e8 - 12000 + 100, 10000, 0},
-							60:     {1e8 - 6000, 5000, 2e6},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0, 0},
+							966:    {1e8 - 12000 + 100, 10000, 0, 0},
+							60:     {1e8 - 6000, 5000, 2e6, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2236,9 +2427,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0},
-							966:    {1e8 - 12000 + 100, 10000, 0},
-							60:     {1e8 - 5800 + 2e6, 5000, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 5e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(5e7, 3e6) + calc.BaseToQuote(6e7, 2e6), 0, 0},
+							966:    {1e8 - 12000 + 100, 10000, 0, 0},
+							60:     {1e8 - 5800 + 2e6, 5000, 0, 0},
 						},
 					},
 					numPendingTrades: 2,
@@ -2249,9 +2440,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[0], &coinIDs[2], nil, 2e6, 5e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(6e7, 2e6), 0},
-							966:    {1e8 - 7000 + 100, 5000, 0},
-							60:     {1e8 + 2e6 - 3800, 3000, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6)), calc.BaseToQuote(6e7, 2e6), 0, 0},
+							966:    {1e8 - 7000 + 100, 5000, 0, 0},
+							60:     {1e8 + 2e6 - 3800, 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -2268,9 +2459,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], nil, nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6)), 0, calc.BaseToQuote(6e7, 3e6)},
-							966:    {1e8 - 6000 + 100, 2000, 0},
-							60:     {1e8 + 2e6 - 3800, 3000, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 5e6)), 0, calc.BaseToQuote(6e7, 3e6), 0},
+							966:    {1e8 - 6000 + 100, 2000, 0, 0},
+							60:     {1e8 + 2e6 - 3800, 3000, 0, 0},
 						},
 					},
 					numPendingTrades: 1,
@@ -2287,9 +2478,9 @@ func TestDEXTrade(t *testing.T) {
 						newMatchUpdate(&coinIDs[4], &coinIDs[5], nil, 2e6, 6e7)),
 					stats: &RunStats{
 						DEXBalances: map[uint32]*BotBalance{
-							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 2e6)), 0, 0},
-							966:    {1e8 - 3900, 0, 0},
-							60:     {1e8 + 4e6 - 1500, 0, 0},
+							966001: {1e8 - (calc.BaseToQuote(5e7, 2e6) + calc.BaseToQuote(6e7, 2e6)), 0, 0, 0},
+							966:    {1e8 - 3900, 0, 0, 0},
+							60:     {1e8 + 4e6 - 1500, 0, 0, 0},
 						},
 					},
 				},
@@ -2753,129 +2944,113 @@ func TestDeposit(t *testing.T) {
 	}
 
 	runTest := func(test *test) {
-		tCore := newTCore()
-		tCore.isWithdrawer[test.assetID] = test.isWithdrawer
-		tCore.isDynamicSwapper[test.assetID] = test.isDynamicSwapper
-		tCore.setAssetBalances(map[uint32]uint64{test.assetID: test.initialDEXBalance, 0: 2e6, 966: 2e6})
-		tCore.walletTxsMtx.Lock()
-		tCore.walletTxs[test.unconfirmedTx.ID] = test.unconfirmedTx
-		tCore.walletTxsMtx.Unlock()
-		tCore.sendCoin = test.sendCoin
+		t.Run(test.name, func(t *testing.T) {
+			tCore := newTCore()
+			tCore.isWithdrawer[test.assetID] = test.isWithdrawer
+			tCore.isDynamicSwapper[test.assetID] = test.isDynamicSwapper
+			tCore.setAssetBalances(map[uint32]uint64{test.assetID: test.initialDEXBalance, 0: 2e6, 966: 2e6})
+			tCore.walletTxsMtx.Lock()
+			tCore.walletTxs[test.unconfirmedTx.ID] = test.unconfirmedTx
+			tCore.walletTxsMtx.Unlock()
+			tCore.sendCoin = test.sendCoin
 
-		tCEX := newTCEX()
-		tCEX.balances[test.assetID] = &libxc.ExchangeBalance{
-			Available: test.initialCEXBalance,
-		}
-		tCEX.balances[0] = &libxc.ExchangeBalance{
-			Available: 2e6,
-		}
-		tCEX.balances[966] = &libxc.ExchangeBalance{
-			Available: 1e8,
-		}
-
-		dexBalances := map[uint32]uint64{
-			test.assetID: test.initialDEXBalance,
-			0:            2e6,
-			966:          2e6,
-		}
-		cexBalances := map[uint32]uint64{
-			0:   2e6,
-			966: 1e8,
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		botID := dexMarketID("host1", test.assetID, 0)
-		eventLogDB := newTEventLogDB()
-		adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
-			botID:           botID,
-			core:            tCore,
-			cex:             tCEX,
-			baseDexBalances: dexBalances,
-			baseCexBalances: cexBalances,
-			log:             tLogger,
-			market: &MarketWithHost{
-				Host:    "host1",
-				BaseID:  test.assetID,
-				QuoteID: 0,
-			},
-			eventLogDB: eventLogDB,
-		})
-		adaptor.run(ctx)
-
-		err := adaptor.Deposit(ctx, test.assetID, test.depositAmt)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", test.name, err)
-		}
-
-		preConfirmBal := adaptor.DEXBalance(test.assetID)
-		if *preConfirmBal != *test.preConfirmDEXBalance {
-			t.Fatalf("%s: unexpected pre confirm dex balance. want %d, got %d", test.name, test.preConfirmDEXBalance, preConfirmBal.Available)
-		}
-
-		if test.assetID == 966001 {
-			preConfirmParentBal := adaptor.DEXBalance(966)
-			if preConfirmParentBal.Available != 2e6-test.unconfirmedTx.Fees {
-				t.Fatalf("%s: unexpected pre confirm dex balance. want %d, got %d", test.name, test.preConfirmDEXBalance, preConfirmBal.Available)
+			tCEX := newTCEX()
+			tCEX.balances[test.assetID] = &libxc.ExchangeBalance{
+				Available: test.initialCEXBalance,
 			}
-		}
+			tCEX.balances[0] = &libxc.ExchangeBalance{
+				Available: 2e6,
+			}
+			tCEX.balances[966] = &libxc.ExchangeBalance{
+				Available: 1e8,
+			}
 
-		i := len(eventLogDB.storedEvents) - 1
-		eventLogDB.storedEvents[i].TimeStamp = 0 // ignore timestamp
-		if !reflect.DeepEqual(eventLogDB.storedEvents[i], test.initialEvent) {
-			t.Fatalf("%s: unexpected event logged. want:\n%+v\ngot:\n%+v", test.name, test.initialEvent.DepositEvent, eventLogDB.storedEvents[i].DepositEvent)
-		}
+			dexBalances := map[uint32]uint64{
+				test.assetID: test.initialDEXBalance,
+				0:            2e6,
+				966:          2e6,
+			}
+			cexBalances := map[uint32]uint64{
+				0:   2e6,
+				966: 1e8,
+			}
 
-		tCore.walletTxsMtx.Lock()
-		tCore.walletTxs[test.unconfirmedTx.ID] = test.confirmedTx
-		tCore.walletTxsMtx.Unlock()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
-		tCEX.confirmDeposit <- test.receivedAmt
-		<-tCEX.confirmDepositComplete
+			botID := dexMarketID("host1", test.assetID, 0)
+			eventLogDB := newTEventLogDB()
+			adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+				botID:           botID,
+				core:            tCore,
+				cex:             tCEX,
+				baseDexBalances: dexBalances,
+				baseCexBalances: cexBalances,
+				log:             tLogger,
+				market: &MarketWithHost{
+					Host:    "host1",
+					BaseID:  test.assetID,
+					QuoteID: 0,
+				},
+				eventLogDB: eventLogDB,
+			})
+			adaptor.run(ctx)
 
-		checkPostConfirmBalance := func() error {
-			postConfirmBal := adaptor.DEXBalance(test.assetID)
-			if *postConfirmBal != *test.postConfirmDEXBalance {
-				return fmt.Errorf("%s: unexpected post confirm dex balance. want %d, got %d", test.name, test.postConfirmDEXBalance, postConfirmBal.Available)
+			err := adaptor.Deposit(ctx, test.assetID, test.depositAmt)
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", test.name, err)
+			}
+
+			preConfirmBal := adaptor.DEXBalance(test.assetID)
+			if *preConfirmBal != *test.preConfirmDEXBalance {
+				t.Fatalf("%s: unexpected pre confirm dex balance. want %d, got %d", test.name, test.preConfirmDEXBalance, preConfirmBal.Available)
 			}
 
 			if test.assetID == 966001 {
-				postConfirmParentBal := adaptor.DEXBalance(966)
-				if postConfirmParentBal.Available != 2e6-test.confirmedTx.Fees {
-					return fmt.Errorf("%s: unexpected post confirm dex balance. want %d, got %d", test.name, 2e6-test.confirmedTx.Fees, postConfirmParentBal.Available)
+				preConfirmParentBal := adaptor.DEXBalance(966)
+				if preConfirmParentBal.Available != 2e6-test.unconfirmedTx.Fees {
+					t.Fatalf("%s: unexpected pre confirm dex balance. want %d, got %d", test.name, test.preConfirmDEXBalance, preConfirmBal.Available)
 				}
 			}
-			return nil
-		}
 
-		// Dynamic swappers start a goroutine to wait for a transaction to be
-		// confirmed in order to get the correct fees. Here we wait for the
-		// goroutine to finish.
-		if test.isDynamicSwapper {
-			var err error
-			for i := 0; i < 10; i++ {
-				time.Sleep(time.Millisecond * 100)
-				err = checkPostConfirmBalance()
-				if err == nil {
-					break
+			i := len(eventLogDB.storedEvents) - 1
+			eventLogDB.storedEvents[i].TimeStamp = 0 // ignore timestamp
+			if !reflect.DeepEqual(eventLogDB.storedEvents[i], test.initialEvent) {
+				t.Fatalf("%s: unexpected event logged. want:\n%+v\ngot:\n%+v", test.name, test.initialEvent.DepositEvent, eventLogDB.storedEvents[i].DepositEvent)
+			}
+
+			tCore.walletTxsMtx.Lock()
+			tCore.walletTxs[test.unconfirmedTx.ID] = test.confirmedTx
+			tCore.walletTxsMtx.Unlock()
+			tCEX.confirmedDeposit = &test.receivedAmt
+			adaptor.confirmDeposit(ctx, txID)
+
+			checkPostConfirmBalance := func() error {
+				postConfirmBal := adaptor.DEXBalance(test.assetID)
+				if *postConfirmBal != *test.postConfirmDEXBalance {
+					return fmt.Errorf("%s: unexpected post confirm dex balance. want %d, got %d", test.name, test.postConfirmDEXBalance, postConfirmBal.Available)
 				}
+
+				if test.assetID == 966001 {
+					postConfirmParentBal := adaptor.DEXBalance(966)
+					if postConfirmParentBal.Available != 2e6-test.confirmedTx.Fees {
+						return fmt.Errorf("%s: unexpected post confirm dex balance. want %d, got %d", test.name, 2e6-test.confirmedTx.Fees, postConfirmParentBal.Available)
+					}
+				}
+				return nil
 			}
-			if err != nil {
-				t.Fatal(err)
-			}
-		} else {
+
 			err = checkPostConfirmBalance()
 			if err != nil {
 				t.Fatal(err)
 			}
-		}
 
-		i = len(eventLogDB.storedEvents) - 1
-		eventLogDB.storedEvents[i].TimeStamp = 0 // ignore timestamp
-		if !reflect.DeepEqual(eventLogDB.storedEvents[i], test.postConfirmEvent) {
-			t.Fatalf("%s: unexpected event logged. want:\n%+v\ngot:\n%+v", test.name, test.postConfirmEvent.DepositEvent, eventLogDB.storedEvents[i].DepositEvent)
-		}
+			i = len(eventLogDB.storedEvents) - 1
+			eventLogDB.storedEvents[i].TimeStamp = 0 // ignore timestamp
+			if !reflect.DeepEqual(eventLogDB.storedEvents[i], test.postConfirmEvent) {
+				t.Fatalf("%s: unexpected event logged. want:\n%+v\ngot:\n%+v", test.name, test.postConfirmEvent.DepositEvent, eventLogDB.storedEvents[i].DepositEvent)
+			}
+		})
 	}
 
 	for _, test := range tests {
@@ -2887,6 +3062,7 @@ func TestWithdraw(t *testing.T) {
 	assetID := uint32(42)
 	coinID := encode.RandomBytes(32)
 	txID := hex.EncodeToString(coinID)
+	withdrawalID := hex.EncodeToString(encode.RandomBytes(32))
 
 	type test struct {
 		name              string
@@ -2935,6 +3111,7 @@ func TestWithdraw(t *testing.T) {
 				WithdrawalEvent: &WithdrawalEvent{
 					AssetID:  42,
 					CEXDebit: 1e6,
+					ID:       withdrawalID,
 				},
 			},
 			postConfirmEvent: &MarketMakingEvent{
@@ -2944,6 +3121,7 @@ func TestWithdraw(t *testing.T) {
 				WithdrawalEvent: &WithdrawalEvent{
 					AssetID:  42,
 					CEXDebit: 1e6,
+					ID:       withdrawalID,
 					Transaction: &asset.WalletTransaction{
 						ID:        txID,
 						Amount:    0.9e6 - 2000,
@@ -2972,6 +3150,8 @@ func TestWithdraw(t *testing.T) {
 			assetID: test.initialCEXBalance,
 			966:     1e8,
 		}
+
+		tCEX.withdrawalID = withdrawalID
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -3010,13 +3190,13 @@ func TestWithdraw(t *testing.T) {
 			t.Fatalf("%s: unexpected pre confirm dex balance. want %+v, got %+v", test.name, test.preConfirmDEXBalance, preConfirmBal)
 		}
 
-		tCEX.confirmWithdrawal <- &withdrawArgs{
+		tCEX.confirmWithdrawal = &withdrawArgs{
 			assetID: assetID,
 			amt:     test.withdrawAmt,
 			txID:    test.tx.ID,
 		}
 
-		<-tCEX.confirmWithdrawalComplete
+		adaptor.confirmWithdrawal(ctx, withdrawalID)
 
 		postConfirmBal := adaptor.DEXBalance(assetID)
 		if *postConfirmBal != *test.postConfirmDEXBalance {
@@ -3114,8 +3294,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {5e6, 5e6 - 3e6, 0},
-							0:  {1e7 + 1.6e6, 0, 0},
+							42: {5e6, 5e6 - 3e6, 0, 0},
+							0:  {1e7 + 1.6e6, 0, 0, 0},
 						},
 					},
 				},
@@ -3143,8 +3323,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {5e6, 0, 0},
-							0:  {1e7 + 2.8e6, 0, 0},
+							42: {5e6, 0, 0, 0},
+							0:  {1e7 + 2.8e6, 0, 0, 0},
 						},
 					},
 				},
@@ -3158,8 +3338,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {5e6, 0, 0},
-							0:  {1e7 + 2.8e6, 0, 0},
+							42: {5e6, 0, 0, 0},
+							0:  {1e7 + 2.8e6, 0, 0, 0},
 						},
 					},
 				},
@@ -3218,8 +3398,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {7e6, 0, 0},
-							0:  {1e7 + 1.6e6, 0, 0},
+							42: {7e6, 0, 0, 0},
+							0:  {1e7 + 1.6e6, 0, 0, 0},
 						},
 					},
 				},
@@ -3277,8 +3457,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {1e7 + 3e6, 0, 0},
-							0:  {1e7 - b2q(5e7, 5e6), b2q(5e7, 5e6) - 1.6e6, 0},
+							42: {1e7 + 3e6, 0, 0, 0},
+							0:  {1e7 - b2q(5e7, 5e6), b2q(5e7, 5e6) - 1.6e6, 0, 0},
 						},
 					},
 				},
@@ -3306,8 +3486,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {1e7 + 5.1e6, 0, 0},
-							0:  {1e7 - b2q(5e7, 5e6), 0, 0},
+							42: {1e7 + 5.1e6, 0, 0, 0},
+							0:  {1e7 - b2q(5e7, 5e6), 0, 0, 0},
 						},
 					},
 				},
@@ -3321,8 +3501,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {1e7 + 5.1e6, 0, 0},
-							0:  {1e7 - b2q(5e7, 5e6), 0, 0},
+							42: {1e7 + 5.1e6, 0, 0, 0},
+							0:  {1e7 - b2q(5e7, 5e6), 0, 0, 0},
 						},
 					},
 				},
@@ -3381,8 +3561,8 @@ func TestCEXTrade(t *testing.T) {
 					},
 					stats: &RunStats{
 						CEXBalances: map[uint32]*BotBalance{
-							42: {1e7 + 3e6, 0, 0},
-							0:  {1e7 - 1.6e6, 0, 0},
+							42: {1e7 + 3e6, 0, 0, 0},
+							0:  {1e7 - 1.6e6, 0, 0, 0},
 						},
 					},
 				},
@@ -3665,4 +3845,179 @@ func TestCalcProfitLoss(t *testing.T) {
 	if math.Abs(profitLoss-expProfitLoss) > 1e-6 {
 		t.Fatalf("unexpected profit loss. want %f, got %f", expProfitLoss, profitLoss)
 	}
+}
+
+func TestRefreshPendingEvents(t *testing.T) {
+	tCore := newTCore()
+	tCEX := newTCEX()
+
+	dexBalances := map[uint32]uint64{
+		42: 1e9,
+		0:  1e9,
+	}
+	cexBalances := map[uint32]uint64{
+		42: 1e9,
+		0:  1e9,
+	}
+
+	adaptor := unifiedExchangeAdaptorForBot(&exchangeAdaptorCfg{
+		core: tCore,
+		cex:  tCEX,
+		market: &MarketWithHost{
+			Host:    "host1",
+			BaseID:  42,
+			QuoteID: 0,
+		},
+		baseDexBalances: dexBalances,
+		baseCexBalances: cexBalances,
+		log:             tLogger,
+		eventLogDB:      &tEventLogDB{},
+	})
+
+	// These will be updated throughout the test
+	expectedDEXAvailableBalance := map[uint32]uint64{
+		42: 1e9,
+		0:  1e9,
+	}
+	expectedCEXAvailableBalance := map[uint32]uint64{
+		42: 1e9,
+		0:  1e9,
+	}
+	checkAvailableBalances := func() {
+		t.Helper()
+		for assetID, expectedBal := range expectedDEXAvailableBalance {
+			bal := adaptor.DEXBalance(assetID)
+			if bal.Available != expectedBal {
+				t.Fatalf("unexpected dex balance for asset %d. want %d, got %d", assetID, expectedBal, bal.Available)
+			}
+		}
+
+		for assetID, expectedBal := range expectedCEXAvailableBalance {
+			bal := adaptor.CEXBalance(assetID)
+			if bal.Available != expectedBal {
+				t.Fatalf("unexpected cex balance for asset %d. want %d, got %d", assetID, expectedBal, bal.Available)
+			}
+		}
+	}
+
+	// Add a pending dex order, then refresh pending events
+	var dexOrderID order.OrderID
+	copy(dexOrderID[:], encode.RandomBytes(32))
+	swapCoinID := encode.RandomBytes(32)
+	redeemCoinID := encode.RandomBytes(32)
+	tCore.walletTxs = map[string]*asset.WalletTransaction{
+		hex.EncodeToString(swapCoinID): {
+			Confirmed: true,
+			Fees:      2000,
+			Amount:    5e6,
+		},
+		hex.EncodeToString(redeemCoinID): {
+			Confirmed: true,
+			Fees:      1000,
+			Amount:    calc.BaseToQuote(5e6, 5e7),
+		},
+	}
+	adaptor.pendingDEXOrders[dexOrderID] = &pendingDEXOrder{
+		swaps:   map[string]*asset.WalletTransaction{},
+		redeems: map[string]*asset.WalletTransaction{},
+		refunds: map[string]*asset.WalletTransaction{},
+	}
+	adaptor.pendingDEXOrders[dexOrderID].updateState(&core.Order{
+		ID:      dexOrderID[:],
+		Sell:    true,
+		Rate:    5e6,
+		Qty:     5e7,
+		BaseID:  42,
+		QuoteID: 0,
+		Matches: []*core.Match{
+			{
+				Rate: 5e6,
+				Qty:  5e7,
+				Swap: &core.Coin{
+					ID: swapCoinID,
+				},
+				Redeem: &core.Coin{
+					ID: redeemCoinID,
+				},
+			},
+		},
+	}, &balanceEffects{})
+	ctx := context.Background()
+	adaptor.refreshAllPendingEvents(ctx)
+	expectedDEXAvailableBalance[42] -= 5e6 + 2000
+	expectedDEXAvailableBalance[0] += calc.BaseToQuote(5e6, 5e7) - 1000
+	checkAvailableBalances()
+
+	// Add a pending unfilled CEX order, then refresh pending events
+	cexOrderID := "123"
+	adaptor.pendingCEXOrders = map[string]*pendingCEXOrder{
+		cexOrderID: {
+			trade: &libxc.Trade{
+				ID:      cexOrderID,
+				Sell:    true,
+				Rate:    5e6,
+				Qty:     5e7,
+				BaseID:  42,
+				QuoteID: 0,
+			},
+		},
+	}
+	tCEX.tradeStatus = &libxc.Trade{
+		ID:          cexOrderID,
+		Sell:        true,
+		Rate:        5e6,
+		Qty:         5e7,
+		BaseID:      42,
+		QuoteID:     0,
+		BaseFilled:  5e7,
+		QuoteFilled: calc.BaseToQuote(5e6, 5e7),
+		Complete:    true,
+	}
+	adaptor.refreshAllPendingEvents(ctx)
+	expectedCEXAvailableBalance[42] -= 5e7
+	expectedCEXAvailableBalance[0] += calc.BaseToQuote(5e6, 5e7)
+	checkAvailableBalances()
+
+	// Add a pending deposit, then refresh pending events
+	depositTxID := hex.EncodeToString(encode.RandomBytes(32))
+	adaptor.pendingDeposits[depositTxID] = &pendingDeposit{
+		assetID: 42,
+		tx: &asset.WalletTransaction{
+			ID:        depositTxID,
+			Fees:      1000,
+			Amount:    1e7,
+			Confirmed: true,
+		},
+		feeConfirmed: true,
+	}
+	amtReceived := uint64(1e7 - 1000)
+	tCEX.confirmedDeposit = &amtReceived
+	adaptor.refreshAllPendingEvents(ctx)
+	expectedDEXAvailableBalance[42] -= 1e7 + 1000
+	expectedCEXAvailableBalance[42] += amtReceived
+	checkAvailableBalances()
+
+	// Add a pending withdrawal, then refresh pending events
+	withdrawalID := "456"
+	adaptor.pendingWithdrawals[withdrawalID] = &pendingWithdrawal{
+		withdrawalID: withdrawalID,
+		assetID:      42,
+		amtWithdrawn: 2e7,
+	}
+
+	withdrawalTxID := hex.EncodeToString(encode.RandomBytes(32))
+	tCore.walletTxs[withdrawalTxID] = &asset.WalletTransaction{
+		ID:        withdrawalTxID,
+		Amount:    2e7 - 3000,
+		Confirmed: true,
+	}
+	tCEX.confirmWithdrawal = &withdrawArgs{
+		assetID: 42,
+		amt:     2e7,
+		txID:    withdrawalTxID,
+	}
+	adaptor.refreshAllPendingEvents(ctx)
+	expectedDEXAvailableBalance[42] += 2e7 - 3000
+	expectedCEXAvailableBalance[42] -= 2e7
+	checkAvailableBalances()
 }

@@ -75,12 +75,26 @@ type centralizedExchange struct {
 }
 
 type runningBot struct {
-	adaptor *unifiedExchangeAdaptor
+	adaptor exchangeAdaptor
 	die     context.CancelFunc
 	cexCfg  *CEXConfig
 
 	botCfgMtx sync.RWMutex
 	botCfg    *BotConfig
+}
+
+func (rb *runningBot) usingAssets() map[uint32]interface{} {
+	assets := make(map[uint32]interface{})
+
+	rb.botCfgMtx.RLock()
+	defer rb.botCfgMtx.RUnlock()
+
+	assets[rb.botCfg.BaseID] = struct{}{}
+	assets[rb.botCfg.QuoteID] = struct{}{}
+	assets[feeAsset(rb.botCfg.BaseID)] = struct{}{}
+	assets[feeAsset(rb.botCfg.QuoteID)] = struct{}{}
+
+	return assets
 }
 
 func (rb *runningBot) cexName() string {
@@ -315,6 +329,7 @@ func (m *MarketMaker) loadAndConnectCEX(ctx context.Context, cfg *CEXConfig) (*c
 			return nil, fmt.Errorf("error refreshing markets: %v", err)
 		}
 	}
+
 	return c, nil
 }
 
@@ -404,80 +419,23 @@ func (m *MarketMaker) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	return &wg, nil
 }
 
-func (m *MarketMaker) availableBalanceDEX(assetID uint32) (uint64, error) {
-	bal, err := m.core.AssetBalance(assetID)
+func (m *MarketMaker) balancesSufficient(balances *BotBalanceAllocation, mkt *MarketWithHost, cexCfg *CEXConfig) error {
+	availableDEXBalances, availableCEXBalances, err := m.availableBalances(mkt, cexCfg)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("error getting available balances: %v", err)
 	}
 
-	availableBalance := bal.Available
-
-	runningBots := m.runningBotsLookup()
-	for _, bot := range runningBots {
-		botBalance := bot.adaptor.dexBalance(assetID)
-		// TODO: add support in adaptor to check each of the pending
-		// incoming transactions to see if they have become available.
-		if availableBalance > botBalance.Available {
-			availableBalance = availableBalance - botBalance.Available
-		} else {
-			return 0, nil
+	for assetID, amount := range balances.DEX {
+		availableBalance := availableDEXBalances[assetID]
+		if amount > availableBalance {
+			return fmt.Errorf("insufficient DEX balance for %s: %d < %d", dex.BipIDSymbol(assetID), availableBalance, amount)
 		}
 	}
 
-	return availableBalance, nil
-}
-
-func (m *MarketMaker) availableBalanceCEX(assetID uint32, cexCfg *CEXConfig) (uint64, error) {
-	cex, err := m.loadAndConnectCEX(m.ctx, cexCfg)
-	if err != nil {
-		return 0, err
-	}
-
-	balance, err := cex.Balance(assetID)
-	if err != nil {
-		return 0, err
-	}
-
-	availableBalance := balance.Available
-
-	runningBots := m.runningBotsLookup()
-
-	for _, bot := range runningBots {
-		botCexName := bot.cexName()
-		if botCexName == "" || botCexName != cex.Name {
-			continue
-		}
-		botBalance := bot.adaptor.cexBalance(assetID)
-		if availableBalance > botBalance.Available {
-			availableBalance = balance.Available - botBalance.Available
-		} else {
-			return 0, nil
-		}
-	}
-
-	return availableBalance, nil
-}
-
-func (m *MarketMaker) balancesSufficient(balances *BotBalanceAllocation, cexCfg *CEXConfig) error {
-	for assetID, balance := range balances.DEX {
-		available, err := m.availableBalanceDEX(assetID)
-		if err != nil {
-			return fmt.Errorf("error getting available balance for asset %d: %v", assetID, err)
-		}
-		if balance > available {
-			return fmt.Errorf("insufficient balance for asset %d: %d available, %d required", assetID, available, balance)
-		}
-	}
-
-	if cexCfg != nil {
-		for assetID, balance := range balances.CEX {
-			available, err := m.availableBalanceCEX(assetID, cexCfg)
-			if err != nil {
-				return fmt.Errorf("error getting available balance for asset %d: %v", assetID, err)
-			}
-			if balance > available {
-				return fmt.Errorf("insufficient balance for asset %d: %d available, %d required", assetID, available, balance)
-			}
+	for assetID, amount := range balances.CEX {
+		availableBalance := availableCEXBalances[assetID]
+		if amount > availableBalance {
+			return fmt.Errorf("insufficient CEX balance for %s: %d < %d", dex.BipIDSymbol(assetID), availableBalance, amount)
 		}
 	}
 
@@ -560,7 +518,7 @@ func (m *MarketMaker) StartBot(mkt *MarketWithHost, allocation *BotBalanceAlloca
 		return err
 	}
 
-	if err := m.balancesSufficient(allocation, cexCfg); err != nil {
+	if err := m.balancesSufficient(allocation, mkt, cexCfg); err != nil {
 		return err
 	}
 
@@ -839,7 +797,7 @@ func (m *MarketMaker) UpdateRunningBot(cfg *BotConfig, balanceDiffs *BotBalanceD
 		return err
 	}
 
-	if err := m.balancesSufficient(balanceDiffsToAllocation(balanceDiffs), runningBot.cexCfg); err != nil {
+	if err := m.balancesSufficient(balanceDiffsToAllocation(balanceDiffs), &mkt, runningBot.cexCfg); err != nil {
 		return err
 	}
 
@@ -875,7 +833,7 @@ func (m *MarketMaker) ArchivedRuns() ([]*MarketMakingRun, error) {
 	archivedRuns := make([]*MarketMakingRun, 0, len(allRuns))
 	for _, run := range allRuns {
 		runningBot := runningBots[*run.Market]
-		if runningBot == nil || runningBot.adaptor.startTime.Load() != run.StartTime {
+		if runningBot == nil || runningBot.adaptor.timeStart() != run.StartTime {
 			archivedRuns = append(archivedRuns, run)
 		}
 	}
@@ -895,45 +853,133 @@ func (m *MarketMaker) RunLogs(startTime int64, mkt *MarketWithHost, n uint64, re
 	return m.eventLogDB.runEvents(startTime, mkt, n, refID, false)
 }
 
-// AvailableBalances returns the available balances of assets relevant to
-// market making on the specified market on the DEX (including fee assets),
-// and optionally a CEX depending on the configured strategy.
-func (m *MarketMaker) AvailableBalances(mkt *MarketWithHost, alternateConfigPath *string) (dexBalances, cexBalances map[uint32]uint64, _ error) {
-	botCfg, cexCfg, err := m.configsForMarket(mkt, alternateConfigPath)
+func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) (dexBalances, cexBalances map[uint32]uint64, _ error) {
+	dexAssets := make(map[uint32]interface{})
+	cexAssets := make(map[uint32]interface{})
+
+	dexAssets[mkt.BaseID] = struct{}{}
+	dexAssets[mkt.QuoteID] = struct{}{}
+	dexAssets[feeAsset(mkt.BaseID)] = struct{}{}
+	dexAssets[feeAsset(mkt.QuoteID)] = struct{}{}
+
+	if cexCfg != nil {
+		cexAssets[mkt.BaseID] = struct{}{}
+		cexAssets[mkt.QuoteID] = struct{}{}
+	}
+
+	checkTotalBalances := func() (dexBals, cexBals map[uint32]uint64, err error) {
+		dexBals = make(map[uint32]uint64, len(dexAssets))
+		cexBals = make(map[uint32]uint64, len(cexAssets))
+
+		for assetID := range dexAssets {
+			bal, err := m.core.AssetBalance(assetID)
+			if err != nil {
+				return nil, nil, err
+			}
+			dexBals[assetID] = bal.Available
+		}
+
+		if cexCfg != nil {
+			cex, err := m.loadAndConnectCEX(m.ctx, cexCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			for assetID := range cexAssets {
+				balance, err := cex.Balance(assetID)
+				if err != nil {
+					return nil, nil, err
+				}
+				cexBals[assetID] = balance.Available
+			}
+		}
+
+		return dexBals, cexBals, nil
+	}
+
+	checkBot := func(bot *runningBot) bool {
+		botAssets := bot.usingAssets()
+		for assetID := range dexAssets {
+			if _, found := botAssets[assetID]; found {
+				return true
+			}
+		}
+		return false
+	}
+
+	balancesEqual := func(bal1, bal2 map[uint32]uint64) bool {
+		if len(bal1) != len(bal2) {
+			return false
+		}
+		for assetID, bal := range bal1 {
+			if bal2[assetID] != bal {
+				return false
+			}
+		}
+		return true
+	}
+
+	totalDEXBalances, totalCEXBalances, err := checkTotalBalances()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	dexAssets := []uint32{botCfg.BaseID, botCfg.QuoteID}
-	baseFeeAsset := feeAsset(botCfg.BaseID)
-	if baseFeeAsset != botCfg.BaseID {
-		dexAssets = append(dexAssets, baseFeeAsset)
-	}
-	quoteFeeAsset := feeAsset(botCfg.QuoteID)
-	if quoteFeeAsset != botCfg.QuoteID {
-		dexAssets = append(dexAssets, quoteFeeAsset)
-	}
+	const maxTries = 5
+	for i := 0; i < maxTries; i++ {
+		reservedDEXBalances := make(map[uint32]uint64, len(dexAssets))
+		reservedCEXBalances := make(map[uint32]uint64, len(cexAssets))
 
-	dexBalances = make(map[uint32]uint64, len(dexAssets))
-	for _, assetID := range dexAssets {
-		bal, err := m.availableBalanceDEX(assetID)
+		runningBots := m.runningBotsLookup()
+		for _, bot := range runningBots {
+			if !checkBot(bot) {
+				continue
+			}
+
+			bot.adaptor.refreshAllPendingEvents(m.ctx)
+
+			for assetID := range dexAssets {
+				botBalance := bot.adaptor.DEXBalance(assetID)
+				reservedDEXBalances[assetID] += botBalance.Available
+			}
+
+			if cexCfg != nil && bot.cexName() == cexCfg.Name {
+				for assetID := range cexAssets {
+					botBalance := bot.adaptor.CEXBalance(assetID)
+					reservedCEXBalances[assetID] += botBalance.Available
+				}
+			}
+		}
+
+		updatedDEXBalances, updatedCEXBalances, err := checkTotalBalances()
 		if err != nil {
 			return nil, nil, err
 		}
-		dexBalances[assetID] = bal
+
+		if balancesEqual(updatedDEXBalances, totalDEXBalances) && balancesEqual(updatedCEXBalances, totalCEXBalances) {
+			for assetID, bal := range reservedDEXBalances {
+				totalDEXBalances[assetID] -= bal
+			}
+			for assetID, bal := range reservedCEXBalances {
+				totalCEXBalances[assetID] -= bal
+			}
+			return totalDEXBalances, totalCEXBalances, nil
+		}
+
+		totalDEXBalances = updatedDEXBalances
+		totalCEXBalances = updatedCEXBalances
 	}
 
-	if cexCfg != nil {
-		cexBalances = make(map[uint32]uint64, 2)
-		cexBalances[botCfg.BaseID], err = m.availableBalanceCEX(botCfg.BaseID, cexCfg)
-		if err != nil {
-			return nil, nil, err
-		}
-		cexBalances[botCfg.QuoteID], err = m.availableBalanceCEX(botCfg.QuoteID, cexCfg)
-		if err != nil {
-			return nil, nil, err
-		}
+	return nil, nil, fmt.Errorf("failed to get available balances after %d tries", maxTries)
+}
+
+// AvailableBalances returns the available balances of assets relevant to
+// market making on the specified market on the DEX (including fee assets),
+// and optionally a CEX depending on the configured strategy.
+func (m *MarketMaker) AvailableBalances(mkt *MarketWithHost, alternateConfigPath *string) (dexBalances, cexBalances map[uint32]uint64, _ error) {
+	_, cexCfg, err := m.configsForMarket(mkt, alternateConfigPath)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return
+	return m.availableBalances(mkt, cexCfg)
 }

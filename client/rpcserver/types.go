@@ -907,6 +907,38 @@ func parseMMAvailableBalancesArgs(params *RawParams) (*mmAvailableBalancesForm, 
 	return form, nil
 }
 
+func parseBotDiffs(balanceArg string) (map[uint32]int64, error) {
+	balances := make([][2]int64, 0)
+	err := json.Unmarshal([]byte(balanceArg), &balances)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal bot balances: %v", err)
+	}
+
+	toReturn := make(map[uint32]int64)
+	for _, b := range balances {
+		toReturn[uint32(b[0])] = b[1]
+	}
+
+	return toReturn, nil
+}
+
+func parseBotBalances(balanceArg string) (map[uint32]uint64, error) {
+	diffs, err := parseBotDiffs(balanceArg)
+	if err != nil {
+		return nil, err
+	}
+
+	toReturn := make(map[uint32]uint64)
+	for k, v := range diffs {
+		if v < 0 {
+			return nil, fmt.Errorf("balances must be positive")
+		}
+		toReturn[k] = uint64(v)
+	}
+
+	return toReturn, nil
+}
+
 func parseStartBotArgs(params *RawParams) (*startBotForm, error) {
 	if err := checkNArgs(params, []int{1}, []int{6}); err != nil {
 		return nil, err
@@ -921,16 +953,17 @@ func parseStartBotArgs(params *RawParams) (*startBotForm, error) {
 	}
 	form.mkt = mkt
 
-	dexBals := make(map[uint32]uint64)
-	err = json.Unmarshal([]byte(params.Args[4]), &dexBals)
+	dexBals, err := parseBotBalances(params.Args[4])
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal dex balances: %v", err)
+		return nil, err
 	}
 
 	cexBals := make(map[uint32]uint64)
-	err = json.Unmarshal([]byte(params.Args[5]), &cexBals)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal cex balances: %v", err)
+	if len(params.Args) > 5 {
+		cexBals, err = parseBotBalances(params.Args[5])
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	form.balances = &mm.BotBalanceAllocation{
@@ -963,23 +996,26 @@ func parseUpdateRunningBotArgs(params *RawParams) (*updateRunningBotForm, error)
 	}
 	form.mkt = mkt
 
+	dexBals := make(map[uint32]int64)
+	cexBals := make(map[uint32]int64)
+
 	if len(params.Args) > 4 {
-		dexBals := make(map[uint32]int64)
-		err = json.Unmarshal([]byte(params.Args[4]), &dexBals)
+		dexBals, err = parseBotDiffs(params.Args[4])
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal dex balance diffs: %v", err)
 		}
+	}
 
-		cexBals := make(map[uint32]int64)
-		err = json.Unmarshal([]byte(params.Args[5]), &cexBals)
+	if len(params.Args) > 5 {
+		cexBals, err = parseBotDiffs(params.Args[5])
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal cex balance diffs: %v", err)
 		}
+	}
 
-		form.balances = &mm.BotBalanceDiffs{
-			DEX: dexBals,
-			CEX: cexBals,
-		}
+	form.balances = &mm.BotBalanceDiffs{
+		DEX: dexBals,
+		CEX: cexBals,
 	}
 
 	return form, nil

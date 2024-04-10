@@ -2,6 +2,7 @@ package libxc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"decred.org/dcrdex/dex"
@@ -32,6 +33,10 @@ type Market struct {
 	BaseID  uint32 `json:"baseID"`
 	QuoteID uint32 `json:"quoteID"`
 }
+
+var (
+	ErrWithdrawalPending = errors.New("withdrawal pending")
+)
 
 // CEX implements a set of functions that can be used to interact with a
 // centralized exchange's spot trading API. All rates and quantities
@@ -69,11 +74,14 @@ type CEX interface {
 	GetDepositAddress(ctx context.Context, assetID uint32) (string, error)
 	// ConfirmDeposit is an async function that calls onConfirm when the status
 	// of a deposit has been confirmed.
-	ConfirmDeposit(ctx context.Context, txID string, onConfirm func(amount uint64))
+	ConfirmDeposit(ctx context.Context, txID string) (bool, uint64)
 	// Withdraw withdraws funds from the CEX to a certain address. onComplete
 	// is called with the actual amount withdrawn (amt - fees) and the
 	// transaction ID of the withdrawal.
-	Withdraw(ctx context.Context, assetID uint32, amt uint64, address string, onComplete func(txID string)) (string, error)
+	Withdraw(ctx context.Context, assetID uint32, amt uint64, address string) (string, error)
+	// ConfirmWithdrawal
+	ConfirmWithdrawal(ctx context.Context, withdrawalID string, assetID uint32) (uint64, string, error)
+	TradeStatus(ctx context.Context, id string, baseID, quoteID uint32) (*Trade, error)
 }
 
 const (
