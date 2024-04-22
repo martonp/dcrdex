@@ -440,6 +440,54 @@ func (m *MarketMaker) defaultConfig() *MarketMakingConfig {
 	return m.defaultCfg.Copy()
 }
 
+func (m *MarketMaker) ensureSufficientBalanceOnDEX(assetID uint32) {
+	dexBals, _, err := m.availableBalances(map[uint32]interface{}{assetID: struct{}{}}, nil, nil)
+	if err != nil {
+		m.log.Errorf("Error getting available balances: %v", err)
+		return
+	}
+
+	if dexBals[assetID] >= 0 {
+		return
+	}
+
+	amtToDecrease := -dexBals[assetID]
+
+	m.log.Warnf("Insufficient balance for %s on DEX. Attempting to decrease bot balances.", dex.BipIDSymbol(assetID))
+
+	m.startUpdateMtx.Lock()
+	defer m.startUpdateMtx.Unlock()
+
+	runningBots := m.runningBotsLookup()
+
+	botsToAdjustBalance := make([]*runningBot, 0)
+	for _, rb := range runningBots {
+		if _, found := rb.assets()[assetID]; found {
+			botsToAdjustBalance = append(botsToAdjustBalance, rb)
+		}
+	}
+
+	amtToDecreasePerBot := amtToDecrease / int64(len(botsToAdjustBalance))
+	var additionalOnFirstBot int64
+	if amtToDecrease > amtToDecreasePerBot*int64(len(botsToAdjustBalance)) {
+		additionalOnFirstBot = amtToDecrease - amtToDecreasePerBot*int64(len(botsToAdjustBalance))
+	}
+
+	m.log.Infof("Decreasing balance for %s by %d on %d bots", dex.BipIDSymbol(assetID), amtToDecrease, len(botsToAdjustBalance))
+
+	for i, rb := range botsToAdjustBalance {
+		balDiff := -amtToDecreasePerBot
+		if i == 0 {
+			balDiff -= additionalOnFirstBot
+		}
+		rb.botCfgMtx.RLock()
+		rb.adaptor.updateConfig(rb.botCfg, &BotBalanceDiffs{
+			DEX: map[uint32]int64{assetID: balDiff},
+		})
+		rb.botCfgMtx.RUnlock()
+	}
+}
+
 func (m *MarketMaker) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	m.ctx = ctx
 	cfg := m.defaultConfig()
@@ -449,6 +497,32 @@ func (m *MarketMaker) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		}
 	}
 	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		noteFeed := m.core.NotificationFeed()
+		defer noteFeed.ReturnFeed()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case note := <-noteFeed.C:
+				walletNote, is := note.(*core.WalletNote)
+				if !is {
+					continue
+				}
+				txNote, is := walletNote.Payload.(*asset.TransactionNote)
+				if !is {
+					continue
+				}
+				if txNote.Transaction.Type == asset.CreateBond {
+					m.ensureSufficientBalanceOnDEX(txNote.AssetID)
+				}
+			}
+		}
+	}()
 
 	wg.Add(1)
 	go func() {
@@ -468,7 +542,7 @@ func (m *MarketMaker) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 }
 
 func (m *MarketMaker) balancesSufficient(balances *BotBalanceAllocation, mkt *MarketWithHost, cexCfg *CEXConfig) error {
-	availableDEXBalances, availableCEXBalances, err := m.availableBalances(mkt, cexCfg)
+	availableDEXBalances, availableCEXBalances, err := m.availableBalancesForMarket(mkt, cexCfg)
 	if err != nil {
 		return fmt.Errorf("error getting available balances: %v", err)
 	}
@@ -950,30 +1024,17 @@ func marketFees(c clientCore, host string, baseID, quoteID uint32, useMaxFeeRate
 		}, nil
 }
 
-func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) (dexBalances, cexBalances map[uint32]uint64, _ error) {
-	dexAssets := make(map[uint32]interface{})
-	cexAssets := make(map[uint32]interface{})
-
-	dexAssets[mkt.BaseID] = struct{}{}
-	dexAssets[mkt.QuoteID] = struct{}{}
-	dexAssets[feeAsset(mkt.BaseID)] = struct{}{}
-	dexAssets[feeAsset(mkt.QuoteID)] = struct{}{}
-
-	if cexCfg != nil {
-		cexAssets[mkt.BaseID] = struct{}{}
-		cexAssets[mkt.QuoteID] = struct{}{}
-	}
-
-	checkTotalBalances := func() (dexBals, cexBals map[uint32]uint64, err error) {
-		dexBals = make(map[uint32]uint64, len(dexAssets))
-		cexBals = make(map[uint32]uint64, len(cexAssets))
+func (m *MarketMaker) availableBalances(dexAssets, cexAssets map[uint32]interface{}, cexCfg *CEXConfig) (dexBalances, cexBalances map[uint32]int64, _ error) {
+	checkTotalBalances := func() (dexBals, cexBals map[uint32]int64, err error) {
+		dexBals = make(map[uint32]int64, len(dexAssets))
+		cexBals = make(map[uint32]int64, len(cexAssets))
 
 		for assetID := range dexAssets {
 			bal, err := m.core.AssetBalance(assetID)
 			if err != nil {
 				return nil, nil, err
 			}
-			dexBals[assetID] = bal.Available
+			dexBals[assetID] = int64(bal.Available)
 		}
 
 		if cexCfg != nil {
@@ -988,9 +1049,7 @@ func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) 
 					return nil, nil, err
 				}
 
-				m.log.Infof("CEX BALANCE FOR %d: %+v", assetID, balance)
-
-				cexBals[assetID] = balance.Available
+				cexBals[assetID] = int64(balance.Available)
 			}
 		}
 
@@ -1007,7 +1066,7 @@ func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) 
 		return false
 	}
 
-	balancesEqual := func(bal1, bal2 map[uint32]uint64) bool {
+	balancesEqual := func(bal1, bal2 map[uint32]int64) bool {
 		if len(bal1) != len(bal2) {
 			return false
 		}
@@ -1062,20 +1121,10 @@ func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) 
 
 		if balancesEqual(updatedDEXBalances, totalDEXBalances) && balancesEqual(updatedCEXBalances, totalCEXBalances) {
 			for assetID, bal := range reservedDEXBalances {
-				if bal > totalDEXBalances[assetID] {
-					m.log.Warnf("reserved DEX balance for %s exceeds available balance: %d > %d", dex.BipIDSymbol(assetID), bal, totalDEXBalances[assetID])
-					totalDEXBalances[assetID] = 0
-				} else {
-					totalDEXBalances[assetID] -= bal
-				}
+				totalDEXBalances[assetID] -= int64(bal)
 			}
 			for assetID, bal := range reservedCEXBalances {
-				if bal > totalCEXBalances[assetID] {
-					m.log.Warnf("reserved CEX balance for %s exceeds available balance: %d > %d", dex.BipIDSymbol(assetID), bal, totalCEXBalances[assetID])
-					totalCEXBalances[assetID] = 0
-				} else {
-					totalCEXBalances[assetID] -= bal
-				}
+				totalCEXBalances[assetID] -= int64(bal)
 			}
 			return totalDEXBalances, totalCEXBalances, nil
 		}
@@ -1087,6 +1136,49 @@ func (m *MarketMaker) availableBalances(mkt *MarketWithHost, cexCfg *CEXConfig) 
 	return nil, nil, fmt.Errorf("failed to get available balances after %d tries", maxTries)
 }
 
+func (m *MarketMaker) availableBalancesForMarket(mkt *MarketWithHost, cexCfg *CEXConfig) (dexBalances, cexBalances map[uint32]uint64, _ error) {
+	dexAssets := make(map[uint32]interface{})
+	cexAssets := make(map[uint32]interface{})
+
+	dexAssets[mkt.BaseID] = struct{}{}
+	dexAssets[mkt.QuoteID] = struct{}{}
+	dexAssets[feeAsset(mkt.BaseID)] = struct{}{}
+	dexAssets[feeAsset(mkt.QuoteID)] = struct{}{}
+
+	if cexCfg != nil {
+		cexAssets[mkt.BaseID] = struct{}{}
+		cexAssets[mkt.QuoteID] = struct{}{}
+	}
+
+	dexBals, cexBals, err := m.availableBalances(dexAssets, cexAssets, cexCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dexBalances = make(map[uint32]uint64, len(dexBals))
+	cexBalances = make(map[uint32]uint64, len(cexBals))
+
+	for assetID, bal := range dexBals {
+		if bal >= 0 {
+			dexBalances[assetID] = uint64(bal)
+		} else {
+			m.log.Warnf("Negative DEX balance for %s: %d", dex.BipIDSymbol(assetID), bal)
+			dexBalances[assetID] = 0
+		}
+	}
+
+	for assetID, bal := range cexBals {
+		if bal >= 0 {
+			cexBalances[assetID] = uint64(bal)
+		} else {
+			m.log.Warnf("Negative CEX balance for %s: %d", dex.BipIDSymbol(assetID), bal)
+			cexBalances[assetID] = 0
+		}
+	}
+
+	return dexBalances, cexBalances, nil
+}
+
 // AvailableBalances returns the available balances of assets relevant to
 // market making on the specified market on the DEX (including fee assets),
 // and optionally a CEX depending on the configured strategy.
@@ -1096,5 +1188,5 @@ func (m *MarketMaker) AvailableBalances(mkt *MarketWithHost, alternateConfigPath
 		return nil, nil, err
 	}
 
-	return m.availableBalances(mkt, cexCfg)
+	return m.availableBalancesForMarket(mkt, cexCfg)
 }

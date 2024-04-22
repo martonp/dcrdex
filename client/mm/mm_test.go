@@ -676,6 +676,8 @@ func (c *tBotCexAdaptor) PrepareRebalance(ctx context.Context, assetID uint32) (
 type tExchangeAdaptor struct {
 	dexBalances map[uint32]*BotBalance
 	cexBalances map[uint32]*BotBalance
+
+	lastBalanceDiff *BotBalanceDiffs
 }
 
 var _ exchangeAdaptor = (*tExchangeAdaptor)(nil)
@@ -693,9 +695,11 @@ func (t *tExchangeAdaptor) CEXBalance(assetID uint32) *BotBalance {
 	}
 	return t.cexBalances[assetID]
 }
-func (t *tExchangeAdaptor) stats() *RunStats                                           { return nil }
-func (t *tExchangeAdaptor) updateConfig(cfg *BotConfig, balanceDiffs *BotBalanceDiffs) {}
-func (t *tExchangeAdaptor) timeStart() int64                                           { return 0 }
+func (t *tExchangeAdaptor) stats() *RunStats { return nil }
+func (t *tExchangeAdaptor) updateConfig(cfg *BotConfig, balanceDiffs *BotBalanceDiffs) {
+	t.lastBalanceDiff = balanceDiffs
+}
+func (t *tExchangeAdaptor) timeStart() int64 { return 0 }
 
 func TestAvailableBalances(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -841,4 +845,86 @@ func TestAvailableBalances(t *testing.T) {
 	checkAvailableBalances(ethBtc, map[uint32]uint64{60: 7e5, 0: 3e5}, map[uint32]uint64{60: 9e5, 0: 5e5})
 	checkAvailableBalances(btcUsdc, map[uint32]uint64{0: 3e5, 60: 7e5, 60001: 4e5}, map[uint32]uint64{0: 5e5, 60001: 4e5})
 	checkAvailableBalances(dcrUsdc, map[uint32]uint64{42: 9e5, 60: 7e5, 60001: 4e5}, map[uint32]uint64{42: 7e5, 60001: 6e5})
+}
+
+func TestEnsureSufficientBalance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tCore := newTCore()
+
+	dcrBtc := &MarketWithHost{
+		Host:    "dex.com",
+		BaseID:  42,
+		QuoteID: 0,
+	}
+
+	dcrUsdc := &MarketWithHost{
+		Host:    "dex.com",
+		BaseID:  42,
+		QuoteID: 60001,
+	}
+
+	cfg := &MarketMakingConfig{
+		BotConfigs: []*BotConfig{
+			{
+				Host:    "dex.com",
+				BaseID:  42,
+				QuoteID: 0,
+			},
+			{
+				Host:    "dex.com",
+				BaseID:  42,
+				QuoteID: 60001,
+			},
+		},
+	}
+
+	mm := MarketMaker{
+		ctx:         ctx,
+		log:         tLogger,
+		core:        tCore,
+		defaultCfg:  cfg,
+		runningBots: make(map[MarketWithHost]*runningBot),
+	}
+
+	tCore.setAssetBalances(map[uint32]uint64{
+		42: 8e5,
+	})
+
+	mm.runningBots[*dcrBtc] = &runningBot{
+		adaptor: &tExchangeAdaptor{
+			dexBalances: map[uint32]*BotBalance{
+				42: {Available: 4.5e5},
+			},
+		},
+		botCfg: cfg.BotConfigs[0],
+	}
+
+	mm.runningBots[*dcrUsdc] = &runningBot{
+		adaptor: &tExchangeAdaptor{
+			dexBalances: map[uint32]*BotBalance{
+				42: {Available: 4.5e5},
+			},
+		},
+		botCfg: cfg.BotConfigs[1],
+	}
+
+	mm.ensureSufficientBalanceOnDEX(42)
+
+	dcrBTCAdaptor := mm.runningBots[*dcrBtc].adaptor.(*tExchangeAdaptor)
+	if dcrBTCAdaptor.lastBalanceDiff == nil {
+		t.Fatalf("no balance diff")
+	}
+	if dcrBTCAdaptor.lastBalanceDiff.DEX[42] != -0.5e5 {
+		t.Fatalf("unexpected balance diff. wanted -0.5e5, got %d", dcrBTCAdaptor.lastBalanceDiff.DEX[42])
+	}
+
+	dcrUSDCAdaptor := mm.runningBots[*dcrUsdc].adaptor.(*tExchangeAdaptor)
+	if dcrUSDCAdaptor.lastBalanceDiff == nil {
+		t.Fatalf("no balance diff")
+	}
+	if dcrUSDCAdaptor.lastBalanceDiff.DEX[42] != -0.5e5 {
+		t.Fatalf("unexpected balance diff. wanted -0.5e5, got %d", dcrUSDCAdaptor.lastBalanceDiff.DEX[42])
+	}
 }
