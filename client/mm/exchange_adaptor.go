@@ -816,7 +816,7 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 			availableBalance := bal.Available
 			if dexReserves != nil {
 				if dexReserves[assetID] > availableBalance {
-					u.log.Errorf("MultiTrade: insufficient dex balance for reserves. required: %d, have: %d", dexReserves[assetID], availableBalance)
+					u.log.Errorf("MultiTrade: insufficient dex balance for %s reserves. required: %d, have: %d", dex.BipIDSymbol(assetID), dexReserves[assetID], availableBalance)
 					return nil
 				}
 				availableBalance -= dexReserves[assetID]
@@ -825,7 +825,7 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 		}
 	}
 	if remainingBalances[fromFeeAsset] < fundingFees {
-		u.log.Debugf("MultiTrade: insufficient balance for funding fees. required: %d, have: %d", fundingFees, remainingBalances[fromFeeAsset])
+		u.log.Debugf("MultiTrade: insufficient balance for %s funding fees. required: %d, have: %d", dex.BipIDSymbol(fromFeeAsset), fundingFees, remainingBalances[fromFeeAsset])
 		return nil
 	}
 	remainingBalances[fromFeeAsset] -= fundingFees
@@ -839,7 +839,7 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 		remainingCEXBal = cexBal.Available
 		reserves := cexReserves[toAsset]
 		if remainingCEXBal < reserves {
-			u.log.Errorf("MultiTrade: insufficient CEX balance for reserves. required: %d, have: %d", cexReserves, remainingCEXBal)
+			u.log.Errorf("MultiTrade: insufficient CEX balance for %s reserves. required: %d, have: %d", dex.BipIDSymbol(toAsset), cexReserves, remainingCEXBal)
 			return nil
 		}
 		remainingCEXBal -= reserves
