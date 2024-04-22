@@ -74,7 +74,6 @@ type botCoreAdaptor interface {
 	DEXTrade(rate, qty uint64, sell bool) (*core.Order, error)
 	ExchangeMarket(host string, base, quote uint32) (*core.Market, error)
 	MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) []*order.OrderID
-	CancelAllOrders() bool
 	ExchangeRateFromFiatSources() uint64
 	OrderFeesInUnits(sell, base bool, rate uint64) (uint64, error) // estimated fees, not max
 	SubscribeOrderUpdates() (updates <-chan *core.Order)
@@ -2025,24 +2024,85 @@ func (u *unifiedExchangeAdaptor) OrderFeesInUnits(sell, base bool, rate uint64) 
 
 // CancelAllOrders cancels all booked orders. True is returned no orders
 // needed to be cancelled.
-func (u *unifiedExchangeAdaptor) CancelAllOrders() bool {
-	u.balancesMtx.RLock()
-	defer u.balancesMtx.RUnlock()
+func (u *unifiedExchangeAdaptor) cancelAllOrders(ctx context.Context) {
+	doCancels := func(epoch *uint64) bool {
+		u.balancesMtx.RLock()
+		defer u.balancesMtx.RUnlock()
 
-	noCancels := true
+		done := true
 
-	for _, pendingOrder := range u.pendingDEXOrders {
-		o := pendingOrder.currentState().order
-		if o.Status <= order.OrderStatusBooked {
-			err := u.clientCore.Cancel(o.ID)
-			if err != nil {
-				u.log.Errorf("Error canceling order %s: %v", o.ID, err)
+		freeCancel := func(orderEpoch uint64) bool {
+			if epoch == nil {
+				return true
 			}
-			noCancels = false
+			return *epoch-orderEpoch >= 2
 		}
+
+		for _, pendingOrder := range u.pendingDEXOrders {
+			o := pendingOrder.currentState().order
+			if o.Status > order.OrderStatusBooked {
+				continue
+			}
+
+			done = false
+			if freeCancel(o.Epoch) {
+				err := u.clientCore.Cancel(o.ID)
+				if err != nil {
+					u.log.Errorf("Error canceling order %s: %v", o.ID, err)
+				}
+			}
+		}
+
+		for _, pendingOrder := range u.pendingCEXOrders {
+			if pendingOrder.trade.Complete {
+				continue
+			}
+
+			done = false
+			err := u.CEX.CancelTrade(ctx, u.market.BaseID, u.market.QuoteID, pendingOrder.trade.ID)
+			if err != nil {
+				u.log.Errorf("Error canceling CEX trade %s: %v", pendingOrder.trade.ID, err)
+			}
+		}
+
+		return done
 	}
 
-	return noCancels
+	_, bookFeed, err := u.clientCore.SyncBook(u.market.Host, u.market.BaseID, u.market.QuoteID)
+	if err != nil {
+		u.log.Errorf("Error syncing book for cancellations: %v", err)
+		doCancels(nil)
+		return
+	}
+
+	mktCfg, err := u.clientCore.ExchangeMarket(u.market.Host, u.market.BaseID, u.market.QuoteID)
+	if err != nil {
+		u.log.Errorf("Error getting market configuration: %v", err)
+		doCancels(nil)
+		return
+	}
+
+	i := 0
+	for {
+		timer := time.NewTimer(time.Second * time.Duration(3*mktCfg.EpochLen))
+		select {
+		case n := <-bookFeed.Next():
+			if n.Action == core.EpochMatchSummary {
+				payload := n.Payload.(*core.EpochMatchSummaryPayload)
+				if doCancels(&payload.Epoch) {
+					return
+				}
+				i++
+			}
+		case <-timer.C:
+			doCancels(nil)
+			i++
+		}
+
+		if i >= 3 {
+			return
+		}
+	}
 }
 
 // SubscribeOrderUpdates returns a channel that sends updates for orders placed
@@ -2441,7 +2501,7 @@ func (u *unifiedExchangeAdaptor) updateFeeRates() error {
 }
 
 // run must complete running before calls are made to other methods.
-func (u *unifiedExchangeAdaptor) run(ctx context.Context) error {
+func (u *unifiedExchangeAdaptor) run(ctx context.Context) (*sync.WaitGroup, error) {
 	fiatRates := u.clientCore.FiatConversionRates()
 	u.fiatRates.Store(fiatRates)
 
@@ -2456,16 +2516,23 @@ func (u *unifiedExchangeAdaptor) run(ctx context.Context) error {
 	botCfg := u.botCfg.Load().(*BotConfig)
 	err = u.eventLogDB.storeNewRun(startTime, u.market, botCfg, u.balanceState())
 	if err != nil {
-		return fmt.Errorf("failed to store new run in event log db: %v", err)
+		return nil, fmt.Errorf("failed to store new run in event log db: %v", err)
 	}
 
+	wg := new(sync.WaitGroup)
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		<-ctx.Done()
+		u.cancelAllOrders(ctx)
 		u.eventLogDB.endRun(startTime, u.market, time.Now().Unix())
 	}()
 
 	// Listen for core notifications
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		feed := u.clientCore.NotificationFeed()
 		defer feed.ReturnFeed()
 
@@ -2479,7 +2546,9 @@ func (u *unifiedExchangeAdaptor) run(ctx context.Context) error {
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		refreshTime := time.Minute * 10
 		for {
 			select {
@@ -2497,7 +2566,7 @@ func (u *unifiedExchangeAdaptor) run(ctx context.Context) error {
 		}
 	}()
 
-	return nil
+	return wg, nil
 }
 
 // RunStats is a snapshot of the bot's balances and performance at a point in

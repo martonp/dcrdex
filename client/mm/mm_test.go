@@ -275,8 +275,6 @@ func (c *tBotCoreAdaptor) GroupedBookedOrders() (buys, sells map[uint64][]*core.
 	return c.groupedBuys, c.groupedSells
 }
 
-func (c *tBotCoreAdaptor) CancelAllOrders() bool { return false }
-
 func (c *tBotCoreAdaptor) ExchangeRateFromFiatSources() uint64 {
 	return c.fiatExchangeRate
 }

@@ -613,7 +613,8 @@ func (m *MarketMaker) StartBot(mkt *MarketWithHost, allocation *BotBalanceAlloca
 		eventLogDB:       m.eventLogDB,
 		cfgUpdateManager: adaptorUpdateManager,
 	})
-	if err := exchangeAdaptor.run(ctx); err != nil {
+	adaptorWg, err := exchangeAdaptor.run(ctx)
+	if err != nil {
 		die()
 		return err
 	}
@@ -630,8 +631,10 @@ func (m *MarketMaker) StartBot(mkt *MarketWithHost, allocation *BotBalanceAlloca
 	startedBot = true
 
 	doneRunning := func(mtxLocked bool) {
-		m.log.Infof("Market maker for %s stopped", mkt)
+		m.log.Infof("Stopping bot for %s...", mkt)
 		die()
+		adaptorWg.Wait()
+		m.log.Infof("Bot for %s stopped.", mkt)
 
 		m.runningBotsMtx.Lock()
 		if bot, found := m.runningBots[*mkt]; found {

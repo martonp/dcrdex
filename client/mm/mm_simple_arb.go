@@ -350,15 +350,6 @@ func (a *simpleArbMarketMaker) handleDEXOrderUpdate(o *core.Order) {
 	}
 }
 
-func (a *simpleArbMarketMaker) cancelAllOrders() {
-	a.activeArbsMtx.Lock()
-	defer a.activeArbsMtx.Unlock()
-
-	for _, arb := range a.activeArbs {
-		a.cancelArbSequence(arb)
-	}
-}
-
 // rebalance checks if there is an arbitrage opportunity between the dex and cex,
 // and if so, executes trades to capitalize on it.
 func (a *simpleArbMarketMaker) rebalance(newEpoch uint64) {
@@ -522,7 +513,6 @@ func (a *simpleArbMarketMaker) run(cfgUpdateManager *botCfgUpdateManager) {
 	}()
 
 	wg.Wait()
-	a.cancelAllOrders()
 }
 
 func (a *simpleArbMarketMaker) registerFeeGap() {

@@ -483,8 +483,6 @@ func (m *basicMarketMaker) run(cfgUpdateManager *botCfgUpdateManager) {
 	}()
 
 	wg.Wait()
-
-	m.core.CancelAllOrders()
 }
 
 // RunBasicMarketMaker starts a basic market maker bot.

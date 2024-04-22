@@ -513,7 +513,6 @@ func (a *arbMarketMaker) run(updateManager *botCfgUpdateManager) {
 	}()
 
 	wg.Wait()
-	a.core.CancelAllOrders()
 }
 
 func RunArbMarketMaker(ctx context.Context, cfg *BotConfig, c botCoreAdaptor, cex botCexAdaptor, updateManager *botCfgUpdateManager, log dex.Logger) {
