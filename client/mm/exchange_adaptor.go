@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -123,7 +124,7 @@ type pendingDeposit struct {
 	timestamp  int64
 	assetID    uint32
 
-	mtx          sync.Mutex
+	mtx          sync.RWMutex
 	tx           *asset.WalletTransaction
 	feeConfirmed bool
 	cexConfirmed bool
@@ -268,6 +269,7 @@ type unifiedExchangeAdaptor struct {
 	pendingCEXOrders   map[string]*pendingCEXOrder
 	pendingWithdrawals map[string]*pendingWithdrawal
 	pendingDeposits    map[string]*pendingDeposit
+	inventoryMods      map[uint32]int64
 
 	// If pendingBaseRebalance/pendingQuoteRebalance are true, it means
 	// there is a pending deposit/withdrawal of the base/quote asset,
@@ -541,6 +543,18 @@ func (u *unifiedExchangeAdaptor) updateDepositEvent(deposit *pendingDeposit) {
 	}
 	u.eventLogDB.storeEvent(u.startTime.Load(), u.market, e, u.balanceState())
 	u.notifyEvent(e)
+}
+
+func (u *unifiedExchangeAdaptor) updateConfigEvent(updatedCfg *BotConfig, inventoryMods map[uint32]int64) {
+	e := &MarketMakingEvent{
+		ID:        u.eventLogID.Add(1),
+		TimeStamp: time.Now().Unix(),
+		UpdateConfig: &UpdateConfigEvent{
+			NewCfg:        updatedCfg,
+			InventoryMods: inventoryMods,
+		},
+	}
+	u.eventLogDB.storeEvent(u.startTime.Load(), u.market, e, u.balanceState())
 }
 
 // updateWithdrawalEvent updates the event log with the current state of a
@@ -1041,6 +1055,7 @@ func (u *unifiedExchangeAdaptor) dexBalance(assetID uint32) *BotBalance {
 	}
 
 	for _, pendingDeposit := range u.pendingDeposits {
+		pendingDeposit.mtx.RLock()
 		if pendingDeposit.assetID == assetID {
 			totalAvailableDiff -= int64(pendingDeposit.tx.Amount)
 		}
@@ -1051,6 +1066,7 @@ func (u *unifiedExchangeAdaptor) dexBalance(assetID uint32) *BotBalance {
 		} else if token == nil && pendingDeposit.assetID == assetID {
 			totalAvailableDiff -= fee
 		}
+		pendingDeposit.mtx.RUnlock()
 	}
 
 	for _, pendingWithdrawal := range u.pendingWithdrawals {
@@ -1218,7 +1234,7 @@ func (u *unifiedExchangeAdaptor) CEXBalance(assetID uint32) *BotBalance {
 	return u.cexBalance(assetID)
 }
 
-func (u *unifiedExchangeAdaptor) totalBalances() map[uint32]*BotBalance {
+func (u *unifiedExchangeAdaptor) balanceState() *BalanceState {
 	u.balancesMtx.RLock()
 	defer u.balancesMtx.RUnlock()
 
@@ -1243,13 +1259,15 @@ func (u *unifiedExchangeAdaptor) totalBalances() map[uint32]*BotBalance {
 		}
 	}
 
-	return balances
-}
+	mods := make(map[uint32]int64, len(u.inventoryMods))
+	for assetID, mod := range u.inventoryMods {
+		mods[assetID] = mod
+	}
 
-func (u *unifiedExchangeAdaptor) balanceState() *BalanceState {
 	return &BalanceState{
-		FiatRates: u.fiatRates.Load().(map[uint32]float64),
-		Balances:  u.totalBalances(),
+		FiatRates:     u.fiatRates.Load().(map[uint32]float64),
+		Balances:      balances,
+		InventoryMods: mods,
 	}
 }
 
@@ -2516,7 +2534,7 @@ type RunStats struct {
 	FeeGap             *FeeGapStats           `json:"feeGap"`
 }
 
-func calcRunProfitLoss(initialBalances, finalBalances map[uint32]uint64, fiatRates map[uint32]float64) (deltaUSD, profitRatio float64) {
+func calcRunProfitLoss(initialBalances, finalBalances map[uint32]uint64, mods map[uint32]int64, fiatRates map[uint32]float64) (deltaUSD, profitRatio float64) {
 	assetIDs := make(map[uint32]struct{}, len(initialBalances))
 	for assetID := range initialBalances {
 		assetIDs[assetID] = struct{}{}
@@ -2543,6 +2561,12 @@ func calcRunProfitLoss(initialBalances, finalBalances map[uint32]uint64, fiatRat
 		finalBalance, err := convertToConventional(assetID, int64(finalBalances[assetID]))
 		if err != nil {
 			continue
+		}
+
+		if mod := mods[assetID]; mod != 0 {
+			if modConv, err := convertToConventional(assetID, mod); err == nil {
+				initialBalance += modConv
+			}
 		}
 
 		fiatRate := fiatRates[assetID]
@@ -2582,7 +2606,7 @@ func (u *unifiedExchangeAdaptor) stats() *RunStats {
 		feeGap = feeGapI.(*FeeGapStats)
 	}
 
-	profitLoss, profitRatio := calcRunProfitLoss(u.initialBalances, totalBalances, fiatRates)
+	profitLoss, profitRatio := calcRunProfitLoss(u.initialBalances, totalBalances, u.inventoryMods, fiatRates)
 	u.runStats.tradedUSD.Lock()
 	tradedUSD := u.runStats.tradedUSD.v
 	u.runStats.tradedUSD.Unlock()
@@ -2616,9 +2640,11 @@ func (u *unifiedExchangeAdaptor) registerFeeGap(s *FeeGapStats) {
 	u.runStats.feeGapStats.Store(s)
 }
 
-func (u *unifiedExchangeAdaptor) updateBalances(balanceDiffs *BotBalanceDiffs) {
+func (u *unifiedExchangeAdaptor) updateBalances(balanceDiffs *BotBalanceDiffs) map[uint32]int64 {
 	u.balancesMtx.Lock()
 	defer u.balancesMtx.Unlock()
+
+	mods := map[uint32]int64{}
 
 	for assetID, diff := range balanceDiffs.DEX {
 		if diff < 0 {
@@ -2629,6 +2655,7 @@ func (u *unifiedExchangeAdaptor) updateBalances(balanceDiffs *BotBalanceDiffs) {
 			}
 		}
 		u.baseDexBalances[assetID] += diff
+		mods[assetID] = diff
 	}
 
 	for assetID, diff := range balanceDiffs.CEX {
@@ -2640,15 +2667,29 @@ func (u *unifiedExchangeAdaptor) updateBalances(balanceDiffs *BotBalanceDiffs) {
 			}
 		}
 		u.baseCexBalances[assetID] += diff
+		mods[assetID] += diff
 	}
+
+	for assetID, diff := range mods {
+		u.inventoryMods[assetID] += diff
+	}
+
+	return mods
 }
 
 func (u *unifiedExchangeAdaptor) updateConfig(cfg *BotConfig, balanceDiffs *BotBalanceDiffs) {
+	cfgUpdated := !reflect.DeepEqual(cfg, u.botCfg.Load().(*BotConfig))
 	u.cfgUpdateManager.updateBot <- cfg
 	<-u.cfgUpdateManager.botPaused
 	u.botCfg.Store(cfg)
-	u.updateBalances(balanceDiffs)
+	thisUpdateInventoryMods := u.updateBalances(balanceDiffs)
 	u.cfgUpdateManager.resumeBot <- struct{}{}
+
+	var newConfig *BotConfig
+	if cfgUpdated {
+		newConfig = cfg
+	}
+	u.updateConfigEvent(newConfig, thisUpdateInventoryMods)
 }
 
 type exchangeAdaptorCfg struct {
@@ -2699,6 +2740,7 @@ func unifiedExchangeAdaptorForBot(cfg *exchangeAdaptorCfg) *unifiedExchangeAdapt
 		pendingDeposits:    make(map[string]*pendingDeposit),
 		pendingWithdrawals: make(map[string]*pendingWithdrawal),
 		market:             cfg.market,
+		inventoryMods:      make(map[uint32]int64),
 	}
 
 	adaptor.fiatRates.Store(map[uint32]float64{})
