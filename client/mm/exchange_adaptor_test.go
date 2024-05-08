@@ -175,7 +175,10 @@ func TestSufficientBalanceForDEXTrade(t *testing.T) {
 				adaptor.botCfg.Store(&BotConfig{})
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				adaptor.run(ctx)
+				_, err := adaptor.Connect(ctx)
+				if err != nil {
+					t.Fatalf("Connect error: %v", err)
+				}
 				sufficient, err := adaptor.SufficientBalanceForDEXTrade(test.rate, test.qty, test.sell)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -2535,7 +2538,11 @@ func TestDEXTrade(t *testing.T) {
 			eventLogDB: eventLogDB,
 		})
 		adaptor.botCfg.Store(&BotConfig{})
-		adaptor.run(ctx)
+		_, err := adaptor.Connect(ctx)
+		if err != nil {
+			t.Fatalf("%s: Connect error: %v", test.name, err)
+		}
+
 		orders := adaptor.MultiTrade(test.placements, test.sell, 0.01, 100, nil, nil)
 		if len(orders) == 0 {
 			t.Fatalf("%s: multi trade did not place orders", test.name)
@@ -2992,9 +2999,12 @@ func TestDeposit(t *testing.T) {
 				},
 				eventLogDB: eventLogDB,
 			})
-			adaptor.run(ctx)
+			_, err := adaptor.Connect(ctx)
+			if err != nil {
+				t.Fatalf("%s: Connect error: %v", test.name, err)
+			}
 
-			err := adaptor.Deposit(ctx, test.assetID, test.depositAmt)
+			err = adaptor.Deposit(ctx, test.assetID, test.depositAmt)
 			if err != nil {
 				t.Fatalf("%s: unexpected error: %v", test.name, err)
 			}
@@ -3020,7 +3030,11 @@ func TestDeposit(t *testing.T) {
 			tCore.walletTxsMtx.Lock()
 			tCore.walletTxs[test.unconfirmedTx.ID] = test.confirmedTx
 			tCore.walletTxsMtx.Unlock()
+
+			tCEX.confirmDepositMtx.Lock()
 			tCEX.confirmedDeposit = &test.receivedAmt
+			tCEX.confirmDepositMtx.Unlock()
+
 			adaptor.confirmDeposit(ctx, txID)
 
 			checkPostConfirmBalance := func() error {
@@ -3032,7 +3046,7 @@ func TestDeposit(t *testing.T) {
 				if test.assetID == 966001 {
 					postConfirmParentBal := adaptor.DEXBalance(966)
 					if postConfirmParentBal.Available != 2e6-test.confirmedTx.Fees {
-						return fmt.Errorf("%s: unexpected post confirm dex balance. want %d, got %d", test.name, 2e6-test.confirmedTx.Fees, postConfirmParentBal.Available)
+						return fmt.Errorf("%s: unexpected post confirm fee balance. want %d, got %d", test.name, 2e6-test.confirmedTx.Fees, postConfirmParentBal.Available)
 					}
 				}
 				return nil
@@ -3170,9 +3184,12 @@ func TestWithdraw(t *testing.T) {
 			},
 			eventLogDB: eventLogDB,
 		})
-		adaptor.run(ctx)
+		_, err := adaptor.Connect(ctx)
+		if err != nil {
+			t.Fatalf("%s: Connect error: %v", test.name, err)
+		}
 
-		err := adaptor.Withdraw(ctx, assetID, test.withdrawAmt)
+		err = adaptor.Withdraw(ctx, assetID, test.withdrawAmt)
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
@@ -3188,11 +3205,13 @@ func TestWithdraw(t *testing.T) {
 			t.Fatalf("%s: unexpected pre confirm dex balance. want %+v, got %+v", test.name, test.preConfirmDEXBalance, preConfirmBal)
 		}
 
+		tCEX.confirmWithdrawalMtx.Lock()
 		tCEX.confirmWithdrawal = &withdrawArgs{
 			assetID: assetID,
 			amt:     test.withdrawAmt,
 			txID:    test.tx.ID,
 		}
+		tCEX.confirmWithdrawalMtx.Unlock()
 
 		adaptor.confirmWithdrawal(ctx, withdrawalID)
 
@@ -3601,11 +3620,14 @@ func TestCEXTrade(t *testing.T) {
 			},
 			eventLogDB: eventLogDB,
 		})
-		adaptor.run(ctx)
+		_, err := adaptor.Connect(ctx)
+		if err != nil {
+			t.Fatalf("%s: Connect error: %v", test.name, err)
+		}
 
 		adaptor.SubscribeTradeUpdates()
 
-		_, err := adaptor.CEXTrade(ctx, baseID, quoteID, test.sell, test.rate, test.qty)
+		_, err = adaptor.CEXTrade(ctx, baseID, quoteID, test.sell, test.rate, test.qty)
 		if test.wantErr {
 			if err == nil {
 				t.Fatalf("%s: expected error but did not get", test.name)
@@ -3767,7 +3789,10 @@ func TestOrderFeesInUnits(t *testing.T) {
 		adaptor.botCfg.Store(&BotConfig{})
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		adaptor.run(ctx)
+		_, err := adaptor.Connect(ctx)
+		if err != nil {
+			t.Fatalf("%s: Connect error: %v", tt.name, err)
+		}
 
 		sellBase, err := adaptor.OrderFeesInUnits(true, true, tt.rate)
 		if err != nil {
@@ -3991,7 +4016,9 @@ func TestRefreshPendingEvents(t *testing.T) {
 		feeConfirmed: true,
 	}
 	amtReceived := uint64(1e7 - 1000)
+	tCEX.confirmDepositMtx.Lock()
 	tCEX.confirmedDeposit = &amtReceived
+	tCEX.confirmDepositMtx.Unlock()
 	adaptor.refreshAllPendingEvents(ctx)
 	expectedDEXAvailableBalance[42] -= 1e7 + 1000
 	expectedCEXAvailableBalance[42] += amtReceived
@@ -4011,11 +4038,15 @@ func TestRefreshPendingEvents(t *testing.T) {
 		Amount:    2e7 - 3000,
 		Confirmed: true,
 	}
+
+	tCEX.confirmWithdrawalMtx.Lock()
 	tCEX.confirmWithdrawal = &withdrawArgs{
 		assetID: 42,
 		amt:     2e7,
 		txID:    withdrawalTxID,
 	}
+	tCEX.confirmWithdrawalMtx.Unlock()
+
 	adaptor.refreshAllPendingEvents(ctx)
 	expectedDEXAvailableBalance[42] += 2e7 - 3000
 	expectedCEXAvailableBalance[42] -= 2e7

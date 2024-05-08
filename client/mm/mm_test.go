@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,8 +80,6 @@ type tCore struct {
 	isWithdrawer      map[uint32]bool
 	isDynamicSwapper  map[uint32]bool
 	cancelsPlaced     []dex.Bytes
-	buysPlaced        []*core.TradeForm
-	sellsPlaced       []*core.TradeForm
 	multiTradesPlaced []*core.MultiTradeForm
 	maxFundingFees    uint64
 	book              *orderbook.OrderBook
@@ -106,6 +105,7 @@ func newTCore() *tCore {
 			c: make(chan *core.BookUpdate, 1),
 		},
 		walletTxs: make(map[string]*asset.WalletTransaction),
+		book:      &orderbook.OrderBook{},
 	}
 }
 
@@ -616,8 +616,8 @@ func (c *tBotCexAdaptor) CancelTrade(ctx context.Context, baseID, quoteID uint32
 func (c *tBotCexAdaptor) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) error {
 	return nil
 }
-func (c *tBotCexAdaptor) SubscribeTradeUpdates() (updates <-chan *libxc.Trade, unsubscribe func()) {
-	return c.tradeUpdates, func() {}
+func (c *tBotCexAdaptor) SubscribeTradeUpdates() (updates <-chan *libxc.Trade) {
+	return c.tradeUpdates
 }
 func (c *tBotCexAdaptor) CEXTrade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64) (*libxc.Trade, error) {
 	if c.tradeErr != nil {
@@ -688,7 +688,7 @@ type tExchangeAdaptor struct {
 	dexBalances map[uint32]*BotBalance
 	cexBalances map[uint32]*BotBalance
 
-	lastBalanceDiff *BotBalanceDiffs
+	lastBalanceDiff *BotInventoryDiffs
 }
 
 var _ exchangeAdaptor = (*tExchangeAdaptor)(nil)
@@ -706,9 +706,10 @@ func (t *tExchangeAdaptor) CEXBalance(assetID uint32) *BotBalance {
 	}
 	return t.cexBalances[assetID]
 }
-func (t *tExchangeAdaptor) stats() *RunStats { return nil }
-func (t *tExchangeAdaptor) updateConfig(cfg *BotConfig, balanceDiffs *BotBalanceDiffs) {
-	t.lastBalanceDiff = balanceDiffs
+func (t *tExchangeAdaptor) stats() *RunStats            { return nil }
+func (t *tExchangeAdaptor) updateConfig(cfg *BotConfig) {}
+func (t *tExchangeAdaptor) updateInventory(diffs *BotInventoryDiffs) {
+	t.lastBalanceDiff = diffs
 }
 func (t *tExchangeAdaptor) timeStart() int64 { return 0 }
 
@@ -938,4 +939,212 @@ func TestEnsureSufficientBalance(t *testing.T) {
 	if dcrUSDCAdaptor.lastBalanceDiff.DEX[42] != -0.5e5 {
 		t.Fatalf("unexpected balance diff. wanted -0.5e5, got %d", dcrUSDCAdaptor.lastBalanceDiff.DEX[42])
 	}
+}
+
+type tBot struct {
+	ctx             context.Context
+	running         atomic.Bool
+	connectErr      error
+	updateConfigErr error
+	die             atomic.Value // context.CancelFunc
+}
+
+func newTBot() *tBot {
+	bot := &tBot{}
+	var cancel context.CancelFunc
+	bot.die.Store(cancel)
+	return bot
+}
+
+func (t *tBot) Connect(ctx context.Context) (*sync.WaitGroup, error) {
+	if t.connectErr != nil {
+		return nil, t.connectErr
+	}
+	if !t.running.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("already running")
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	t.die.Store(cancel)
+	t.ctx = ctx
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		<-ctx.Done()
+		t.running.Store(false)
+		wg.Done()
+	}()
+
+	return &wg, nil
+}
+
+func (t *tBot) updateConfig(cfg *BotConfig) error {
+	return t.updateConfigErr
+}
+
+func (t *tBot) on() bool {
+	return t.running.Load()
+}
+
+func (t *tBot) kill() {
+	if die, ok := t.die.Load().(context.CancelFunc); ok {
+		die()
+	}
+}
+
+var _ bot = (*tBot)(nil)
+
+func TestBotConnectionMaster(t *testing.T) {
+	t.Parallel()
+
+	checkDone := func(bcm *botConnectionMaster, expDone bool) {
+		t.Helper()
+
+		for i := 0; i < 10; i++ {
+			select {
+			case <-bcm.done:
+				if expDone {
+					return
+				} else {
+					t.Fatalf("unexpected done")
+				}
+			default:
+			}
+			time.Sleep(time.Millisecond * 200)
+		}
+
+		if expDone {
+			t.Fatalf("expected done")
+		}
+	}
+
+	t.Run("successful pause/resume, then second restart fail", func(t *testing.T) {
+		t.Parallel()
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(context.Background(), testBot)
+		if botCm.updateConfig(&BotConfig{}) == nil {
+			t.Fatalf("expected error when updating config of running bot")
+		}
+		if botCm.pause() != nil {
+			t.Fatal(err)
+		}
+		if testBot.on() {
+			t.Fatalf("bot should be stopped")
+		}
+		if botCm.pause() == nil {
+			t.Fatalf("expected error when pausing already paused bot")
+		}
+		if botCm.resume() != nil {
+			t.Fatal(err)
+		}
+		if !testBot.on() {
+			t.Fatalf("bot should be running")
+		}
+		if botCm.pause() != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		testBot.connectErr = fmt.Errorf("connect error")
+		checkDone(botCm, false)
+		if botCm.resume() == nil {
+			t.Fatalf("expected error when resuming bot with connect error")
+		}
+		checkDone(botCm, true)
+		testBot.connectErr = nil
+		if botCm.resume() == nil {
+			t.Fatalf("cannot resume after failed resume")
+		}
+	})
+
+	t.Run("disconnect", func(t *testing.T) {
+		t.Parallel()
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(context.Background(), testBot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkDone(botCm, false)
+		if !testBot.on() {
+			t.Fatalf("bot should be running")
+		}
+		botCm.disconnect()
+		checkDone(botCm, true)
+		if testBot.on() {
+			t.Fatalf("bot should be stopped")
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(ctx, testBot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !testBot.on() {
+			t.Fatalf("bot should be running")
+		}
+		checkDone(botCm, false)
+		cancel()
+		if !testBot.on() {
+			t.Fatalf("bot should be stopped")
+		}
+		checkDone(botCm, true)
+	})
+
+	t.Run("bot stops running on its own", func(t *testing.T) {
+		t.Parallel()
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(context.Background(), testBot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !testBot.on() {
+			t.Fatalf("bot should be running")
+		}
+		checkDone(botCm, false)
+		testBot.kill()
+		checkDone(botCm, true)
+		if testBot.on() {
+			t.Fatalf("bot should be stopped")
+		}
+	})
+
+	t.Run("disconnect while paused", func(t *testing.T) {
+		t.Parallel()
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(context.Background(), testBot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !testBot.on() {
+			t.Fatalf("bot should be running")
+		}
+		if botCm.pause() != nil {
+			t.Fatal(err)
+		}
+		checkDone(botCm, false)
+		botCm.disconnect()
+		checkDone(botCm, true)
+	})
+
+	t.Run("context cancellation while paused", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		testBot := newTBot()
+		botCm, err := newBotConnectionMaster(ctx, testBot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if botCm.pause() != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		checkDone(botCm, false)
+		if botCm.resume() != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkDone(botCm, true)
+	})
 }
