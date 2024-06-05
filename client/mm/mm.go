@@ -569,11 +569,11 @@ func (m *MarketMaker) newBot(cfg *BotConfig, adaptorCfg *exchangeAdaptorCfg) (bo
 	mktID := dexMarketID(cfg.Host, cfg.BaseID, cfg.QuoteID)
 	switch {
 	case cfg.ArbMarketMakerConfig != nil:
-		return newArbMarketMaker(cfg, adaptorCfg, m.log.SubLogger(fmt.Sprintf("AMM-%s", mktID)))
+		return newArbMarketMaker(cfg, adaptorCfg, m.core.Broadcast, m.log.SubLogger(fmt.Sprintf("AMM-%s", mktID)))
 	case cfg.BasicMMConfig != nil:
-		return newBasicMarketMaker(cfg, adaptorCfg, m.oracle, m.log.SubLogger(fmt.Sprintf("MM-%s", mktID)))
+		return newBasicMarketMaker(cfg, adaptorCfg, m.oracle, m.core.Broadcast, m.log.SubLogger(fmt.Sprintf("MM-%s", mktID)))
 	case cfg.SimpleArbConfig != nil:
-		return newSimpleArbMarketMaker(cfg, adaptorCfg, m.log.SubLogger(fmt.Sprintf("ARB-%s", mktID)))
+		return newSimpleArbMarketMaker(cfg, adaptorCfg, m.core.Broadcast, m.log.SubLogger(fmt.Sprintf("ARB-%s", mktID)))
 	default:
 		return nil, fmt.Errorf("not bot config found")
 	}

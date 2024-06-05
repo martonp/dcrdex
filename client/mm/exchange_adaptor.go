@@ -62,7 +62,7 @@ type botCoreAdaptor interface {
 	Cancel(oidB dex.Bytes) error
 	DEXTrade(rate, qty uint64, sell bool) (*core.Order, error)
 	ExchangeMarket(host string, baseID, quoteID uint32) (*core.Market, error)
-	MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) []*order.OrderID
+	MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) ([]*order.OrderID, []*botTimedError)
 	ExchangeRateFromFiatSources() uint64
 	OrderFeesInUnits(sell, base bool, rate uint64) (uint64, error) // estimated fees, not max
 	SubscribeOrderUpdates() (updates <-chan *core.Order)
@@ -883,19 +883,22 @@ func (u *unifiedExchangeAdaptor) placeMultiTrade(placements []*dexOrderInfo, sel
 // The placements must be passed in decreasing priority order. If there is not
 // enough balance to place all of the orders, the lower priority trades that
 // were made in previous calls will be cancelled.
-func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) []*order.OrderID {
+//
+// There may be errors returned from this function even though orders were placed.
+func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, sell bool, driftTolerance float64, currEpoch uint64, dexReserves, cexReserves map[uint32]uint64) (oids []*order.OrderID, errs []*botTimedError) {
 	if len(placements) == 0 {
-		return nil
+		u.log.Errorf("MultiTrade: no placements")
+		return nil, nil
 	}
 	mkt, err := u.ExchangeMarket(u.host, u.baseID, u.quoteID)
 	if err != nil {
-		u.log.Errorf("MultiTrade: error getting market: %v", err)
-		return nil
+		errs = append(errs, newBotTimedError(fmt.Sprintf("error getting market info", err), false))
+		return nil, errs
 	}
 	buyFees, sellFees, err := u.orderFees()
 	if err != nil {
-		u.log.Errorf("MultiTrade: error getting order fees: %v", err)
-		return nil
+		errs = append(errs, newBotTimedError(fmt.Sprintf("error getting order fees", err), false))
+		return nil, errs
 	}
 	fromAsset, fromFeeAsset, toAsset, toFeeAsset := orderAssets(mkt.BaseID, mkt.QuoteID, sell)
 	fees, fundingFees := buyFees.Max, buyFees.funding
@@ -912,8 +915,8 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 			availableBalance := bal.Available
 			if dexReserves != nil {
 				if dexReserves[assetID] > availableBalance {
-					u.log.Errorf("MultiTrade: insufficient dex balance for reserves. required: %d, have: %d", dexReserves[assetID], availableBalance)
-					return nil
+					errs = append(errs, newBotTimedError(fmt.Sprintf("insufficient dex balance for reserves. required: %d, have: %d", dexReserves[assetID], availableBalance), false))
+					return nil, errs
 				}
 				availableBalance -= dexReserves[assetID]
 			}
@@ -921,8 +924,7 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 		}
 	}
 	if remainingBalances[fromFeeAsset] < fundingFees {
-		u.log.Debugf("MultiTrade: insufficient balance for funding fees. required: %d, have: %d", fundingFees, remainingBalances[fromFeeAsset])
-		return nil
+		return nil, errs
 	}
 	remainingBalances[fromFeeAsset] -= fundingFees
 
@@ -935,8 +937,8 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 		remainingCEXBal = cexBal.Available
 		reserves := cexReserves[toAsset]
 		if remainingCEXBal < reserves {
-			u.log.Errorf("MultiTrade: insufficient CEX balance for reserves. required: %d, have: %d", cexReserves, remainingCEXBal)
-			return nil
+			errs = append(errs, newBotTimedError(fmt.Sprintf("insufficient cex balance for reserves. required: %d, have: %d", cexReserves, remainingCEXBal), true))
+			return nil, errs
 		}
 		remainingCEXBal -= reserves
 	}
@@ -1083,15 +1085,14 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 
 	for _, cancel := range cancels {
 		if err := u.Cancel(cancel); err != nil {
-			u.log.Errorf("MultiTrade: error canceling order %s: %v", cancel, err)
+			errs = append(errs, newBotTimedError(fmt.Sprintf("error canceling order %s: %v", cancel, err), false))
 		}
 	}
 
 	if len(orderInfos) > 0 {
 		orders, err := u.placeMultiTrade(orderInfos, sell)
 		if err != nil {
-			u.log.Errorf("MultiTrade: error placing orders: %v", err)
-			return nil
+			errs = append(errs, newBotTimedError(fmt.Sprintf("error placing orders: %v", err), false))
 		}
 
 		orderIDs := make([]*order.OrderID, len(placements))
@@ -1101,10 +1102,10 @@ func (u *unifiedExchangeAdaptor) MultiTrade(placements []*multiTradePlacement, s
 			copy(orderID[:], o.ID)
 			orderIDs[info.placementIndex] = &orderID
 		}
-		return orderIDs
+		return orderIDs, errs
 	}
 
-	return nil
+	return nil, errs
 }
 
 // DEXTrade places a single order on the DEX order book.

@@ -93,6 +93,7 @@ type arbMarketMaker struct {
 	// accessed during a rebalance which is protected by rebalanceRunning.
 	dexReserves map[uint32]uint64
 	cexReserves map[uint32]uint64
+	broadcast   func(core.Notification)
 
 	matchesMtx    sync.RWMutex
 	matchesSeen   map[order.MatchID]bool
@@ -124,7 +125,12 @@ func (a *arbMarketMaker) tradeOnCEX(rate, qty uint64, sell bool) {
 
 	cexTrade, err := a.cex.CEXTrade(a.ctx, a.baseID, a.quoteID, sell, rate, qty)
 	if err != nil {
-		a.log.Errorf("Error sending trade to CEX: %v", err)
+		mkt := &MarketWithHost{
+			Host:    a.host,
+			BaseID:  a.baseID,
+			QuoteID: a.quoteID,
+		}
+		a.broadcast(newBotErrorNote(mkt, fmt.Sprintf("error placing CEX trade: %v", err), false))
 		return
 	}
 
@@ -168,7 +174,7 @@ func (a *arbMarketMaker) processDEXOrderUpdate(o *core.Order) {
 
 // cancelExpiredCEXTrades cancels any trades on the CEX that have been open for
 // more than the number of epochs specified in the config.
-func (a *arbMarketMaker) cancelExpiredCEXTrades() {
+func (a *arbMarketMaker) cancelExpiredCEXTrades() (errs []*botTimedError) {
 	currEpoch := a.currEpoch.Load()
 
 	a.cexTradesMtx.RLock()
@@ -178,12 +184,15 @@ func (a *arbMarketMaker) cancelExpiredCEXTrades() {
 		if currEpoch-epoch >= a.cfg().NumEpochsLeaveOpen {
 			err := a.cex.CancelTrade(a.ctx, a.baseID, a.quoteID, tradeID)
 			if err != nil {
-				a.log.Errorf("Error canceling CEX trade %s: %v", tradeID, err)
+				errMsg := fmt.Sprintf("error canceling CEX trade %s: %w", tradeID, err)
+				errs = append(errs, newBotTimedError(errMsg, false))
 			}
 
-			a.log.Infof("Cex trade %s was cancelled before it was filled", tradeID)
+			a.log.Infof("CEX trade %s was cancelled before it was filled", tradeID)
 		}
 	}
+
+	return
 }
 
 // dexPlacementRate calculates the rate at which an order should be placed on
@@ -234,7 +243,7 @@ func (a *arbMarketMaker) dexPlacementRate(cexRate uint64, sell bool) (uint64, er
 	return dexPlacementRate(cexRate, sell, a.cfg().Profit, a.market, feesInQuoteUnits, a.log)
 }
 
-func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement) {
+func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement, errs []*botTimedError) {
 	orders := func(cfgPlacements []*ArbMarketMakingPlacement, sellOnDEX bool) []*multiTradePlacement {
 		newPlacements := make([]*multiTradePlacement, 0, len(cfgPlacements))
 		var cumulativeCEXDepth uint64
@@ -242,7 +251,7 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement) {
 			cumulativeCEXDepth += uint64(float64(cfgPlacement.Lots*a.lotSize) * cfgPlacement.Multiplier)
 			_, extrema, filled, err := a.cex.VWAP(a.baseID, a.quoteID, !sellOnDEX, cumulativeCEXDepth)
 			if err != nil {
-				a.log.Errorf("Error calculating vwap: %v", err)
+				errs = append(errs, newBotTimedError(fmt.Sprintf("error calculating volume weighted average price on CEX: %w", err), false))
 				newPlacements = append(newPlacements, &multiTradePlacement{
 					rate: 0,
 					lots: 0,
@@ -257,7 +266,8 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement) {
 			}
 
 			if !filled {
-				a.log.Infof("CEX %s side has < %s on the orderbook.", map[bool]string{true: "sell", false: "buy"}[!sellOnDEX], a.fmtBase(cumulativeCEXDepth))
+				warnMsg := fmt.Sprintf("CEX %s side has < %s on the orderbook.", map[bool]string{true: "sell", false: "buy"}[!sellOnDEX], a.fmtBase(cumulativeCEXDepth))
+				errs = append(errs, newBotTimedError(warnMsg, true))
 				newPlacements = append(newPlacements, &multiTradePlacement{
 					rate: 0,
 					lots: 0,
@@ -267,7 +277,8 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement) {
 
 			placementRate, err := a.dexPlacementRate(extrema, sellOnDEX)
 			if err != nil {
-				a.log.Errorf("Error calculating dex placement rate: %v", err)
+				warnMsg := fmt.Sprintf("error calculating dex placement rate: %v", err)
+				errs = append(errs, newBotTimedError(warnMsg, true))
 				newPlacements = append(newPlacements, &multiTradePlacement{
 					rate: 0,
 					lots: 0,
@@ -290,7 +301,7 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement) {
 	return
 }
 
-func (a *arbMarketMaker) depositWithdrawIfNeeded() {
+func (a *arbMarketMaker) depositWithdrawIfNeeded() (errs []*botTimedError) {
 	a.cexTradesMtx.RLock()
 	numCEXTrades := len(a.cexTrades)
 	a.cexTradesMtx.RUnlock()
@@ -302,13 +313,14 @@ func (a *arbMarketMaker) depositWithdrawIfNeeded() {
 	if rebalanceBase > 0 {
 		err := a.cex.Deposit(a.ctx, a.baseID, uint64(rebalanceBase))
 		if err != nil {
-			a.log.Errorf("Error depositing %s to CEX: %v", rebalanceBase, a.baseTicker, err)
+			errMsg := fmt.Sprintf("error depositing %s to CEX: %w", a.baseTicker, err)
+			errs = append(errs, newBotTimedError(errMsg, false))
 		}
 	}
 	if rebalanceBase < 0 {
 		err := a.cex.Withdraw(a.ctx, a.baseID, uint64(-rebalanceBase))
 		if err != nil {
-			a.log.Errorf("Error withdrawing %s from CEX: %v", -rebalanceBase, a.baseTicker, err)
+			errs = append(errs, newBotTimedError(fmt.Sprintf("error withdrawing %s from CEX: %w", a.baseTicker, err), false))
 		}
 	}
 	if cexReserves > 0 {
@@ -324,13 +336,13 @@ func (a *arbMarketMaker) depositWithdrawIfNeeded() {
 	if rebalanceQuote > 0 {
 		err := a.cex.Deposit(a.ctx, a.quoteID, uint64(rebalanceQuote))
 		if err != nil {
-			a.log.Errorf("Error depositing %d %s to CEX: %v", rebalanceQuote, a.quoteTicker, err)
+			errs = append(errs, newBotTimedError(fmt.Sprintf("error depositing %s to CEX: %w", a.quoteTicker, err), false))
 		}
 	}
 	if rebalanceQuote < 0 {
 		err := a.cex.Withdraw(a.ctx, a.quoteID, uint64(-rebalanceQuote))
 		if err != nil {
-			a.log.Errorf("Error withdrawing %d %s from CEX: %v", -rebalanceQuote, a.quoteTicker, err)
+			errs = append(errs, newBotTimedError(fmt.Sprintf("error withdrawing %s from CEX: %w", a.quoteTicker, err), false))
 		}
 	}
 	if cexReserves > 0 {
@@ -342,6 +354,8 @@ func (a *arbMarketMaker) depositWithdrawIfNeeded() {
 
 	a.cexReserves[a.quoteID] = cexReserves
 	a.dexReserves[a.quoteID] = dexReserves
+
+	return
 }
 
 // rebalance is called on each new epoch. It will calculate the rates orders
@@ -350,7 +364,7 @@ func (a *arbMarketMaker) depositWithdrawIfNeeded() {
 // and potentially needed withdrawals and deposits, and finally cancel any
 // trades on the CEX that have been open for more than the number of epochs
 // specified in the config.
-func (a *arbMarketMaker) rebalance(epoch uint64) {
+func (a *arbMarketMaker) rebalance(epoch uint64) (errs []*botTimedError) {
 	if !a.rebalanceRunning.CompareAndSwap(false, true) {
 		return
 	}
@@ -363,31 +377,40 @@ func (a *arbMarketMaker) rebalance(epoch uint64) {
 	}
 	a.currEpoch.Store(epoch)
 
-	buys, sells := a.ordersToPlace()
+	buys, sells, errs := a.ordersToPlace()
 
-	buyIDs := a.core.MultiTrade(buys, false, a.cfg().DriftTolerance, currEpoch, a.dexReserves, a.cexReserves)
-	for i, id := range buyIDs {
-		if id != nil {
-			a.matchesMtx.Lock()
-			a.pendingOrders[*id] = buys[i].counterTradeRate
-			a.matchesMtx.Unlock()
+	if len(buys) > 0 {
+		buyIDs, buyErrs := a.core.MultiTrade(buys, false, a.cfg().DriftTolerance, currEpoch, a.dexReserves, a.cexReserves)
+		for i, id := range buyIDs {
+			if id != nil {
+				a.matchesMtx.Lock()
+				a.pendingOrders[*id] = buys[i].counterTradeRate
+				a.matchesMtx.Unlock()
+			}
 		}
+		errs = append(errs, buyErrs...)
 	}
 
-	sellIDs := a.core.MultiTrade(sells, true, a.cfg().DriftTolerance, currEpoch, a.dexReserves, a.cexReserves)
-	for i, id := range sellIDs {
-		if id != nil {
-			a.matchesMtx.Lock()
-			a.pendingOrders[*id] = sells[i].counterTradeRate
-			a.matchesMtx.Unlock()
+	if len(sells) > 0 {
+		sellIDs, sellErrs := a.core.MultiTrade(sells, true, a.cfg().DriftTolerance, currEpoch, a.dexReserves, a.cexReserves)
+		for i, id := range sellIDs {
+			if id != nil {
+				a.matchesMtx.Lock()
+				a.pendingOrders[*id] = sells[i].counterTradeRate
+				a.matchesMtx.Unlock()
+			}
 		}
+		errs = append(errs, sellErrs...)
 	}
 
-	a.depositWithdrawIfNeeded()
+	depositWithdrawErrs := a.depositWithdrawIfNeeded()
+	errs = append(errs, depositWithdrawErrs...)
 
-	a.cancelExpiredCEXTrades()
+	cancelCEXTradesErrs := a.cancelExpiredCEXTrades()
+	errs = append(errs, cancelCEXTradesErrs...)
 
 	a.registerFeeGap()
+	return
 }
 
 func feeGap(core botCoreAdaptor, cex botCexAdaptor, baseID, quoteID uint32, lotSize uint64) (*FeeGapStats, error) {
@@ -433,7 +456,6 @@ func (a *arbMarketMaker) registerFeeGap() {
 }
 
 func (a *arbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {
-
 	book, bookFeed, err := a.core.SyncBook(a.host, a.baseID, a.quoteID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sync book: %v", err)
@@ -447,16 +469,24 @@ func (a *arbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {
 
 	tradeUpdates := a.cex.SubscribeTradeUpdates()
 
+	mkt := &MarketWithHost{
+		Host:    a.host,
+		BaseID:  a.baseID,
+		QuoteID: a.quoteID,
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		var oldErrs []*botTimedError
 		for {
 			select {
 			case ni := <-bookFeed.Next():
 				switch payload := ni.Payload.(type) {
 				case *core.EpochMatchSummaryPayload:
-					a.rebalance(payload.Epoch + 1)
+					newErrs := a.rebalance(payload.Epoch + 1)
+					oldErrs = broadcastNewErrors(oldErrs, newErrs, mkt, a.broadcast)
 				}
 			case <-ctx.Done():
 				return
@@ -510,7 +540,7 @@ func (a *arbMarketMaker) updateConfig(cfg *BotConfig) error {
 	return nil
 }
 
-func newArbMarketMaker(cfg *BotConfig, adaptorCfg *exchangeAdaptorCfg, log dex.Logger) (*arbMarketMaker, error) {
+func newArbMarketMaker(cfg *BotConfig, adaptorCfg *exchangeAdaptorCfg, broadcast func(core.Notification), log dex.Logger) (*arbMarketMaker, error) {
 	if cfg.ArbMarketMakerConfig == nil {
 		// implies bug in caller
 		return nil, errors.New("no arb market maker config provided")
@@ -530,6 +560,7 @@ func newArbMarketMaker(cfg *BotConfig, adaptorCfg *exchangeAdaptorCfg, log dex.L
 		cexTrades:              make(map[string]uint64),
 		dexReserves:            make(map[uint32]uint64),
 		cexReserves:            make(map[uint32]uint64),
+		broadcast:              broadcast,
 	}
 
 	adaptor.setBotLoop(arbMM.botLoop)
