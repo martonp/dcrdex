@@ -269,7 +269,19 @@ func (p *provider) refreshHeader(ctx context.Context, log dex.Logger) {
 // instantiation of these variable is necessary to accepting that a websocket
 // connection is valid, so they are generated early in connectProviders.
 func (p *provider) subscribeHeaders(ctx context.Context, sub ethereum.Subscription, h chan *types.Header, log dex.Logger) {
-	defer sub.Unsubscribe()
+	defer func() {
+		doneUnsubbing := make(chan struct{})
+		go func() {
+			sub.Unsubscribe()
+			close(doneUnsubbing)
+		}()
+		select {
+		case <-doneUnsubbing:
+		case <-time.After(time.Second * 30):
+			log.Errorf("timed out waiting for unsubscribe to complete for %q", p.host)
+		}
+	}()
+
 	var lastWarning time.Time
 	newSub := func() (ethereum.Subscription, error) {
 		for {
