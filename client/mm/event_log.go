@@ -12,6 +12,7 @@ import (
 	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/encode"
+	"github.com/gookit/goutil/dump"
 	"go.etcd.io/bbolt"
 )
 
@@ -198,6 +199,8 @@ func newBoltEventLogDB(ctx context.Context, path string, log dex.Logger) (*boltE
 // the event already exists, it is updated. If it does not exist, it is added.
 // The stats for the run are also updated based on the event.
 func (db *boltEventLogDB) updateEvent(update *eventUpdate) {
+	dump.Println(update.e)
+
 	if err := db.Update(func(tx *bbolt.Tx) error {
 		botRuns := tx.Bucket(botRunsBucket)
 		runBucket := botRuns.Bucket(update.runKey)
@@ -226,11 +229,15 @@ func (db *boltEventLogDB) updateEvent(update *eventUpdate) {
 		}
 
 		// Update the final state.
-		bsJSON, err := json.Marshal(update.bs)
-		if err != nil {
-			return err
+		if update.bs != nil {
+			bsJSON, err := json.Marshal(update.bs)
+			if err != nil {
+				return err
+			}
+			return runBucket.Put(finalStateKey, versionedBytes(0).AddData(bsJSON))
 		}
-		return runBucket.Put(finalStateKey, versionedBytes(0).AddData(bsJSON))
+
+		return nil
 	}); err != nil {
 		db.log.Errorf("error storing event: %v", err)
 	}

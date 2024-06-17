@@ -165,6 +165,10 @@ type pendingDEXOrder struct {
 	counterTradeRate uint64
 }
 
+func (p *pendingDEXOrder) cexBalanceEffects() *balanceEffects {
+	return p.currentState().balanceEffects
+}
+
 // updateState should only be called with txsMtx write locked. The dex order
 // state is stored as an atomic.Value in order to allow reads without locking.
 // The mutex only needs to be locked for reading if the caller wants a consistent
@@ -1403,6 +1407,7 @@ func (u *unifiedExchangeAdaptor) balanceState() *BalanceState {
 			Available: dexBal.Available + cexBal.Available,
 			Locked:    dexBal.Locked + cexBal.Locked,
 			Pending:   dexBal.Pending + cexBal.Pending,
+			Reserved:  dexBal.Reserved + cexBal.Reserved,
 		}
 	}
 
