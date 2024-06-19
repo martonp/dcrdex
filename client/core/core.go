@@ -6341,8 +6341,7 @@ func (c *Core) TradeAsync(pw []byte, form *TradeForm) (*InFlightOrder, error) {
 		_, err := c.sendTradeRequest(req)
 		if err != nil {
 			// If it's an OrderQuantityTooHigh error, send simplified notification
-			var mErr *msgjson.Error
-			if errors.As(err, &mErr) && mErr.Code == msgjson.OrderQuantityTooHigh {
+			if errors.Is(err, ErrOrderQtyTooHigh) {
 				topic := TopicOrderQuantityTooHigh
 				subject, details := c.formatDetails(topic, corder.Host)
 				c.notify(newOrderNoteWithTempID(topic, subject, details, db.ErrorLevel, corder, tempID))
@@ -6401,7 +6400,7 @@ func (c *Core) prepareForTradeRequestPrep(pw []byte, base, quote uint32, host st
 		return fail(err)
 	}
 	if dc.acct.suspended() {
-		return fail(newError(suspendedAcctErr, "may not trade while account is suspended"))
+		return fail(newError(suspendedAcctErr, "%w", ErrAccountSuspended))
 	}
 
 	mktID := marketName(base, quote)
@@ -6438,12 +6437,10 @@ func (c *Core) prepareForTradeRequestPrep(pw []byte, base, quote uint32, host st
 		w.mtx.RLock()
 		defer w.mtx.RUnlock()
 		if w.peerCount < 1 {
-			return fmt.Errorf("%s wallet has no network peers (check your network or firewall)",
-				unbip(w.AssetID))
+			return &WalletNoPeersError{w.AssetID}
 		}
 		if !w.synced {
-			return fmt.Errorf("%s still syncing. progress = %.2f%%", unbip(w.AssetID),
-				w.syncProgress*100)
+			return &WalletSyncError{w.AssetID, w.syncProgress}
 		}
 		return nil
 	}
@@ -10305,7 +10302,7 @@ func sendRequest(conn comms.WsConn, route string, request, response any, timeout
 	}
 
 	// Check the response error.
-	return <-errChan
+	return mapServerError(<-errChan)
 }
 
 // newPreimage creates a random order commitment. If you require a matching
@@ -11575,4 +11572,143 @@ func (c *Core) checkEpochResolution(host string, mktID string) {
 		}
 
 	}
+}
+
+// calcParcelLimit computes the users score-scaled user parcel limit.
+func calcParcelLimit(tier int64, score, maxScore int32) uint32 {
+	// Users limit starts at 2 parcels per tier.
+	lowerLimit := tier * dex.PerTierBaseParcelLimit
+	// Limit can scale up to 3x with score.
+	upperLimit := lowerLimit * dex.ParcelLimitScoreMultiplier
+	limitRange := upperLimit - lowerLimit
+	var scaleFactor float64
+	if score > 0 {
+		scaleFactor = float64(score) / float64(maxScore)
+	}
+	return uint32(lowerLimit) + uint32(math.Round(scaleFactor*float64(limitRange)))
+}
+
+// TradingLimits returns the number of parcels the user can trade on an
+// exchange and the amount that are currently being traded.
+func (c *Core) TradingLimits(host string) (userParcels, parcelLimit uint32, err error) {
+	exchange, err := c.Exchange(host)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	dc, _, err := c.dex(host)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	likelyTaker := func(o *Order, midGap uint64) bool {
+		if o.Type == order.MarketOrderType || o.TimeInForce == order.ImmediateTiF {
+			return true
+		}
+
+		if midGap == 0 {
+			return false
+		}
+
+		if o.Sell {
+			return o.Rate < midGap
+		}
+
+		return o.Rate > midGap
+	}
+
+	baseQty := func(o *Order, midGap, lotSize uint64) uint64 {
+		qty := o.Qty
+
+		if o.Type == order.MarketOrderType && !o.Sell {
+			if midGap == 0 {
+				qty = lotSize
+			} else {
+				qty = calc.QuoteToBase(midGap, qty)
+			}
+		}
+
+		return qty
+	}
+
+	epochWeight := func(o *Order, midGap, lotSize uint64) uint64 {
+		if o.Status >= order.OrderStatusBooked {
+			return 0
+		}
+
+		if likelyTaker(o, midGap) {
+			return 2 * baseQty(o, midGap, lotSize)
+		}
+
+		return baseQty(o, midGap, lotSize)
+	}
+
+	bookedWeight := func(o *Order) uint64 {
+		if o.Status != order.OrderStatusBooked {
+			return 0
+		}
+
+		return o.Qty - o.Filled
+	}
+
+	settlingWeight := func(o *Order) (weight uint64) {
+		for _, match := range o.Matches {
+			if (match.Side == order.Maker && match.Status >= order.MakerRedeemed) ||
+				(match.Side == order.Taker && match.Status >= order.MatchComplete) {
+				continue
+			}
+			weight += match.Qty
+		}
+		return
+	}
+
+	isEpochOrder := func(o *Order) bool {
+		return o.Status == order.OrderStatusEpoch
+	}
+
+	parcelLimit = calcParcelLimit(exchange.Auth.EffectiveTier, exchange.Auth.Rep.Score, int32(exchange.MaxScore))
+	for _, mkt := range exchange.Markets {
+		if len(mkt.InFlightOrders) == 0 && len(mkt.Orders) == 0 {
+			continue
+		}
+
+		var hasEpochOrder bool
+		for _, ord := range mkt.InFlightOrders {
+			if isEpochOrder(ord.Order) {
+				hasEpochOrder = true
+				break
+			}
+		}
+
+		if !hasEpochOrder {
+			for _, ord := range mkt.Orders {
+				if isEpochOrder(ord) {
+					hasEpochOrder = true
+					break
+				}
+			}
+		}
+
+		// The mid-gap is only required for epoch orders. If there are no epoch
+		// orders, there is no reason to get the mid-gap.
+		var midGap uint64
+		if hasEpochOrder {
+			midGap, err = dc.midGap(mkt.BaseID, mkt.QuoteID)
+			if err != nil && !errors.Is(err, orderbook.ErrEmptyOrderbook) {
+				return 0, 0, err
+			}
+		}
+
+		var mktWeight uint64
+		for _, ord := range mkt.InFlightOrders {
+			mktWeight += epochWeight(ord.Order, midGap, mkt.LotSize) + bookedWeight(ord.Order) + settlingWeight(ord.Order)
+		}
+		for _, ord := range mkt.Orders {
+			mktWeight += epochWeight(ord, midGap, mkt.LotSize) + bookedWeight(ord) + settlingWeight(ord)
+		}
+
+		userParcels += uint32(mktWeight / (uint64(mkt.ParcelSize) * mkt.LotSize))
+	}
+
+	return userParcels, parcelLimit, nil
 }

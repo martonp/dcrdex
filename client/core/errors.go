@@ -6,6 +6,8 @@ package core
 import (
 	"errors"
 	"fmt"
+
+	"decred.org/dcrdex/dex/msgjson"
 )
 
 // Error codes here are used on the frontend.
@@ -105,4 +107,51 @@ func UnwrapErr(err error) error {
 		return err
 	}
 	return UnwrapErr(InnerErr)
+}
+
+var (
+	ErrOrderQtyTooHigh  = errors.New("user order limit exceeded")
+	ErrAccountSuspended = errors.New("may not trade while account is suspended")
+)
+
+var serverErrsMap = map[int]error{
+	msgjson.OrderQuantityTooHigh: ErrOrderQtyTooHigh,
+}
+
+// mapServerError maps an error sent in a server response to a client core
+// error.
+func mapServerError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var mErr *msgjson.Error
+	if !errors.As(err, &mErr) {
+		return err
+	}
+
+	if mappedErr, found := serverErrsMap[mErr.Code]; found {
+		return mappedErr
+	}
+
+	return err
+}
+
+// WalletNoPeersError should be returned when a wallet has no network peers.
+type WalletNoPeersError struct {
+	AssetID uint32
+}
+
+func (e *WalletNoPeersError) Error() string {
+	return fmt.Sprintf("%s wallet has no network peers (check your network or firewall)", unbip(e.AssetID))
+}
+
+// WalletSyncError should be returned when a wallet is still syncing.
+type WalletSyncError struct {
+	AssetID  uint32
+	Progress float32
+}
+
+func (e *WalletSyncError) Error() string {
+	return fmt.Sprintf("%s still syncing. progress = %.2f%%", unbip(e.AssetID), e.Progress*100)
 }
