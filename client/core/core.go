@@ -6341,7 +6341,8 @@ func (c *Core) TradeAsync(pw []byte, form *TradeForm) (*InFlightOrder, error) {
 		_, err := c.sendTradeRequest(req)
 		if err != nil {
 			// If it's an OrderQuantityTooHigh error, send simplified notification
-			if errors.Is(err, ErrOrderQtyTooHigh) {
+			var mErr *msgjson.Error
+			if errors.As(err, &mErr) && mErr.Code == msgjson.OrderQuantityTooHigh {
 				topic := TopicOrderQuantityTooHigh
 				subject, details := c.formatDetails(topic, corder.Host)
 				c.notify(newOrderNoteWithTempID(topic, subject, details, db.ErrorLevel, corder, tempID))
@@ -10302,7 +10303,7 @@ func sendRequest(conn comms.WsConn, route string, request, response any, timeout
 	}
 
 	// Check the response error.
-	return mapServerError(<-errChan)
+	return <-errChan
 }
 
 // newPreimage creates a random order commitment. If you require a matching
