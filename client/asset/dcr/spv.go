@@ -548,7 +548,7 @@ func (w *spvWallet) AddressInfo(ctx context.Context, addrStr string) (*AddressIn
 	return nil, fmt.Errorf("unsupported address type %T", ka)
 }
 
-// isMixingTx checks if a transactino is a mixing transaction, and the
+// isMixingTx checks if a transaction is a mixing transaction, and the
 // fees incurred by this wallet.
 func isMixingTx(msgTx *wire.MsgTx,
 	acctOwnsAddress func(stdaddr.Address) (bool, string, error),
