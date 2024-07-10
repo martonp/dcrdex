@@ -591,7 +591,7 @@ func isMixingTx(msgTx *wire.MsgTx,
 		return nil
 	}
 
-	for _, txIn := range msgTx.TxIn {
+	for i, txIn := range msgTx.TxIn {
 		inTx, err := getTransaction(&txIn.PreviousOutPoint.Hash)
 		if err != nil && !errors.Is(err, asset.CoinNotFoundError) {
 			return false, 0, 0, err
@@ -606,7 +606,8 @@ func isMixingTx(msgTx *wire.MsgTx,
 		}
 
 		if len(inMsgTx.TxOut) <= int(txIn.PreviousOutPoint.Index) {
-			continue
+			return false, 0, 0, fmt.Errorf("%s input %d referencing output %d, but only %d outputs", msgTx.TxHash().String(),
+				i, txIn.PreviousOutPoint.Index, len(inMsgTx.TxOut))
 		}
 
 		txOut := inMsgTx.TxOut[txIn.PreviousOutPoint.Index]
