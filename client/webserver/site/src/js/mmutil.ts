@@ -1011,8 +1011,8 @@ export function feesAndCommit (
     base: {
       ...baseFees,
       bookingFeesPerLot: baseBookingFeesPerLot,
-      bookingFeesPerCounterLot: baseRedeemReservesPerLot + baseRedeemReservesPerLot * quoteLots,
-      bookingFees: baseBookingFeesPerLot * baseLots,
+      bookingFeesPerCounterLot: baseRedeemReservesPerLot,
+      bookingFees: baseBookingFeesPerLot * baseLots + baseRedeemReservesPerLot * quoteLots,
       tokenFeesPerSwap: baseTokenFeesPerSwap
     },
     quote: {
