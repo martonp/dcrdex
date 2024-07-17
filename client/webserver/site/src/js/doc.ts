@@ -449,6 +449,14 @@ export default class Doc {
     return BipIDs[assetID]
   }
 
+  static bipCEXSymbol (assetID: number): string {
+    const bipSymbol = BipIDs[assetID]
+    if (!bipSymbol || bipSymbol === '') return ''
+    const parts = bipSymbol.split('.')
+    if (parts[0] === 'weth') return 'eth'
+    return parts[0]
+  }
+
   static bipIDFromSymbol (symbol: string): number {
     return BipSymbolIDs[symbol]
   }

@@ -7,7 +7,8 @@ import {
   ExchangeBalance,
   StartConfig,
   OrderPlacement,
-  AutoRebalanceConfig
+  AutoRebalanceConfig,
+  CexUpdateNote
 } from './registry'
 import {
   MM,
@@ -78,13 +79,16 @@ interface FundingOutlook {
   fundedAndNotBalanced: boolean
 }
 
-function parseFundingOptions (f: FundingOutlook): [number, number, FundingSlider | undefined] {
+function parseFundingOptions (f: FundingOutlook, canRebalance: boolean): [number, number, FundingSlider | undefined] {
   const { cex: { avail: cexAvail, req: cexReq }, dex: { avail: dexAvail, req: dexReq }, transferable } = f
 
   let proposedDex = Math.min(dexAvail, dexReq)
   let proposedCex = Math.min(cexAvail, cexReq)
   let slider: FundingSlider | undefined
-  if (f.fundedAndNotBalanced) {
+
+  const assetFundedAndNotBalanced = !f.fundedAndBalanced && canRebalance && (dexReq + cexReq + transferable <= dexAvail + cexAvail)
+
+  if (assetFundedAndNotBalanced) {
     // We have everything we need, but not where we need it, and we can
     // deposit and withdraw.
     if (dexAvail > dexReq) {
@@ -148,6 +152,9 @@ function parseFundingOptions (f: FundingOutlook): [number, number, FundingSlider
     slider.dexRange = slider.right.dex - slider.left.dex
     proposedDex = slider.left.dex + (slider.dexRange / 2)
     proposedCex = slider.left.cex + (slider.cexRange / 2)
+  } else if (canRebalance) {
+    proposedDex = dexAvail
+    proposedCex = cexAvail
   }
   return [proposedDex, proposedCex, slider]
 }
@@ -195,10 +202,14 @@ export default class MarketMakerPage extends BasePage {
       const tr = page.exchangeRowTmpl.cloneNode(true) as PageElement
       page.cexRows.appendChild(tr)
       const tmpl = Doc.parseTemplate(tr)
-      Doc.bind(tmpl.configureBttn, 'click', () => {
+      const configure = () => {
         this.cexConfigForm.setCEX(cexName)
         this.forms.show(page.cexConfigForm)
-      })
+      }
+      Doc.bind(tmpl.configureBttn, 'click', configure)
+      Doc.bind(tmpl.reconfigBttn, 'click', configure)
+      Doc.bind(tmpl.errConfigureBttn, 'click', configure)
+
       const row = this.cexes[cexName] = { tr, tmpl, dinfo, cexName }
       this.updateCexRow(row)
     }
@@ -225,6 +236,9 @@ export default class MarketMakerPage extends BasePage {
       runevent: (note: RunEventNote) => {
         const bot = this.bots[hostedMarketID(note.host, note.baseID, note.quoteID)]
         if (bot) return bot.handleRunStats()
+      },
+      cexbal: (note: CexUpdateNote) => {
+        this.handleCexBalNote(note)
       }
       // TODO bot start-stop notification
     })
@@ -247,6 +261,13 @@ export default class MarketMakerPage extends BasePage {
     const startupBalanceCache: Record<number, Promise<ExchangeBalance>> = {}
 
     for (const botStatus of sortedBots) this.addBot(botStatus, startupBalanceCache)
+  }
+
+  async handleCexBalNote (note: CexUpdateNote) {
+    console.log(note)
+    const cexRow = this.cexes[note.cexName]
+    if (!cexRow) return
+    this.updateCexRow(cexRow)
   }
 
   async handleRunStatsNote (note: RunStatsNote) {
@@ -318,8 +339,13 @@ export default class MarketMakerPage extends BasePage {
     tmpl.logo.classList.toggle('greyscale', !status)
     if (!status) return
     let usdBal = 0
+    const cexSymbolAdded : Record<string, boolean> = {} // avoid double counting tokens
+    console.log(status.balances)
     for (const [assetIDStr, bal] of Object.entries(status.balances)) {
       const assetID = parseInt(assetIDStr)
+      const cexSymbol = Doc.bipCEXSymbol(assetID)
+      if (cexSymbolAdded[cexSymbol]) continue
+      cexSymbolAdded[cexSymbol] = true
       const { unitInfo } = app().assets[assetID]
       const fiatRate = app().fiatRatesMap[assetID]
       if (fiatRate) usdBal += fiatRate * (bal.available + bal.locked) / unitInfo.conventional.conversionFactor
@@ -489,6 +515,7 @@ class Bot extends BotMarket {
 
   updateRunningDisplay () {
     this.runDisplay.update()
+    this.runDisplay.readBook()
   }
 
   updateIdleDisplay () {
@@ -560,14 +587,16 @@ class Bot extends BotMarket {
    */
   allocate () {
     const f = this.fundingState()
+
     const {
       page, marketReport: { baseFiatRate, quoteFiatRate }, baseID, quoteID,
       baseFeeID, quoteFeeID, baseFeeFiatRate, quoteFeeFiatRate, cexName,
-      baseFactor, quoteFactor, baseFeeFactor, quoteFeeFactor
+      baseFactor, quoteFactor, baseFeeFactor, quoteFeeFactor, cfg: { uiConfig: { cexRebalance } }
     } = this
 
-    const [proposedDexBase, proposedCexBase, baseSlider] = parseFundingOptions(f.base)
-    const [proposedDexQuote, proposedCexQuote, quoteSlider] = parseFundingOptions(f.quote)
+    const canRebalance = Boolean(cexName && cexRebalance)
+    const [proposedDexBase, proposedCexBase, baseSlider] = parseFundingOptions(f.base, canRebalance)
+    const [proposedDexQuote, proposedCexQuote, quoteSlider] = parseFundingOptions(f.quote, canRebalance)
 
     const alloc = this.alloc = {
       dex: {
@@ -579,8 +608,9 @@ class Bot extends BotMarket {
         [quoteID]: proposedCexQuote * quoteFactor
       }
     }
-    alloc.dex[baseFeeID] = Math.min((alloc.dex[baseFeeID] ?? 0) + f.base.fees.req, f.base.fees.avail) * baseFeeFactor
-    alloc.dex[quoteFeeID] = Math.min((alloc.dex[quoteFeeID] ?? 0) + f.quote.fees.req, f.quote.fees.avail) * quoteFeeFactor
+
+    alloc.dex[baseFeeID] = Math.min((alloc.dex[baseFeeID] ?? 0) + (f.base.fees.req * baseFeeFactor), f.base.fees.avail * baseFeeFactor)
+    alloc.dex[quoteFeeID] = Math.min((alloc.dex[quoteFeeID] ?? 0) + (f.quote.fees.req * quoteFeeFactor), f.quote.fees.avail * quoteFeeFactor)
 
     let totalUSD = (alloc.dex[baseID] / baseFactor * baseFiatRate) + (alloc.dex[quoteID] / quoteFactor * quoteFiatRate)
     totalUSD += (alloc.cex[baseID] / baseFactor * baseFiatRate) + (alloc.cex[quoteID] / quoteFactor * quoteFiatRate)
