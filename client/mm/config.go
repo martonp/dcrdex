@@ -44,9 +44,13 @@ type CEXConfig struct {
 // total amount allocated for trading.
 // The way these are configured will probably be changed to better capture the
 // reasoning above.
+//
+// If MinBaseTransfer or MinQuoteTransfer are set to 0, the bot will only
+// attempt internal transfers.
 type AutoRebalanceConfig struct {
 	MinBaseTransfer  uint64 `json:"minBaseTransfer"`
 	MinQuoteTransfer uint64 `json:"minQuoteTransfer"`
+	InternalOnly     bool   `json:"internalOnly"`
 }
 
 // BotBalanceAllocation is the initial allocation of funds for a bot.
