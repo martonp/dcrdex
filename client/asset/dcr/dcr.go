@@ -922,7 +922,12 @@ func (dcr *ExchangeWallet) findExistingAddressBasedTxHistoryDB() (string, error)
 		}
 
 		address := match[1]
-		owns, err := dcr.OwnsDepositAddress(address)
+
+		decodedAddr, err := stdaddr.DecodeAddress(address, dcr.chainParams)
+		if err != nil {
+			continue
+		}
+		owns, err := dcr.wallet.WalletOwnsAddress(dcr.ctx, decodedAddr)
 		if err != nil {
 			continue
 		}
@@ -934,101 +939,33 @@ func (dcr *ExchangeWallet) findExistingAddressBasedTxHistoryDB() (string, error)
 	return "", nil
 }
 
-// rpcTxHistoryDBInfo is the information stored in the rpc-tx-dbs.json file.
-// Each tx history db file is associated with a set of accounts used to
-// configure an rpc wallet.
-type rpcTxHistoryDBInfo struct {
-	Addresses *rpcWalletAddresses `json:"addresses"`
-	FileName  string              `json:"fileName"`
-}
-
-func (dcr *ExchangeWallet) rpcHistoryDBInfosFilePath() string {
-	return filepath.Join(dcr.walletDir, "rpc-tx-dbs.json")
-}
-
-func (dcr *ExchangeWallet) existingRPCTxHistoryDBs() ([]*rpcTxHistoryDBInfo, error) {
-	if b, err := os.ReadFile(dcr.rpcHistoryDBInfosFilePath()); err == nil {
-		var dbInfos []*rpcTxHistoryDBInfo
-		err = json.Unmarshal(b, &dbInfos)
-		if err != nil {
-			return nil, fmt.Errorf("unable to unmarshal rpc tx dbs file: %v", err)
-		}
-		return dbInfos, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("unable to rpc tx dbs file: %v", err)
-	}
-
-	return []*rpcTxHistoryDBInfo{}, nil
-}
-
-func (dcr *ExchangeWallet) updateRPCTxHistoryDBs(dbInfos []*rpcTxHistoryDBInfo) error {
-	b, err := json.Marshal(dbInfos)
-	if err != nil {
-		return fmt.Errorf("unable to marshal rpc tx dbs: %v", err)
-	}
-
-	err = os.WriteFile(dcr.rpcHistoryDBInfosFilePath(), b, 0644)
-	if err != nil {
-		return fmt.Errorf("unable to write rpc tx dbs file: %v", err)
-	}
-
-	return nil
-}
-
-func (dcr *ExchangeWallet) findRPCTxHistoryDBFile(ctx context.Context, wallet *rpcWallet) (string, error) {
-	dbInfos, err := dcr.existingRPCTxHistoryDBs()
-	if err != nil {
-		return "", err
-	}
-
-	for _, dbInfo := range dbInfos {
-		match, err := wallet.addressesMatchAccounts(ctx, dbInfo.Addresses)
-		if err != nil {
-			return "", err
-		}
-		if match {
-			return dbInfo.FileName, nil
-		}
-	}
-
-	addresses, err := wallet.accountAddresses(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	fileName := fmt.Sprintf("txhistorydb-%s", strconv.Itoa(int(time.Now().Unix())))
-	dbInfo := &rpcTxHistoryDBInfo{
-		Addresses: addresses,
-		FileName:  fileName,
-	}
-
-	dbInfos = append(dbInfos, dbInfo)
-	err = dcr.updateRPCTxHistoryDBs(dbInfos)
-	if err != nil {
-		return "", err
-	}
-
-	return fileName, nil
-}
-
 func (dcr *ExchangeWallet) startTxHistoryDB(ctx context.Context) (*dex.ConnectionMaster, error) {
 	var dbPath string
-
 	if spvWallet, ok := dcr.wallet.(*spvWallet); ok {
 		initialAddress, err := spvWallet.InitialAddress(ctx)
 		if err != nil {
 			return nil, err
 		}
-		dbPath = filepath.Join(dcr.walletDir, fmt.Sprintf("txhistorydb-%s", initialAddress))
-	} else if rpcWallet, ok := dcr.wallet.(*rpcWallet); ok {
-		var err error
-		fileName, err := dcr.findRPCTxHistoryDBFile(ctx, rpcWallet)
+
+		dbPath = dcr.txHistoryDBPath(initialAddress)
+	}
+
+	if dbPath == "" {
+		addressPath, err := dcr.findExistingAddressBasedTxHistoryDB()
 		if err != nil {
 			return nil, err
 		}
-		dbPath = filepath.Join(dcr.walletDir, fileName)
-	} else {
-		return nil, fmt.Errorf("unknown wallet type")
+		if addressPath != "" {
+			dbPath = addressPath
+		}
+	}
+
+	if dbPath == "" {
+		depositAddr, err := dcr.DepositAddress()
+		if err != nil {
+			return nil, fmt.Errorf("error getting deposit address: %w", err)
+		}
+		dbPath = dcr.txHistoryDBPath(depositAddr)
 	}
 
 	dcr.log.Debugf("Using tx history db at %s", dbPath)
@@ -5925,6 +5862,36 @@ func rpcTxFee(tx *ListTransactionsResult) uint64 {
 	return 0
 }
 
+func isMixTx(tx *wire.MsgTx) (isMix bool, mixDenom int64) {
+	if len(tx.TxOut) < 3 || len(tx.TxIn) < 3 {
+		return false, 0
+	}
+
+	mixedOuts := make(map[int64]uint32)
+	for _, o := range tx.TxOut {
+		val := o.Value
+		if _, ok := splitPointMap[val]; ok {
+			mixedOuts[val]++
+			continue
+		}
+	}
+
+	var mixCount uint32
+	for val, count := range mixedOuts {
+		if count < 3 {
+			continue
+		}
+		if val > mixDenom {
+			mixDenom = val
+			mixCount = count
+		}
+	}
+
+	// TODO: revisit the input count requirements
+	isMix = mixCount >= uint32(len(tx.TxOut)/2)
+	return
+}
+
 // idUnknownTx identifies the type and details of a transaction either made
 // or recieved by the wallet.
 func (dcr *ExchangeWallet) idUnknownTx(ctx context.Context, tx *ListTransactionsResult) (*asset.WalletTransaction, error) {
@@ -6099,19 +6066,6 @@ func (dcr *ExchangeWallet) idUnknownTx(ctx context.Context, tx *ListTransactions
 
 	const scriptVersion = 0
 
-	isMix, amt, fees, err := dcr.wallet.IsMixingTx(dcr.ctx, msgTx)
-	if err != nil {
-		return nil, err
-	}
-	if isMix {
-		return &asset.WalletTransaction{
-			Type:   asset.Mix,
-			ID:     tx.TxID,
-			Amount: amt,
-			Fees:   fees,
-		}, nil
-	}
-
 	allOutputsPayUs := func(msgTx *wire.MsgTx) bool {
 		for _, txOut := range msgTx.TxOut {
 			_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, dcr.chainParams)
@@ -6141,6 +6095,66 @@ func (dcr *ExchangeWallet) idUnknownTx(ctx context.Context, tx *ListTransactions
 		}, nil
 	}
 
+	if isMix, mixDenom := isMixTx(msgTx); isMix {
+		var mixedAmount uint64
+		for _, txOut := range msgTx.TxOut {
+			if txOut.Value == mixDenom {
+				_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, dcr.chainParams)
+				if err != nil {
+					dcr.log.Errorf("ExtractAddrs error: %w", err)
+					continue
+				}
+				if len(addrs) != 1 { // sanity check
+					continue
+				}
+
+				addr := addrs[0]
+				owns, err := dcr.wallet.WalletOwnsAddress(ctx, addr)
+				if err != nil {
+					dcr.log.Errorf("walletOwnsAddress error: %w", err)
+					continue
+				}
+
+				if owns {
+					mixedAmount += uint64(txOut.Value)
+				}
+			}
+		}
+
+		return &asset.WalletTransaction{
+			Type:   asset.Mix,
+			ID:     tx.TxID,
+			Amount: mixedAmount,
+			Fees:   fee,
+		}, nil
+	}
+
+	getRecipient := func(msgTx *wire.MsgTx, receive bool) *string {
+		for _, txOut := range msgTx.TxOut {
+			_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, dcr.chainParams)
+			if err != nil {
+				dcr.log.Errorf("ExtractAddrs error: %w", err)
+				continue
+			}
+			if len(addrs) != 1 { // sanity check
+				continue
+			}
+
+			addr := addrs[0]
+			owns, err := dcr.wallet.WalletOwnsAddress(ctx, addr)
+			if err != nil {
+				dcr.log.Errorf("walletOwnsAddress error: %w", err)
+				continue
+			}
+
+			if receive == owns {
+				str := addr.String()
+				return &str
+			}
+		}
+		return nil
+	}
+
 	txOutDirection := func(msgTx *wire.MsgTx) (in, out uint64) {
 		for _, txOut := range msgTx.TxOut {
 			_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, dcr.chainParams)
@@ -6168,32 +6182,6 @@ func (dcr *ExchangeWallet) idUnknownTx(ctx context.Context, tx *ListTransactions
 	}
 
 	in, out := txOutDirection(msgTx)
-
-	getRecipient := func(msgTx *wire.MsgTx, receive bool) *string {
-		for _, txOut := range msgTx.TxOut {
-			_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, dcr.chainParams)
-			if err != nil {
-				dcr.log.Errorf("ExtractAddrs error: %w", err)
-				continue
-			}
-			if len(addrs) != 1 { // sanity check
-				continue
-			}
-
-			addr := addrs[0]
-			owns, err := dcr.wallet.WalletOwnsAddress(ctx, addr)
-			if err != nil {
-				dcr.log.Errorf("walletOwnsAddress error: %w", err)
-				continue
-			}
-
-			if receive == owns {
-				str := addr.String()
-				return &str
-			}
-		}
-		return nil
-	}
 
 	if tx.Send {
 		txType := asset.Send

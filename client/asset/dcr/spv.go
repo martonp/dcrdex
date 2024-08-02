@@ -41,7 +41,6 @@ import (
 	chainjson "github.com/decred/dcrd/rpc/jsonrpc/types/v4"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
-	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/wire"
 	"github.com/decred/slog"
 	"github.com/jrick/logrotate/rotator"
@@ -546,118 +545,6 @@ func (w *spvWallet) AddressInfo(ctx context.Context, addrStr string) (*AddressIn
 		return &AddressInfo{Account: ka.AccountName(), Branch: branch}, nil
 	}
 	return nil, fmt.Errorf("unsupported address type %T", ka)
-}
-
-// isMixingTx checks if a transaction is a mixing transaction, and the
-// fees incurred by this wallet.
-func isMixingTx(msgTx *wire.MsgTx,
-	acctOwnsAddress func(stdaddr.Address) (bool, string, error),
-	getTransaction func(txHash *chainhash.Hash) (*WalletTransaction, error),
-	unmixedAcct, tradingAcct, mixedAcct string,
-	chainParams *chaincfg.Params,
-) (isMix bool, amt, fees uint64, err error) {
-	const scriptVersion = 0
-
-	var mixedInputs, mixedOutputs, unmixedInputs, unmixedOutputs uint64
-
-	idOutput := func(txOut *wire.TxOut, fromInput bool) error {
-		_, addrs := stdscript.ExtractAddrs(scriptVersion, txOut.PkScript, chainParams)
-		if len(addrs) != 1 {
-			return nil
-		}
-
-		owns, acct, err := acctOwnsAddress(addrs[0])
-		if err != nil {
-			return err
-		}
-		if !owns {
-			return nil
-		}
-
-		if acct == mixedAcct || acct == tradingAcct {
-			if fromInput {
-				mixedInputs += uint64(txOut.Value)
-			} else {
-				mixedOutputs += uint64(txOut.Value)
-			}
-		} else if acct == unmixedAcct {
-			if fromInput {
-				unmixedInputs += uint64(txOut.Value)
-			} else {
-				unmixedOutputs += uint64(txOut.Value)
-			}
-		}
-
-		return nil
-	}
-
-	for i, txIn := range msgTx.TxIn {
-		inTx, err := getTransaction(&txIn.PreviousOutPoint.Hash)
-		if err != nil && !errors.Is(err, asset.CoinNotFoundError) {
-			return false, 0, 0, err
-		}
-		if errors.Is(err, asset.CoinNotFoundError) {
-			continue
-		}
-
-		inMsgTx, err := msgTxFromHex(inTx.Hex)
-		if err != nil {
-			return false, 0, 0, err
-		}
-
-		if len(inMsgTx.TxOut) <= int(txIn.PreviousOutPoint.Index) {
-			return false, 0, 0, fmt.Errorf("%s input %d referencing output %d, but only %d outputs", msgTx.TxHash().String(),
-				i, txIn.PreviousOutPoint.Index, len(inMsgTx.TxOut))
-		}
-
-		txOut := inMsgTx.TxOut[txIn.PreviousOutPoint.Index]
-		err = idOutput(txOut, true)
-		if err != nil {
-			return false, 0, 0, err
-		}
-	}
-
-	for _, txOut := range msgTx.TxOut {
-		err := idOutput(txOut, false)
-		if err != nil {
-			return false, 0, 0, err
-		}
-	}
-
-	totalIn := mixedInputs + unmixedInputs
-	totalOut := mixedOutputs + unmixedOutputs
-	if totalIn > totalOut {
-		fees = totalIn - totalOut
-	}
-
-	if mixedOutputs > 0 && unmixedInputs > 0 {
-		return true, mixedOutputs, fees, nil
-	}
-
-	return false, 0, 0, nil
-}
-
-// IsMixingTx returns whether or not a transaction is a mixing related
-// transaction, which happens when funds are moved into the mixed account.
-//
-// This function works even if mixing is not currently enabled, as the names of
-// the accounts will always be the same.
-func (w *spvWallet) IsMixingTx(ctx context.Context, msgTx *wire.MsgTx) (isMix bool, amt, fees uint64, err error) {
-	acctOwnsAddress := func(addr stdaddr.Address) (bool, string, error) {
-		knownAddr, err := w.KnownAddress(ctx, addr)
-		if err != nil && !errors.Is(err, walleterrors.NotExist) {
-			return false, "", err
-		} else if errors.Is(err, walleterrors.NotExist) {
-			return false, "", nil
-		}
-		return true, knownAddr.AccountName(), nil
-	}
-
-	getTx := func(txHash *chainhash.Hash) (*WalletTransaction, error) {
-		return w.GetTransaction(ctx, txHash)
-	}
-
-	return isMixingTx(msgTx, acctOwnsAddress, getTx, defaultAccountName, tradingAccountName, mixedAccountName, w.chainParams)
 }
 
 // WalletOwnsAddress returns whether any of the account controlled by this

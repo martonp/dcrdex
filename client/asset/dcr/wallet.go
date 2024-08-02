@@ -179,7 +179,6 @@ type Wallet interface {
 	StakeInfo(ctx context.Context) (*wallet.StakeInfoData, error)
 	Reconfigure(ctx context.Context, cfg *asset.WalletConfig, net dex.Network, currentAddress string) (restart bool, err error)
 	WalletOwnsAddress(ctx context.Context, addr stdaddr.Address) (bool, error)
-	IsMixingTx(ctx context.Context, msgTx *wire.MsgTx) (isMix bool, amt, fees uint64, err error)
 }
 
 // WalletTransaction is a pared down version of walletjson.GetTransactionResult.
