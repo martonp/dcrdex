@@ -294,6 +294,7 @@ export default class WalletsPage extends BasePage {
     Doc.bind(page.copyRecipientBtn, 'click', () => { setupCopyBtn(this.currTx?.recipient || '', page.txDetailsRecipient, page.copyRecipientBtn, '#1e7d11') })
     Doc.bind(page.copyBondIDBtn, 'click', () => { setupCopyBtn(this.currTx?.bondInfo?.bondID || '', page.txDetailsBondID, page.copyBondIDBtn, '#1e7d11') })
     Doc.bind(page.copyBondAccountIDBtn, 'click', () => { setupCopyBtn(this.currTx?.bondInfo?.accountID || '', page.txDetailsBondAccountID, page.copyBondAccountIDBtn, '#1e7d11') })
+    Doc.bind(page.hideMixTxsCheckbox, 'change', () => { this.showTxHistory(this.selectedAssetID) })
 
     // Bind the new wallet form.
     this.newWalletForm = new NewWalletForm(page.newWalletForm, (assetID: number) => {
@@ -1819,6 +1820,9 @@ export default class WalletsPage extends BasePage {
   }
 
   handleTxNote (tx: WalletTransaction, newTx: boolean) {
+    const w = app().assets[this.selectedAssetID].wallet
+    const hideMixing = (w.traits & traitFundsMixer) !== 0 && !!this.page.hideMixTxs.checked
+    if (hideMixing && tx.type === txTypeMixing) return
     if (newTx) {
       if (!this.oldestTx) {
         Doc.show(this.page.txHistoryTable)
@@ -1846,19 +1850,54 @@ export default class WalletsPage extends BasePage {
     }
   }
 
+  async getTxHistory (assetID: number, hideMixTxs: boolean, after?: string) : Promise<TxHistoryResult> {
+    let numToFetch = 10
+    if (hideMixTxs) numToFetch = 15
+
+    const res : TxHistoryResult = { txs: [], lastTx: false }
+    let ref = after
+
+    for (let i = 0; i < 40; i++) {
+      const currRes = await app().txHistory(assetID, numToFetch, ref)
+      if (currRes.txs.length > 0) {
+        ref = currRes.txs[currRes.txs.length - 1].id
+      }
+      let txs = currRes.txs
+      if (hideMixTxs) {
+        txs = txs.filter((tx) => tx.type !== txTypeMixing)
+      }
+      if (res.txs.length + txs.length > 10) {
+        const numToPush = 10 - res.txs.length
+        res.txs.push(...txs.slice(0, numToPush))
+      } else {
+        if (currRes.lastTx) res.lastTx = true
+        res.txs.push(...txs)
+      }
+      if (res.txs.length >= 10 || currRes.lastTx) break
+    }
+    return res
+  }
+
   async showTxHistory (assetID: number) {
     const page = this.page
     let txRes : TxHistoryResult
-    Doc.hide(page.txHistoryTable, page.txHistoryBox, page.noTxHistory, page.earlierTxs, page.txHistoryNotAvailable)
+    Doc.hide(page.txHistoryTable, page.txHistoryBox, page.noTxHistory, page.earlierTxs, page.txHistoryNotAvailable, page.hideMixTxs)
     Doc.empty(page.txHistoryTableBody)
     const w = app().assets[assetID].wallet
     if (!w || w.disabled || (w.traits & traitHistorian) === 0) {
       Doc.show(page.txHistoryNotAvailable)
       return
     }
+
+    this.oldestTx = undefined
+
+    const isMixing = (w.traits & traitFundsMixer) !== 0
+    Doc.setVis(isMixing, page.hideMixTxs)
     Doc.show(page.txHistoryBox)
+
     try {
-      txRes = await app().txHistory(assetID, 10)
+      const hideMixing = isMixing && !!page.hideMixTxsCheckbox.checked
+      txRes = await this.getTxHistory(assetID, hideMixing)
     } catch (err) {
       Doc.show(page.noTxHistory)
       return
@@ -1867,6 +1906,7 @@ export default class WalletsPage extends BasePage {
       Doc.show(page.noTxHistory)
       return
     }
+
     let oldestDate = this.txDate(txRes.txs[0])
     page.txHistoryTableBody.appendChild(this.txHistoryDateRow(oldestDate))
     for (const tx of txRes.txs) {
@@ -1887,8 +1927,10 @@ export default class WalletsPage extends BasePage {
     if (!this.oldestTx) return
     const page = this.page
     let txRes : TxHistoryResult
+    const w = app().assets[this.selectedAssetID].wallet
+    const hideMixing = (w.traits & traitFundsMixer) !== 0 && !!page.hideMixTxsCheckbox.checked
     try {
-      txRes = await app().txHistory(this.selectedAssetID, 10, this.oldestTx.id)
+      txRes = await this.getTxHistory(this.selectedAssetID, hideMixing, this.oldestTx.id)
     } catch (err) {
       console.error(err)
       return

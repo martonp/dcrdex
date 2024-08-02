@@ -675,6 +675,8 @@ type ExchangeWallet struct {
 	txHistoryDB      atomic.Value // *btc.BadgerTxDB
 	syncingTxHistory atomic.Bool
 
+	previouslySynced atomic.Bool
+
 	rescan struct {
 		sync.RWMutex
 		progress *rescanProgress // nil = no rescan in progress
@@ -4823,11 +4825,29 @@ func (dcr *ExchangeWallet) shutdown() {
 }
 
 // SyncStatus is information about the blockchain sync status.
-func (dcr *ExchangeWallet) SyncStatus() (bool, float32, error) {
+func (dcr *ExchangeWallet) SyncStatus() (synced bool, pct float32, err error) {
+	defer func() {
+		previouslySynced := dcr.previouslySynced.Load()
+		if err != nil {
+			dcr.previouslySynced.Store(false)
+			return
+		}
+		dcr.previouslySynced.Store(synced)
+
+		if !previouslySynced && synced {
+			dcr.tipMtx.RLock()
+			tip := dcr.currentTip
+			dcr.tipMtx.RUnlock()
+
+			dcr.syncTxHistory(dcr.ctx, uint64(tip.height))
+		}
+	}()
+
 	// If we have a rescan running, do different math.
 	dcr.rescan.RLock()
 	rescanProgress := dcr.rescan.progress
 	dcr.rescan.RUnlock()
+
 	if rescanProgress != nil {
 		height := dcr.cachedBestBlock().height
 		if height < rescanProgress.scannedThrough {
@@ -4835,6 +4855,7 @@ func (dcr *ExchangeWallet) SyncStatus() (bool, float32, error) {
 		}
 		return false, float32(rescanProgress.scannedThrough) / float32(height), nil
 	}
+
 	// No rescan in progress. Ask wallet.
 	return dcr.wallet.SyncStatus(dcr.ctx)
 }
@@ -6232,6 +6253,8 @@ func (dcr *ExchangeWallet) addUnknownTransactionsToHistory(tip uint64) {
 		return
 	}
 
+	dcr.log.Infof("LISTING SINCE BLOCK %d", len(txs))
+
 	for _, tx := range txs {
 		if dcr.ctx.Err() != nil {
 			return
@@ -6286,6 +6309,8 @@ func (dcr *ExchangeWallet) syncTxHistory(ctx context.Context, tip uint64) {
 		return
 	}
 	defer dcr.syncingTxHistory.Store(false)
+
+	dcr.log.Infof("Starting tx history sync to tip %d", tip)
 
 	txHistoryDB := dcr.txDB()
 	if txHistoryDB == nil {
