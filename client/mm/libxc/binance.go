@@ -173,6 +173,8 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 	}
 
 	acceptUpdate := func(update *bntypes.BookUpdate) bool {
+		b.log.Infof("Orderbook update firstID=%d, lastID=%d, currUpdateID=%d", update.FirstUpdateID, update.LastUpdateID, updateID)
+
 		if updateID == updateIDUnsynced {
 			// Book is still syncing. Add it to the sync cache.
 			syncCache = append(syncCache, update)
