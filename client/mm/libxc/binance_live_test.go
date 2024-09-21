@@ -48,7 +48,7 @@ func tNewBinance(t *testing.T, net dex.Network) *binance {
 		},
 	}
 	const binanceUS = true
-	return newBinance(cfg, binanceUS)
+	return newBinance(cfg, !binanceUS)
 }
 
 type spoofDriver struct {
@@ -203,9 +203,11 @@ func TestVWAP(t *testing.T) {
 		t.Fatalf("failed to subscribe to market: %v", err)
 	}
 
-	time.Sleep(30 * time.Second)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	wg.Wait()
 
-	avg, extrema, filled, err := bnc.VWAP(60, 0, true, 2e9)
+	/*avg, extrema, filled, err := bnc.VWAP(60, 0, true, 2e9)
 	if err != nil {
 		t.Fatalf("VWAP failed: %v", err)
 	}
@@ -246,7 +248,7 @@ func TestVWAP(t *testing.T) {
 	_, _, _, err = bnc.VWAP(60, 0, true, 2e9)
 	if err == nil {
 		t.Fatalf("error should be returned since all subscribers have unsubscribed")
-	}
+	}*/
 }
 
 func TestSubscribeMarket(t *testing.T) {

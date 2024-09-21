@@ -175,6 +175,8 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 	}
 
 	acceptUpdate := func(update *bntypes.BookUpdate) bool {
+		b.log.Infof("%s update with ID %d", b.mktID, update.LastUpdateID)
+
 		if updateID == updateIDUnsynced {
 			// Book is still syncing. Add it to the sync cache.
 			syncCache = append(syncCache, update)
@@ -650,25 +652,25 @@ func (bnc *binance) getMarkets(ctx context.Context) (map[string]*bntypes.Market,
 func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	wg := new(sync.WaitGroup)
 
-	if err := bnc.getCoinInfo(ctx); err != nil {
+	/*if err := bnc.getCoinInfo(ctx); err != nil {
 		return nil, fmt.Errorf("error getting coin info: %v", err)
-	}
+	}*/
 
 	if _, err := bnc.getMarkets(ctx); err != nil {
 		return nil, fmt.Errorf("error getting markets: %v", err)
 	}
 
-	if err := bnc.setBalances(ctx); err != nil {
+	/*if err := bnc.setBalances(ctx); err != nil {
 		return nil, err
 	}
 
 	if err := bnc.getUserDataStream(ctx); err != nil {
 		return nil, err
-	}
+	}*/
 
 	// Refresh balances periodically. This is just for safety as they should
 	// be updated based on the user data stream.
-	wg.Add(1)
+	/*wg.Add(1)
 	go func() {
 		defer wg.Done()
 		ticker := time.NewTicker(time.Minute)
@@ -684,7 +686,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 				return
 			}
 		}
-	}()
+	}()*/
 
 	// Refresh the markets periodically.
 	wg.Add(1)
@@ -708,7 +710,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	}()
 
 	// Refresh the coin info periodically.
-	wg.Add(1)
+	/*wg.Add(1)
 	go func() {
 		defer wg.Done()
 		nextTick := time.After(time.Hour)
@@ -726,7 +728,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 				return
 			}
 		}
-	}()
+	}()*/
 
 	return wg, nil
 }
@@ -1759,9 +1761,11 @@ func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quote
 				default:
 				}
 			},
-			ConnectEventFunc: func(cs comms.ConnectionStatus) {},
-			Logger:           bnc.log.SubLogger("BNCBOOK"),
-			RawHandler:       bnc.handleMarketDataNote,
+			ConnectEventFunc: func(cs comms.ConnectionStatus) {
+				fmt.Println("Market stream connection status:", cs)
+			},
+			Logger:     bnc.log.SubLogger("BNCBOOK"),
+			RawHandler: bnc.handleMarketDataNote,
 		})
 		if err != nil {
 			return nil, nil, err
@@ -1820,7 +1824,7 @@ func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quote
 			return nil
 		}
 
-		checkSubsInterval := time.Minute * 30
+		checkSubsInterval := time.Minute * 1
 		checkSubs := time.After(checkSubsInterval)
 		reconnectTimer := time.After(time.Hour * 12)
 		for {
