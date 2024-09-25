@@ -88,7 +88,7 @@ func newBinanceOrderBook(
 		quoteConversionFactor: quoteConversionFactor,
 		log:                   log,
 		getSnapshot:           getSnapshot,
-		connectedChan:         make(chan bool),
+		connectedChan:         make(chan bool, 4),
 	}
 }
 
@@ -164,7 +164,7 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 
 	resyncChan := make(chan struct{}, 1)
 
-	desync := func() {
+	desync := func(resync bool) {
 		// clear the sync cache, set the special ID, trigger a book refresh.
 		syncMtx.Lock()
 		defer syncMtx.Unlock()
@@ -173,7 +173,9 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 		if updateID != updateIDUnsynced {
 			b.synced.Store(false)
 			updateID = updateIDUnsynced
-			resyncChan <- struct{}{}
+			if resync {
+				resyncChan <- struct{}{}
+			}
 		}
 	}
 
@@ -268,7 +270,7 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 			case update := <-b.updateQueue:
 				if !processUpdate(update) {
 					b.log.Tracef("Bad %s update with ID %d", b.mktID, update.LastUpdateID)
-					desync()
+					desync(true)
 				}
 			case <-ctx.Done():
 				return
@@ -288,13 +290,10 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 			select {
 			case <-retry:
 			case <-resyncChan:
-				if retry != nil { // don't hammer
-					continue
-				}
 			case connected := <-b.connectedChan:
 				if !connected {
-					b.log.Debugf("Unsyncing %s orderbook due to disconnect.", b.mktID, retryFrequency)
-					desync()
+					b.log.Debugf("Unsyncing %s orderbook due to disconnect.", b.mktID)
+					desync(false)
 					retry = nil
 					continue
 				}
@@ -307,7 +306,7 @@ func (b *binanceOrderBook) Connect(ctx context.Context) (*sync.WaitGroup, error 
 				retry = nil
 			} else {
 				b.log.Infof("Failed to sync %s orderbook. Trying again in %s", b.mktID, retryFrequency)
-				desync() // Clears the syncCache
+				desync(false) // Clears the syncCache
 				retry = time.After(retryFrequency)
 			}
 		}
@@ -1647,17 +1646,23 @@ func (bnc *binance) subscribeToAdditionalMarketDataStream(ctx context.Context, b
 	bnc.books[mktID] = book
 	book.sync(ctx)
 
+	bnc.marketStream.UpdateURL(bnc.marketStreamsURL())
+
 	return nil
 }
 
+// bnc.booksMtx MUST be read locked when calling this function.
 func (bnc *binance) streams() []string {
-	bnc.booksMtx.RLock()
-	defer bnc.booksMtx.RUnlock()
 	streamNames := make([]string, 0, len(bnc.books))
 	for mktID := range bnc.books {
 		streamNames = append(streamNames, marketDataStreamID(mktID))
 	}
 	return streamNames
+}
+
+// bnc.booksMtx MUST be read locked when calling this function.
+func (bnc *binance) marketStreamsURL() string {
+	return fmt.Sprintf("%s/stream?streams=%s", bnc.wsURL, strings.Join(bnc.streams(), "/"))
 }
 
 // checkSubs will query binance for current market subscriptions and compare
@@ -1666,7 +1671,11 @@ func (bnc *binance) streams() []string {
 func (bnc *binance) checkSubs(ctx context.Context) error {
 	bnc.marketStreamMtx.Lock()
 	defer bnc.marketStreamMtx.Unlock()
+
+	bnc.booksMtx.RLock()
 	streams := bnc.streams()
+	bnc.booksMtx.RUnlock()
+
 	if len(streams) == 0 {
 		return nil
 	}
@@ -1746,61 +1755,9 @@ out:
 }
 
 // connectToMarketDataStream is called when the first market is subscribed to.
-// It creates a connection to the market data stream and starts a goroutine
-// to reconnect every 12 hours, as Binance will close the stream every 24
-// hours. Additional markets are subscribed to by calling
+// Additional markets are subscribed to by calling
 // subscribeToAdditionalMarketDataStream.
 func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quoteID uint32) error {
-	reconnectC := make(chan struct{})
-
-	newConnection := func() (comms.WsConn, *dex.ConnectionMaster, error) {
-		addr := fmt.Sprintf("%s/stream?streams=%s", bnc.wsURL, strings.Join(bnc.streams(), "/"))
-		// Need to send key but not signature
-		connectEventFunc := func(cs comms.ConnectionStatus) {
-			if cs != comms.Disconnected && cs != comms.Connected {
-				return
-			}
-			// If disconnected, set all books to unsynced so bots
-			// will not place new orders.
-			connected := cs == comms.Connected
-			bnc.booksMtx.RLock()
-			defer bnc.booksMtx.RLock()
-			for _, b := range bnc.books {
-				b.connectedChan <- connected
-			}
-		}
-		conn, err := comms.NewWsConn(&comms.WsCfg{
-			URL: addr,
-			// Binance Docs: The websocket server will send a ping frame every 3
-			// minutes. If the websocket server does not receive a pong frame
-			// back from the connection within a 10 minute period, the connection
-			// will be disconnected. Unsolicited pong frames are allowed.
-			PingWait:     time.Minute * 4,
-			EchoPingData: true,
-			ReconnectSync: func() {
-				bnc.log.Debugf("Binance reconnected")
-				select {
-				case reconnectC <- struct{}{}:
-				default:
-				}
-			},
-			ConnectEventFunc: connectEventFunc,
-			Logger:           bnc.log.SubLogger("BNCBOOK"),
-			RawHandler:       bnc.handleMarketDataNote,
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-
-		bnc.marketStream = conn
-		cm := dex.NewConnectionMaster(conn)
-		if err = cm.ConnectOnce(ctx); err != nil {
-			return nil, nil, fmt.Errorf("websocketHandler remote connect: %v", err)
-		}
-
-		return conn, cm, nil
-	}
-
 	// Add the initial book to the books map
 	baseCfg, quoteCfg, err := bncAssetCfgs(baseID, quoteID)
 	if err != nil {
@@ -1813,60 +1770,65 @@ func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quote
 	}
 	book := newBinanceOrderBook(baseCfg.conversionFactor, quoteCfg.conversionFactor, mktID, getSnapshot, bnc.log)
 	bnc.books[mktID] = book
+	marketStreamsURL := bnc.marketStreamsURL()
 	bnc.booksMtx.Unlock()
 
-	// Create initial connection to the market data stream
-	conn, cm, err := newConnection()
+	// Need to send key but not signature
+	connectEventFunc := func(cs comms.ConnectionStatus) {
+		if cs != comms.Disconnected && cs != comms.Connected {
+			return
+		}
+
+		// If disconnected, set all books to unsynced so bots
+		// will not place new orders.
+		connected := cs == comms.Connected
+
+		bnc.booksMtx.RLock()
+		defer bnc.booksMtx.RUnlock()
+
+		for _, b := range bnc.books {
+			select {
+			case b.connectedChan <- connected:
+			default: // don't block
+			}
+		}
+	}
+
+	reconnectInterval := 12 * time.Hour
+	conn, err := comms.NewWsConn(&comms.WsCfg{
+		URL: marketStreamsURL,
+		// Binance Docs: The websocket server will send a ping frame every 3
+		// minutes. If the websocket server does not receive a pong frame
+		// back from the connection within a 10 minute period, the connection
+		// will be disconnected. Unsolicited pong frames are allowed.
+		PingWait:     time.Minute * 4,
+		EchoPingData: true,
+		ReconnectSync: func() {
+			bnc.log.Debugf("Binance reconnected")
+		},
+		ConnectEventFunc: connectEventFunc,
+		Logger:           bnc.log.SubLogger("BNCBOOK"),
+		RawHandler:       bnc.handleMarketDataNote,
+		AutoReconnect:    &reconnectInterval,
+	})
 	if err != nil {
-		return fmt.Errorf("error connecting to market data stream : %v", err)
+		return err
+	}
+
+	cm := dex.NewConnectionMaster(conn)
+	if err = cm.ConnectOnce(ctx); err != nil {
+		return fmt.Errorf("websocketHandler remote connect: %v", err)
 	}
 
 	bnc.marketStream = conn
 
 	book.sync(ctx)
 
-	// Start a goroutine to reconnect every 12 hours
 	go func() {
-		reconnect := func() error {
-			bnc.marketStreamMtx.Lock()
-			defer bnc.marketStreamMtx.Unlock()
-
-			oldCm := cm
-			conn, cm, err = newConnection()
-			if err != nil {
-				return err
-			}
-
-			if oldCm != nil {
-				oldCm.Disconnect()
-			}
-
-			bnc.marketStream = conn
-			return nil
-		}
-
 		checkSubsInterval := time.Minute
 		checkSubs := time.After(checkSubsInterval)
-		reconnectTimer := time.After(time.Hour * 12)
 		for {
 			select {
-			case <-reconnectC:
-				if err := reconnect(); err != nil {
-					bnc.log.Errorf("Error reconnecting: %v", err)
-					reconnectTimer = time.After(time.Second * 30)
-					checkSubs = make(<-chan time.Time)
-					continue
-				}
-				checkSubs = time.After(checkSubsInterval)
-			case <-reconnectTimer:
-				if err := reconnect(); err != nil {
-					bnc.log.Errorf("Error refreshing connection: %v", err)
-					reconnectTimer = time.After(time.Second * 30)
-					checkSubs = make(<-chan time.Time)
-					continue
-				}
-				reconnectTimer = time.After(time.Hour * 12)
-				checkSubs = time.After(checkSubsInterval)
 			case <-checkSubs:
 				if err := bnc.checkSubs(ctx); err != nil {
 					bnc.log.Errorf("Error checking subscriptions: %v", err)
@@ -1934,6 +1896,7 @@ func (bnc *binance) UnsubscribeMarket(baseID, quoteID uint32) (err error) {
 		unsubscribe = true
 		delete(bnc.books, mktID)
 		closer = book.cm
+		bnc.marketStream.UpdateURL(bnc.marketStreamsURL())
 	}
 	book.mtx.Unlock()
 

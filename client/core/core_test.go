@@ -346,6 +346,8 @@ func (conn *TWebsocket) Connect(context.Context) (*sync.WaitGroup, error) {
 	return &sync.WaitGroup{}, conn.connectErr
 }
 
+func (conn *TWebsocket) UpdateURL(rawURL string) {}
+
 type TDB struct {
 	updateWalletErr          error
 	acct                     *db.AccountInfo
