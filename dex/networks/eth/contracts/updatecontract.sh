@@ -24,6 +24,8 @@ fi
 
 mkdir temp
 
+git clone -b releases/v0.6 git@github.com:eth-infinitism/account-abstraction.git ./temp/aa
+
 solc --abi --bin --bin-runtime --overwrite --optimize ${SOLIDITY_FILE} -o ./temp/
 BYTECODE=$(<./temp/${CONTRACT_NAME}.bin-runtime)
 

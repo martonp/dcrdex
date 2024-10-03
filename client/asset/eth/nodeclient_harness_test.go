@@ -1705,6 +1705,122 @@ func testRedeem(t *testing.T, assetID uint32) {
 	}
 }
 
+func testGaslessRedeem(t *testing.T) {
+	lockTime := uint64(time.Now().Add(12 * secPerBlock).Unix())
+	numSecrets := 10
+	secrets := make([][32]byte, 0, numSecrets)
+	secretHashes := make([][32]byte, 0, numSecrets)
+	for i := 0; i < numSecrets; i++ {
+		var secret [32]byte
+		copy(secret[:], encode.RandomBytes(32))
+		secretHash := sha256.Sum256(secret[:])
+		secrets = append(secrets, secret)
+		secretHashes = append(secretHashes, secretHash)
+	}
+
+	tests := []struct {
+		name               string
+		sleepNBlocks       int
+		redeemerClient     ethFetcher
+		redeemer           *accounts.Account
+		redeemerContractor contractor
+		swaps              []*asset.Contract
+		redemptions        []*asset.Redemption
+		finalStates        []dexeth.SwapStep
+		addAmt             bool
+		expectRedeemErr    bool
+	}{
+		{
+			name:               "ok before locktime",
+			sleepNBlocks:       8,
+			redeemerClient:     participantEthClient,
+			redeemer:           participantAcct,
+			redeemerContractor: pc,
+			swaps:              []*asset.Contract{newContract(lockTime, secretHashes[0], 1)},
+			redemptions:        []*asset.Redemption{newRedeem(secrets[0], secretHashes[0])},
+			finalStates:        []dexeth.SwapStep{dexeth.SSRedeemed},
+			addAmt:             true,
+		},
+	}
+
+	for _, test := range tests {
+		var optsVal uint64
+		for i, contract := range test.swaps {
+			swap, err := c.swap(ctx, bytesToArray(test.swaps[i].SecretHash))
+			if err != nil {
+				t.Fatal("unable to get swap state")
+			}
+			state := dexeth.SwapStep(swap.State)
+			if state != dexeth.SSNone {
+				t.Fatalf("unexpected swap state for test %v: want %s got %s", test.name, dexeth.SSNone, state)
+			}
+			if isETH {
+				optsVal += contract.Value
+			}
+		}
+
+		balance := func() (*big.Int, error) {
+			return test.redeemerClient.addressBalance(ctx, test.redeemerClient.address())
+		}
+		if !isETH {
+			balance = func() (*big.Int, error) {
+				return test.redeemerContractor.(tokenContractor).balance(ctx)
+			}
+		}
+
+		txOpts, err := test.redeemerClient.txOpts(ctx, optsVal, gases.SwapN(len(test.swaps)), dexeth.GweiToWei(maxFeeRate), nil, nil)
+		if err != nil {
+			t.Fatalf("%s: txOpts error: %v", test.name, err)
+		}
+		tx, err := test.redeemerContractor.initiate(txOpts, test.swaps)
+		if err != nil {
+			t.Fatalf("%s: initiate error: %v ", test.name, err)
+		}
+
+		// This waitForMined will always take test.sleepNBlocks to complete.
+		if err := waitForMined(); err != nil {
+			t.Fatalf("%s: post-init mining error: %v", test.name, err)
+		}
+
+		receipt, err := waitForReceipt(test.redeemerClient, tx)
+		if err != nil {
+			t.Fatalf("%s: failed to get init receipt: %v", test.name, err)
+		}
+		spew.Dump(receipt)
+
+		err = checkTxStatus(receipt, txOpts.GasLimit)
+		if err != nil {
+			t.Fatalf("%s: failed init transaction status: %v", test.name, err)
+		}
+
+		fmt.Printf("Gas used for %d inits: %d \n", len(test.swaps), receipt.GasUsed)
+
+		for i := range test.swaps {
+			swap, err := test.redeemerContractor.swap(ctx, bytesToArray(test.swaps[i].SecretHash))
+			if err != nil {
+				t.Fatal("unable to get swap state")
+			}
+			if swap.State != dexeth.SSInitiated {
+				t.Fatalf("unexpected swap state for test %v: want %s got %s", test.name, dexeth.SSInitiated, swap.State)
+			}
+		}
+
+		var originalParentBal *big.Int
+		if !isETH {
+			originalParentBal, err = test.redeemerClient.addressBalance(ctx, test.redeemerClient.address())
+			if err != nil {
+				t.Fatalf("%s: eth balance error: %v", test.name, err)
+			}
+		}
+
+		originalBal, err := balance()
+		if err != nil {
+			t.Fatalf("%s: balance error: %v", test.name, err)
+		}
+
+	}
+}
+
 func testRefundGas(t *testing.T, assetID uint32) {
 	if assetID != BipID {
 		prepareTokenClients(t)
