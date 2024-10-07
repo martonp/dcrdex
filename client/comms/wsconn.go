@@ -119,9 +119,9 @@ type WsCfg struct {
 	// latency.
 	PingWait time.Duration
 
-	// AutoReconnect, if non-nil, will reconnect to the server after each
+	// AutoReconnect, if non-zero, will reconnect to the server after each
 	// interval of the amount of time specified.
-	AutoReconnect *time.Duration
+	AutoReconnect time.Duration
 
 	// The server's certificate.
 	Cert []byte
@@ -166,7 +166,7 @@ type wsConn struct {
 	cfg    *WsCfg
 	tlsCfg *tls.Config
 	readCh chan *msgjson.Message
-	URL    atomic.Value // string
+	urlV   atomic.Value // string
 
 	wsMtx sync.Mutex
 	ws    *websocket.Conn
@@ -177,6 +177,7 @@ type wsConn struct {
 	respHandlers map[uint64]*responseHandler
 
 	reconnectCh chan struct{} // trigger for immediate reconnect
+	connected   atomic.Int64
 }
 
 var _ WsConn = (*wsConn)(nil)
@@ -218,14 +219,17 @@ func NewWsConn(cfg *WsCfg) (WsConn, error) {
 		reconnectCh:  make(chan struct{}, 1),
 	}
 
-	conn.URL.Store(cfg.URL)
+	conn.urlV.Store(cfg.URL)
 
 	return conn, nil
 }
 
-// UpdateURL updates the URL that the connection uses when reconnecting.
-func (conn *wsConn) UpdateURL(rawURL string) {
-	conn.URL.Store(rawURL)
+func (conn *wsConn) UpdateURL(uri string) {
+	conn.urlV.Store(uri)
+}
+
+func (conn *wsConn) url() string {
+	return conn.urlV.Load().(string)
 }
 
 // IsDown indicates if the connection is known to be down.
@@ -255,7 +259,7 @@ func (conn *wsConn) connect(ctx context.Context) error {
 		dialer.Proxy = http.ProxyFromEnvironment
 	}
 
-	ws, _, err := dialer.DialContext(ctx, conn.URL.Load().(string), conn.cfg.ConnectHeaders)
+	ws, _, err := dialer.DialContext(ctx, conn.url(), conn.cfg.ConnectHeaders)
 	if err != nil {
 		if isErrorInvalidCert(err) {
 			conn.setConnectionStatus(InvalidCert)
@@ -267,6 +271,7 @@ func (conn *wsConn) connect(ctx context.Context) error {
 		conn.setConnectionStatus(Disconnected)
 		return err
 	}
+	conn.connected.Store(time.Now().Unix())
 
 	// Set the initial read deadline for the first ping. Subsequent read
 	// deadlines are set in the ping handler.
@@ -318,9 +323,9 @@ func (conn *wsConn) connect(ctx context.Context) error {
 	go func() {
 		defer conn.wg.Done()
 		if conn.cfg.RawHandler != nil {
-			conn.readRaw(ctx, ws)
+			conn.readRaw(ctx)
 		} else {
-			conn.read(ctx, ws)
+			conn.read(ctx)
 		}
 	}()
 
@@ -346,7 +351,7 @@ func (conn *wsConn) handleReadError(err error) {
 
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		conn.log.Errorf("Read timeout on connection to %s.", conn.URL.Load().(string))
+		conn.log.Errorf("Read timeout on connection to %s.", conn.url())
 		reconnect()
 		return
 	}
@@ -387,110 +392,75 @@ func (conn *wsConn) close() {
 	conn.ws.Close()
 }
 
-func (conn *wsConn) readRaw(ctx context.Context, ws *websocket.Conn) {
-	var reconnectTimer <-chan time.Time
-	if conn.cfg.AutoReconnect != nil {
-		reconnectTimer = time.After(*conn.cfg.AutoReconnect)
-	}
-
-	type readResult struct {
-		msgBytes []byte
-		err      error
-	}
-
-	readMessage := func() chan *readResult {
-		ch := make(chan *readResult, 1)
-		go func() {
-			_, msgBytes, err := ws.ReadMessage()
-			ch <- &readResult{msgBytes, err}
-		}()
-		return ch
-	}
-
+func (conn *wsConn) readRaw(ctx context.Context) {
 	for {
-		select {
-		case result := <-readMessage():
-			if ctx.Err() != nil {
-				return
-			}
-			if result.err != nil {
-				conn.handleReadError(result.err)
-				return
-			}
-			conn.cfg.RawHandler(result.msgBytes)
-		case <-reconnectTimer:
-			conn.reconnectCh <- struct{}{}
-			return
-		case <-ctx.Done():
+		// Lock since conn.ws may be set by connect.
+		conn.wsMtx.Lock()
+		ws := conn.ws
+		conn.wsMtx.Unlock()
+
+		// Block until a message is received or an error occurs.
+		_, msgBytes, err := ws.ReadMessage()
+		// Drop the read error on context cancellation.
+		if ctx.Err() != nil {
 			return
 		}
+		if err != nil {
+			conn.handleReadError(err)
+			return
+		}
+		conn.cfg.RawHandler(msgBytes)
 	}
 }
 
 // read fetches and parses incoming messages for processing. This should be
 // run as a goroutine. Increment the wg before calling read.
-func (conn *wsConn) read(ctx context.Context, ws *websocket.Conn) {
-	var reconnectTimer <-chan time.Time
-	if conn.cfg.AutoReconnect != nil {
-		reconnectTimer = time.After(*conn.cfg.AutoReconnect)
-	}
-
-	type readResult struct {
-		msg *msgjson.Message
-		err error
-	}
-
-	readMessage := func() chan *readResult {
-		ch := make(chan *readResult, 1)
-		go func() {
-			msg := new(msgjson.Message)
-			err := ws.ReadJSON(msg)
-			ch <- &readResult{msg, err}
-		}()
-		return ch
-	}
-
+func (conn *wsConn) read(ctx context.Context) {
 	for {
-		select {
-		case result := <-readMessage():
-			if ctx.Err() != nil {
-				return
-			}
-			if result.err != nil {
-				var mErr *json.UnmarshalTypeError
-				if errors.As(result.err, &mErr) {
-					// JSON decode errors are not fatal, log and proceed.
-					conn.log.Errorf("json decode error: %v", mErr)
-					continue
-				}
-				conn.handleReadError(result.err)
-				return
-			}
-			// If the message is a response, find the handler.
-			if result.msg.Type == msgjson.Response {
-				handler := conn.respHandler(result.msg.ID)
-				if handler == nil {
-					b, _ := json.Marshal(result.msg)
-					conn.log.Errorf("No handler found for response: %v", string(b))
-					continue
-				}
-				// Run handlers in a goroutine so that other messages can be
-				// received. Include the handler goroutines in the WaitGroup to
-				// allow them to complete if the connection master desires.
-				conn.wg.Add(1)
-				go func() {
-					defer conn.wg.Done()
-					handler.f(result.msg)
-				}()
-				continue
-			}
-			conn.readCh <- result.msg
-		case <-reconnectTimer:
-			conn.reconnectCh <- struct{}{}
-			return
-		case <-ctx.Done():
+		msg := new(msgjson.Message)
+
+		// Lock since conn.ws may be set by connect.
+		conn.wsMtx.Lock()
+		ws := conn.ws
+		conn.wsMtx.Unlock()
+
+		// The read itself does not require locking since only this goroutine
+		// uses read functions that are not safe for concurrent use.
+		err := ws.ReadJSON(msg)
+		// Drop the read error on context cancellation.
+		if ctx.Err() != nil {
 			return
 		}
+		if err != nil {
+			var mErr *json.UnmarshalTypeError
+			if errors.As(err, &mErr) {
+				// JSON decode errors are not fatal, log and proceed.
+				conn.log.Errorf("json decode error: %v", mErr)
+				continue
+			}
+			conn.handleReadError(err)
+			return
+		}
+
+		// If the message is a response, find the handler.
+		if msg.Type == msgjson.Response {
+			handler := conn.respHandler(msg.ID)
+			if handler == nil {
+				b, _ := json.Marshal(msg)
+				conn.log.Errorf("No handler found for response: %v", string(b))
+				continue
+			}
+			// Run handlers in a goroutine so that other messages can be
+			// received. Include the handler goroutines in the WaitGroup to
+			// allow them to complete if the connection master desires.
+			conn.wg.Add(1)
+			go func() {
+				defer conn.wg.Done()
+				handler.f(msg)
+			}()
+			continue
+		}
+		conn.readCh <- msg
 	}
 }
 
@@ -507,11 +477,11 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 				return
 			}
 
-			conn.log.Infof("Attempting to reconnect to %s...", conn.URL.Load().(string))
+			conn.log.Infof("Attempting to reconnect to %s...", conn.url())
 			err := conn.connect(ctx)
 			if err != nil {
 				conn.log.Errorf("Reconnect failed. Scheduling reconnect to %s in %.1f seconds.",
-					conn.URL.Load().(string), rcInt.Seconds())
+					conn.url(), rcInt.Seconds())
 				time.AfterFunc(rcInt, func() {
 					conn.reconnectCh <- struct{}{}
 				})
@@ -529,6 +499,7 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 			if conn.cfg.ReconnectSync != nil {
 				conn.cfg.ReconnectSync()
 			}
+
 		case <-ctx.Done():
 			return
 		}
@@ -599,6 +570,29 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 
 		close(conn.readCh) // signal to MessageSource receivers that the wsConn is dead
 	}()
+
+	if interval := conn.cfg.AutoReconnect; interval > 0 {
+		conn.wg.Add(1)
+		go func() {
+			defer conn.wg.Done()
+			tick := time.After(interval)
+			for {
+				select {
+				case <-tick:
+				case <-ctx.Done():
+					return
+				}
+				lastConnect := time.Unix(conn.connected.Load(), 0)
+				if since := time.Since(lastConnect); since >= interval {
+					conn.reconnectCh <- struct{}{}
+					tick = time.After(interval)
+				} else {
+					tick = time.After(interval - since)
+				}
+			}
+
+		}()
+	}
 
 	return &conn.wg, err
 }
