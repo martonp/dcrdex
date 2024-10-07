@@ -1809,7 +1809,7 @@ func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quote
 		ConnectEventFunc: connectEventFunc,
 		Logger:           bnc.log.SubLogger("BNCBOOK"),
 		RawHandler:       bnc.handleMarketDataNote,
-		AutoReconnect:    reconnectInterval,
+		AutoReconnect:    &reconnectInterval,
 	})
 	if err != nil {
 		return err
