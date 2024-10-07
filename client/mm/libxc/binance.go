@@ -659,15 +659,15 @@ func (bnc *binance) getMarkets(ctx context.Context) (map[string]*bntypes.Market,
 func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	wg := new(sync.WaitGroup)
 
-	if err := bnc.getCoinInfo(ctx); err != nil {
+	/*if err := bnc.getCoinInfo(ctx); err != nil {
 		return nil, fmt.Errorf("error getting coin info: %v", err)
-	}
+	}*/
 
 	if _, err := bnc.getMarkets(ctx); err != nil {
 		return nil, fmt.Errorf("error getting markets: %v", err)
 	}
 
-	if err := bnc.setBalances(ctx); err != nil {
+	/*if err := bnc.setBalances(ctx); err != nil {
 		return nil, err
 	}
 
@@ -693,7 +693,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 				return
 			}
 		}
-	}()
+	}()*/
 
 	// Refresh the markets periodically.
 	wg.Add(1)
@@ -717,7 +717,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	}()
 
 	// Refresh the coin info periodically.
-	wg.Add(1)
+	/*wg.Add(1)
 	go func() {
 		defer wg.Done()
 		nextTick := time.After(time.Hour)
@@ -735,7 +735,7 @@ func (bnc *binance) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 				return
 			}
 		}
-	}()
+	}()*/
 
 	return wg, nil
 }
@@ -1794,7 +1794,7 @@ func (bnc *binance) connectToMarketDataStream(ctx context.Context, baseID, quote
 		}
 	}
 
-	reconnectInterval := 12 * time.Hour
+	reconnectInterval := time.Minute
 	conn, err := comms.NewWsConn(&comms.WsCfg{
 		URL: marketStreamsURL,
 		// Binance Docs: The websocket server will send a ping frame every 3

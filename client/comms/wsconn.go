@@ -433,6 +433,7 @@ func genericRead[T any](ctx context.Context,
 
 			handleResp(result.msg)
 		case <-reconnectTimer:
+			fmt.Println("~~~~ auto reconnect ~~~~")
 			reconnect()
 			return
 		case <-ctx.Done():

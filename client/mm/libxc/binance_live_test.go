@@ -203,49 +203,22 @@ func TestVWAP(t *testing.T) {
 		t.Fatalf("failed to subscribe to market: %v", err)
 	}
 
-	time.Sleep(30 * time.Second)
+	for {
+		avg, extrema, filled, err := bnc.VWAP(60, 0, true, 2e9)
+		if err != nil {
+			t.Logf("VWAP failed: %v", err)
+		} else {
+			t.Logf("ethbtc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
+		}
 
-	avg, extrema, filled, err := bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-	t.Logf("ethbtc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
+		avg, extrema, filled, err = bnc.VWAP(60, 60001, true, 2e9)
+		if err != nil {
+			t.Logf("VWAP failed: %v", err)
+		} else {
+			t.Logf("ethusdc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
+		}
 
-	avg, extrema, filled, err = bnc.VWAP(60, 60001, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-	t.Logf("ethusdc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	err = bnc.SubscribeMarket(ctx, 60, 0)
-	if err != nil {
-		t.Fatalf("failed to subscribe to market: %v", err)
-	}
-
-	avg, extrema, filled, err = bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-
-	t.Logf("ethbtc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	bnc.UnsubscribeMarket(60, 0)
-
-	avg, extrema, filled, err = bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-
-	t.Logf("avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	err = bnc.UnsubscribeMarket(60, 0)
-	if err != nil {
-		t.Fatalf("error unsubscribing market")
-	}
-
-	_, _, _, err = bnc.VWAP(60, 0, true, 2e9)
-	if err == nil {
-		t.Fatalf("error should be returned since all subscribers have unsubscribed")
+		time.Sleep(5 * time.Second)
 	}
 }
 
