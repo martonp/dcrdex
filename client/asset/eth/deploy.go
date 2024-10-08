@@ -205,7 +205,7 @@ func (contractDeployer) DeployContract(
 		switch contractVer {
 		case 0:
 			deployer = func(txOpts *bind.TransactOpts, cb bind.ContractBackend) (common.Address, *types.Transaction, error) {
-				contractAddr, tx, _, err := ethv0.DeployETHSwap(txOpts, cb)
+				contractAddr, tx, _, err := ethv0.DeployETHSwap(txOpts, cb, tokenAddress)
 				return contractAddr, tx, err
 			}
 		}
@@ -219,7 +219,7 @@ func (contractDeployer) DeployContract(
 
 type deployerFunc func(txOpts *bind.TransactOpts, cb bind.ContractBackend) (common.Address, *types.Transaction, error)
 
-// DeployContract deployes a dcrdex swap contract.
+// DeployContract deploys a dcrdex swap contract.
 func (contractDeployer) deployContract(
 	ctx context.Context,
 	txData []byte,

@@ -8,6 +8,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"decred.org/dcrdex/dex/encode"
@@ -37,10 +39,10 @@ import (
 var alphaHTTPAddress = "http://localhost:38556"
 
 type rpcRequest struct {
-	JSONRPC string        `json:"jsonrpc"`
-	ID      int           `json:"id"`
-	Method  string        `json:"method"`
-	Params  []interface{} `json:"params"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
 }
 
 type rpcResponse struct {
@@ -132,7 +134,7 @@ func newBundler(privKey string) (*bundler, error) {
 		"eth_supportedEntryPoints":     b.handleSupportedEntryPoints,
 		"eth_getUserOperationByHash":   unsupportedEndpoint,
 		"eth_sendUserOperation":        b.handleSendUserOperation,
-		"eth_estimateUserOperationGas": unsupportedEndpoint,
+		"eth_estimateUserOperationGas": b.handleEstimateUserOperationGas,
 	}
 
 	return b, nil
@@ -185,45 +187,46 @@ type userOperationParam struct {
 	Signature            string `json:"signature"`
 }
 
+func decodeBig(val string) (*big.Int, error) {
+	if val == "" {
+		return new(big.Int), nil
+	}
+
+	return hexutil.DecodeBig(val)
+}
+
 func (param *userOperationParam) userOp() (*UserOperation, error) {
 	sender := common.HexToAddress(param.Sender)
 
-	nonce := new(big.Int)
-	nonce, ok := nonce.SetString(param.Nonce, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid nonce: %s", param.Nonce)
+	nonce, err := decodeBig(param.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("invalid nonce: %v", err)
 	}
 
-	callGasLimit := new(big.Int)
-	callGasLimit, ok = callGasLimit.SetString(param.CallGasLimit, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid call gas limit: %s", param.CallGasLimit)
+	callGasLimit, err := decodeBig(param.CallGasLimit)
+	if err != nil {
+		return nil, fmt.Errorf("invalid call gas limit: %v", err)
 	}
 
-	verificationGasLimit := new(big.Int)
-	verificationGasLimit, ok = verificationGasLimit.SetString(param.VerificationGasLimit, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid verification gas limit: %s", param.VerificationGasLimit)
+	verificationGasLimit, err := decodeBig(param.VerificationGasLimit)
+	if err != nil {
+		return nil, fmt.Errorf("invalid verification gas limit: %v", err)
 	}
 
-	preVerificationGas := new(big.Int)
-	preVerificationGas, ok = preVerificationGas.SetString(param.PreVerificationGas, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid pre verification gas: %s", param.PreVerificationGas)
+	preVerificationGas, err := decodeBig(param.PreVerificationGas)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pre verification gas: %v", err)
 	}
 
-	maxFeePerGas := new(big.Int)
-	maxFeePerGas, ok = maxFeePerGas.SetString(param.MaxFeePerGas, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid max fee per gas: %s", param.MaxFeePerGas)
+	maxFeePerGas, err := decodeBig(param.MaxFeePerGas)
+	if err != nil {
+		return nil, fmt.Errorf("invalid max fee per gas: %v", err)
 	}
 
-	maxPriorityFeePerGas := new(big.Int)
-	maxPriorityFeePerGas, ok = maxPriorityFeePerGas.SetString(param.MaxPriorityFeePerGas, 16)
-	if !ok {
-		return nil, fmt.Errorf("invalid max priority fee per gas: %s", param.MaxPriorityFeePerGas)
+	maxPriorityFeePerGas, err := decodeBig(param.MaxPriorityFeePerGas)
+	if err != nil {
+		return nil, fmt.Errorf("invalid max priority fee per gas: %v", err)
 	}
-
 	return &UserOperation{
 		Sender:               sender,
 		Nonce:                nonce,
@@ -291,7 +294,12 @@ func (b *bundler) newTxOpts() (*bind.TransactOpts, error) {
 		return nil, err
 	}
 
-	signer := types.LatestSigner(params.AllEthashProtocolChanges)
+	feeCap := new(big.Int).Mul(baseFees, big.NewInt(2))
+	if feeCap.Cmp(tipCap) < 0 {
+		feeCap.Set(tipCap)
+	}
+
+	signer := types.LatestSigner(b.chainCfg)
 
 	return &bind.TransactOpts{
 		From:  b.address,
@@ -299,40 +307,84 @@ func (b *bundler) newTxOpts() (*bind.TransactOpts, error) {
 		Signer: func(address common.Address, tx *types.Transaction) (*types.Transaction, error) {
 			return types.SignTx(tx, signer, b.pk)
 		},
-		GasFeeCap: new(big.Int).Mul(baseFees, big.NewInt(2)),
-		GasTipCap: new(big.Int).Mul(tipCap, big.NewInt(2)),
-		GasLimit:  500_000, // TODO
+		// GasFeeCap: feeCap,
+		// GasTipCap: tipCap,
+		GasLimit: 2_000_000, // TODO
 	}, nil
 }
 
+func parsePositionalArguments(rawArgs json.RawMessage, types []reflect.Type) ([]reflect.Value, error) {
+	dec := json.NewDecoder(bytes.NewReader(rawArgs))
+	var args []reflect.Value
+	tok, err := dec.Token()
+	switch {
+	case err == io.EOF || tok == nil && err == nil:
+		// "params" is optional and may be empty. Also allow "params":null even though it's
+		// not in the spec because our own client used to send it.
+	case err != nil:
+		return nil, err
+	case tok == json.Delim('['):
+		// Read argument array.
+		if args, err = parseArgumentArray(dec, types); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.New("non-array args")
+	}
+	// Set any missing args to nil.
+	for i := len(args); i < len(types); i++ {
+		if types[i].Kind() != reflect.Ptr {
+			return nil, fmt.Errorf("missing value for required argument %d", i)
+		}
+		args = append(args, reflect.Zero(types[i]))
+	}
+	return args, nil
+}
+
+func parseArgumentArray(dec *json.Decoder, types []reflect.Type) ([]reflect.Value, error) {
+	args := make([]reflect.Value, 0, len(types))
+	for i := 0; dec.More(); i++ {
+		if i >= len(types) {
+			return args, fmt.Errorf("too many arguments, want at most %d", len(types))
+		}
+		argval := reflect.New(types[i])
+		if err := dec.Decode(argval.Interface()); err != nil {
+			return args, fmt.Errorf("invalid argument %d: %v", i, err)
+		}
+		if argval.IsNil() && types[i].Kind() != reflect.Ptr {
+			return args, fmt.Errorf("missing value for required argument %d", i)
+		}
+		args = append(args, argval.Elem())
+	}
+	// Read end of args array.
+	_, err := dec.Token()
+	return args, err
+}
+
 func (b *bundler) handleSendUserOperation(w http.ResponseWriter, req *rpcRequest) {
-	userOpB, ok := req.Params[0].([]byte)
-	if !ok {
-		http.Error(w, "Invalid user operation", http.StatusBadRequest)
-	}
+	fmt.Println("Handling send user operation ~~")
 
-	var op userOperationParam
-	if err := json.Unmarshal(userOpB, &op); err != nil {
-		http.Error(w, "Error unmarshalling user operation", http.StatusBadRequest)
-		return
-	}
+	op := userOperationParam{}
 
-	// second param is string specifying the entry point address. If not
-	// equal to the entrypoint address, return an error.
-	entryPointAddr, ok := req.Params[1].(string)
-	if !ok {
-		http.Error(w, "Invalid entry point address", http.StatusBadRequest)
-		return
-	}
-
-	if entryPointAddr != b.entryPointAddress.String() {
-		http.Error(w, "Invalid entry point address", http.StatusBadRequest)
-		return
-	}
-
-	userOp, err := op.userOp()
+	vals, err := parsePositionalArguments(req.Params, []reflect.Type{reflect.TypeOf(op), reflect.TypeOf("")})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	op, ok := vals[0].Interface().(userOperationParam)
+	if !ok {
+		http.Error(w, "Invalid user operation", http.StatusBadRequest)
+		return
+	}
+
+	entryPointAddress, ok := vals[1].Interface().(string)
+	if !ok {
+		http.Error(w, "Invalid entry point address", http.StatusBadRequest)
+		return
+	}
+	if common.HexToAddress(entryPointAddress) != b.entryPointAddress {
+		http.Error(w, "Unsupported entry point", http.StatusBadRequest)
 		return
 	}
 
@@ -342,8 +394,15 @@ func (b *bundler) handleSendUserOperation(w http.ResponseWriter, req *rpcRequest
 		return
 	}
 
+	userOp, err := op.userOp()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	tx, err := b.entryPoint.HandleOps(txOpts, []UserOperation{*userOp}, b.address)
 	if err != nil {
+		fmt.Printf("Error sending user op: %v\n", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -390,8 +449,15 @@ func (b *bundler) handleSupportedEntryPoints(w http.ResponseWriter, req *rpcRequ
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-
 	w.Write(respBytes)
+}
+
+func (b *bundler) handleEstimateUserOperationGas(w http.ResponseWriter, req *rpcRequest) {
+	type estimateGasResponse struct {
+		PreVerificationGas   uint64 `json:"preVerificationGas"`
+		VerificationGasLimit uint64 `json:"verificationGasLimit"`
+		CallGasLimit         uint64 `json:"callGasLimit"`
+	}
 }
 
 func (b *bundler) handleRequest(w http.ResponseWriter, reqBody []byte) bool {

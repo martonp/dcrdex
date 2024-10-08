@@ -15,18 +15,18 @@ fi
 VERSION=$1
 PKG_NAME=v${VERSION}
 CONTRACT_NAME=ETHSwap
-SOLIDITY_FILE=./${CONTRACT_NAME}V${VERSION}.sol
+SOLIDITY_FILE=./${PKG_NAME}/contracts/${CONTRACT_NAME}V${VERSION}.sol
 if [ ! -f ${SOLIDITY_FILE} ]
 then
     echo "${SOLIDITY_FILE} does not exist" >&2
     exit 1
 fi
 
+cd ./${PKG_NAME} && npm install && cd ../
+
 mkdir temp
 
-git clone -b releases/v0.6 git@github.com:eth-infinitism/account-abstraction.git ./temp/aa
-
-solc --abi --bin --bin-runtime --overwrite --optimize ${SOLIDITY_FILE} -o ./temp/
+solc --abi --bin --bin-runtime --overwrite --optimize --base-path ./${PKG_NAME}/node_modules ${SOLIDITY_FILE} -o ./temp/
 BYTECODE=$(<./temp/${CONTRACT_NAME}.bin-runtime)
 
 cat > "./${PKG_NAME}/BinRuntimeV${VERSION}.go" <<EOF

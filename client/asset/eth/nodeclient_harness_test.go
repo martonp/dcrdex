@@ -47,6 +47,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
@@ -1705,7 +1706,7 @@ func testRedeem(t *testing.T, assetID uint32) {
 	}
 }
 
-func testGaslessRedeem(t *testing.T) {
+func TestGaslessRedeem(t *testing.T) {
 	lockTime := uint64(time.Now().Add(12 * secPerBlock).Unix())
 	numSecrets := 10
 	secrets := make([][32]byte, 0, numSecrets)
@@ -1717,6 +1718,8 @@ func testGaslessRedeem(t *testing.T) {
 		secrets = append(secrets, secret)
 		secretHashes = append(secretHashes, secretHash)
 	}
+	gases := ethGases
+	c, pc := simnetContractor, participantContractor
 
 	tests := []struct {
 		name               string
@@ -1725,7 +1728,7 @@ func testGaslessRedeem(t *testing.T) {
 		redeemer           *accounts.Account
 		redeemerContractor contractor
 		swaps              []*asset.Contract
-		redemptions        []*asset.Redemption
+		redemptions        []swapv0.ETHSwapRedemption
 		finalStates        []dexeth.SwapStep
 		addAmt             bool
 		expectRedeemErr    bool
@@ -1736,8 +1739,8 @@ func testGaslessRedeem(t *testing.T) {
 			redeemerClient:     participantEthClient,
 			redeemer:           participantAcct,
 			redeemerContractor: pc,
-			swaps:              []*asset.Contract{newContract(lockTime, secretHashes[0], 1)},
-			redemptions:        []*asset.Redemption{newRedeem(secrets[0], secretHashes[0])},
+			swaps:              []*asset.Contract{newContract(lockTime, secretHashes[0], 1e9)},
+			redemptions:        []swapv0.ETHSwapRedemption{{Secret: secrets[0], SecretHash: secretHashes[0]}},
 			finalStates:        []dexeth.SwapStep{dexeth.SSRedeemed},
 			addAmt:             true,
 		},
@@ -1745,6 +1748,7 @@ func testGaslessRedeem(t *testing.T) {
 
 	for _, test := range tests {
 		var optsVal uint64
+
 		for i, contract := range test.swaps {
 			swap, err := c.swap(ctx, bytesToArray(test.swaps[i].SecretHash))
 			if err != nil {
@@ -1754,18 +1758,11 @@ func testGaslessRedeem(t *testing.T) {
 			if state != dexeth.SSNone {
 				t.Fatalf("unexpected swap state for test %v: want %s got %s", test.name, dexeth.SSNone, state)
 			}
-			if isETH {
-				optsVal += contract.Value
-			}
+			optsVal += contract.Value
 		}
 
 		balance := func() (*big.Int, error) {
 			return test.redeemerClient.addressBalance(ctx, test.redeemerClient.address())
-		}
-		if !isETH {
-			balance = func() (*big.Int, error) {
-				return test.redeemerContractor.(tokenContractor).balance(ctx)
-			}
 		}
 
 		txOpts, err := test.redeemerClient.txOpts(ctx, optsVal, gases.SwapN(len(test.swaps)), dexeth.GweiToWei(maxFeeRate), nil, nil)
@@ -1805,20 +1802,65 @@ func testGaslessRedeem(t *testing.T) {
 			}
 		}
 
-		var originalParentBal *big.Int
-		if !isETH {
-			originalParentBal, err = test.redeemerClient.addressBalance(ctx, test.redeemerClient.address())
-			if err != nil {
-				t.Fatalf("%s: eth balance error: %v", test.name, err)
-			}
-		}
-
-		originalBal, err := balance()
+		preRedeemBal, err := balance()
 		if err != nil {
 			t.Fatalf("%s: balance error: %v", test.name, err)
 		}
 
+		abi, err := swapv0.ETHSwapMetaData.GetAbi()
+		if err != nil {
+			t.Fatalf("unable to get abi: %v", err)
+		}
+		callData, err := abi.Pack("redeemAA", test.redemptions)
+		if err != nil {
+			t.Fatalf("unable to pack call data: %v", err)
+		}
+		redeemGas := big.NewInt(int64(gases.Redeem * 5))
+		preVerificationGas := big.NewInt(int64(gases.Redeem * 5))
+		entryPoint := common.HexToAddress("0x0ab33178da901e8504a1de8d4d64dbb37cf6ab57")
+		bundler, err := newBundler(ctx, "http://localhost:38557", entryPoint, participantEthClient.contractBackend())
+		if err != nil {
+			t.Fatalf("error creating bundler: %v", err)
+		}
+		contractAddr, exists := dexeth.ContractAddresses[0][dex.Simnet]
+		if !exists {
+			t.Fatalf("contract address not found")
+		}
+		nonce, err := bundler.getNonce(&bind.CallOpts{Pending: false}, contractAddr, participantAddr)
+		if err != nil {
+			t.Fatalf("error getting nonce: %v", err)
+		}
+
+		fmt.Println("Nonce: ", hexutil.EncodeBig(nonce))
+		userOpParam := &UserOperationParam{
+			Nonce:                hexutil.EncodeBig(nonce),
+			Sender:               ethSwapContractAddr.Hex(),
+			CallData:             "0x" + hex.EncodeToString(callData),
+			CallGasLimit:         hexutil.EncodeBig(redeemGas),
+			VerificationGasLimit: hexutil.EncodeBig(redeemGas),
+			PreVerificationGas:   hexutil.EncodeBig(preVerificationGas),
+			Signature:            "0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c",
+		}
+		err = bundler.sendUserOp(ctx, userOpParam)
+		if err != nil {
+			t.Fatalf("error sending user op: %v", err)
+		}
+
+		for i := 0; i < 30; i++ {
+			time.Sleep(1 * time.Second)
+
+			postRedeemBal, err := balance()
+			if err != nil {
+				t.Fatalf("balance error: %v", err)
+			}
+
+			if postRedeemBal.Cmp(preRedeemBal) != 0 {
+				fmt.Printf("Balance changed: %v -  %v\n", preRedeemBal, postRedeemBal)
+				break
+			}
+		}
 	}
+
 }
 
 func testRefundGas(t *testing.T, assetID uint32) {
