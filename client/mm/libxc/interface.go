@@ -48,6 +48,8 @@ type Market struct {
 	Day              *MarketDay `json:"day"`
 	BaseMinWithdraw  uint64     `json:"baseMinWithdraw"`
 	QuoteMinWithdraw uint64     `json:"quoteMinWithdraw"`
+	BaseWithdrawFee  uint64     `json:"baseWithdrawFee"`
+	QuoteWithdrawFee uint64     `json:"quoteWithdrawFee"`
 }
 
 type Status struct {
