@@ -69,12 +69,10 @@ type tCore struct {
 	assetBalances     map[uint32]*core.WalletBalance
 	assetBalanceErr   error
 	market            *core.Market
-	singleLotSellFees *orderFees
-	singleLotBuyFees  *orderFees
+	singleLotSellFees *OrderFees
+	singleLotBuyFees  *OrderFees
 	singleLotFeesErr  error
-	multiTradeResult  []*core.Order
-	multiTradeBuyErr  error
-	multiTradeSellErr error
+	multiTradeResult  []*core.MultiTradeResult
 	noteFeed          chan core.Notification
 	isAccountLocker   map[uint32]bool
 	isWithdrawer      map[uint32]bool
@@ -151,15 +149,9 @@ func (c *tCore) Cancel(oidB dex.Bytes) error {
 func (c *tCore) AssetBalance(assetID uint32) (*core.WalletBalance, error) {
 	return c.assetBalances[assetID], c.assetBalanceErr
 }
-func (c *tCore) MultiTrade(pw []byte, forms *core.MultiTradeForm) ([]*core.Order, error) {
-	if forms.Sell && c.multiTradeSellErr != nil {
-		return nil, c.multiTradeSellErr
-	}
-	if !forms.Sell && c.multiTradeBuyErr != nil {
-		return nil, c.multiTradeBuyErr
-	}
+func (c *tCore) MultiTrade(pw []byte, forms *core.MultiTradeForm) []*core.MultiTradeResult {
 	c.multiTradesPlaced = append(c.multiTradesPlaced, forms)
-	return c.multiTradeResult, nil
+	return c.multiTradeResult
 }
 func (c *tCore) WalletTraits(assetID uint32) (asset.WalletTrait, error) {
 	isAccountLocker := c.isAccountLocker[assetID]
@@ -278,8 +270,8 @@ type tBotCoreAdaptor struct {
 	groupedBuys      map[uint64][]*core.Order
 	groupedSells     map[uint64][]*core.Order
 	orderUpdates     chan *core.Order
-	buyFees          *orderFees
-	sellFees         *orderFees
+	buyFees          *OrderFees
+	sellFees         *OrderFees
 	fiatExchangeRate uint64
 	buyFeesInBase    uint64
 	sellFeesInBase   uint64
@@ -309,7 +301,7 @@ func (c *tBotCoreAdaptor) ExchangeRateFromFiatSources() uint64 {
 	return c.fiatExchangeRate
 }
 
-func (c *tBotCoreAdaptor) OrderFees() (buyFees, sellFees *orderFees, err error) {
+func (c *tBotCoreAdaptor) OrderFees() (buyFees, sellFees *OrderFees, err error) {
 	return c.buyFees, c.sellFees, nil
 }
 
@@ -676,10 +668,11 @@ func (t *tExchangeAdaptor) timeStart() int64                         { return 0 
 func (t *tExchangeAdaptor) Book() (buys, sells []*core.MiniOrder, _ error) {
 	return nil, nil, nil
 }
-func (t *tExchangeAdaptor) sendStatsUpdate()             {}
-func (t *tExchangeAdaptor) withPause(func() error) error { return nil }
-func (t *tExchangeAdaptor) botCfg() *BotConfig           { return t.cfg }
-func (t *tExchangeAdaptor) problems() *BotProblems       { return nil }
+func (t *tExchangeAdaptor) sendStatsUpdate()                {}
+func (t *tExchangeAdaptor) withPause(func() error) error    { return nil }
+func (t *tExchangeAdaptor) botCfg() *BotConfig              { return t.cfg }
+func (t *tExchangeAdaptor) latestEpoch() *EpochReport       { return &EpochReport{} }
+func (t *tExchangeAdaptor) latestCEXProblems() *CEXProblems { return nil }
 
 func TestAvailableBalances(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

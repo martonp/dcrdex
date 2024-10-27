@@ -321,7 +321,7 @@ func (m *basicMarketMaker) orderPrice(basisPrice, feeAdj uint64, sell bool, gapF
 	return basisPrice - adj
 }
 
-func (m *basicMarketMaker) ordersToPlace() (buyOrders, sellOrders []*multiTradePlacement, err error) {
+func (m *basicMarketMaker) ordersToPlace() (buyOrders, sellOrders []*TradePlacement, err error) {
 	basisPrice, err := m.calculator.basisPrice()
 	if err != nil {
 		return nil, nil, err
@@ -343,8 +343,8 @@ func (m *basicMarketMaker) ordersToPlace() (buyOrders, sellOrders []*multiTradeP
 			m.name, m.fmtRate(basisPrice), m.fmtRate(feeAdj))
 	}
 
-	orders := func(orderPlacements []*OrderPlacement, sell bool) []*multiTradePlacement {
-		placements := make([]*multiTradePlacement, 0, len(orderPlacements))
+	orders := func(orderPlacements []*OrderPlacement, sell bool) []*TradePlacement {
+		placements := make([]*TradePlacement, 0, len(orderPlacements))
 		for i, p := range orderPlacements {
 			rate := m.orderPrice(basisPrice, feeAdj, sell, p.GapFactor)
 
@@ -357,9 +357,9 @@ func (m *basicMarketMaker) ordersToPlace() (buyOrders, sellOrders []*multiTradeP
 			if rate == 0 {
 				lots = 0
 			}
-			placements = append(placements, &multiTradePlacement{
-				rate: rate,
-				lots: lots,
+			placements = append(placements, &TradePlacement{
+				Rate: rate,
+				Lots: lots,
 			})
 		}
 		return placements
@@ -370,28 +370,6 @@ func (m *basicMarketMaker) ordersToPlace() (buyOrders, sellOrders []*multiTradeP
 	return buyOrders, sellOrders, nil
 }
 
-// updateBotProblems updates the bot problems based on the errors encountered
-// during the bot loop.
-func (m *basicMarketMaker) updateBotLoopProblems(buyErr, sellErr, determinePlacementsErr error, dexDefs map[uint32]uint64) {
-	m.unifiedExchangeAdaptor.updateBotProblems(func(problems *BotProblems) {
-		problems.clearEpochProblems()
-
-		if !updateBotProblemsBasedOnError(problems, buyErr) {
-			problems.PlaceBuyOrdersErr = buyErr
-		}
-
-		if !updateBotProblemsBasedOnError(problems, sellErr) {
-			problems.PlaceSellOrdersErr = sellErr
-		}
-
-		if !updateBotProblemsBasedOnError(problems, determinePlacementsErr) {
-			problems.DeterminePlacementsErr = determinePlacementsErr
-		}
-
-		problems.DEXBalanceDeficiencies = dexDefs
-	})
-}
-
 func (m *basicMarketMaker) rebalance(newEpoch uint64) {
 	if !m.rebalanceRunning.CompareAndSwap(false, true) {
 		return
@@ -400,33 +378,27 @@ func (m *basicMarketMaker) rebalance(newEpoch uint64) {
 
 	m.log.Tracef("rebalance: epoch %d", newEpoch)
 
-	if !m.checkBotHealth() {
+	if !m.checkBotHealth(newEpoch) {
 		m.tryCancelOrders(m.ctx, &newEpoch, false)
 		return
 	}
 
-	var buyErr, sellErr, determinePlacementsErr error
-	var dexDefs map[uint32]uint64
-	defer func() {
-		m.updateBotLoopProblems(buyErr, sellErr, determinePlacementsErr, dexDefs)
-	}()
-
+	var buysReport, sellsReport *OrderReport
 	buyOrders, sellOrders, determinePlacementsErr := m.ordersToPlace()
 	if determinePlacementsErr != nil {
 		m.tryCancelOrders(m.ctx, &newEpoch, false)
-		return
+	} else {
+		_, buysReport = m.multiTrade(buyOrders, false, m.cfg().DriftTolerance, newEpoch)
+		_, sellsReport = m.multiTrade(sellOrders, true, m.cfg().DriftTolerance, newEpoch)
 	}
 
-	_, buyDEXDefs, _, buyErr := m.multiTrade(buyOrders, false, m.cfg().DriftTolerance, newEpoch)
-	_, sellDEXDefs, _, sellErr := m.multiTrade(sellOrders, true, m.cfg().DriftTolerance, newEpoch)
-
-	dexDefs = make(map[uint32]uint64)
-	for k, v := range buyDEXDefs {
-		dexDefs[k] += v
+	epochReport := &EpochReport{
+		BuysReport:  buysReport,
+		SellsReport: sellsReport,
+		EpochNum:    newEpoch,
 	}
-	for k, v := range sellDEXDefs {
-		dexDefs[k] += v
-	}
+	epochReport.setPreOrderProblems(determinePlacementsErr)
+	m.updateEpochReport(epochReport)
 }
 
 func (m *basicMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {

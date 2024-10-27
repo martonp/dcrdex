@@ -9,7 +9,8 @@ import {
   OrderPlacement,
   AutoRebalanceConfig,
   CEXNotification,
-  BotProblemsNote
+  EpochReportNote,
+  CEXProblemsNote
 } from './registry'
 import {
   MM,
@@ -243,9 +244,13 @@ export default class MarketMakerPage extends BasePage {
         const bot = this.bots[hostedMarketID(note.host, note.baseID, note.quoteID)]
         if (bot) return bot.handleRunStats()
       },
-      botproblems: (note: BotProblemsNote) => {
+      epochreport: (note: EpochReportNote) => {
         const bot = this.bots[hostedMarketID(note.host, note.baseID, note.quoteID)]
-        if (bot) bot.handleBotProblemsNote(note)
+        if (bot) bot.handleEpochReportNote(note)
+      },
+      cexproblems: (note: CEXProblemsNote) => {
+        const bot = this.bots[hostedMarketID(note.host, note.baseID, note.quoteID)]
+        if (bot) bot.handleCexProblemsNote(note)
       },
       cexnote: (note: CEXNotification) => { this.handleCEXNote(note) }
       // TODO bot start-stop notification
@@ -416,7 +421,7 @@ class Bot extends BotMarket {
     const div = this.div = pg.page.botTmpl.cloneNode(true) as PageElement
     const page = this.page = Doc.parseTemplate(div)
 
-    this.runDisplay = new RunningMarketMakerDisplay(page.onBox, 'mm')
+    this.runDisplay = new RunningMarketMakerDisplay(page.onBox, pg.forms, pg.page.orderReportForm, 'mm')
 
     setMarketElements(div, baseID, quoteID, host)
     if (cexName) setCexElements(div, cexName)
@@ -814,8 +819,12 @@ class Bot extends BotMarket {
     app().loadPage('mmsettings', { host, baseID, quoteID, cexName, botType })
   }
 
-  handleBotProblemsNote (note: BotProblemsNote) {
-    this.runDisplay.handleBotProblemsNote(note)
+  handleEpochReportNote (note: EpochReportNote) {
+    this.runDisplay.handleEpochReportNote(note)
+  }
+
+  handleCexProblemsNote (note: CEXProblemsNote) {
+    this.runDisplay.handleCexProblemsNote(note)
   }
 
   handleRunStats () {

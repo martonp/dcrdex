@@ -236,13 +236,15 @@ func (a *arbMarketMaker) dexPlacementRate(cexRate uint64, sell bool) (uint64, er
 	return dexPlacementRate(cexRate, sell, a.cfg().Profit, a.market, feesInQuoteUnits, a.log)
 }
 
-func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement, cexTooShallow map[string]bool, err error) {
-	cexTooShallow = make(map[string]bool)
+type arbMMPlacementReason struct {
+	Depth         uint64 `json:"depth"`
+	CEXTooShallow bool   `json:"cexFilled"`
+}
 
-	orders := func(cfgPlacements []*ArbMarketMakingPlacement, sellOnDEX bool) ([]*multiTradePlacement, error) {
-		newPlacements := make([]*multiTradePlacement, 0, len(cfgPlacements))
+func (a *arbMarketMaker) ordersToPlace() (buys, sells []*TradePlacement, err error) {
+	orders := func(cfgPlacements []*ArbMarketMakingPlacement, sellOnDEX bool) ([]*TradePlacement, error) {
+		newPlacements := make([]*TradePlacement, 0, len(cfgPlacements))
 		var cumulativeCEXDepth uint64
-
 		for i, cfgPlacement := range cfgPlacements {
 			cumulativeCEXDepth += uint64(float64(cfgPlacement.Lots*a.lotSize) * cfgPlacement.Multiplier)
 			_, extrema, filled, err := a.CEX.VWAP(a.baseID, a.quoteID, sellOnDEX, cumulativeCEXDepth)
@@ -257,12 +259,8 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement, ce
 			}
 
 			if !filled {
-				cexTooShallow[sellStr(!sellOnDEX)] = true
 				a.log.Infof("CEX %s side has < %s on the orderbook.", sellStr(!sellOnDEX), a.fmtBase(cumulativeCEXDepth))
-				newPlacements = append(newPlacements, &multiTradePlacement{
-					rate: 0,
-					lots: 0,
-				})
+				newPlacements = append(newPlacements, &TradePlacement{})
 				continue
 			}
 
@@ -271,10 +269,10 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*multiTradePlacement, ce
 				return nil, fmt.Errorf("error calculating DEX placement rate: %w", err)
 			}
 
-			newPlacements = append(newPlacements, &multiTradePlacement{
-				rate:             placementRate,
-				lots:             cfgPlacement.Lots,
-				counterTradeRate: extrema,
+			newPlacements = append(newPlacements, &TradePlacement{
+				Rate:             placementRate,
+				Lots:             cfgPlacement.Lots,
+				CounterTradeRate: extrema,
 			})
 		}
 
@@ -324,29 +322,6 @@ func (a *arbMarketMaker) distribution() (dist *distribution, err error) {
 	return dist, nil
 }
 
-func (a *arbMarketMaker) updateBotLoopProblems(buyErr, sellErr, determinePlacementsErr error, cexTooShallow map[string]bool,
-	dexDefs, cexDefs map[uint32]uint64) {
-	a.updateBotProblems(func(problems *BotProblems) {
-		problems.clearEpochProblems()
-
-		if !updateBotProblemsBasedOnError(problems, buyErr) {
-			problems.PlaceBuyOrdersErr = buyErr
-		}
-
-		if !updateBotProblemsBasedOnError(problems, sellErr) {
-			problems.PlaceSellOrdersErr = sellErr
-		}
-
-		if !updateBotProblemsBasedOnError(problems, determinePlacementsErr) {
-			problems.DeterminePlacementsErr = determinePlacementsErr
-		}
-
-		problems.DEXBalanceDeficiencies = dexDefs
-		problems.CEXBalanceDeficiencies = cexDefs
-		problems.CEXTooShallow = cexTooShallow
-	})
-}
-
 // rebalance is called on each new epoch. It will calculate the rates orders
 // need to be placed on the DEX orderbook based on the CEX orderbook, and
 // potentially update the orders on the DEX orderbook. It will also process
@@ -366,7 +341,7 @@ func (a *arbMarketMaker) rebalance(epoch uint64, book *orderbook.OrderBook) {
 	}
 	a.currEpoch.Store(epoch)
 
-	if !a.checkBotHealth() {
+	if !a.checkBotHealth(epoch) {
 		a.tryCancelOrders(a.ctx, &epoch, false)
 		return
 	}
@@ -374,58 +349,40 @@ func (a *arbMarketMaker) rebalance(epoch uint64, book *orderbook.OrderBook) {
 	actionTaken, err := a.tryTransfers(currEpoch)
 	if err != nil {
 		a.log.Errorf("Error performing transfers: %v", err)
-		return
-	}
-	if actionTaken {
+	} else if actionTaken {
 		return
 	}
 
-	var buyErr, sellErr, determinePlacementsErr error
-	var dexDefs, cexDefs map[uint32]uint64
-	var cexTooShallow map[string]bool
-	defer func() {
-		a.updateBotLoopProblems(buyErr, sellErr, determinePlacementsErr, cexTooShallow, dexDefs, cexDefs)
-	}()
-
-	buyOrders, sellOrders, cexTooShallow, determinePlacementsErr := a.ordersToPlace()
+	var buysReport, sellsReport *OrderReport
+	buyOrders, sellOrders, determinePlacementsErr := a.ordersToPlace()
 	if determinePlacementsErr != nil {
 		a.tryCancelOrders(a.ctx, &epoch, false)
-		return
+	} else {
+		var buys, sells map[order.OrderID]*dexOrderInfo
+		buys, buysReport = a.multiTrade(buyOrders, false, a.cfg().DriftTolerance, currEpoch)
+		for id, ord := range buys {
+			a.matchesMtx.Lock()
+			a.pendingOrders[id] = ord.counterTradeRate
+			a.matchesMtx.Unlock()
+		}
+
+		sells, sellsReport = a.multiTrade(sellOrders, true, a.cfg().DriftTolerance, currEpoch)
+		for id, ord := range sells {
+			a.matchesMtx.Lock()
+			a.pendingOrders[id] = ord.counterTradeRate
+			a.matchesMtx.Unlock()
+		}
 	}
 
-	buys, buyDEXDefs, buyCEXDefs, buyErr := a.multiTrade(buyOrders, false, a.cfg().DriftTolerance, currEpoch)
-	for id, ord := range buys {
-		a.matchesMtx.Lock()
-		a.pendingOrders[id] = ord.counterTradeRate
-		a.matchesMtx.Unlock()
+	epochReport := &EpochReport{
+		BuysReport:  buysReport,
+		SellsReport: sellsReport,
+		EpochNum:    epoch,
 	}
-
-	sells, sellDEXDefs, sellCEXDefs, sellErr := a.multiTrade(sellOrders, true, a.cfg().DriftTolerance, currEpoch)
-	for id, ord := range sells {
-		a.matchesMtx.Lock()
-		a.pendingOrders[id] = ord.counterTradeRate
-		a.matchesMtx.Unlock()
-	}
-
-	dexDefs = make(map[uint32]uint64)
-	cexDefs = make(map[uint32]uint64)
-	for assetID, def := range buyDEXDefs {
-		dexDefs[assetID] += def
-	}
-	for assetID, def := range sellDEXDefs {
-		dexDefs[assetID] += def
-	}
-	for assetID, def := range buyCEXDefs {
-		cexDefs[assetID] += def
-	}
-	for assetID, def := range sellCEXDefs {
-		cexDefs[assetID] += def
-	}
-
-	a.updateBotLoopProblems(buyErr, sellErr, determinePlacementsErr, cexTooShallow, dexDefs, cexDefs)
+	epochReport.setPreOrderProblems(determinePlacementsErr)
+	a.updateEpochReport(epochReport)
 
 	a.cancelExpiredCEXTrades()
-
 	a.registerFeeGap()
 }
 

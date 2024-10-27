@@ -213,6 +213,9 @@ const (
 	idPlaceBuyOrdersError            = "PLACE_BUY_ORDERS_ERROR"
 	idPlaceSellOrdersError           = "PLACE_SELL_ORDERS_ERROR"
 	idCEXTradeError                  = "CEX_TRADE_ERROR"
+	idOrderReportTitle               = "ORDER_REPORT_TITLE"
+	idCEXBalances                    = "CEX_BALANCES"
+	idCausesSelfMatch                = "CAUSES_SELF_MATCH"
 )
 
 var enUS = map[string]*intl.Translation{
@@ -425,6 +428,9 @@ var enUS = map[string]*intl.Translation{
 	idPlaceBuyOrdersError:            {T: "Error placing buy orders: {{ error }}"},
 	idPlaceSellOrdersError:           {T: "Error placing sell orders: {{ error }}"},
 	idCEXTradeError:                  {T: "The last attempted CEX trade at {{ time }} failed with the following error: {{ error }}"},
+	idOrderReportTitle:               {T: "{{ side }} orders report for epoch #{{ epochNum }}"},
+	idCEXBalances:                    {T: "{{ cexName }} Balances"},
+	idCausesSelfMatch:                {T: "This order would cause a self-match"},
 }
 
 var ptBR = map[string]*intl.Translation{

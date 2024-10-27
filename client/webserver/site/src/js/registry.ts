@@ -884,11 +884,18 @@ export interface CEXBalanceUpdate {
   balance: ExchangeBalance
 }
 
-export interface BotProblemsNote extends CoreNote {
+export interface EpochReportNote extends CoreNote {
   host: string
   baseID: number
   quoteID: number
-  problems?: BotProblems
+  report?: EpochReport
+}
+
+export interface CEXProblemsNote extends CoreNote {
+  host: string
+  baseID: number
+  quoteID: number
+  problems?: CEXProblems
 }
 
 export interface FeeEstimates extends LotFeeRange {
@@ -950,34 +957,69 @@ export interface RunStats {
 
 export interface StampedError {
   stamp: number
-  err: string
+  error: string
 }
 
 export interface BotProblems {
   walletNotSynced: Record<number, boolean>
   noWalletPeers: Record<number, boolean>
-  depositErr: Record<number, StampedError>
-  withdrawErr: Record<number, StampedError>
-  dexBalanceDeficiencies: Record<number, number>
-  cexBalanceDeficiencies: Record<number, number>
-  cexTooShallow: Record<string, boolean>
   accountSuspended: boolean
   userLimitTooLow: boolean
   noPriceSource: boolean
   oracleFiatMismatch: boolean
   cexOrderbookUnsynced: boolean
-  determinePlacementsErr: string
-  placeBuyOrdersErr: string
-  placeSellOrdersErr: string
-  cexTradeErr: StampedError
-  additionalError: string
+  causesSelfMatch: boolean
+  unknownError: string
+}
+
+export interface TradePlacement {
+  rate: number
+  lots: number
+  standingLots: number
+  orderedLots: number
+  counterTradeRate: number
+  requiredDex: Record<number, number>
+  requiredCex: number
+  usedDex: Record<number, number>
+  usedCex: number
+  causesSelfMatch: boolean
+  error?: BotProblems
+  reason: any
+}
+
+export interface OrderReport {
+  placements: TradePlacement[]
+  fees: LotFeeRange
+  availableDexBals: Record<number, BotBalance>
+  requiredDexBals: Record<number, number>
+  remainingDexBals: Record<number, number>
+  usedDexBals: Record<number, number>
+  availableCexBal: BotBalance
+  requiredCexBal: number
+  remainingCexBal: number
+  usedCexBal: number
+  error?: BotProblems
+}
+
+export interface EpochReport {
+  epochNum: number
+  preOrderProblems?: BotProblems
+  buysReport?: OrderReport
+  sellsReport?: OrderReport
+}
+
+export interface CEXProblems {
+  depositErr: Record<number, StampedError>
+  withdrawErr: Record<number, StampedError>
+  tradeErr: StampedError
 }
 
 export interface MMBotStatus {
   config: BotConfig
   running: boolean
   runStats?: RunStats
-  problems?: BotProblems
+  latestEpoch?: EpochReport
+  cexProblems?: CEXProblems
 }
 
 export interface MarketMakingStatus {

@@ -368,25 +368,12 @@ func (a *simpleArbMarketMaker) handleDEXOrderUpdate(o *core.Order) {
 	}
 }
 
-func (a *simpleArbMarketMaker) updateBotLoopProblems(determinePlacementsErr error, dexDefs, cexDefs map[uint32]uint64) {
-	a.updateBotProblems(func(problems *BotProblems) {
-		problems.clearEpochProblems()
-
-		if !updateBotProblemsBasedOnError(problems, determinePlacementsErr) {
-			problems.DeterminePlacementsErr = determinePlacementsErr
-		}
-
-		problems.DEXBalanceDeficiencies = dexDefs
-		problems.CEXBalanceDeficiencies = cexDefs
-	})
-}
-
 func (a *simpleArbMarketMaker) tryArb(newEpoch uint64) (exists, sellOnDEX bool) {
-	if !(a.checkBotHealth() && a.tradingLimitNotReached()) {
+	if !(a.checkBotHealth(newEpoch) && a.tradingLimitNotReached(newEpoch)) {
 		return false, false
 	}
 
-	exists, sellOnDex, lotsToArb, dexRate, cexRate, dexDefs, cexDefs, determinePlacementsErr := a.arbExists()
+	exists, sellOnDex, lotsToArb, dexRate, cexRate, _, _, _ := a.arbExists()
 	if a.log.Level() == dex.LevelTrace {
 		a.log.Tracef("%s rebalance. exists = %t, %s on dex, lots = %d, dex rate = %s, cex rate = %s",
 			a.name, exists, sellStr(sellOnDex), lotsToArb, a.fmtRate(dexRate), a.fmtRate(cexRate))
@@ -395,8 +382,6 @@ func (a *simpleArbMarketMaker) tryArb(newEpoch uint64) (exists, sellOnDEX bool) 
 		// Execution will not happen if it would cause a self-match.
 		a.executeArb(sellOnDex, lotsToArb, dexRate, cexRate, newEpoch)
 	}
-
-	a.updateBotLoopProblems(determinePlacementsErr, dexDefs, cexDefs)
 
 	return exists, sellOnDex
 }
@@ -413,9 +398,7 @@ func (a *simpleArbMarketMaker) rebalance(newEpoch uint64) {
 	actionTaken, err := a.tryTransfers(newEpoch)
 	if err != nil {
 		a.log.Errorf("Error performing transfers: %v", err)
-		return
-	}
-	if actionTaken {
+	} else if actionTaken {
 		return
 	}
 

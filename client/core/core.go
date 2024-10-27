@@ -5749,34 +5749,36 @@ func (c *Core) PreOrder(form *TradeForm) (*OrderEstimate, error) {
 	}, nil
 }
 
+// MultiTradeResult is returned from MultiTrade. Some orders may be placed
+// successfully, while others may fail.
+type MultiTradeResult struct {
+	Order *Order
+	Error error
+}
+
 // MultiTrade is used to place multiple standing limit orders on the same
 // side of the same market simultaneously.
-func (c *Core) MultiTrade(pw []byte, form *MultiTradeForm) ([]*Order, error) {
+func (c *Core) MultiTrade(pw []byte, form *MultiTradeForm) []*MultiTradeResult {
+	results := make([]*MultiTradeResult, len(form.Placements))
 	reqs, err := c.prepareMultiTradeRequests(pw, form)
 	if err != nil {
-		return nil, err
+		for i := range results {
+			results[i] = &MultiTradeResult{Error: err}
+		}
+		return results
 	}
 
-	orders := make([]*Order, 0, len(reqs))
-
-	for _, req := range reqs {
-		// return last error below if none of the orders succeeded
+	for i, req := range reqs {
 		var corder *Order
 		corder, err = c.sendTradeRequest(req)
 		if err != nil {
-			c.log.Errorf("failed to send trade request: %v", err)
+			results[i] = &MultiTradeResult{Error: err}
 			continue
 		}
-		orders = append(orders, corder)
-	}
-	if len(orders) < len(reqs) {
-		c.log.Errorf("failed to send %d of %d trade requests", len(reqs)-len(orders), len(reqs))
-	}
-	if len(orders) == 0 {
-		return nil, err
+		results[i] = &MultiTradeResult{Order: corder}
 	}
 
-	return orders, nil
+	return results
 }
 
 // TxHistory returns all the transactions a wallet has made. If refID

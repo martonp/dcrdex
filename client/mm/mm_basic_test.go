@@ -3,13 +3,11 @@
 package mm
 
 import (
-	"errors"
 	"math"
 	"testing"
 
 	"decred.org/dcrdex/client/core"
 	"decred.org/dcrdex/dex/calc"
-	"decred.org/dcrdex/dex/msgjson"
 )
 
 type tBasicMMCalculator struct {
@@ -195,8 +193,8 @@ func TestBasicMMRebalance(t *testing.T) {
 		cfgBuyPlacements  []*OrderPlacement
 		cfgSellPlacements []*OrderPlacement
 
-		expBuyPlacements  []*multiTradePlacement
-		expSellPlacements []*multiTradePlacement
+		expBuyPlacements  []*TradePlacement
+		expSellPlacements []*TradePlacement
 	}
 	tests := []*test{
 		{
@@ -212,15 +210,15 @@ func TestBasicMMRebalance(t *testing.T) {
 				{Lots: 2, GapFactor: 2},
 				{Lots: 1, GapFactor: 3},
 			},
-			expBuyPlacements: []*multiTradePlacement{
-				{lots: 1, rate: steppedRate(basisPrice-3*halfSpread, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice-2*halfSpread, rateStep)},
-				{lots: 3, rate: steppedRate(basisPrice-1*halfSpread, rateStep)},
+			expBuyPlacements: []*TradePlacement{
+				{Lots: 1, Rate: steppedRate(basisPrice-3*halfSpread, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice-2*halfSpread, rateStep)},
+				{Lots: 3, Rate: steppedRate(basisPrice-1*halfSpread, rateStep)},
 			},
-			expSellPlacements: []*multiTradePlacement{
-				{lots: 3, rate: steppedRate(basisPrice+1*halfSpread, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice+2*halfSpread, rateStep)},
-				{lots: 1, rate: steppedRate(basisPrice+3*halfSpread, rateStep)},
+			expSellPlacements: []*TradePlacement{
+				{Lots: 3, Rate: steppedRate(basisPrice+1*halfSpread, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice+2*halfSpread, rateStep)},
+				{Lots: 1, Rate: steppedRate(basisPrice+3*halfSpread, rateStep)},
 			},
 		},
 		{
@@ -236,15 +234,15 @@ func TestBasicMMRebalance(t *testing.T) {
 				{Lots: 2, GapFactor: 0.1},
 				{Lots: 1, GapFactor: 0.05},
 			},
-			expBuyPlacements: []*multiTradePlacement{
-				{lots: 1, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
-				{lots: 3, rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+			expBuyPlacements: []*TradePlacement{
+				{Lots: 1, Rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{Lots: 3, Rate: steppedRate(basisPrice-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
 			},
-			expSellPlacements: []*multiTradePlacement{
-				{lots: 3, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
-				{lots: 1, rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+			expSellPlacements: []*TradePlacement{
+				{Lots: 3, Rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{Lots: 1, Rate: steppedRate(basisPrice+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
 			},
 		},
 		{
@@ -260,15 +258,15 @@ func TestBasicMMRebalance(t *testing.T) {
 				{Lots: 2, GapFactor: 0.1},
 				{Lots: 1, GapFactor: 0.05},
 			},
-			expBuyPlacements: []*multiTradePlacement{
-				{lots: 1, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
-				{lots: 3, rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+			expBuyPlacements: []*TradePlacement{
+				{Lots: 1, Rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{Lots: 3, Rate: steppedRate(basisPrice-halfSpread-uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
 			},
-			expSellPlacements: []*multiTradePlacement{
-				{lots: 3, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
-				{lots: 1, rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
+			expSellPlacements: []*TradePlacement{
+				{Lots: 3, Rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.15))), rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.1))), rateStep)},
+				{Lots: 1, Rate: steppedRate(basisPrice+halfSpread+uint64(math.Round((float64(basisPrice)*0.05))), rateStep)},
 			},
 		},
 		{
@@ -284,14 +282,14 @@ func TestBasicMMRebalance(t *testing.T) {
 				{Lots: 2, GapFactor: .03},
 				{Lots: 1, GapFactor: .01},
 			},
-			expBuyPlacements: []*multiTradePlacement{
-				{lots: 1, rate: steppedRate(basisPrice-1e6, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice-3e6, rateStep)},
+			expBuyPlacements: []*TradePlacement{
+				{Lots: 1, Rate: steppedRate(basisPrice-1e6, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice-3e6, rateStep)},
 			},
-			expSellPlacements: []*multiTradePlacement{
-				{lots: 3, rate: steppedRate(basisPrice+6e6, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice+3e6, rateStep)},
-				{lots: 1, rate: steppedRate(basisPrice+1e6, rateStep)},
+			expSellPlacements: []*TradePlacement{
+				{Lots: 3, Rate: steppedRate(basisPrice+6e6, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice+3e6, rateStep)},
+				{Lots: 1, Rate: steppedRate(basisPrice+1e6, rateStep)},
 			},
 		},
 		{
@@ -307,14 +305,14 @@ func TestBasicMMRebalance(t *testing.T) {
 				{Lots: 2, GapFactor: .03},
 				{Lots: 1, GapFactor: .01},
 			},
-			expBuyPlacements: []*multiTradePlacement{
-				{lots: 1, rate: steppedRate(basisPrice-halfSpread-1e6, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice-halfSpread-3e6, rateStep)},
+			expBuyPlacements: []*TradePlacement{
+				{Lots: 1, Rate: steppedRate(basisPrice-halfSpread-1e6, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice-halfSpread-3e6, rateStep)},
 			},
-			expSellPlacements: []*multiTradePlacement{
-				{lots: 3, rate: steppedRate(basisPrice+halfSpread+6e6, rateStep)},
-				{lots: 2, rate: steppedRate(basisPrice+halfSpread+3e6, rateStep)},
-				{lots: 1, rate: steppedRate(basisPrice+halfSpread+1e6, rateStep)},
+			expSellPlacements: []*TradePlacement{
+				{Lots: 3, Rate: steppedRate(basisPrice+halfSpread+6e6, rateStep)},
+				{Lots: 2, Rate: steppedRate(basisPrice+halfSpread+3e6, rateStep)},
+				{Lots: 1, Rate: steppedRate(basisPrice+halfSpread+1e6, rateStep)},
 			},
 		},
 	}
@@ -343,7 +341,7 @@ func TestBasicMMRebalance(t *testing.T) {
 			mm.fiatRates.Store(map[uint32]float64{baseID: 1, quoteID: 1})
 			const sellSwapFees, sellRedeemFees = 3e6, 1e6
 			const buySwapFees, buyRedeemFees = 2e5, 1e5
-			mm.buyFees = &orderFees{
+			mm.buyFees = &OrderFees{
 				LotFeeRange: &LotFeeRange{
 					Max: &LotFees{
 						Redeem: buyRedeemFees,
@@ -351,9 +349,9 @@ func TestBasicMMRebalance(t *testing.T) {
 					},
 					Estimated: &LotFees{},
 				},
-				bookingFeesPerLot: buySwapFees,
+				BookingFeesPerLot: buySwapFees,
 			}
-			mm.sellFees = &orderFees{
+			mm.sellFees = &OrderFees{
 				LotFeeRange: &LotFeeRange{
 					Max: &LotFees{
 						Redeem: sellRedeemFees,
@@ -361,7 +359,7 @@ func TestBasicMMRebalance(t *testing.T) {
 					},
 					Estimated: &LotFees{},
 				},
-				bookingFeesPerLot: sellSwapFees,
+				BookingFeesPerLot: sellSwapFees,
 			}
 			mm.baseDexBalances[baseID] = lotSize * 50
 			mm.baseCexBalances[baseID] = lotSize * 50
@@ -389,11 +387,11 @@ func TestBasicMMRebalance(t *testing.T) {
 				buyRateLots[p.Rate] = p.Qty / lotSize
 			}
 			for _, expBuy := range tt.expBuyPlacements {
-				if lots, found := buyRateLots[expBuy.rate]; !found {
-					t.Fatalf("buy rate %d not found", expBuy.rate)
+				if lots, found := buyRateLots[expBuy.Rate]; !found {
+					t.Fatalf("buy rate %d not found", expBuy.Rate)
 				} else {
-					if expBuy.lots != lots {
-						t.Fatalf("wrong lots %d for buy at rate %d", lots, expBuy.rate)
+					if expBuy.Lots != lots {
+						t.Fatalf("wrong lots %d for buy at rate %d", lots, expBuy.Rate)
 					}
 				}
 			}
@@ -402,155 +400,13 @@ func TestBasicMMRebalance(t *testing.T) {
 				sellRateLots[p.Rate] = p.Qty / lotSize
 			}
 			for _, expSell := range tt.expSellPlacements {
-				if lots, found := sellRateLots[expSell.rate]; !found {
-					t.Fatalf("sell rate %d not found", expSell.rate)
+				if lots, found := sellRateLots[expSell.Rate]; !found {
+					t.Fatalf("sell rate %d not found", expSell.Rate)
 				} else {
-					if expSell.lots != lots {
-						t.Fatalf("wrong lots %d for sell at rate %d", lots, expSell.rate)
+					if expSell.Lots != lots {
+						t.Fatalf("wrong lots %d for sell at rate %d", lots, expSell.Rate)
 					}
 				}
-			}
-		})
-	}
-}
-
-func TestBasicMMBotProblems(t *testing.T) {
-	const basisPrice uint64 = 5e6
-	const halfSpread uint64 = 2e5
-	const rateStep uint64 = 1e3
-	const atomToConv float64 = 1
-	const baseID, quoteID = uint32(42), uint32(0)
-	const lotSize = uint64(1e8)
-
-	type test struct {
-		name              string
-		bpErr             error
-		multiTradeBuyErr  error
-		multiTradeSellErr error
-		noBalance         bool
-
-		expBotProblems *BotProblems
-	}
-
-	updateBotProblems := func(f func(*BotProblems)) *BotProblems {
-		bp := newBotProblems()
-		f(bp)
-		return bp
-	}
-
-	noIDErr1 := errors.New("no ID")
-	noIDErr2 := errors.New("no ID")
-
-	var swapFees, redeemFees, refundFees uint64 = 1e5, 2e5, 3e5
-
-	tests := []*test{
-		{
-			name:           "no problems",
-			expBotProblems: newBotProblems(),
-		},
-		{
-			name:  "mid gap outside oracle safe range",
-			bpErr: errOracleFiatMismatch,
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.OracleFiatMismatch = true
-			}),
-		},
-		{
-			name:              "wallet sync errors",
-			multiTradeBuyErr:  &core.WalletSyncError{AssetID: baseID},
-			multiTradeSellErr: &core.WalletSyncError{AssetID: quoteID},
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.WalletNotSynced[baseID] = true
-				bp.WalletNotSynced[quoteID] = true
-			}),
-		},
-		{
-			name:              "account suspended",
-			multiTradeBuyErr:  core.ErrAccountSuspended,
-			multiTradeSellErr: core.ErrAccountSuspended,
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.AccountSuspended = true
-			}),
-		},
-		{
-			name:              "buy no peers, sell qty too high",
-			multiTradeBuyErr:  &core.WalletNoPeersError{AssetID: baseID},
-			multiTradeSellErr: &msgjson.Error{Code: msgjson.OrderQuantityTooHigh},
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.NoWalletPeers[baseID] = true
-				bp.UserLimitTooLow = true
-			}),
-		},
-		{
-			name:              "unidentified errors",
-			multiTradeBuyErr:  noIDErr1,
-			multiTradeSellErr: noIDErr2,
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.PlaceBuyOrdersErr = noIDErr1
-				bp.PlaceSellOrdersErr = noIDErr2
-			}),
-		},
-		{
-			name:      "no balance",
-			noBalance: true,
-			expBotProblems: updateBotProblems(func(bp *BotProblems) {
-				bp.DEXBalanceDeficiencies = map[uint32]uint64{
-					baseID:  lotSize + swapFees,
-					quoteID: calc.BaseToQuote(basisPrice-basisPrice/100, lotSize) + swapFees,
-				}
-			}),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			calculator := &tBasicMMCalculator{
-				bp:    basisPrice,
-				bpErr: tt.bpErr,
-				hs:    halfSpread,
-			}
-
-			adaptor := newTBotCoreAdaptor(newTCore())
-			mm := &basicMarketMaker{
-				unifiedExchangeAdaptor: mustParseAdaptorFromMarket(&core.Market{
-					RateStep:   rateStep,
-					AtomToConv: atomToConv,
-					BaseID:     baseID,
-					QuoteID:    quoteID,
-					LotSize:    lotSize,
-				}),
-				calculator: calculator,
-				core:       adaptor,
-			}
-
-			mm.buyFees = tFees(swapFees, redeemFees, refundFees, 0)
-			mm.sellFees = tFees(swapFees, redeemFees, refundFees, 0)
-
-			mm.unifiedExchangeAdaptor.clientCore.(*tCore).multiTradeBuyErr = tt.multiTradeBuyErr
-			mm.unifiedExchangeAdaptor.clientCore.(*tCore).multiTradeSellErr = tt.multiTradeSellErr
-
-			if !tt.noBalance {
-				mm.baseDexBalances[baseID] = int64(lotSize * 50)
-				mm.baseDexBalances[quoteID] = int64(calc.BaseToQuote(basisPrice, lotSize*50))
-			}
-
-			mm.cfgV.Store(&BasicMarketMakingConfig{
-				GapStrategy: GapStrategyPercent,
-				SellPlacements: []*OrderPlacement{
-					{Lots: 1, GapFactor: 0.01},
-				},
-				BuyPlacements: []*OrderPlacement{
-					{Lots: 1, GapFactor: 0.01},
-				},
-			})
-
-			mm.unifiedExchangeAdaptor.fiatRates.Store(map[uint32]float64{baseID: 1, quoteID: 1})
-
-			mm.rebalance(100)
-
-			problems := mm.problems()
-			if !tt.expBotProblems.isEqual(problems) {
-				t.Fatalf("expected bot problems %v, got %v", tt.expBotProblems, problems)
 			}
 		})
 	}
