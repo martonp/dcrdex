@@ -37,6 +37,8 @@ func parseCoinpapNameSymbol(name, symbol string) (string, string) {
 	switch symbol {
 	case "usdc":
 		name = "usd-coin"
+	case "usdt":
+		name = "tether"
 	case "polygon":
 		symbol = "matic"
 		name = "polygon"
@@ -59,6 +61,7 @@ func FetchCoinpaprikaRates(ctx context.Context, assets []*CoinpaprikaAsset, log 
 	slugAssets := make(map[string][]uint32)
 	for _, a := range assets {
 		slug := CoinpapSlug(a.Name, a.Symbol)
+		fmt.Println(slug)
 		slugAssets[slug] = append(slugAssets[slug], a.AssetID)
 	}
 
@@ -79,6 +82,7 @@ func FetchCoinpaprikaRates(ctx context.Context, assets []*CoinpaprikaAsset, log 
 		return fiatRates
 	}
 	for _, coinInfo := range res {
+		// fmt.Println(coinInfo.ID)
 		assetIDs, found := slugAssets[coinInfo.ID]
 		if !found {
 			continue

@@ -46,6 +46,7 @@ type Market struct {
 	BaseID           uint32     `json:"baseID"`
 	QuoteID          uint32     `json:"quoteID"`
 	Day              *MarketDay `json:"day"`
+	TransfersEnabled bool       `json:"transfersEnabled"`
 	BaseMinWithdraw  uint64     `json:"baseMinWithdraw"`
 	QuoteMinWithdraw uint64     `json:"quoteMinWithdraw"`
 }
@@ -79,6 +80,7 @@ type BalanceUpdate struct {
 var (
 	ErrWithdrawalPending = errors.New("withdrawal pending")
 	ErrUnsyncedOrderbook = errors.New("orderbook not synced")
+	ErrTransfersDisabled = errors.New("transfers disabled")
 )
 
 // CEX implements a set of functions that can be used to interact with a
@@ -93,8 +95,6 @@ type CEX interface {
 	Balances(ctx context.Context) (map[uint32]*ExchangeBalance, error)
 	// CancelTrade cancels a trade on the CEX.
 	CancelTrade(ctx context.Context, baseID, quoteID uint32, tradeID string) error
-	// MatchedMarkets returns the list of markets at the CEX.
-	MatchedMarkets(ctx context.Context) ([]*MarketMatch, error)
 	// Markets returns the list of markets at the CEX.
 	Markets(ctx context.Context) (map[string]*Market, error)
 	// SubscribeMarket subscribes to order book updates on a market. This must

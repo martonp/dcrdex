@@ -1090,6 +1090,7 @@ export interface CEXMarket {
   quoteID: number
   baseMinWithdraw: number
   quoteMinWithdraw: number
+  transfersEnabled: boolean
   day: MarketDay
 }
 

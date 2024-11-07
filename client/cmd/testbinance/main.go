@@ -63,6 +63,7 @@ var (
 			makeMarket("eth", "btc"),
 			makeMarket("dcr", "usdc"),
 			makeMarket("zec", "btc"),
+			makeMarket("btc", "usdt"),
 		},
 	}
 
@@ -70,7 +71,8 @@ var (
 		makeCoinInfo("BTC", "BTC", true, true, 0.00000610, 0.0007),
 		makeCoinInfo("ETH", "ETH", true, true, 0.00035, 0.008),
 		makeCoinInfo("DCR", "DCR", true, true, 0.00001000, 0.05),
-		makeCoinInfo("USDC", "MATIC", true, true, 0.01000, 10),
+		makeCoinInfo("USDT", "ETH", true, true, 0.01000, 10),
+		makeCoinInfo("USDC", "ETH", true, true, 0.01000, 10),
 		makeCoinInfo("ZEC", "ZEC", true, true, 0.00500000, 0.01000000),
 	}
 
@@ -78,7 +80,8 @@ var (
 		makeCoinpapAsset(0, "btc", "Bitcoin"),
 		makeCoinpapAsset(42, "dcr", "Decred"),
 		makeCoinpapAsset(60, "eth", "Ethereum"),
-		makeCoinpapAsset(966001, "usdc.polygon", "USDC"),
+		makeCoinpapAsset(60001, "usdc.eth", "USDC"),
+		makeCoinpapAsset(60002, "usdt.eth", "USDT"),
 		makeCoinpapAsset(133, "zec", "Zcash"),
 	}
 
@@ -86,6 +89,7 @@ var (
 		makeBalance("btc", 1.5),
 		makeBalance("dcr", 10000),
 		makeBalance("eth", 5),
+		makeBalance("usdt", 1152),
 		makeBalance("usdc", 1152),
 		makeBalance("zec", 10000),
 	}
@@ -94,8 +98,10 @@ var (
 func parseAssetID(asset string) uint32 {
 	symbol := strings.ToLower(asset)
 	switch symbol {
+	case "usdt":
+		symbol = "usdt.eth"
 	case "usdc":
-		symbol = "usdc.polygon"
+		symbol = "usdc.eth"
 	}
 	assetID, _ := dex.BipSymbolID(symbol)
 	return assetID
@@ -177,21 +183,104 @@ func sendBalanceUpdateRequest(coin string, balanceUpdate float64) {
 	fmt.Println("Balance update request sent")
 }
 
+func sendUpdateTransferEnabled(coin, network string, enabled bool, deposit bool) {
+	if coin == "" || network == "" {
+		fmt.Printf("Invalid transfer enabled request: coin = %q, network = %q, enabled = %t, deposit = %t\n", coin, network, enabled, deposit)
+		return
+	}
+
+	url := fmt.Sprintf("http://localhost:37346/testbinance/updatetransferenabled?coin=%s&network=%s&enabled=%t&deposit=%t",
+		coin, network, enabled, deposit)
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Errorf("Error sending transfer enabled request: %v", err)
+		return
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Println("Transfer enabled request failed:", string(body))
+		return
+	}
+
+	fmt.Println("Transfer enabled request sent")
+}
+
+func printAdminUsage() {
+	fmt.Println("Admin commands:")
+	fmt.Println("updatebalance <coin> <amt>")
+	fmt.Println("updatetransferenabled <coin> <network> <deposit> <enabled>")
+}
+
+func adminUpdate(args []string) {
+	if len(args) == 0 {
+		fmt.Println("No arguments provided")
+		printAdminUsage()
+		return
+	}
+
+	command := args[0]
+
+	switch command {
+	case "updatebalance":
+		if len(args) != 3 {
+			printAdminUsage()
+			return
+		}
+		coin := args[1]
+		balUpdate, err := strconv.ParseFloat(args[2], 64)
+		if err != nil {
+			fmt.Println("Invalid balance update amount")
+			printAdminUsage()
+			return
+		}
+		sendBalanceUpdateRequest(coin, balUpdate)
+	case "updatetransferenabled":
+		if len(args) != 5 {
+			printAdminUsage()
+			return
+		}
+		coin := args[1]
+		network := args[2]
+		depositStr := args[3]
+		deposit, err := strconv.ParseBool(depositStr)
+		if err != nil {
+			fmt.Println("Invalid deposit enable status")
+			printAdminUsage()
+			return
+		}
+		enabledStr := args[4]
+		enabled, err := strconv.ParseBool(enabledStr)
+		if err != nil {
+			fmt.Println("Invalid withdraw enable status")
+			printAdminUsage()
+			return
+		}
+		sendUpdateTransferEnabled(coin, network, enabled, deposit)
+	default:
+		fmt.Println("Unknown admin command")
+		printAdminUsage()
+	}
+}
+
 func main() {
 	var logDebug, logTrace bool
-	var coin string
-	var balanceUpdate float64
+	var didAdminUpdate bool
+
 	flag.Float64Var(&walkingSpeedAdj, "walkspeed", 1.0, "scale the maximum walking speed. default scale of 1.0 is about 3%")
 	flag.Float64Var(&gapRange, "gaprange", 0.04, "a ratio of how much the gap can vary. default is 0.04 => 4%")
 	flag.BoolVar(&logDebug, "debug", false, "use debug logging")
 	flag.BoolVar(&logTrace, "trace", false, "use trace logging")
 	flag.BoolVar(&flappyWS, "flappyws", false, "periodically drop websocket clients and delete subscriptions")
-	flag.Float64Var(&balanceUpdate, "balupdate", 0, "update the balance of an asset on a testbinance server running as another process")
-	flag.StringVar(&coin, "coin", "", "coin for testbinance admin update")
+	flag.BoolFunc("admin", "perform admin update on a testbinance server running as another process", func(s string) error {
+		adminUpdate(flag.Args())
+		didAdminUpdate = true
+		return nil
+	})
 	flag.Parse()
 
-	if balanceUpdate != 0 {
-		sendBalanceUpdateRequest(coin, balanceUpdate)
+	if didAdminUpdate {
 		return
 	}
 
@@ -350,6 +439,7 @@ func newFakeBinanceServer(ctx context.Context) (*fakeBinance, error) {
 	mux.Get("/stream", f.handleMarketStream)
 	mux.Route("/testbinance", func(r chi.Router) {
 		r.Get("/updatebalance", f.handleUpdateBalance)
+		r.Get("/updatetransferenabled", f.handleUpdateTransferEnabled)
 	})
 
 	return f, nil
@@ -371,6 +461,45 @@ func (f *fakeBinance) handleUpdateBalance(w http.ResponseWriter, r *http.Request
 	}
 
 	f.sendBalanceUpdates([]*bntypes.WSBalance{balUpdate})
+	w.WriteHeader(http.StatusOK)
+}
+
+func (f *fakeBinance) handleUpdateTransferEnabled(w http.ResponseWriter, r *http.Request) {
+	coin := r.URL.Query().Get("coin")
+	network := r.URL.Query().Get("network")
+	enabledStr := r.URL.Query().Get("enabled")
+	deposit := r.URL.Query().Get("deposit") == "true"
+	enabled, err := strconv.ParseBool(enabledStr)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid enabled %q: %v", enabledStr, err), http.StatusBadRequest)
+		return
+	}
+
+	var updated bool
+	for _, info := range coinInfos {
+		if info.Coin != coin {
+			continue
+		}
+		for _, net := range info.NetworkList {
+			if net.Network != network {
+				continue
+			}
+			if deposit {
+				fmt.Printf("Setting deposit enable for %q %q to %t\n", coin, network, enabled)
+				net.DepositEnable = enabled
+			} else {
+				fmt.Printf("Setting withdraw enable for %q %q to %t\n", coin, network, enabled)
+				net.WithdrawEnable = enabled
+			}
+			updated = true
+		}
+	}
+
+	if !updated {
+		http.Error(w, fmt.Sprintf("no coin info to update for %q", coin), http.StatusBadRequest)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -725,6 +854,7 @@ func (f *fakeBinance) cleanMarkets() {
 
 func (f *fakeBinance) handleWalletCoinsReq(w http.ResponseWriter, r *http.Request) {
 	respB, _ := json.Marshal(coinInfos)
+	fmt.Println(string(respB))
 	writeBytesWithStatus(w, respB, http.StatusOK)
 }
 

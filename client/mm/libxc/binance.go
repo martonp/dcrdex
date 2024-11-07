@@ -466,8 +466,9 @@ type binance struct {
 	// tokenIDs maps the token's symbol to the list of bip ids of the token
 	// for each chain for which deposits and withdrawals are enabled on
 	// binance.
-	tokenIDs    atomic.Value // map[string][]uint32, binance coin ID string -> assset IDs
-	minWithdraw atomic.Value // map[uint32]map[uint32]uint64
+	tokenIDs          atomic.Value // map[string][]uint32, binance coin ID string -> assset IDs
+	minWithdraw       atomic.Value // map[uint32]map[uint32]uint64
+	transfersEnabledV atomic.Value // map[uint32]bool
 
 	marketSnapshotMtx sync.Mutex
 	marketSnapshot    struct {
@@ -602,6 +603,7 @@ func (bnc *binance) refreshBalances(ctx context.Context) error {
 func (bnc *binance) readCoins(coins []*bntypes.CoinInfo) {
 	tokenIDs := make(map[string][]uint32)
 	minWithdraw := make(map[uint32]uint64)
+	transfersEnabled := make(map[uint32]bool)
 	for _, nfo := range coins {
 		for _, netInfo := range nfo.NetworkList {
 			symbol := binanceCoinNetworkToDexSymbol(nfo.Coin, netInfo.Network)
@@ -614,18 +616,16 @@ func (bnc *binance) readCoins(coins []*bntypes.CoinInfo) {
 				// not a registered asset
 				continue
 			}
-			if !netInfo.WithdrawEnable || !netInfo.DepositEnable {
-				bnc.log.Tracef("Skipping %s network %s because deposits and/or withdraws are not enabled.", netInfo.Coin, netInfo.Network)
-				continue
-			}
 			if tkn := asset.TokenInfo(assetID); tkn != nil {
 				tokenIDs[nfo.Coin] = append(tokenIDs[nfo.Coin], assetID)
 			}
+			transfersEnabled[assetID] = netInfo.WithdrawEnable && netInfo.DepositEnable
 			minWithdraw[assetID] = uint64(math.Round(float64(ui.Conventional.ConversionFactor) * netInfo.WithdrawMin))
 		}
 	}
 	bnc.tokenIDs.Store(tokenIDs)
 	bnc.minWithdraw.Store(minWithdraw)
+	bnc.transfersEnabledV.Store(transfersEnabled)
 }
 
 // getCoinInfo retrieves binance configs then updates the user balances and
@@ -1105,6 +1105,15 @@ func (bnc *binance) minimumWithdraws(baseID, quoteID uint32) (uint64, uint64) {
 	return mins[baseID], mins[quoteID]
 }
 
+func (bnc *binance) transfersEnabled(baseID, quoteID uint32) bool {
+	transfersEnabledI := bnc.transfersEnabledV.Load()
+	if transfersEnabledI == nil {
+		return false
+	}
+	transfersEnabled := transfersEnabledI.(map[uint32]bool)
+	return transfersEnabled[baseID] && transfersEnabled[quoteID]
+}
+
 func (bnc *binance) Markets(ctx context.Context) (map[string]*Market, error) {
 	bnc.marketSnapshotMtx.Lock()
 	defer bnc.marketSnapshotMtx.Unlock()
@@ -1144,12 +1153,14 @@ func (bnc *binance) Markets(ctx context.Context) (map[string]*Market, error) {
 			continue
 		}
 		for _, mkt := range ms {
+			transfersEnabled := bnc.transfersEnabled(mkt.BaseID, mkt.QuoteID)
 			baseMinWithdraw, quoteMinWithdraw := bnc.minimumWithdraws(mkt.BaseID, mkt.QuoteID)
 			m[mkt.MarketID] = &Market{
 				BaseID:           mkt.BaseID,
 				QuoteID:          mkt.QuoteID,
 				BaseMinWithdraw:  baseMinWithdraw,
 				QuoteMinWithdraw: quoteMinWithdraw,
+				TransfersEnabled: transfersEnabled,
 				Day: &MarketDay{
 					Vol:            d.Volume,
 					QuoteVol:       d.QuoteVolume,
