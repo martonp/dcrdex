@@ -15,11 +15,13 @@
 package eth
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,11 +40,13 @@ import (
 	"time"
 
 	"decred.org/dcrdex/client/asset"
+	"decred.org/dcrdex/client/mnemonic"
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/encode"
 	dexeth "decred.org/dcrdex/dex/networks/eth"
 	swapv0 "decred.org/dcrdex/dex/networks/eth/contracts/v0"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
@@ -2050,11 +2054,17 @@ func testApproveGas(t *testing.T) {
 // either create a replacement transaction that redeems the swap, or one that
 // just sends ETH to another address. If the swap is redeemed by another tx,
 // the DEX should not attempt to resubmit the redemption.
-/*func TestReplaceWithRandomTransaction(t *testing.T) {
-	appSeed := "36e6976207c4ae35d2942fc644fc845cba28c2d3832f93c94fd23e9857e19ad65c2752a041afbf3f1897f693d4abe3903d6374d53cb78b90002ecc6999d4b317"
+func TestReplaceWithRandomTransaction(t *testing.T) {
+	seedStr := "poverty agent attend reflect debate nominee erode result company lunch build document hobby cheese guitar"
+	appSeedB, _, err := mnemonic.DecodeMnemonic(seedStr)
+	if err != nil {
+		t.Fatalf("failed to decode mnemonic: %v", err)
+	}
+
 	var gasFeeCap int64 = 300000000000
 	var gasTipCap int64 = 300000000000
 	var nonce int64 = 6
+	var net dex.Network = dex.Simnet
 
 	// uncomment these lines to override the tx with another one that redeems the swap
 	// addressToCall := common.HexToAddress("0x2f68e723b8989ba1c6a9f03e42f33cb7dc9d606f")
@@ -2062,12 +2072,22 @@ func testApproveGas(t *testing.T) {
 	// value := 0
 
 	// uncomment these lines to override the tx with another one that does not redeem the swap
-	// addressToCall := simnetAddr
-	// data := []byte{}
-	// value := uint64(1)
+	addressToCall := simnetAddr
+	data := []byte{}
+	value := uint64(1)
 
-	walletDir := filepath.Join(dcrutil.AppDataDir("bisonw", false), "simnet", "assetdb", dex.BipIDSymbol(60))
-	client, err := newNodeClient(getWalletDir(walletDir, dex.Simnet), dex.Simnet, tLogger.SubLogger("initiator"))
+	cfg, err := ChainConfig(net)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("error getting home dir: %v", err)
+	}
+	walletDir := filepath.Join(homeDir, "dextest", "simnet-walletpair", "dexc1", "simnet", "assetdb", "eth")
+	fmt.Println("walletDir:", walletDir)
+	client, err := newMultiRPCClient(walletDir, []string{betaIPCFile}, tLogger.SubLogger("initiator"), cfg, 3, net)
 	if err != nil {
 		t.Fatalf("unable to create node client %v", err)
 	}
@@ -2075,11 +2095,6 @@ func testApproveGas(t *testing.T) {
 		t.Fatalf("failed to connect to node: %v", err)
 	}
 	defer client.shutdown()
-
-	appSeedB, err := hex.DecodeString(appSeed)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	appSeedAndPass := func(assetID uint32, appSeed []byte) ([]byte, []byte) {
 		b := make([]byte, len(appSeed)+4)
@@ -2107,13 +2122,16 @@ func testApproveGas(t *testing.T) {
 		Nonce:     big.NewInt(nonce),
 	}
 
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+
 	tx, err := client.sendTransaction(ctx, txOpts, addressToCall, data)
 	if err != nil {
 		t.Fatalf("failed to send transaction: %v", err)
 	}
 
 	fmt.Printf("replacement tx hash: %s\n", tx.Hash())
-}*/
+}
 
 func testSignMessage(t *testing.T) {
 	msg := []byte("test message")
