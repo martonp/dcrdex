@@ -285,14 +285,7 @@ export default class MarketMakerPage extends BasePage {
   }
 
   async handleCEXNote (n: CEXNotification) {
-    switch (n.topic) {
-      case 'BalanceUpdate':
-        return this.handleCEXBalanceUpdate(n.cexName /* , n.note */)
-    }
-  }
-
-  async handleCEXBalanceUpdate (cexName: string /* , note: CEXBalanceUpdate */) {
-    const cexRow = this.cexes[cexName]
+    const cexRow = this.cexes[n.cexName]
     if (cexRow) this.updateCexRow(cexRow)
   }
 
@@ -382,16 +375,21 @@ export default class MarketMakerPage extends BasePage {
   }
 
   updateCexRow (row: CEXRow) {
+    console.log('updateCexRow', row)
     const { tmpl, dinfo, cexName } = row
     tmpl.logo.src = dinfo.logo
     tmpl.name.textContent = dinfo.name
     const status = app().mmStatus.cexes[cexName]
     Doc.setVis(!status, tmpl.unconfigured)
-    Doc.setVis(status && !status.connectErr, tmpl.configured)
-    Doc.setVis(status?.connectErr, tmpl.connectErrBox)
+    Doc.setVis(status && !status.connectErr && !status.disconnected, tmpl.configured)
+    Doc.setVis(status?.connectErr || status?.disconnected, tmpl.connectErrBox)
+    console.log('status', status)
     if (status?.connectErr) {
       tmpl.connectErr.textContent = 'connection error'
       tmpl.connectErr.dataset.tooltip = status.connectErr
+    } else if (status?.disconnected) {
+      tmpl.connectErr.textContent = 'disconnected'
+      tmpl.connectErr.dataset.tooltip = ''
     }
     tmpl.logo.classList.toggle('greyscale', !status)
     if (!status) return
@@ -663,7 +661,7 @@ class Bot extends BotMarket {
 
     if (cexName) {
       const cex = app().mmStatus.cexes[cexName]
-      if (!cex || !cex.connected) {
+      if (!cex || cex.connectErr || cex.disconnected) {
         page.offError.textContent = intl.prep(intl.ID_CEX_NOT_CONNECTED, { cexName })
         Doc.showTemporarily(3000, page.offError)
         return
@@ -796,10 +794,13 @@ class Bot extends BotMarket {
     const { page, alloc, baseID, quoteID, host, cexName, cfg: { uiConfig: { cexRebalance } } } = this
 
     Doc.hide(page.errMsg)
-    if (cexName && !app().mmStatus.cexes[cexName]?.connected) {
-      page.errMsg.textContent = `${cexName} not connected`
-      Doc.show(page.errMsg)
-      return
+    if (cexName) {
+      const cex = app().mmStatus.cexes[cexName]
+      if (!cex || cex.connectErr || cex.disconnected) {
+        page.errMsg.textContent = `${cexName} not connected`
+        Doc.show(page.errMsg)
+        return
+      }
     }
 
     // round allocations values.
@@ -859,7 +860,7 @@ class Bot extends BotMarket {
     const { host, baseID, quoteID, cexName, botType, page } = this
     if (cexName) {
       const cex = app().mmStatus.cexes[cexName]
-      if (!cex || !cex.connected) {
+      if (!cex || cex.connectErr || cex.disconnected) {
         page.offError.textContent = intl.prep(intl.ID_CEX_NOT_CONNECTED, { cexName })
         Doc.showTemporarily(3000, page.offError)
         return

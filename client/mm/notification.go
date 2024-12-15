@@ -64,6 +64,8 @@ type cexNotification struct {
 
 const (
 	TopicBalanceUpdate = "BalanceUpdate"
+	TopicDisconnected  = "Disconnected"
+	TopicConnected     = "Connected"
 )
 
 func newCexUpdateNote(cexName string, topic db.Topic, note interface{}) *cexNotification {

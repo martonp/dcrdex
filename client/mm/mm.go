@@ -79,11 +79,15 @@ type centralizedExchange struct {
 	libxc.CEX
 	*CEXConfig
 
-	mtx        sync.RWMutex
-	cm         *dex.ConnectionMaster
-	mkts       map[string]*libxc.Market
-	balances   map[uint32]*libxc.ExchangeBalance
-	connectErr string
+	mtx sync.RWMutex
+	cm  *dex.ConnectionMaster
+	// The connection master may be connected, but the CEX may not be. The CEX
+	// will send ConnectedUpdate and DisconnectedUpdate notifications to
+	// indicate the connection status.
+	disconnected bool
+	connectErr   string
+	mkts         map[string]*libxc.Market
+	balances     map[uint32]*libxc.ExchangeBalance
 }
 
 // mtx must be locked
@@ -206,8 +210,11 @@ type Status struct {
 
 // CEXStatus is state information about a cex.
 type CEXStatus struct {
-	Config          *CEXConfig                        `json:"config"`
-	Connected       bool                              `json:"connected"`
+	Config *CEXConfig `json:"config"`
+	// Disconnected is true if we have established a connection to the CEX
+	// and it has been disconnected.
+	Disconnected bool `json:"disconnected"`
+	// ConnectionError is the error message from the last connection attempt.
 	ConnectionError string                            `json:"connectErr"`
 	Markets         map[string]*libxc.Market          `json:"markets"`
 	Balances        map[uint32]*libxc.ExchangeBalance `json:"balances"`
@@ -382,7 +389,8 @@ func (m *MarketMaker) Status() *Status {
 		s := &CEXStatus{Config: cex.CEXConfig}
 		if cex != nil {
 			cex.mtx.RLock()
-			s.Connected = cex.cm != nil && cex.cm.On()
+			// s.Active = cex.cm != nil && cex.cm.On()
+			s.Disconnected = cex.disconnected
 			s.Markets = cex.mkts
 			s.ConnectionError = cex.connectErr
 			s.Balances = cex.balancesCopy()
@@ -603,6 +611,7 @@ func (m *MarketMaker) loadCEX(ctx context.Context, cfg *CEXConfig) (*centralized
 }
 
 func (m *MarketMaker) handleCEXUpdate(cexName string, ni interface{}) {
+	fmt.Println("handleCEXUpdate", cexName, ni)
 	switch n := ni.(type) {
 	case *libxc.BalanceUpdate:
 		m.cexMtx.RLock()
@@ -616,6 +625,41 @@ func (m *MarketMaker) handleCEXUpdate(cexName string, ni interface{}) {
 		cex.balances[n.AssetID] = n.Balance
 		cex.mtx.Unlock()
 		m.core.Broadcast(newCexUpdateNote(cexName, TopicBalanceUpdate, ni))
+	case *libxc.ConnectedUpdate:
+		fmt.Println("ConnectedUpdate", cexName)
+		m.cexMtx.RLock()
+		cex := m.cexes[cexName]
+		m.cexMtx.RUnlock()
+		if cex == nil {
+			m.log.Errorf("CEX update received from unknown cex %q?", cexName)
+			return
+		}
+		bals, err := cex.Balances(m.ctx)
+		if err != nil {
+			// TODO: how to handle this?
+			cex.mtx.Lock()
+			cex.connectErr = core.UnwrapErr(err).Error()
+			cex.mtx.Unlock()
+			return
+		}
+		cex.mtx.Lock()
+		cex.balances = bals
+		cex.disconnected = false
+		cex.mtx.Unlock()
+		m.core.Broadcast(newCexUpdateNote(cexName, TopicConnected, cexName))
+	case *libxc.DisconnectedUpdate:
+		fmt.Println("DisconnectedUpdate", cexName)
+		m.cexMtx.RLock()
+		cex := m.cexes[cexName]
+		m.cexMtx.RUnlock()
+		if cex == nil {
+			m.log.Errorf("CEX update received from unknown cex %q?", cexName)
+			return
+		}
+		cex.mtx.Lock()
+		cex.disconnected = true
+		cex.mtx.Unlock()
+		m.core.Broadcast(newCexUpdateNote(cexName, TopicDisconnected, cexName))
 	}
 }
 

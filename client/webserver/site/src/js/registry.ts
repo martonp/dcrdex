@@ -843,7 +843,7 @@ export interface MarketWithHost {
 
 export interface MMCEXStatus {
   config: CEXConfig
-  connected: boolean
+  disconnected: boolean
   connectErr: string
   markets: Record<string, CEXMarket>
   balances: Record<number, ExchangeBalance>
