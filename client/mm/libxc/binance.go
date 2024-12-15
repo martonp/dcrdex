@@ -1492,12 +1492,20 @@ func (bnc *binance) getUserDataStream(ctx context.Context) (err error) {
 			return nil, err
 		}
 
+		initialConnect := true
 		conn, err := comms.NewWsConn(&comms.WsCfg{
 			URL:          bnc.wsURL + "/ws/" + listenKey,
 			PingWait:     time.Minute * 4,
 			EchoPingData: true,
-			ReconnectSync: func() {
-				bnc.log.Debugf("Binance reconnected")
+			ConnectEventFunc: func(status comms.ConnectionStatus) {
+				if status == comms.Connected {
+					if !initialConnect {
+						bnc.broadcast(&ConnectedUpdate{})
+					}
+					initialConnect = false
+				} else {
+					bnc.broadcast(&DisconnectedUpdate{})
+				}
 			},
 			Logger:         bnc.log.SubLogger("BNCWS"),
 			RawHandler:     bnc.handleUserDataStreamUpdate,

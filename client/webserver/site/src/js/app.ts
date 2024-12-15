@@ -1186,7 +1186,24 @@ export default class Application {
         switch (n.topic) {
           case 'BalanceUpdate': {
             const u = n.note as CEXBalanceUpdate
-            this.mmStatus.cexes[n.cexName].balances[u.assetID] = u.balance
+            const cex = this.mmStatus.cexes[n.cexName]
+            if (!cex) break
+            cex.balances[u.assetID] = u.balance
+            break
+          }
+          case 'Disconnected': {
+            const cexName = n.note as string
+            const cex = this.mmStatus.cexes[cexName]
+            if (!cex) break
+            cex.connected = false
+            break
+          }
+          case 'Connected': {
+            const cexName = n.note as string
+            const cex = this.mmStatus.cexes[cexName]
+            if (!cex) break
+            cex.connected = true
+            break
           }
         }
         break

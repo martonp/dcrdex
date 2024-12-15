@@ -285,14 +285,7 @@ export default class MarketMakerPage extends BasePage {
   }
 
   async handleCEXNote (n: CEXNotification) {
-    switch (n.topic) {
-      case 'BalanceUpdate':
-        return this.handleCEXBalanceUpdate(n.cexName /* , n.note */)
-    }
-  }
-
-  async handleCEXBalanceUpdate (cexName: string /* , note: CEXBalanceUpdate */) {
-    const cexRow = this.cexes[cexName]
+    const cexRow = this.cexes[n.cexName]
     if (cexRow) this.updateCexRow(cexRow)
   }
 
@@ -387,13 +380,18 @@ export default class MarketMakerPage extends BasePage {
     tmpl.name.textContent = dinfo.name
     const status = app().mmStatus.cexes[cexName]
     Doc.setVis(!status, tmpl.unconfigured)
-    Doc.setVis(status && !status.connectErr, tmpl.configured)
-    Doc.setVis(status?.connectErr, tmpl.connectErrBox)
+    Doc.setVis(status && status.connected, tmpl.configured)
+    const disconnected = status && !status.connected
+    Doc.setVis(disconnected, tmpl.connectErrBox)
     if (status?.connectErr) {
       tmpl.connectErr.textContent = 'connection error'
       tmpl.connectErr.dataset.tooltip = status.connectErr
+    } else if (disconnected) {
+      tmpl.connectErr.textContent = 'disconnected'
+      tmpl.connectErr.dataset.tooltip = ''
     }
     tmpl.logo.classList.toggle('greyscale', !status)
+    console.log('status', status)
     if (!status) return
     let usdBal = 0
     const cexSymbolAdded : Record<string, boolean> = {} // avoid double counting tokens or counting both eth and weth
@@ -796,10 +794,13 @@ class Bot extends BotMarket {
     const { page, alloc, baseID, quoteID, host, cexName, cfg: { uiConfig: { cexRebalance } } } = this
 
     Doc.hide(page.errMsg)
-    if (cexName && !app().mmStatus.cexes[cexName]?.connected) {
-      page.errMsg.textContent = `${cexName} not connected`
-      Doc.show(page.errMsg)
-      return
+    if (cexName) {
+      const cex = app().mmStatus.cexes[cexName]
+      if (!cex || !cex.connected) {
+        page.errMsg.textContent = `${cexName} not connected`
+        Doc.show(page.errMsg)
+        return
+      }
     }
 
     // round allocations values.

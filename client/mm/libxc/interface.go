@@ -71,10 +71,17 @@ type MarketMatch struct {
 	Slug string `json:"slug"`
 }
 
+// BalanceUpdate is a notification that a balance has been updated.
 type BalanceUpdate struct {
 	AssetID uint32           `json:"assetID"`
 	Balance *ExchangeBalance `json:"balance"`
 }
+
+// ConnectedUpdate is a notification that the connection to the CEX has been reconnected.
+type ConnectedUpdate struct{}
+
+// DisconnectedUpdate is a notification that the connection to the CEX has been lost.
+type DisconnectedUpdate struct{}
 
 var (
 	ErrWithdrawalPending = errors.New("withdrawal pending")
