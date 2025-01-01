@@ -475,6 +475,25 @@ func (c *tCEX) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rat
 	}
 	return c.lastTrade, nil
 }
+func (c *tCEX) MarketTrade(ctx context.Context, baseID, quoteID, assetToTrade uint32, qty uint64, updaterID int) (*libxc.Trade, error) {
+	if c.tradeErr != nil {
+		return nil, c.tradeErr
+	}
+	c.lastTrade = &libxc.Trade{
+		ID:      c.tradeID,
+		BaseID:  baseID,
+		QuoteID: quoteID,
+		Market:  true,
+		Sell:    assetToTrade == baseID,
+	}
+	if assetToTrade == baseID {
+		c.lastTrade.Qty = qty
+	} else {
+		c.lastTrade.QuoteQty = qty
+	}
+	return c.lastTrade, nil
+}
+
 func (c *tCEX) CancelTrade(ctx context.Context, seID, quoteID uint32, tradeID string) error {
 	if c.cancelTradeErr != nil {
 		return c.cancelTradeErr
@@ -507,6 +526,10 @@ func (c *tCEX) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrem
 	}
 	return res.avg, res.extrema, true, nil
 }
+func (c *tCEX) InvVWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
+	return 0, 0, false, fmt.Errorf("not implemented")
+}
+
 func (c *tCEX) MidGap(baseID, quoteID uint32) uint64 { return 0 }
 func (c *tCEX) SubscribeTradeUpdates() (<-chan *libxc.Trade, func(), int) {
 	return c.tradeUpdates, func() {}, c.tradeUpdatesID
@@ -546,6 +569,9 @@ func (c *tCEX) ConfirmDeposit(ctx context.Context, deposit *libxc.DepositData) (
 }
 
 func (c *tCEX) TradeStatus(ctx context.Context, id string, baseID, quoteID uint32) (*libxc.Trade, error) {
+	if c.tradeStatus == nil {
+		return nil, fmt.Errorf("trade not found")
+	}
 	return c.tradeStatus, nil
 }
 
@@ -565,6 +591,7 @@ type tBotCexAdaptor struct {
 	tradeID         string
 	tradeErr        error
 	lastTrade       *libxc.Trade
+	lastMarketTrade *libxc.Trade
 	cancelledTrades []string
 	cancelTradeErr  error
 	tradeUpdates    chan *libxc.Trade
@@ -615,6 +642,25 @@ func (c *tBotCexAdaptor) CEXTrade(ctx context.Context, baseID, quoteID uint32, s
 	}
 	return c.lastTrade, nil
 }
+func (c *tBotCexAdaptor) CEXMarketTrade(ctx context.Context, baseID, quoteID, assetToTrade uint32, qty uint64) (*libxc.Trade, error) {
+	if assetToTrade != baseID && assetToTrade != quoteID {
+		return nil, fmt.Errorf("invalid asset to trade: %d", assetToTrade)
+	}
+	c.lastMarketTrade = &libxc.Trade{
+		ID:      c.tradeID,
+		BaseID:  baseID,
+		QuoteID: quoteID,
+		Market:  true,
+		Sell:    assetToTrade == baseID,
+	}
+	if assetToTrade == baseID {
+		c.lastMarketTrade.Qty = qty
+	} else {
+		c.lastMarketTrade.QuoteQty = qty
+	}
+	return c.lastMarketTrade, nil
+}
+
 func (c *tBotCexAdaptor) FreeUpFunds(assetID uint32, cex bool, amt uint64, currEpoch uint64) {
 }
 

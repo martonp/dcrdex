@@ -21,6 +21,8 @@ type Trade struct {
 	ID          string
 	Sell        bool
 	Qty         uint64
+	QuoteQty    uint64
+	Market      bool
 	Rate        uint64
 	BaseID      uint32
 	QuoteID     uint32
@@ -109,6 +111,9 @@ type CEX interface {
 	// Trade executes a trade on the CEX. updaterID takes a subscriptionID
 	// returned from SubscribeTradeUpdates.
 	Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int) (*Trade, error)
+	// MarketTrade executes a market trade on the CEX. updaterID takes a
+	// subscriptionID returned from SubscribeTradeUpdates.
+	MarketTrade(ctx context.Context, baseID, quoteID uint32, assetToTrade uint32, qty uint64, subscriptionID int) (*Trade, error)
 	// UnsubscribeMarket unsubscribes from order book updates on a market.
 	UnsubscribeMarket(baseID, quoteID uint32) error
 	// VWAP returns the volume weighted average price for a certain quantity
@@ -116,6 +121,7 @@ type CEX interface {
 	// the market on which to get the average price. SubscribeMarket must be
 	// called, and the market must be synced before results can be expected.
 	VWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error)
+	InvVWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error)
 	// MidGap returns the mid-gap price for an order book.
 	MidGap(baseID, quoteID uint32) uint64
 	// GetDepositAddress returns a deposit address for an asset.

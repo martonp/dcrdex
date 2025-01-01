@@ -773,12 +773,18 @@ export interface ArbMarketMakingPlacement {
   multiplier: number
 }
 
+export interface MultiHopCfg {
+  baseAssetMarket: [number, number]
+  quoteAssetMarket: [number, number]
+}
+
 export interface ArbMarketMakingConfig {
   buyPlacements: ArbMarketMakingPlacement[]
   sellPlacements: ArbMarketMakingPlacement[]
   profit: number
   driftTolerance: number
   orderPersistence: number
+  multiHop?: MultiHopCfg
 }
 
 export interface SimpleArbConfig {

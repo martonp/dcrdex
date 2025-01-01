@@ -30,6 +30,7 @@ import (
 	"decred.org/dcrdex/dex/dexnet"
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/utils"
+	"github.com/davecgh/go-spew/spew"
 )
 
 // Binance API spot trading docs:
@@ -332,6 +333,18 @@ func (b *binanceOrderBook) vwap(bids bool, qty uint64) (vwap, extrema uint64, fi
 	return
 }
 
+func (b *binanceOrderBook) invVWAP(bids bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+
+	if !b.synced.Load() {
+		return 0, 0, filled, ErrUnsyncedOrderbook
+	}
+
+	vwap, extrema, filled = b.book.invVWAP(bids, qty)
+	return
+}
+
 func (b *binanceOrderBook) midGap() uint64 {
 	return b.book.midGap()
 }
@@ -446,6 +459,8 @@ type tradeInfo struct {
 	sell      bool
 	rate      uint64
 	qty       uint64
+	quoteQty  uint64
+	market    bool
 }
 
 type withdrawInfo struct {
@@ -696,6 +711,7 @@ func (bnc *binance) getMarkets(ctx context.Context) (map[string]*bntypes.Market,
 	}
 
 	bnc.markets.Store(marketsMap)
+
 	return marketsMap, nil
 }
 
@@ -915,6 +931,136 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 		QuoteFilled: uint64(orderResponse.CumulativeQuoteQty * float64(quoteCfg.conversionFactor)),
 		Complete:    orderResponse.Status != "NEW" && orderResponse.Status != "PARTIALLY_FILLED",
 	}, err
+}
+
+// TODO: check quoteOrderQtyMarketAllowed
+
+func (bnc *binance) calcFees(fills []*bntypes.Fill, baseCfg, quoteCfg *bncAssetConfig) (uint64, uint64) {
+	var feeBase, feeQuote uint64
+	for _, fill := range fills {
+		if fill.CommissionAsset == baseCfg.coin {
+			feeBase += uint64(fill.Commission * float64(baseCfg.conversionFactor))
+		} else if fill.CommissionAsset == quoteCfg.coin {
+			feeQuote += uint64(fill.Commission * float64(quoteCfg.conversionFactor))
+		}
+	}
+	return feeBase, feeQuote
+}
+
+func (bnc *binance) MarketTrade(ctx context.Context, baseID, quoteID uint32, assetToTrade uint32, qty uint64, subscriptionID int) (*Trade, error) {
+	if assetToTrade != baseID && assetToTrade != quoteID {
+		return nil, fmt.Errorf("invalid asset to trade: %d", assetToTrade)
+	}
+
+	baseCfg, err := bncAssetCfg(baseID)
+	if err != nil {
+		return nil, fmt.Errorf("error getting asset cfg for %d: %w", baseID, err)
+	}
+
+	quoteCfg, err := bncAssetCfg(quoteID)
+	if err != nil {
+		return nil, fmt.Errorf("error getting asset cfg for %d: %w", quoteID, err)
+	}
+
+	slug := baseCfg.coin + quoteCfg.coin
+
+	marketsMap := bnc.markets.Load().(map[string]*bntypes.Market)
+	market, found := marketsMap[slug]
+	if !found {
+		return nil, fmt.Errorf("market not found: %v", slug)
+	}
+
+	var side, qtyStr string
+	if assetToTrade == baseID {
+		side = "SELL"
+		steppedQty := steppedRate(qty, market.LotSize)
+		convQty := float64(steppedQty) / float64(baseCfg.conversionFactor)
+		qtyPrec := int(math.Round(math.Log10(float64(baseCfg.conversionFactor) / float64(market.LotSize))))
+		qtyStr = strconv.FormatFloat(convQty, 'f', qtyPrec, 64)
+	} else {
+		// If specifying the quote asset, the lot size requirement will not
+		// be applied.
+		// Binance docs:
+		// MARKET orders using quoteOrderQty will not break LOT_SIZE filter
+		// rules; the order will execute a quantity that will have the notional
+		// value as close as possible to quoteOrderQty.
+		side = "BUY"
+		qtyPrec := int(math.Round(math.Log10(float64(quoteCfg.conversionFactor))))
+		convQty := float64(qty) / float64(quoteCfg.conversionFactor)
+		qtyStr = strconv.FormatFloat(convQty, 'f', qtyPrec, 64)
+	}
+
+	tradeID := bnc.generateTradeID()
+
+	v := make(url.Values)
+	v.Add("symbol", slug)
+	v.Add("side", side)
+	v.Add("type", "MARKET")
+	v.Add("newClientOrderId", tradeID)
+	if assetToTrade == baseID {
+		v.Add("quantity", qtyStr)
+	} else {
+		v.Add("quoteOrderQty", qtyStr)
+	}
+
+	bnc.tradeUpdaterMtx.Lock()
+	_, found = bnc.tradeUpdaters[subscriptionID]
+	if !found {
+		bnc.tradeUpdaterMtx.Unlock()
+		return nil, fmt.Errorf("no trade updater with ID %v", subscriptionID)
+	}
+	bnc.tradeInfo[tradeID] = &tradeInfo{
+		updaterID: subscriptionID,
+		baseID:    baseID,
+		quoteID:   quoteID,
+		market:    true,
+	}
+	if assetToTrade == baseID {
+		bnc.tradeInfo[tradeID].qty = qty
+	} else {
+		bnc.tradeInfo[tradeID].quoteQty = qty
+	}
+	bnc.tradeUpdaterMtx.Unlock()
+
+	var success bool
+	defer func() {
+		if !success {
+			bnc.tradeUpdaterMtx.Lock()
+			delete(bnc.tradeInfo, tradeID)
+			bnc.tradeUpdaterMtx.Unlock()
+		}
+	}()
+
+	var orderResponse bntypes.OrderResponse
+	err = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	spew.Dump(orderResponse)
+
+	success = true
+
+	baseFee, quoteFee := bnc.calcFees(orderResponse.Fills, baseCfg, quoteCfg)
+	baseFilled := uint64(orderResponse.ExecutedQty * float64(baseCfg.conversionFactor))
+	quoteFilled := uint64(orderResponse.CumulativeQuoteQty * float64(quoteCfg.conversionFactor))
+
+	trade := &Trade{
+		ID:          tradeID,
+		BaseID:      baseID,
+		QuoteID:     quoteID,
+		Market:      true,
+		BaseFilled:  utils.SafeSub(baseFilled, baseFee),
+		QuoteFilled: utils.SafeSub(quoteFilled, quoteFee),
+		Complete:    orderResponse.Status != "NEW" && orderResponse.Status != "PARTIALLY_FILLED",
+	}
+	if assetToTrade == baseID {
+		trade.Qty = qty
+	} else {
+		trade.QuoteQty = qty
+	}
+
+	return trade, nil
 }
 
 // ConfirmWithdrawal checks whether a withdrawal has been completed. If the
@@ -1330,6 +1476,7 @@ func (bnc *binance) request(ctx context.Context, method, endpoint string, query,
 	}
 	if err := dexnet.Do(req, thing, dexnet.WithSizeLimit(1<<24), dexnet.WithErrorParsing(&errPayload)); err != nil {
 		bnc.log.Errorf("request error from endpoint %s %q with query = %q, body = %q", method, endpoint, queryString, bodyString)
+		bnc.log.Errorf("errPayload: %+v\n", errPayload)
 		return fmt.Errorf("%w, bn code = %d, msg = %q", err, errPayload.Code, errPayload.Msg)
 	}
 	return nil
@@ -1433,13 +1580,28 @@ func (bnc *binance) handleExecutionReport(update *bntypes.StreamUpdate) {
 		return
 	}
 
+	baseFilled := uint64(update.Filled * float64(baseCfg.conversionFactor))
+	quoteFilled := uint64(update.QuoteFilled * float64(quoteCfg.conversionFactor))
+	var baseFee, quoteFee uint64
+	if update.Commission > 0 {
+		if update.CommissionAsset == baseCfg.coin {
+			baseFee = uint64(update.Commission * float64(baseCfg.conversionFactor))
+		} else if update.CommissionAsset == quoteCfg.coin {
+			quoteFee = uint64(update.Commission * float64(quoteCfg.conversionFactor))
+		} else {
+			bnc.log.Errorf("unknown commission asset %q", update.CommissionAsset)
+		}
+	}
+
 	updater <- &Trade{
 		ID:          id,
 		Complete:    complete,
 		Rate:        tradeInfo.rate,
 		Qty:         tradeInfo.qty,
-		BaseFilled:  uint64(update.Filled * float64(baseCfg.conversionFactor)),
-		QuoteFilled: uint64(update.QuoteFilled * float64(quoteCfg.conversionFactor)),
+		QuoteQty:    tradeInfo.quoteQty,
+		Market:      tradeInfo.market,
+		BaseFilled:  utils.SafeSub(baseFilled, baseFee),
+		QuoteFilled: utils.SafeSub(quoteFilled, quoteFee),
 		BaseID:      tradeInfo.baseID,
 		QuoteID:     tradeInfo.quoteID,
 		Sell:        tradeInfo.sell,
@@ -2085,6 +2247,14 @@ func (bnc *binance) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (avgPric
 	return book.vwap(!sell, qty)
 }
 
+func (bnc *binance) InvVWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
+	book, err := bnc.book(baseID, quoteID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return book.invVWAP(sell, qty)
+}
+
 func (bnc *binance) MidGap(baseID, quoteID uint32) uint64 {
 	book, err := bnc.book(baseID, quoteID)
 	if err != nil {
@@ -2094,6 +2264,7 @@ func (bnc *binance) MidGap(baseID, quoteID uint32) uint64 {
 	return book.midGap()
 }
 
+// TODO: fees on trade status
 // TradeStatus returns the current status of a trade.
 func (bnc *binance) TradeStatus(ctx context.Context, tradeID string, baseID, quoteID uint32) (*Trade, error) {
 	baseAsset, err := bncAssetCfg(baseID)
@@ -2116,16 +2287,21 @@ func (bnc *binance) TradeStatus(ctx context.Context, tradeID string, baseID, quo
 		return nil, err
 	}
 
+	baseFilled := uint64(resp.ExecutedQty * float64(baseAsset.conversionFactor))
+	quoteFilled := uint64(resp.CumulativeQuoteQty * float64(quoteAsset.conversionFactor))
+
 	return &Trade{
 		ID:          tradeID,
 		Sell:        resp.Side == "SELL",
 		Rate:        calc.MessageRateAlt(resp.Price, baseAsset.conversionFactor, quoteAsset.conversionFactor),
 		Qty:         uint64(resp.OrigQty * float64(baseAsset.conversionFactor)),
+		QuoteQty:    uint64(resp.OrigQuoteQty * float64(quoteAsset.conversionFactor)),
 		BaseID:      baseID,
 		QuoteID:     quoteID,
-		BaseFilled:  uint64(resp.ExecutedQty * float64(baseAsset.conversionFactor)),
-		QuoteFilled: uint64(resp.CumulativeQuoteQty * float64(quoteAsset.conversionFactor)),
+		BaseFilled:  baseFilled,
+		QuoteFilled: quoteFilled,
 		Complete:    resp.Status != "NEW" && resp.Status != "PARTIALLY_FILLED",
+		Market:      resp.Type == "MARKET",
 	}, nil
 }
 

@@ -417,7 +417,7 @@ func (a *simpleArbMarketMaker) rebalance(newEpoch uint64) {
 }
 
 func (a *simpleArbMarketMaker) distribution() (dist *distribution, err error) {
-	sellVWAP, buyVWAP, err := a.cexCounterRates(1, 1)
+	sellVWAP, buyVWAP, err := a.cexCounterRates(1, 1, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error getting cex counter-rates: %w", err)
 	}
@@ -521,7 +521,7 @@ func (a *simpleArbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, er
 }
 
 func (a *simpleArbMarketMaker) registerFeeGap() {
-	feeGap, err := feeGap(a.core, a.CEX, a.baseID, a.quoteID, a.lotSize)
+	feeGap, err := feeGap(a.core, nil, a.CEX, a.market)
 	if err != nil {
 		a.log.Warnf("error getting fee-gap stats: %v", err)
 		return

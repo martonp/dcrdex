@@ -82,7 +82,9 @@ type botCoreAdaptor interface {
 type botCexAdaptor interface {
 	CancelTrade(ctx context.Context, baseID, quoteID uint32, tradeID string) error
 	SubscribeMarket(ctx context.Context, baseID, quoteID uint32) error
+	UnsubscribeMarket(baseID, quoteID uint32) error
 	SubscribeTradeUpdates() <-chan *libxc.Trade
+	CEXMarketTrade(ctx context.Context, baseID, quoteID, assetToTrade uint32, qty uint64) (*libxc.Trade, error)
 	CEXTrade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64) (*libxc.Trade, error)
 	SufficientBalanceForCEXTrade(baseID, quoteID uint32, sell bool, rate, qty uint64) bool
 	MidGap(baseID, quoteID uint32) uint64
@@ -739,6 +741,8 @@ func cexOrderEvent(trade *libxc.Trade, eventID uint64, timestamp int64) *MarketM
 			Rate:        trade.Rate,
 			Qty:         trade.Qty,
 			Sell:        trade.Sell,
+			Market:      trade.Market,
+			QuoteQty:    trade.QuoteQty,
 			BaseFilled:  trade.BaseFilled,
 			QuoteFilled: trade.QuoteFilled,
 		},
@@ -1510,10 +1514,7 @@ func (u *unifiedExchangeAdaptor) refreshAllPendingEvents(ctx context.Context) {
 	}
 }
 
-// incompleteCexTradeBalanceEffects returns the balance effects of an
-// incomplete CEX trade. As soon as a CEX trade is complete, it is removed
-// from the pending map, so completed trades do not need to be calculated.
-func cexTradeBalanceEffects(trade *libxc.Trade) (effects *BalanceEffects) {
+func cexLimitTradeBalanceEffects(trade *libxc.Trade) (effects *BalanceEffects) {
 	effects = newBalanceEffects()
 
 	if trade.Complete {
@@ -1538,6 +1539,40 @@ func cexTradeBalanceEffects(trade *libxc.Trade) (effects *BalanceEffects) {
 	}
 
 	return
+}
+
+func cexMarketTradeBalanceEffects(trade *libxc.Trade) (effects *BalanceEffects) {
+	effects = newBalanceEffects()
+
+	if trade.Complete {
+		if trade.QuoteQty > 0 {
+			effects.Settled[trade.BaseID] = int64(trade.BaseFilled)
+			effects.Settled[trade.QuoteID] -= int64(trade.QuoteFilled)
+		} else {
+			effects.Settled[trade.QuoteID] = int64(trade.QuoteFilled)
+			effects.Settled[trade.BaseID] -= int64(trade.BaseFilled)
+		}
+		return
+	}
+
+	if trade.QuoteQty > 0 {
+		effects.Settled[trade.BaseID] = int64(trade.BaseFilled)
+		effects.Settled[trade.QuoteID] -= int64(trade.QuoteQty)
+		effects.Locked[trade.QuoteID] = trade.QuoteQty - trade.QuoteFilled
+	} else {
+		effects.Settled[trade.QuoteID] = int64(trade.QuoteFilled)
+		effects.Settled[trade.BaseID] -= int64(trade.Qty)
+		effects.Locked[trade.BaseID] = trade.Qty - trade.BaseFilled
+	}
+
+	return
+}
+
+func cexTradeBalanceEffects(trade *libxc.Trade) (effects *BalanceEffects) {
+	if trade.Market {
+		return cexMarketTradeBalanceEffects(trade)
+	}
+	return cexLimitTradeBalanceEffects(trade)
 }
 
 // cexBalance must be called with the balancesMtx read locked.
@@ -2204,6 +2239,63 @@ func (u *unifiedExchangeAdaptor) CEXTrade(ctx context.Context, baseID, quoteID u
 	if trade.Complete {
 		diffs := make(map[uint32]int64)
 		if trade.Sell {
+			u.baseCexBalances[trade.BaseID] -= int64(trade.BaseFilled)
+			u.baseCexBalances[trade.QuoteID] += int64(trade.QuoteFilled)
+			diffs[trade.BaseID] = -int64(trade.BaseFilled)
+			diffs[trade.QuoteID] = int64(trade.QuoteFilled)
+		} else {
+			u.baseCexBalances[trade.BaseID] += int64(trade.BaseFilled)
+			u.baseCexBalances[trade.QuoteID] -= int64(trade.QuoteFilled)
+			diffs[trade.BaseID] = int64(trade.BaseFilled)
+			diffs[trade.QuoteID] = -int64(trade.QuoteFilled)
+		}
+		u.logBalanceAdjustments(nil, diffs, fmt.Sprintf("CEX trade %s completed.", trade.ID))
+	} else {
+		u.pendingCEXOrders[trade.ID] = &pendingCEXOrder{
+			trade:      trade,
+			eventLogID: eventID,
+			timestamp:  now,
+		}
+	}
+
+	return trade, nil
+}
+
+func (u *unifiedExchangeAdaptor) CEXMarketTrade(ctx context.Context, baseID, quoteID uint32, assetToTrade uint32, qty uint64) (*libxc.Trade, error) {
+	assetBal := u.CEXBalance(assetToTrade)
+	if assetBal.Available < qty {
+		return nil, fmt.Errorf("insufficient balance")
+	}
+
+	u.subscriptionIDMtx.RLock()
+	subscriptionID := u.subscriptionID
+	u.subscriptionIDMtx.RUnlock()
+	if subscriptionID == nil {
+		return nil, fmt.Errorf("market trade called before SubscribeTradeUpdates")
+	}
+
+	var trade *libxc.Trade
+	now := time.Now().Unix()
+	eventID := u.eventLogID.Add(1)
+	defer func() {
+		if trade != nil {
+			u.updateCEXOrderEvent(trade, eventID, now)
+			u.sendStatsUpdate()
+		}
+	}()
+
+	u.balancesMtx.Lock()
+	defer u.balancesMtx.Unlock()
+
+	trade, err := u.CEX.MarketTrade(ctx, baseID, quoteID, assetToTrade, qty, *subscriptionID)
+	u.updateCEXProblems(cexTradeProblem, assetToTrade, err)
+	if err != nil {
+		return nil, err
+	}
+
+	if trade.Complete {
+		diffs := make(map[uint32]int64)
+		if assetToTrade == baseID {
 			u.baseCexBalances[trade.BaseID] -= int64(trade.BaseFilled)
 			u.baseCexBalances[trade.QuoteID] += int64(trade.QuoteFilled)
 			diffs[trade.BaseID] = -int64(trade.BaseFilled)
@@ -3164,7 +3256,7 @@ func (u *unifiedExchangeAdaptor) inventory(assetID uint32, dexLot, cexLot uint64
 // cexCounterRates attempts to get vwap estimates for the cex book for a
 // specified number of lots. If the book is too empty for the specified number
 // of lots, a 1-lot estimate will be attempted too.
-func (u *unifiedExchangeAdaptor) cexCounterRates(cexBuyLots, cexSellLots uint64) (dexBuyRate, dexSellRate uint64, err error) {
+func (u *unifiedExchangeAdaptor) cexCounterRates(cexBuyLots, cexSellLots uint64, multiHopCfg *MultiHopCfg) (dexBuyRate, dexSellRate uint64, err error) {
 	tryLots := func(b, s uint64) (uint64, uint64, bool, error) {
 		if b == 0 {
 			b = 1
@@ -3172,14 +3264,15 @@ func (u *unifiedExchangeAdaptor) cexCounterRates(cexBuyLots, cexSellLots uint64)
 		if s == 0 {
 			s = 1
 		}
-		buyRate, _, filled, err := u.CEX.VWAP(u.baseID, u.quoteID, true, u.lotSize*s)
+		buyRate, filled, err := arbMMVWAP(false, u.lotSize*s, multiHopCfg, u.market, u.CEX.VWAP, u.CEX.InvVWAP)
 		if err != nil {
 			return 0, 0, false, fmt.Errorf("error calculating dex buy price for quote conversion: %w", err)
 		}
 		if !filled {
 			return 0, 0, false, nil
 		}
-		sellRate, _, filled, err := u.CEX.VWAP(u.baseID, u.quoteID, false, u.lotSize*b)
+
+		sellRate, filled, err := arbMMVWAP(true, u.lotSize*b, multiHopCfg, u.market, u.CEX.VWAP, u.CEX.InvVWAP)
 		if err != nil {
 			return 0, 0, false, fmt.Errorf("error calculating dex sell price for quote conversion: %w", err)
 		}

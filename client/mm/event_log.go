@@ -27,9 +27,13 @@ type DEXOrderEvent struct {
 
 // CEXOrderEvent represents a a cex order that a bot placed.
 type CEXOrderEvent struct {
-	ID          string `json:"id"`
-	Rate        uint64 `json:"rate"`
-	Qty         uint64 `json:"qty"`
+	ID     string `json:"id"`
+	Rate   uint64 `json:"rate"`
+	Market bool   `json:"market"`
+	Qty    uint64 `json:"qty"`
+	// QuoteQty will be populated for market orders if the quote amount
+	// was specified instead of the base amount.
+	QuoteQty    uint64 `json:"quoteQty"`
 	Sell        bool   `json:"sell"`
 	BaseFilled  uint64 `json:"baseFilled"`
 	QuoteFilled uint64 `json:"quoteFilled"`

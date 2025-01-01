@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/client/core"
 	"decred.org/dcrdex/client/mm/libxc"
 	"decred.org/dcrdex/client/orderbook"
@@ -24,6 +25,11 @@ import (
 type ArbMarketMakingPlacement struct {
 	Lots       uint64  `json:"lots"`
 	Multiplier float64 `json:"multiplier"`
+}
+
+type MultiHopCfg struct {
+	BaseAssetMarket  [2]uint32 `json:"baseAssetMarket"`
+	QuoteAssetMarket [2]uint32 `json:"quoteAssetMarket"`
 }
 
 // ArbMarketMakerConfig is the configuration for a market maker that places
@@ -80,6 +86,11 @@ type ArbMarketMakerConfig struct {
 	Profit             float64                     `json:"profit"`
 	DriftTolerance     float64                     `json:"driftTolerance"`
 	NumEpochsLeaveOpen uint64                      `json:"orderPersistence"`
+	MultiHop           *MultiHopCfg                `json:"multiHop"`
+}
+
+func (c *ArbMarketMakerConfig) isMultiHop() bool {
+	return c.MultiHop != nil
 }
 
 type placementLots struct {
@@ -111,22 +122,77 @@ func (a *arbMarketMaker) cfg() *ArbMarketMakerConfig {
 	return a.cfgV.Load().(*ArbMarketMakerConfig)
 }
 
+func (a *arbMarketMaker) shouldCompleteMultiHopArb(update *libxc.Trade) (isIntermediateTrade bool, baseID, quoteID, assetToTrade uint32, qty uint64) {
+	cfg := a.cfg()
+	if a.baseID == update.BaseID || a.baseID == update.QuoteID {
+		baseID = cfg.MultiHop.QuoteAssetMarket[0]
+		quoteID = cfg.MultiHop.QuoteAssetMarket[1]
+		if a.baseID == update.BaseID {
+			qty = update.QuoteFilled
+			assetToTrade = update.QuoteID
+			isIntermediateTrade = update.Qty > 0
+		} else {
+			qty = update.BaseFilled
+			assetToTrade = update.BaseID
+			isIntermediateTrade = update.QuoteQty > 0
+		}
+	} else {
+		baseID = cfg.MultiHop.BaseAssetMarket[0]
+		quoteID = cfg.MultiHop.BaseAssetMarket[1]
+		if a.quoteID == update.QuoteID {
+			qty = update.BaseFilled
+			assetToTrade = update.BaseID
+			isIntermediateTrade = update.QuoteQty > 0
+		} else {
+			qty = update.QuoteFilled
+			assetToTrade = update.QuoteID
+			isIntermediateTrade = update.Qty > 0
+		}
+	}
+
+	if !isIntermediateTrade {
+		return false, 0, 0, 0, 0
+	}
+
+	return true, baseID, quoteID, assetToTrade, qty
+}
+
 func (a *arbMarketMaker) handleCEXTradeUpdate(update *libxc.Trade) {
-	if update.Complete {
-		a.cexTradesMtx.Lock()
-		delete(a.cexTrades, update.ID)
+	if !update.Complete {
+		return
+	}
+
+	a.cexTradesMtx.Lock()
+	if _, ok := a.cexTrades[update.ID]; !ok {
 		a.cexTradesMtx.Unlock()
 		return
+	}
+	delete(a.cexTrades, update.ID)
+	a.cexTradesMtx.Unlock()
+
+	cfg := a.cfg()
+	if !cfg.isMultiHop() {
+		return
+	}
+
+	if !update.Market {
+		a.log.Errorf("multi hop bot cex trade is not a market trade: %+v", update)
+		return
+	}
+
+	isIntermediateTrade, baseID, quoteID, assetToTrade, qty := a.shouldCompleteMultiHopArb(update)
+	if isIntermediateTrade {
+		a.marketTradeOnCEX(baseID, quoteID, assetToTrade, qty)
 	}
 }
 
 // tradeOnCEX executes a trade on the CEX.
-func (a *arbMarketMaker) tradeOnCEX(rate, qty uint64, sell bool) {
+func (a *arbMarketMaker) tradeOnCEX(doTrade func() (*libxc.Trade, error)) {
 	a.cexTradesMtx.Lock()
-	defer a.cexTradesMtx.Unlock()
 
-	cexTrade, err := a.cex.CEXTrade(a.ctx, a.baseID, a.quoteID, sell, rate, qty)
+	cexTrade, err := doTrade()
 	if err != nil {
+		a.cexTradesMtx.Unlock()
 		a.log.Errorf("Error sending trade to CEX: %v", err)
 		return
 	}
@@ -135,6 +201,40 @@ func (a *arbMarketMaker) tradeOnCEX(rate, qty uint64, sell bool) {
 	// the bot can cancel the trade if it is not filled after a certain number
 	// of epochs.
 	a.cexTrades[cexTrade.ID] = a.currEpoch.Load()
+	a.cexTradesMtx.Unlock()
+
+	a.handleCEXTradeUpdate(cexTrade)
+}
+
+func (a *arbMarketMaker) limitTradeOnCEX(rate, qty uint64, sell bool) {
+	a.tradeOnCEX(func() (*libxc.Trade, error) {
+		return a.cex.CEXTrade(a.ctx, a.baseID, a.quoteID, sell, rate, qty)
+	})
+}
+
+func (a *arbMarketMaker) marketTradeOnCEX(baseID, quoteID, assetToTrade uint32, qty uint64) {
+	a.tradeOnCEX(func() (*libxc.Trade, error) {
+		return a.cex.CEXMarketTrade(a.ctx, baseID, quoteID, assetToTrade, qty)
+	})
+}
+
+func (a *arbMarketMaker) intermediateMarketTradeOnCEX(sell bool, match *core.Match) {
+	cfg := a.cfg()
+	var baseID, quoteID, assetToTrade uint32
+	var qty uint64
+	if sell {
+		baseID = cfg.MultiHop.QuoteAssetMarket[0]
+		quoteID = cfg.MultiHop.QuoteAssetMarket[1]
+		assetToTrade = a.quoteID
+		qty = calc.BaseToQuote(match.Rate, match.Qty)
+	} else {
+		baseID = cfg.MultiHop.BaseAssetMarket[0]
+		quoteID = cfg.MultiHop.BaseAssetMarket[1]
+		assetToTrade = a.baseID
+		qty = match.Qty
+	}
+
+	a.marketTradeOnCEX(baseID, quoteID, assetToTrade, qty)
 }
 
 func (a *arbMarketMaker) processDEXOrderUpdate(o *core.Order) {
@@ -155,7 +255,13 @@ func (a *arbMarketMaker) processDEXOrderUpdate(o *core.Order) {
 
 		if !a.matchesSeen[matchID] {
 			a.matchesSeen[matchID] = true
-			a.tradeOnCEX(cexRate, match.Qty, !o.Sell)
+
+			cfg := a.cfg()
+			if cfg.isMultiHop() {
+				a.intermediateMarketTradeOnCEX(o.Sell, match)
+			} else {
+				a.limitTradeOnCEX(cexRate, match.Qty, !o.Sell)
+			}
 		}
 	}
 
@@ -236,9 +342,111 @@ func (a *arbMarketMaker) dexPlacementRate(cexRate uint64, sell bool) (uint64, er
 	return dexPlacementRate(cexRate, sell, a.cfg().Profit, a.market, feesInQuoteUnits, a.log)
 }
 
-type arbMMPlacementReason struct {
-	Depth         uint64 `json:"depth"`
-	CEXTooShallow bool   `json:"cexFilled"`
+func inverseRate(rate uint64, baseID, quoteID uint32) uint64 {
+	baseUI, _ := asset.UnitInfo(baseID)
+	quoteUI, _ := asset.UnitInfo(quoteID)
+	convRate := calc.ConventionalRate(rate, baseUI, quoteUI)
+	return calc.MessageRate(1/convRate, baseUI, quoteUI)
+}
+
+func aggregateRates(baseMarketRate, quoteMarketRate uint64, mkt *market, baseMarket, quoteMarket [2]uint32) uint64 {
+	msgRate := func(rate float64, baseID, quoteID uint32) uint64 {
+		baseUI, _ := asset.UnitInfo(baseID)
+		quoteUI, _ := asset.UnitInfo(quoteID)
+		return calc.MessageRate(rate, baseUI, quoteUI)
+	}
+	convRate := func(rate uint64, baseID, quoteID uint32) float64 {
+		baseUI, _ := asset.UnitInfo(baseID)
+		quoteUI, _ := asset.UnitInfo(quoteID)
+		return calc.ConventionalRate(rate, baseUI, quoteUI)
+	}
+	if mkt.baseID != baseMarket[0] {
+		baseMarketRate = inverseRate(baseMarketRate, baseMarket[0], baseMarket[1])
+	}
+	if mkt.quoteID != quoteMarket[0] {
+		quoteMarketRate = inverseRate(quoteMarketRate, quoteMarket[0], quoteMarket[1])
+	}
+	convBaseRate := convRate(baseMarketRate, baseMarket[0], baseMarket[1])
+	convQuoteRate := convRate(quoteMarketRate, quoteMarket[0], quoteMarket[1])
+	convAggRate := convBaseRate / convQuoteRate
+	return msgRate(convAggRate, mkt.baseID, mkt.quoteID)
+}
+
+type vwapFunc func(uint32, uint32, bool, uint64) (uint64, uint64, bool, error)
+
+// multiHopExtrema calculates the extrema price for buying or selling a certain
+// asset on one of the multi hop markets. assetID is the asset of which qty and
+// sell refer. For example, on a DCR/USDT market, if assetID is USDT, and sell
+// is true, this means that will be buying DCR on the CEX using qty USDT.
+func multiHopExtrema(baseMarket bool, assetID uint32, qty uint64, sell bool, multiHopCfg *MultiHopCfg, mkt *market, vwapF, invVwapF vwapFunc) (extrema, counterQty uint64, filled bool, err error) {
+	var baseID, quoteID uint32
+	if baseMarket {
+		baseID = multiHopCfg.BaseAssetMarket[0]
+		quoteID = multiHopCfg.BaseAssetMarket[1]
+	} else {
+		baseID = multiHopCfg.QuoteAssetMarket[0]
+		quoteID = multiHopCfg.QuoteAssetMarket[1]
+	}
+
+	var vwapFunc func(uint32, uint32, bool, uint64) (uint64, uint64, bool, error)
+	var sellOnCEX bool
+	if assetID == baseID {
+		vwapFunc = vwapF
+		sellOnCEX = sell
+	} else {
+		vwapFunc = invVwapF
+		sellOnCEX = !sell
+	}
+
+	_, extrema, filled, err = vwapFunc(baseID, quoteID, sellOnCEX, qty)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("error getting VWAP: %w", err)
+	}
+	if !filled {
+		return
+	}
+
+	if assetID == baseID {
+		counterQty = calc.BaseToQuote(extrema, qty)
+	} else {
+		counterQty = calc.QuoteToBase(extrema, qty)
+	}
+
+	return
+}
+
+func multiHopRate(sellOnDEX bool, depth uint64, multiHopCfg *MultiHopCfg, mkt *market, vwap, invVwap vwapFunc) (uint64, bool, error) {
+	intermediateAsset := multiHopCfg.BaseAssetMarket[0]
+	if mkt.baseID == intermediateAsset {
+		intermediateAsset = multiHopCfg.BaseAssetMarket[1]
+	}
+
+	baseRate, intAssetQty, filled, err := multiHopExtrema(true, mkt.baseID, depth, !sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
+	if err != nil {
+		return 0, false, fmt.Errorf("error getting intermediate market VWAP: %w", err)
+	}
+	if !filled {
+		return 0, false, nil
+	}
+
+	quoteRate, _, filled, err := multiHopExtrema(false, intermediateAsset, intAssetQty, !sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
+	if err != nil {
+		return 0, false, fmt.Errorf("error getting target market VWAP: %w", err)
+	}
+	if !filled {
+		return 0, false, nil
+	}
+
+	return aggregateRates(baseRate, quoteRate, mkt, multiHopCfg.BaseAssetMarket, multiHopCfg.QuoteAssetMarket), true, nil
+}
+
+func arbMMVWAP(sell bool, depth uint64, multiHopCfg *MultiHopCfg, mkt *market, vwap, invVwap vwapFunc) (uint64, bool, error) {
+	if multiHopCfg != nil {
+		return multiHopRate(sell, depth, multiHopCfg, mkt, vwap, invVwap)
+	} else {
+		_, rate, filled, err := vwap(mkt.baseID, mkt.quoteID, sell, depth)
+		return rate, filled, err
+	}
 }
 
 func (a *arbMarketMaker) ordersToPlace() (buys, sells []*TradePlacement, err error) {
@@ -247,24 +455,22 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*TradePlacement, err err
 		var cumulativeCEXDepth uint64
 		for i, cfgPlacement := range cfgPlacements {
 			cumulativeCEXDepth += uint64(float64(cfgPlacement.Lots*a.lotSize) * cfgPlacement.Multiplier)
-			_, extrema, filled, err := a.CEX.VWAP(a.baseID, a.quoteID, sellOnDEX, cumulativeCEXDepth)
+			cexRate, filled, err := arbMMVWAP(sellOnDEX, cumulativeCEXDepth, a.cfg().MultiHop, a.market, a.CEX.VWAP, a.CEX.InvVWAP)
 			if err != nil {
-				return nil, fmt.Errorf("error getting CEX VWAP: %w", err)
+				return nil, fmt.Errorf("error getting VWAP: %w", err)
 			}
-
 			if a.log.Level() == dex.LevelTrace {
-				a.log.Tracef("%s placement orders: %s placement # %d, lots = %d, extrema = %s, filled = %t",
-					a.name, sellStr(sellOnDEX), i, cfgPlacement.Lots, a.fmtRate(extrema), filled,
+				a.log.Tracef("%s placement orders: %s placement # %d, lots = %d, cex rate = %s, filled = %t",
+					a.name, sellStr(sellOnDEX), i, cfgPlacement.Lots, a.fmtRate(cexRate), filled,
 				)
 			}
 
 			if !filled {
-				a.log.Infof("CEX %s side has < %s on the orderbook.", sellStr(!sellOnDEX), a.fmtBase(cumulativeCEXDepth))
 				newPlacements = append(newPlacements, &TradePlacement{})
 				continue
 			}
 
-			placementRate, err := a.dexPlacementRate(extrema, sellOnDEX)
+			placementRate, err := a.dexPlacementRate(cexRate, sellOnDEX)
 			if err != nil {
 				return nil, fmt.Errorf("error calculating DEX placement rate: %w", err)
 			}
@@ -272,7 +478,7 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*TradePlacement, err err
 			newPlacements = append(newPlacements, &TradePlacement{
 				Rate:             placementRate,
 				Lots:             cfgPlacement.Lots,
-				CounterTradeRate: extrema,
+				CounterTradeRate: cexRate,
 			})
 		}
 
@@ -300,7 +506,7 @@ func (a *arbMarketMaker) distribution() (dist *distribution, err error) {
 		return nil, errors.New("zero placement lots?")
 	}
 	dexSellLots, dexBuyLots := placements.baseLots, placements.quoteLots
-	dexBuyRate, dexSellRate, err := a.cexCounterRates(dexSellLots, dexBuyLots)
+	dexBuyRate, dexSellRate, err := a.cexCounterRates(dexSellLots, dexBuyLots, a.cfg().MultiHop)
 	if err != nil {
 		return nil, fmt.Errorf("error getting cex counter-rates: %w", err)
 	}
@@ -395,18 +601,17 @@ func (a *arbMarketMaker) tryTransfers(currEpoch uint64) (actionTaken bool, err e
 	return a.transfer(dist, currEpoch)
 }
 
-func feeGap(core botCoreAdaptor, cex libxc.CEX, baseID, quoteID uint32, lotSize uint64) (*FeeGapStats, error) {
-	s := &FeeGapStats{
-		BasisPrice: cex.MidGap(baseID, quoteID),
-	}
-	_, buy, filled, err := cex.VWAP(baseID, quoteID, false, lotSize)
+// TODO: test fee gap with simple arb mm, nil cfg
+func feeGap(core botCoreAdaptor, multiHopCfg *MultiHopCfg, cex libxc.CEX, mkt *market) (*FeeGapStats, error) {
+	s := &FeeGapStats{}
+	buy, filled, err := arbMMVWAP(false, mkt.lotSize, multiHopCfg, mkt, cex.VWAP, cex.InvVWAP)
 	if err != nil {
 		return nil, fmt.Errorf("VWAP buy error: %w", err)
 	}
 	if !filled {
 		return s, nil
 	}
-	_, sell, filled, err := cex.VWAP(baseID, quoteID, true, lotSize)
+	sell, filled, err := arbMMVWAP(true, mkt.lotSize, multiHopCfg, mkt, cex.VWAP, cex.InvVWAP)
 	if err != nil {
 		return nil, fmt.Errorf("VWAP sell error: %w", err)
 	}
@@ -414,6 +619,11 @@ func feeGap(core botCoreAdaptor, cex libxc.CEX, baseID, quoteID uint32, lotSize 
 		return s, nil
 	}
 	s.RemoteGap = sell - buy
+	if multiHopCfg != nil {
+		s.BasisPrice = (buy + sell) / 2
+	} else {
+		s.BasisPrice = cex.MidGap(mkt.baseID, mkt.quoteID)
+	}
 	sellFeesInBaseUnits, err := core.OrderFeesInUnits(true, true, sell)
 	if err != nil {
 		return nil, fmt.Errorf("error getting sell fees: %w", err)
@@ -424,12 +634,12 @@ func feeGap(core botCoreAdaptor, cex libxc.CEX, baseID, quoteID uint32, lotSize 
 	}
 	s.RoundTripFees = sellFeesInBaseUnits + buyFeesInBaseUnits
 	feesInQuoteUnits := calc.BaseToQuote((sell+buy)/2, s.RoundTripFees)
-	s.FeeGap = rateAdjustment(feesInQuoteUnits, lotSize)
+	s.FeeGap = rateAdjustment(feesInQuoteUnits, mkt.lotSize)
 	return s, nil
 }
 
 func (a *arbMarketMaker) registerFeeGap() {
-	feeGap, err := feeGap(a.core, a.CEX, a.baseID, a.quoteID, a.lotSize)
+	feeGap, err := feeGap(a.core, a.cfg().MultiHop, a.CEX, a.market)
 	if err != nil {
 		a.log.Warnf("error getting fee-gap stats: %v", err)
 		return
@@ -444,10 +654,20 @@ func (a *arbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {
 	}
 	a.book = book
 
-	err = a.cex.SubscribeMarket(ctx, a.baseID, a.quoteID)
-	if err != nil {
-		bookFeed.Close()
-		return nil, fmt.Errorf("failed to subscribe to cex market: %v", err)
+	cexMkts := make([][2]uint32, 0, 2)
+	if a.cfg().isMultiHop() {
+		cexMkts = append(cexMkts, a.cfg().MultiHop.BaseAssetMarket)
+		cexMkts = append(cexMkts, a.cfg().MultiHop.QuoteAssetMarket)
+	} else {
+		cexMkts = append(cexMkts, [2]uint32{a.baseID, a.quoteID})
+	}
+	for _, mkt := range cexMkts {
+		fmt.Println("~~~~~~~~~~~~ subscribeMarket ", mkt[0], mkt[1])
+		err = a.cex.SubscribeMarket(ctx, mkt[0], mkt[1])
+		if err != nil {
+			bookFeed.Close()
+			return nil, fmt.Errorf("failed to subscribe to cex market: %v", err)
+		}
 	}
 
 	tradeUpdates := a.cex.SubscribeTradeUpdates()
@@ -501,6 +721,9 @@ func (a *arbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
+		for _, mkt := range cexMkts {
+			a.cex.UnsubscribeMarket(mkt[0], mkt[1])
+		}
 	}()
 
 	a.registerFeeGap()

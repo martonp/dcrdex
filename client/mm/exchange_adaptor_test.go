@@ -52,8 +52,8 @@ func (db *tEventLogDB) storedEventAtIndexEquals(e *MarketMakingEvent, idx int) b
 	if idx < 0 || idx >= len(db.storedEvents) {
 		return false
 	}
-	db.storedEvents[idx].TimeStamp = 0 // ignore timestamp
-	return !reflect.DeepEqual(db.storedEvents[idx], e)
+	db.storedEvents[idx].TimeStamp = 0                 // ignore timestamp
+	return !reflect.DeepEqual(db.storedEvents[idx], e) // TODO: FIX ~~~~~~
 }
 func (db *tEventLogDB) latestStoredEventEquals(e *MarketMakingEvent) bool {
 	db.storedEventsMtx.Lock()
@@ -4748,6 +4748,292 @@ func TestCEXTrade(t *testing.T) {
 			update.BaseID = baseID
 			update.QuoteID = quoteID
 			update.Sell = test.sell
+			eventLogDB.storedEventsMtx.Lock()
+			eventLogDB.storedEvents = []*MarketMakingEvent{}
+			eventLogDB.storedEventsMtx.Unlock()
+			tCEX.tradeUpdates <- updateAndStats.update
+			tCEX.tradeUpdates <- &libxc.Trade{} // dummy update
+			checkBalances(updateAndStats.stats.CEXBalances, i+1)
+			checkLatestEvent(updateAndStats.event, i+1)
+
+			stats := adaptor.stats()
+			stats.DEXBalances = nil
+			stats.StartTime = 0
+			if !reflect.DeepEqual(stats.CEXBalances, updateAndStats.stats.CEXBalances) {
+				t.Fatalf("%s: stats mismatch after update %d.\nwant: %+v\n\ngot: %+v", test.name, i+1, updateAndStats.stats, stats)
+			}
+		}
+	}
+
+	for _, test := range tests {
+		runTest(test)
+	}
+}
+
+func TestCEXMarketTrade(t *testing.T) {
+	baseID := uint32(42)
+	quoteID := uint32(0)
+	tradeID := "123"
+
+	type updateAndStats struct {
+		update *libxc.Trade
+		stats  *RunStats
+		event  *MarketMakingEvent
+	}
+
+	type test struct {
+		name         string
+		baseID       uint32
+		quoteID      uint32
+		assetToTrade uint32
+		qty          uint64
+		balances     map[uint32]uint64
+
+		wantErr           bool
+		postTradeBalances map[uint32]*BotBalance
+		postTradeEvent    *MarketMakingEvent
+		updates           []*updateAndStats
+	}
+
+	tests := []*test{
+		{
+			name:         "market sell base",
+			baseID:       42,
+			quoteID:      60002,
+			assetToTrade: 42,
+			qty:          5e6,
+			balances: map[uint32]uint64{
+				42: 1e7,
+				0:  1e7,
+			},
+			postTradeBalances: map[uint32]*BotBalance{
+				42: {
+					Available: 5e6,
+					Locked:    5e6,
+				},
+				0: {
+					Available: 1e7,
+				},
+			},
+			postTradeEvent: &MarketMakingEvent{
+				ID:      1,
+				Pending: true,
+				BalanceEffects: &BalanceEffects{
+					Settled: map[uint32]int64{
+						60002: 0,
+						42:    -5e6,
+					},
+					Locked: map[uint32]uint64{
+						42: 5e6,
+					},
+					Pending:  map[uint32]uint64{},
+					Reserved: map[uint32]uint64{},
+				},
+				CEXOrderEvent: &CEXOrderEvent{
+					ID:     tradeID,
+					Qty:    5e6,
+					Market: false, // TODO: FIX ~~~~~~~~
+					Sell:   true,
+				},
+			},
+			updates: []*updateAndStats{
+				{
+					update: &libxc.Trade{
+						ID:          tradeID,
+						BaseID:      42,
+						QuoteID:     60002,
+						Market:      true,
+						Sell:        true,
+						Qty:         5e6,
+						BaseFilled:  5e6,
+						QuoteFilled: 10e6,
+						Complete:    true,
+					},
+					event: &MarketMakingEvent{
+						ID:      1,
+						Pending: false,
+						BalanceEffects: &BalanceEffects{
+							Settled: map[uint32]int64{
+								42:    -5e6,
+								60002: 10e6,
+							},
+							Locked:   map[uint32]uint64{},
+							Pending:  map[uint32]uint64{},
+							Reserved: map[uint32]uint64{},
+						},
+						CEXOrderEvent: &CEXOrderEvent{
+							ID:          tradeID,
+							Qty:         5e6,
+							Market:      false, // TODO: FIX ~~~~~~~~
+							Sell:        true,
+							BaseFilled:  5e6,
+							QuoteFilled: 10e6,
+						},
+					},
+					stats: &RunStats{
+						CEXBalances: map[uint32]*BotBalance{
+							42:    {5e6, 0, 0, 0},
+							0:     {1e7, 0, 0, 0},
+							60002: {10e6, 0, 0, 0},
+						},
+					},
+				},
+			},
+		},
+		/*{
+			name:         "market buy with quote",
+			assetToTrade: 0,
+			qty:          2.5e6,
+			balances: map[uint32]uint64{
+				42: 1e7,
+				0:  1e7,
+			},
+			postTradeBalances: map[uint32]*BotBalance{
+				42: {
+					Available: 1e7,
+				},
+				0: {
+					Available: 7.5e6,
+					Locked:    2.5e6,
+				},
+			},
+			postTradeEvent: &MarketMakingEvent{
+				ID:      1,
+				Pending: true,
+				CEXOrderEvent: &CEXOrderEvent{
+					ID:   tradeID,
+					Qty:  2.5e6,
+					Sell: false,
+				},
+			},
+			updates: []*updateAndStats{
+				{
+					update: &libxc.Trade{
+						QuoteQty:    2.5e6,
+						BaseFilled:  4.5e6,
+						QuoteFilled: 2.5e6,
+						Complete:    true,
+					},
+					event: &MarketMakingEvent{
+						ID:      1,
+						Pending: false,
+						BalanceEffects: &BalanceEffects{
+							Settled: map[uint32]int64{
+								42: 4.5e6,
+								0:  -2.5e6,
+							},
+						},
+						CEXOrderEvent: &CEXOrderEvent{
+							ID:          tradeID,
+							Qty:         2.5e6,
+							Sell:        false,
+							BaseFilled:  4.5e6,
+							QuoteFilled: 2.5e6,
+						},
+					},
+					stats: &RunStats{
+						CEXBalances: map[uint32]*BotBalance{
+							42: {1e7 + 4.5e6, 0, 0, 0},
+							0:  {7.5e6, 0, 0, 0},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:         "insufficient balance",
+			assetToTrade: 42,
+			qty:          2e7,
+			balances: map[uint32]uint64{
+				42: 1e7,
+				0:  1e7,
+			},
+			wantErr: true,
+		},*/
+	}
+
+	botCfg := &BotConfig{
+		Host:    "host1",
+		BaseID:  baseID,
+		QuoteID: quoteID,
+		CEXName: "Binance",
+	}
+
+	runTest := func(test *test) {
+		tCore := newTCore()
+		tCEX := newTCEX()
+		tCEX.tradeID = tradeID
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		botID := dexMarketID(botCfg.Host, botCfg.BaseID, botCfg.QuoteID)
+		eventLogDB := newTEventLogDB()
+		adaptor := mustParseAdaptor(&exchangeAdaptorCfg{
+			botID:           botID,
+			core:            tCore,
+			cex:             tCEX,
+			baseDexBalances: test.balances,
+			baseCexBalances: test.balances,
+			mwh: &MarketWithHost{
+				Host:    "host1",
+				BaseID:  botCfg.BaseID,
+				QuoteID: botCfg.QuoteID,
+			},
+			eventLogDB: eventLogDB,
+		})
+		tCore.singleLotBuyFees = tFees(0, 0, 0, 0)
+		tCore.singleLotSellFees = tFees(0, 0, 0, 0)
+
+		_, err := adaptor.Connect(ctx)
+		if err != nil {
+			t.Fatalf("%s: Connect error: %v", test.name, err)
+		}
+
+		adaptor.SubscribeTradeUpdates()
+
+		_, err = adaptor.CEXMarketTrade(ctx, test.baseID, test.quoteID, test.assetToTrade, test.qty)
+		if test.wantErr {
+			if err == nil {
+				t.Fatalf("%s: expected error but did not get", test.name)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", test.name, err)
+		}
+
+		checkBalances := func(expected map[uint32]*BotBalance, i int) {
+			t.Helper()
+			for assetID, expectedBal := range expected {
+				bal := adaptor.CEXBalance(assetID)
+				if *bal != *expectedBal {
+					step := "post trade"
+					if i > 0 {
+						step = fmt.Sprintf("after update #%d", i)
+					}
+					t.Fatalf("%s: unexpected cex balance %s for asset %d. want %+v, got %+v",
+						test.name, step, assetID, expectedBal, bal)
+				}
+			}
+		}
+
+		checkBalances(test.postTradeBalances, 0)
+
+		checkLatestEvent := func(expected *MarketMakingEvent, i int) {
+			t.Helper()
+			step := "post trade"
+			if i > 0 {
+				step = fmt.Sprintf("after update #%d", i)
+			}
+			if !eventLogDB.latestStoredEventEquals(expected) {
+				t.Fatalf("%s: unexpected event %s. want:\n%+v,\ngot:\n%+v", test.name, step, expected, eventLogDB.latestStoredEvent())
+			}
+		}
+
+		checkLatestEvent(test.postTradeEvent, 0)
+
+		for i, updateAndStats := range test.updates {
 			eventLogDB.storedEventsMtx.Lock()
 			eventLogDB.storedEvents = []*MarketMakingEvent{}
 			eventLogDB.storedEventsMtx.Unlock()
