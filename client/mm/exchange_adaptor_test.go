@@ -592,8 +592,8 @@ func testDistribution(t *testing.T, baseID, quoteID uint32) {
 			quoteLots: buyLots,
 		})
 		addBaseFees, addQuoteFees = sellFundingFees, buyFundingFees
-		cex.asksVWAP[lotSize*buyLots] = vwapResult{avg: buyVWAP}
-		cex.bidsVWAP[lotSize*sellLots] = vwapResult{avg: sellVWAP}
+		cex.asksVWAP[lotSize*buyLots] = vwapResult{extrema: sellVWAP}
+		cex.bidsVWAP[lotSize*sellLots] = vwapResult{extrema: buyVWAP}
 		minDexBase = sellLots*lotSize + sellFundingFees
 		if baseID == u.baseFeeID {
 			minDexBase += sellLots * a.sellFees.BookingFeesPerLot

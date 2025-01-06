@@ -650,8 +650,8 @@ func TestMultiHopRate(t *testing.T) {
 					},
 				},
 			},
-			expectedSellRate: aggregateRates(dcrUSDTBuyRate, btcUSDTSellRate, mkt, cfg.MultiHop.BaseAssetMarket, cfg.MultiHop.QuoteAssetMarket),
-			expectedBuyRate:  aggregateRates(dcrUSDTSellRate, btcUSDTBuyRate, mkt, cfg.MultiHop.BaseAssetMarket, cfg.MultiHop.QuoteAssetMarket),
+			expectedBuyRate:  aggregateRates(dcrUSDTBuyRate, btcUSDTSellRate, mkt, cfg.MultiHop.BaseAssetMarket, cfg.MultiHop.QuoteAssetMarket),
+			expectedSellRate: aggregateRates(dcrUSDTSellRate, btcUSDTBuyRate, mkt, cfg.MultiHop.BaseAssetMarket, cfg.MultiHop.QuoteAssetMarket),
 			expectedOk:       true,
 		},
 		{
@@ -694,8 +694,8 @@ func TestMultiHopRate(t *testing.T) {
 					},
 				},
 			},
-			expectedSellRate: aggregateRates(usdtDCRSellRate, usdtBTCBuyRate, mkt, inverseCfg.MultiHop.BaseAssetMarket, inverseCfg.MultiHop.QuoteAssetMarket),
-			expectedBuyRate:  aggregateRates(usdtDCRBuyRate, usdtBTCSellRate, mkt, inverseCfg.MultiHop.BaseAssetMarket, inverseCfg.MultiHop.QuoteAssetMarket),
+			expectedBuyRate:  aggregateRates(usdtDCRSellRate, usdtBTCBuyRate, mkt, inverseCfg.MultiHop.BaseAssetMarket, inverseCfg.MultiHop.QuoteAssetMarket),
+			expectedSellRate: aggregateRates(usdtDCRBuyRate, usdtBTCSellRate, mkt, inverseCfg.MultiHop.BaseAssetMarket, inverseCfg.MultiHop.QuoteAssetMarket),
 			expectedOk:       true,
 		},
 	}
@@ -715,7 +715,7 @@ func TestMultiHopRate(t *testing.T) {
 			}
 
 			testRate := func(sell bool, expectedRate uint64) {
-				rate, filled, err := multiHopRate(sell, test.depth, test.cfg, mkt, mockVWAP, mockInvVWAP)
+				rate, filled, err := multiHopRate(sell, test.depth, test.cfg.MultiHop, mkt, mockVWAP, mockInvVWAP)
 				if test.expectedError != "" {
 					if err == nil || err.Error() != test.expectedError {
 						t.Fatalf("expected error %q, got %v", test.expectedError, err)

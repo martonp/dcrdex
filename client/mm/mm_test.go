@@ -624,6 +624,9 @@ func (c *tBotCexAdaptor) CancelTrade(ctx context.Context, baseID, quoteID uint32
 func (c *tBotCexAdaptor) SubscribeMarket(ctx context.Context, baseID, quoteID uint32) error {
 	return nil
 }
+func (c *tBotCexAdaptor) UnsubscribeMarket(baseID, quoteID uint32) error {
+	return nil
+}
 func (c *tBotCexAdaptor) SubscribeTradeUpdates() (updates <-chan *libxc.Trade) {
 	return c.tradeUpdates
 }

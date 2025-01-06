@@ -421,7 +421,7 @@ func multiHopRate(sellOnDEX bool, depth uint64, multiHopCfg *MultiHopCfg, mkt *m
 		intermediateAsset = multiHopCfg.BaseAssetMarket[1]
 	}
 
-	baseRate, intAssetQty, filled, err := multiHopExtrema(true, mkt.baseID, depth, !sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
+	baseRate, intAssetQty, filled, err := multiHopExtrema(true, mkt.baseID, depth, sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
 	if err != nil {
 		return 0, false, fmt.Errorf("error getting intermediate market VWAP: %w", err)
 	}
@@ -429,7 +429,7 @@ func multiHopRate(sellOnDEX bool, depth uint64, multiHopCfg *MultiHopCfg, mkt *m
 		return 0, false, nil
 	}
 
-	quoteRate, _, filled, err := multiHopExtrema(false, intermediateAsset, intAssetQty, !sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
+	quoteRate, _, filled, err := multiHopExtrema(false, intermediateAsset, intAssetQty, sellOnDEX, multiHopCfg, mkt, vwap, invVwap)
 	if err != nil {
 		return 0, false, fmt.Errorf("error getting target market VWAP: %w", err)
 	}
@@ -594,9 +594,7 @@ func (a *arbMarketMaker) rebalance(epoch uint64, book *orderbook.OrderBook) {
 
 // TODO: test fee gap with simple arb mm, nil cfg
 func feeGap(core botCoreAdaptor, multiHopCfg *MultiHopCfg, cex libxc.CEX, mkt *market) (*FeeGapStats, error) {
-	s := &FeeGapStats{
-		BasisPrice: cex.MidGap(mkt.baseID, mkt.quoteID),
-	}
+	s := &FeeGapStats{}
 	buy, filled, err := arbMMVWAP(false, mkt.lotSize, multiHopCfg, mkt, cex.VWAP, cex.InvVWAP)
 	if err != nil {
 		return nil, fmt.Errorf("VWAP buy error: %w", err)
@@ -655,7 +653,6 @@ func (a *arbMarketMaker) botLoop(ctx context.Context) (*sync.WaitGroup, error) {
 		cexMkts = append(cexMkts, [2]uint32{a.baseID, a.quoteID})
 	}
 	for _, mkt := range cexMkts {
-		fmt.Println("~~~~~~~~~~~~ subscribeMarket ", mkt[0], mkt[1])
 		err = a.cex.SubscribeMarket(ctx, mkt[0], mkt[1])
 		if err != nil {
 			bookFeed.Close()
