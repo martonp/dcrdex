@@ -496,7 +496,7 @@ func (a *arbMarketMaker) ordersToPlace() (buys, sells []*TradePlacement, err err
 
 // distribution parses the current inventory distribution and checks if better
 // distributions are possible via deposit or withdrawal.
-func (a *arbMarketMaker) distribution() (dist *distribution, err error) {
+func (a *arbMarketMaker) distribution(additionalDEX, additionalCEX map[uint32]uint64) (dist *distribution, err error) {
 	cfgI := a.placementLotsV.Load()
 	if cfgI == nil {
 		return nil, errors.New("no placements?")
@@ -524,7 +524,7 @@ func (a *arbMarketMaker) distribution() (dist *distribution, err error) {
 		return nil, fmt.Errorf("error getting lot costs: %w", err)
 	}
 	dist = a.newDistribution(perLot)
-	a.optimizeTransfers(dist, dexSellLots, dexBuyLots, dexSellLots, dexBuyLots)
+	a.optimizeTransfers(dist, dexSellLots, dexBuyLots, dexSellLots, dexBuyLots, additionalDEX, additionalCEX)
 	return dist, nil
 }
 
@@ -552,7 +552,7 @@ func (a *arbMarketMaker) rebalance(epoch uint64, book *orderbook.OrderBook) {
 		return
 	}
 
-	actionTaken, err := a.tryTransfers(currEpoch)
+	actionTaken, err := a.tryTransfers(currEpoch, a.distribution)
 	if err != nil {
 		a.log.Errorf("Error performing transfers: %v", err)
 	} else if actionTaken {
@@ -592,18 +592,11 @@ func (a *arbMarketMaker) rebalance(epoch uint64, book *orderbook.OrderBook) {
 	a.registerFeeGap()
 }
 
-func (a *arbMarketMaker) tryTransfers(currEpoch uint64) (actionTaken bool, err error) {
-	dist, err := a.distribution()
-	if err != nil {
-		a.log.Errorf("distribution calculation error: %v", err)
-		return
-	}
-	return a.transfer(dist, currEpoch)
-}
-
 // TODO: test fee gap with simple arb mm, nil cfg
 func feeGap(core botCoreAdaptor, multiHopCfg *MultiHopCfg, cex libxc.CEX, mkt *market) (*FeeGapStats, error) {
-	s := &FeeGapStats{}
+	s := &FeeGapStats{
+		BasisPrice: cex.MidGap(mkt.baseID, mkt.quoteID),
+	}
 	buy, filled, err := arbMMVWAP(false, mkt.lotSize, multiHopCfg, mkt, cex.VWAP, cex.InvVWAP)
 	if err != nil {
 		return nil, fmt.Errorf("VWAP buy error: %w", err)
