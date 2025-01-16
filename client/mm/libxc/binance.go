@@ -579,7 +579,7 @@ func (bnc *binance) setBalances(ctx context.Context) error {
 
 func (bnc *binance) refreshBalances(ctx context.Context) error {
 	var resp bntypes.Account
-	err, _ := bnc.getAPI(ctx, "/api/v3/account", nil, true, true, &resp)
+	err := bnc.getAPI(ctx, "/api/v3/account", nil, true, true, &resp)
 	if err != nil {
 		return fmt.Errorf("error getting balances: %w", err)
 	}
@@ -656,7 +656,7 @@ func (bnc *binance) readCoins(coins []*bntypes.CoinInfo) {
 // the tokenIDs.
 func (bnc *binance) getCoinInfo(ctx context.Context) error {
 	coins := make([]*bntypes.CoinInfo, 0)
-	err, _ := bnc.getAPI(ctx, "/sapi/v1/capital/config/getall", nil, true, true, &coins)
+	err := bnc.getAPI(ctx, "/sapi/v1/capital/config/getall", nil, true, true, &coins)
 	if err != nil {
 		return fmt.Errorf("error getting binance coin info: %w", err)
 	}
@@ -667,7 +667,7 @@ func (bnc *binance) getCoinInfo(ctx context.Context) error {
 
 func (bnc *binance) getMarkets(ctx context.Context) (map[string]*bntypes.Market, error) {
 	var exchangeInfo bntypes.ExchangeInfo
-	err, _ := bnc.getAPI(ctx, "/api/v3/exchangeInfo", nil, false, false, &exchangeInfo)
+	err := bnc.getAPI(ctx, "/api/v3/exchangeInfo", nil, false, false, &exchangeInfo)
 	if err != nil {
 		return nil, fmt.Errorf("error getting markets from Binance: %w", err)
 	}
@@ -913,7 +913,7 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 	}()
 
 	var orderResponse bntypes.OrderResponse
-	err, _ = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
+	err = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -1032,7 +1032,7 @@ func (bnc *binance) MarketTrade(ctx context.Context, baseID, quoteID uint32, ass
 	}()
 
 	var orderResponse bntypes.OrderResponse
-	err, _ = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
+	err = bnc.postAPI(ctx, "/api/v3/order", v, nil, true, true, &orderResponse)
 	if err != nil {
 		return nil, err
 	}
@@ -1081,7 +1081,7 @@ func (bnc *binance) ConfirmWithdrawal(ctx context.Context, withdrawalID string, 
 	withdrawHistoryResponse := []*withdrawalHistoryStatus{}
 	v := make(url.Values)
 	v.Add("coin", assetCfg.coin)
-	err, _ = bnc.getAPI(ctx, "/sapi/v1/capital/withdraw/history", v, true, true, &withdrawHistoryResponse)
+	err = bnc.getAPI(ctx, "/sapi/v1/capital/withdraw/history", v, true, true, &withdrawHistoryResponse)
 	if err != nil {
 		return 0, "", err
 	}
@@ -1135,7 +1135,7 @@ func (bnc *binance) Withdraw(ctx context.Context, assetID uint32, qty uint64, ad
 	withdrawResp := struct {
 		ID string `json:"id"`
 	}{}
-	err, _ = bnc.postAPI(ctx, "/sapi/v1/capital/withdraw/apply", nil, v, true, true, &withdrawResp)
+	err = bnc.postAPI(ctx, "/sapi/v1/capital/withdraw/apply", nil, v, true, true, &withdrawResp)
 	if err != nil {
 		return "", err
 	}
@@ -1157,7 +1157,7 @@ func (bnc *binance) GetDepositAddress(ctx context.Context, assetID uint32) (stri
 	resp := struct {
 		Address string `json:"address"`
 	}{}
-	err, _ = bnc.getAPI(ctx, "/sapi/v1/capital/deposit/address", v, true, true, &resp)
+	err = bnc.getAPI(ctx, "/sapi/v1/capital/deposit/address", v, true, true, &resp)
 	if err != nil {
 		return "", err
 	}
@@ -1187,7 +1187,7 @@ func (bnc *binance) ConfirmDeposit(ctx context.Context, deposit *DepositData) (b
 	}
 	// TODO: Use the "startTime" parameter to apply a reasonable limit to
 	// this request.
-	err, _ := bnc.getAPI(ctx, "/sapi/v1/capital/deposit/hisrec", query, true, true, &resp)
+	err := bnc.getAPI(ctx, "/sapi/v1/capital/deposit/hisrec", query, true, true, &resp)
 	if err != nil {
 		bnc.log.Errorf("error getting deposit status: %v", err)
 		return false, 0
@@ -1267,8 +1267,7 @@ func (bnc *binance) CancelTrade(ctx context.Context, baseID, quoteID uint32, tra
 	v.Add("symbol", slug)
 	v.Add("origClientOrderId", tradeID)
 
-	err, _ = bnc.request(ctx, "DELETE", "/api/v3/order", v, nil, true, true, nil)
-	return err
+	return bnc.request(ctx, "DELETE", "/api/v3/order", v, nil, true, true, nil)
 }
 
 func (bnc *binance) Balances(ctx context.Context) (map[uint32]*ExchangeBalance, error) {
@@ -1349,7 +1348,7 @@ func (bnc *binance) Markets(ctx context.Context) (map[string]*Market, error) {
 	q.Set("symbols", string(encSymbols))
 
 	var ds []*bntypes.MarketTicker24
-	if err, _ = bnc.getAPI(ctx, "/api/v3/ticker/24hr", q, false, false, &ds); err != nil {
+	if err = bnc.getAPI(ctx, "/api/v3/ticker/24hr", q, false, false, &ds); err != nil {
 		return nil, err
 	}
 
@@ -1412,15 +1411,15 @@ func (bnc *binance) MatchedMarkets(ctx context.Context) (_ []*MarketMatch, err e
 	return markets, nil
 }
 
-func (bnc *binance) getAPI(ctx context.Context, endpoint string, query url.Values, key, sign bool, thing interface{}) (error, int) {
+func (bnc *binance) getAPI(ctx context.Context, endpoint string, query url.Values, key, sign bool, thing interface{}) error {
 	return bnc.request(ctx, http.MethodGet, endpoint, query, nil, key, sign, thing)
 }
 
-func (bnc *binance) postAPI(ctx context.Context, endpoint string, query, form url.Values, key, sign bool, thing interface{}) (error, int) {
+func (bnc *binance) postAPI(ctx context.Context, endpoint string, query, form url.Values, key, sign bool, thing interface{}) error {
 	return bnc.request(ctx, http.MethodPost, endpoint, query, form, key, sign, thing)
 }
 
-func (bnc *binance) request(ctx context.Context, method, endpoint string, query, form url.Values, key, sign bool, thing interface{}) (error, int) {
+func (bnc *binance) request(ctx context.Context, method, endpoint string, query, form url.Values, key, sign bool, thing interface{}) error {
 	var fullURL string
 	if strings.Contains(endpoint, "sapi") {
 		fullURL = bnc.accountsURL + endpoint
@@ -1450,7 +1449,7 @@ func (bnc *binance) request(ctx context.Context, method, endpoint string, query,
 		raw := queryString + bodyString
 		mac := hmac.New(sha256.New, []byte(bnc.secretKey))
 		if _, err := mac.Write([]byte(raw)); err != nil {
-			return fmt.Errorf("hmax Write error: %w", err), 0
+			return fmt.Errorf("hmax Write error: %w", err)
 		}
 		v := url.Values{}
 		v.Set("signature", hex.EncodeToString(mac.Sum(nil)))
@@ -1466,7 +1465,7 @@ func (bnc *binance) request(ctx context.Context, method, endpoint string, query,
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
-		return fmt.Errorf("NewRequestWithContext error: %w", err), 0
+		return fmt.Errorf("NewRequestWithContext error: %w", err)
 	}
 
 	req.Header = header
@@ -1478,9 +1477,9 @@ func (bnc *binance) request(ctx context.Context, method, endpoint string, query,
 	if err := dexnet.Do(req, thing, dexnet.WithSizeLimit(1<<24), dexnet.WithErrorParsing(&errPayload)); err != nil {
 		bnc.log.Errorf("request error from endpoint %s %q with query = %q, body = %q", method, endpoint, queryString, bodyString)
 		bnc.log.Errorf("errPayload: %+v\n", errPayload)
-		return fmt.Errorf("%w, bn code = %d, msg = %q", err, errPayload.Code, errPayload.Msg), errPayload.Code
+		return fmt.Errorf("%w, bn code = %d, msg = %q", err, errPayload.Code, errPayload.Msg)
 	}
-	return nil, 0
+	return nil
 }
 
 func (bnc *binance) handleOutboundAccountPosition(update *bntypes.StreamUpdate) {
@@ -1641,7 +1640,7 @@ func (bnc *binance) handleUserDataStreamUpdate(b []byte) {
 
 func (bnc *binance) getListenID(ctx context.Context) (string, error) {
 	var resp *bntypes.DataStreamKey
-	if err, _ := bnc.postAPI(ctx, "/api/v3/userDataStream", nil, nil, true, false, &resp); err != nil {
+	if err := bnc.postAPI(ctx, "/api/v3/userDataStream", nil, nil, true, false, &resp); err != nil {
 		return "", err
 	}
 	bnc.listenKey.Store(resp.ListenKey)
@@ -1721,12 +1720,7 @@ func (bnc *binance) getUserDataStream(ctx context.Context) (err error) {
 			q := make(url.Values)
 			q.Add("listenKey", bnc.listenKey.Load().(string))
 			// Doing a PUT on a listenKey will extend its validity for 60 minutes.
-			if err, errCode := bnc.request(ctx, http.MethodPut, "/api/v3/userDataStream", q, nil, true, false, nil); err != nil {
-				if errCode == -1125 { // Invalid listen key
-					bnc.log.Warnf("Invalid listen key. Reconnecting...")
-					doReconnect()
-					return
-				}
+			if err := bnc.request(ctx, http.MethodPut, "/api/v3/userDataStream", q, nil, true, false, nil); err != nil {
 				bnc.log.Errorf("Error sending keep-alive request: %v. Trying again in 10 seconds", err)
 				retryKeepAlive = time.After(time.Second * 10)
 				return
@@ -1845,8 +1839,7 @@ func (bnc *binance) getOrderbookSnapshot(ctx context.Context, mktSymbol string) 
 	v.Add("symbol", strings.ToUpper(mktSymbol))
 	v.Add("limit", "1000")
 	var resp bntypes.OrderbookSnapshot
-	err, _ := bnc.getAPI(ctx, "/api/v3/depth", v, false, false, &resp)
-	return &resp, err
+	return &resp, bnc.getAPI(ctx, "/api/v3/depth", v, false, false, &resp)
 }
 
 // subscribeToAdditionalMarketDataStream is called when a new market is
@@ -2289,7 +2282,7 @@ func (bnc *binance) TradeStatus(ctx context.Context, tradeID string, baseID, quo
 	v.Add("origClientOrderId", tradeID)
 
 	var resp bntypes.BookedOrder
-	err, _ = bnc.getAPI(ctx, "/api/v3/order", v, true, true, &resp)
+	err = bnc.getAPI(ctx, "/api/v3/order", v, true, true, &resp)
 	if err != nil {
 		return nil, err
 	}
