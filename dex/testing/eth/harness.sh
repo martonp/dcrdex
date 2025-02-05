@@ -106,7 +106,7 @@ echo "Starting simnet alpha node"
 	"$ALPHA_AUTHRPC_PORT" "$ALPHA_HTTP_PORT" "$ALPHA_WS_PORT" \
 	"$ALPHA_WS_MODULES"
 
-sleep 1
+sleep 10
 
 SEND_AMT=5000000000000000000000
 echo "Sending 5000 eth to testing."
@@ -130,13 +130,28 @@ MULTIBALANCE_CONTRACT_HASH=$("${NODES_ROOT}/harness-ctl/alpha" "attach --preload
 
 mine_pending_txs() {
   while true
-  do
+  do  
     TXSLEN=$("${NODES_ROOT}/harness-ctl/alpha" "attach --exec eth.pendingTransactions.length")
     if [ "$TXSLEN" -eq 0 ]; then
       break
     fi
-    echo "Waiting for transactions to be mined."
-    "${NODES_ROOT}/harness-ctl/mine-alpha" "5"
+    echo "Waiting for transactions to be mined. TXSLEN: ${TXSLEN}"
+    sleep 1
+  done
+}
+
+get_block_hash() {
+  BLOCK_NUM=$1
+  while true
+  do
+    CURRENT_BLOCK=$("${NODES_ROOT}/harness-ctl/alpha" "attach --exec eth.blockNumber")
+    if [ "$CURRENT_BLOCK" -ge "$BLOCK_NUM" ]; then
+      BLOCK_HASH=$("${NODES_ROOT}/harness-ctl/alpha" "attach --exec eth.getHeaderByNumber(${BLOCK_NUM}).hash" | sed 's/"//g')
+      echo "$BLOCK_HASH"
+      break
+    fi
+    echo "Waiting for block $BLOCK_NUM. Current height: $CURRENT_BLOCK"
+    sleep 1
   done
 }
 
@@ -226,21 +241,13 @@ EOF
 "${NODES_ROOT}/harness-ctl/alpha" "attach --preload ${NODES_ROOT}/harness-ctl/loadTestToken.js --exec setSenderBalance(\"${TEST_USDC_CONTRACT_ADDR}\",4400000000000)"
 "${NODES_ROOT}/harness-ctl/alpha" "attach --preload ${NODES_ROOT}/harness-ctl/loadTestToken.js --exec setSenderBalance(\"${TEST_USDT_CONTRACT_ADDR}\",4400000000000)"
 
-# Mine to block 10 to take the hash for tests.
-"${NODES_ROOT}/harness-ctl/mine-alpha" "4"
-
 cd "${NODES_ROOT}/harness-ctl"
 
-TEST_BLOCK10_HASH=$("${NODES_ROOT}/harness-ctl/alpha" "attach --exec eth.getHeaderByNumber(10).hash" | sed 's/"//g')
+TEST_BLOCK10_HASH=$(get_block_hash 10)
 echo "ETH block 10 hash to use in tests is ${TEST_BLOCK10_HASH}. Saving to ${NODES_ROOT}/test_block10_hash.txt"
 cat > "${NODES_ROOT}/test_block10_hash.txt" <<EOF
 ${TEST_BLOCK10_HASH}
 EOF
-
-# Miner
-tmux new-window -t $SESSION:5 -n "miner" $SHELL
-tmux send-keys -t $SESSION:5 "cd ${NODES_ROOT}/harness-ctl" C-m
-tmux send-keys -t $SESSION:5 "watch -n 15 ./mine-alpha 1" C-m
 
 # Reenable history and attach to the control session.
 tmux select-window -t $SESSION:0
