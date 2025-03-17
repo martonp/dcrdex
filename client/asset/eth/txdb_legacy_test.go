@@ -30,7 +30,7 @@ func TestMigrateLegacyTxDB(t *testing.T) {
 	defer shutdown()
 
 	newTx := func(nonce uint64) *extendedWalletTx {
-		return eth.extendedTx(node.newTransaction(nonce, big.NewInt(1)), asset.Send, 1, nil)
+		return eth.extendedTx(node.newTransaction(nonce, big.NewInt(1)), asset.Send, 1, nil, nil)
 	}
 
 	wt1 := newTx(1)

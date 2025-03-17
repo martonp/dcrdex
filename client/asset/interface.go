@@ -694,6 +694,18 @@ type Withdrawer interface {
 	Withdraw(address string, value, feeRate uint64) (Coin, error)
 }
 
+type Bridger interface {
+	ApproveBridgeContract(ctx context.Context) (string, error)
+	UnapproveBridgeContract(ctx context.Context) (string, error)
+	BridgeContractApprovalStatus(ctx context.Context) (ApprovalStatus, error)
+	Bridge(ctx context.Context, amt uint64, dest uint32) (txID string, err error)
+	GetMintData(ctx context.Context, txID string) ([]byte, error)
+	Mint(ctx context.Context, burnTxID string, burnAssetID uint32, mintData []byte) (txID string, err error)
+	MintComplete(burnTxID, mintTxID string)
+	PendingBridges() ([]*WalletTransaction, error)
+	BridgeHistory(n int, refID *string, past bool) ([]*WalletTransaction, error)
+}
+
 // Sweeper is a wallet that can clear the entire balance of the wallet/account
 // to an address. Similar to Withdraw, but no input value is required.
 type Sweeper interface {
@@ -1122,6 +1134,8 @@ const (
 	// and was unable to determine if the transaction was a swap or a send.
 	SwapOrSend
 	Mix
+	InitiateBridge
+	CompleteBridge
 )
 
 // IncomingTxType returns true if the wallet's balance increases due to a
@@ -1139,6 +1153,21 @@ type BondTxInfo struct {
 	LockTime uint64 `json:"lockTime"`
 	// BondID is the ID of the bond.
 	BondID dex.Bytes `json:"bondID"`
+}
+
+// NoMintRequiredBridgeTxID is a placeholder ID used when a bridge transaction
+// does not require a corresponding mint transaction. This typically occurs when
+// bridging from a base chain to a Layer 2, where the network automatically
+// allocates tokens to the recipient without a mint step.
+const NoMintRequiredBridgeTxID = "no-mint-required"
+
+// BridgeCounterpartTx is a transaction that either initiated or completed a
+// bridge.
+type BridgeCounterpartTx struct {
+	ID      string `json:"id"`
+	AssetID uint32 `json:"assetID"`
+	// BlockCompleted is the block number in which the bridge was completed.
+	BlockCompleted uint64 `json:"blockCompleted"`
 }
 
 // WalletTransaction represents a transaction that was made by a wallet.
@@ -1169,6 +1198,10 @@ type WalletTransaction struct {
 	// Rejected will be true the transaction was rejected and did not have any
 	// effect, though fees were incurred.
 	Rejected bool `json:"rejected,omitempty"`
+	// BridgeCounterpartTx is only populated for Bridge related transactions.
+	// It contains the ID and asset ID of the transaction that either initiated
+	// the bridge or completed it.
+	BridgeCounterpartTx *BridgeCounterpartTx `json:"bridgeCounterpartTx,omitempty"`
 }
 
 // WalletHistorian is a wallet that is able to retrieve the history of all
@@ -1497,6 +1530,19 @@ type TipChangeNote struct {
 	Data any    `json:"data"`
 }
 
+type BridgeReadyToMintNote struct {
+	baseWalletNotification
+	DestAssetID uint32 `json:"destAssetID"`
+	BridgeTxID  string `json:"bridgeTxID"`
+	MintInfo    []byte `json:"mintInfo"`
+}
+
+type BridgeMintCompleteNote struct {
+	baseWalletNotification
+	SourceAssetID uint32 `json:"sourceAssetID"`
+	BurnTxID      string `json:"burnTxID"`
+}
+
 // BalanceChangeNote can be sent when the wallet detects a balance change
 // between tip changes.
 type BalanceChangeNote struct {
@@ -1627,6 +1673,29 @@ func (e *WalletEmitter) ActionRequired(uniqueID, actionID string, payload any) {
 		UniqueID: uniqueID,
 		ActionID: actionID,
 		Payload:  payload,
+	})
+}
+
+func (e *WalletEmitter) BridgeReadyToMint(destAssetID uint32, bridgeTxID string, mintInfo []byte) {
+	e.emit(&BridgeReadyToMintNote{
+		baseWalletNotification: baseWalletNotification{
+			AssetID: e.assetID,
+			Route:   "bridgeReadyToMint",
+		},
+		DestAssetID: destAssetID,
+		BridgeTxID:  bridgeTxID,
+		MintInfo:    mintInfo,
+	})
+}
+
+func (e *WalletEmitter) BridgeMintComplete(sourceAssetID uint32, burnTxID string) {
+	e.emit(&BridgeMintCompleteNote{
+		baseWalletNotification: baseWalletNotification{
+			AssetID: e.assetID,
+			Route:   "bridgeMintComplete",
+		},
+		SourceAssetID: sourceAssetID,
+		BurnTxID:      burnTxID,
 	})
 }
 

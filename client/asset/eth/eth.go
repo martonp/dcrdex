@@ -31,6 +31,7 @@ import (
 	"decred.org/dcrdex/dex/networks/erc20"
 	dexeth "decred.org/dcrdex/dex/networks/eth"
 	multibal "decred.org/dcrdex/dex/networks/eth/contracts/multibalance"
+	"decred.org/dcrdex/dex/utils"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/hdkeychain/v3"
 	"github.com/ethereum/go-ethereum"
@@ -473,8 +474,8 @@ type assetWallet struct {
 	findRedemptionReqs map[string]*findRedemptionRequest
 
 	approvalsMtx     sync.RWMutex
-	pendingApprovals map[uint32]*pendingApproval
-	approvalCache    map[uint32]bool
+	pendingApprovals map[common.Address]*pendingApproval
+	approvalCache    map[common.Address]bool
 
 	lastPeerCount uint32
 	peersChange   func(uint32, error)
@@ -660,7 +661,7 @@ func CreateEVMWallet(chainID int64, createWalletParams *asset.CreateWalletParams
 }
 
 // newWallet is the constructor for an Ethereum asset.Wallet.
-func newWallet(assetCFG *asset.WalletConfig, logger dex.Logger, net dex.Network) (w *ETHWallet, err error) {
+func newWallet(assetCFG *asset.WalletConfig, logger dex.Logger, net dex.Network) (w asset.Wallet, err error) {
 	chainCfg, err := ChainConfig(net)
 	if err != nil {
 		return nil, fmt.Errorf("failed to locate Ethereum genesis configuration for network %s", net)
@@ -705,7 +706,7 @@ func newWallet(assetCFG *asset.WalletConfig, logger dex.Logger, net dex.Network)
 		}
 	}
 
-	return NewEVMWallet(&EVMWalletConfig{
+	evmWallet, err := NewEVMWallet(&EVMWalletConfig{
 		BaseChainID:        BipID,
 		ChainCfg:           chainCfg,
 		AssetCfg:           assetCFG,
@@ -721,6 +722,17 @@ func newWallet(assetCFG *asset.WalletConfig, logger dex.Logger, net dex.Network)
 		DefaultProviders:   defaultProviders,
 		MaxTxFeeGwei:       dexeth.GweiFactor, // 1 ETH
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	if IsPolygonBridgeSupported(BipID, net) {
+		return &ETHBridgeWallet{
+			ETHWallet: evmWallet,
+		}, nil
+	}
+
+	return evmWallet, nil
 }
 
 // EVMWalletConfig is the configuration for an evm-compatible wallet.
@@ -804,8 +816,8 @@ func NewEVMWallet(cfg *EVMWalletConfig) (w *ETHWallet, err error) {
 		versionedGases:     cfg.VersionedGases,
 		emit:               cfg.AssetCfg.Emit,
 		findRedemptionReqs: make(map[string]*findRedemptionRequest),
-		pendingApprovals:   make(map[uint32]*pendingApproval),
-		approvalCache:      make(map[uint32]bool),
+		pendingApprovals:   make(map[common.Address]*pendingApproval),
+		approvalCache:      make(map[common.Address]bool),
 		peersChange:        cfg.AssetCfg.PeersChange,
 		evmify:             dexeth.GweiToWei,
 		atomize:            dexeth.WeiToGwei,
@@ -1034,6 +1046,62 @@ func (w *TokenWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	return &wg, nil
 }
 
+func (w *ETHBridgeWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
+	wg, err := w.ETHWallet.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var bridge bridge
+	switch w.assetID {
+	case ethID:
+		bridge, err = newPolygonBridgeEth(w.node.contractBackend(), w.net, w.addr, w.log)
+	case polygonID:
+		bridge, err = newPolygonBridgePolygon(w.node.contractBackend(), w.log)
+	default:
+		err = fmt.Errorf("bridge not supported for asset %d", w.assetID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	w.manager, err = newBridgeManager(ctx, bridge, w.ETHWallet.emit, w.txDB, w.log.SubLogger("BridgeManager"))
+	if err != nil {
+		return nil, err
+	}
+
+	return wg, nil
+}
+
+func (w *TokenBridgeWallet) Connect(ctx context.Context) (wg *sync.WaitGroup, err error) {
+	wg, err = w.TokenWallet.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var bridge bridge
+	switch {
+	case isUSDCBridgeSupported(w.assetID, w.net):
+		bridge, err = newUsdcBridge(w.assetID, w.net, w.netToken.Address, w.node.contractBackend(), w.addr, w.node)
+	case w.baseChainID == polygonID:
+		bridge, err = newPolygonBridgePolygonErc20(w.node.contractBackend(), w.assetID, w.netToken.Address, w.log)
+	case w.baseChainID == ethID:
+		bridge, err = newPolygonBridgeEthErc20(w.node.contractBackend(), w.assetID, w.netToken.Address, w.net, w.addr, w.log)
+	default:
+		err = fmt.Errorf("bridge not supported for asset %d", w.assetID)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	w.manager, err = newBridgeManager(ctx, bridge, w.TokenWallet.emit, w.txDB, w.log.SubLogger("BridgeManager"))
+	if err != nil {
+		return nil, err
+	}
+
+	return wg, nil
+}
+
 func (w *baseWallet) tip() *types.Header {
 	w.tipMtx.RLock()
 	defer w.tipMtx.RUnlock()
@@ -1119,9 +1187,18 @@ func (eth *baseWallet) gasFeeLimit() uint64 {
 	return atomic.LoadUint64(&eth.gasFeeLimitV)
 }
 
+type genTxResult struct {
+	tx                       *types.Transaction
+	txType                   asset.TransactionType
+	amt                      uint64
+	recipient                *string
+	bridgeCounterpartAssetID *uint32
+	bridgeCounterpartTxID    *string
+}
+
 // transactionGenerator is an action that uses a nonce and returns a tx, it's
 // type specifier, and its value.
-type transactionGenerator func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error)
+type transactionGenerator func(nonce *big.Int) (*genTxResult, error)
 
 // withNonce is called with a function intended to generate a new transaction
 // using the next available nonce. If the function returns a non-nil tx, the
@@ -1152,7 +1229,7 @@ func (w *assetWallet) withNonce(ctx context.Context, f transactionGenerator) (er
 	w.log.Trace("Nonce chosen for tx generator =", n)
 
 	// Make a first attempt with our best-known nonce.
-	tx, txType, amt, recipient, err := f(n)
+	genTxResult, err := f(n)
 	if err != nil && strings.Contains(err.Error(), "nonce too low") {
 		w.log.Warnf("Too-low nonce detected. Attempting recovery")
 		confirmedNonceAt, pendingNonceAt, err := w.node.nonce(ctx)
@@ -1164,7 +1241,7 @@ func (w *assetWallet) withNonce(ctx context.Context, f transactionGenerator) (er
 		if newNonce := nonce(); newNonce != n {
 			n = newNonce
 			// Try again.
-			tx, txType, amt, recipient, err = f(n)
+			genTxResult, err = f(n)
 			if err != nil {
 				return err
 			}
@@ -1174,8 +1251,8 @@ func (w *assetWallet) withNonce(ctx context.Context, f transactionGenerator) (er
 		}
 	}
 
-	if tx != nil {
-		et := w.extendedTx(tx, txType, amt, recipient)
+	if genTxResult != nil {
+		et := w.extendedTx(genTxResult)
 		w.pendingTxs = append(w.pendingTxs, et)
 		if n.Cmp(w.pendingNonceAt) >= 0 {
 			w.pendingNonceAt.Add(n, big.NewInt(1))
@@ -1254,6 +1331,146 @@ func (w *baseWallet) CreateTokenWallet(tokenID uint32, _ map[string]string) erro
 	return nil
 }
 
+// bridgeManager manages pending bridges. It periodically checks if the
+// bridges are ready for minting by querying the bridge interface for mint
+// information. When a bridge is ready, it emits a BridgeReadyToMint notification.
+// The manager handles adding and removing pending bridges and automatically starts
+// and stops monitoring based on the presence of pending bridges.
+type bridgeManager struct {
+	bridge          bridge
+	ctx             context.Context
+	emit            *asset.WalletEmitter
+	log             dex.Logger
+	monitorInterval time.Duration
+	txDB            txDB
+
+	mtx            sync.RWMutex
+	stopMonitoring context.CancelFunc
+	pendingBridges map[string]uint32
+}
+
+func newBridgeManager(ctx context.Context, bridge bridge, emit *asset.WalletEmitter, txDB txDB, log dex.Logger) (*bridgeManager, error) {
+	manager := &bridgeManager{
+		bridge:         bridge,
+		ctx:            ctx,
+		emit:           emit,
+		txDB:           txDB,
+		pendingBridges: make(map[string]uint32),
+		log:            log.SubLogger("BridgeManager"),
+		// TODO: set to 1 min
+		monitorInterval: 15 * time.Second,
+	}
+
+	pendingBridges, err := txDB.getPendingBridges()
+	if err != nil {
+		return nil, fmt.Errorf("error getting pending bridges: %v", err)
+	}
+	for _, tx := range pendingBridges {
+		if tx.BridgeCounterpartTx != nil {
+			manager.pendingBridges[tx.ID] = tx.BridgeCounterpartTx.AssetID
+		} else {
+			manager.log.Errorf("Bridge tx %s has no counterpart tx. This should have been added when the transaction was created", tx.ID)
+		}
+	}
+	if len(manager.pendingBridges) > 0 {
+		manager.startMonitoring()
+	}
+
+	return manager, nil
+}
+
+func (bm *bridgeManager) addPendingBridge(burnTxID string, destAssetID uint32) {
+	bm.mtx.Lock()
+	defer bm.mtx.Unlock()
+
+	bm.pendingBridges[burnTxID] = destAssetID
+	bm.startMonitoring()
+}
+
+func (bm *bridgeManager) checkPendingBridges(ctx context.Context) {
+	bm.mtx.RLock()
+	pending := utils.CopyMap(bm.pendingBridges)
+	bm.mtx.RUnlock()
+
+	for txID, destAssetID := range pending {
+		mintInfo, err := bm.bridge.getMintInfo(ctx, txID)
+		if err == nil {
+			bm.emit.BridgeReadyToMint(destAssetID, txID, mintInfo)
+		} else {
+			bm.log.Debugf("Unable to get mint info for bridge with burn tx ID %s: %v", txID, err)
+		}
+	}
+}
+
+func (bm *bridgeManager) markBridgeComplete(burnTxID, mintTxID string, tip uint64) {
+	bm.mtx.Lock()
+	delete(bm.pendingBridges, burnTxID)
+	if len(bm.pendingBridges) == 0 {
+		bm.stopMonitoring()
+		bm.stopMonitoring = nil
+	}
+	bm.mtx.Unlock()
+
+	bridgeTx, err := bm.txDB.getTx(common.HexToHash(burnTxID))
+	if err != nil {
+		bm.log.Errorf("error getting bridge tx: %v", err)
+		return
+	}
+
+	if bridgeTx.BridgeCounterpartTx == nil {
+		bm.log.Errorf("Bridge tx %s has no counterpart tx. This should have been added when the transaction was created", burnTxID)
+		return
+	}
+
+	bridgeTx.BridgeCounterpartTx.ID = mintTxID
+	bridgeTx.BridgeCounterpartTx.BlockCompleted = tip
+	if err := bm.txDB.storeTx(bridgeTx); err != nil {
+		bm.log.Errorf("error storing completed bridge tx: %v", err)
+	}
+}
+
+func (bm *bridgeManager) startMonitoring() {
+	if bm.stopMonitoring != nil { // already running
+		return
+	}
+
+	ctx, cancel := context.WithCancel(bm.ctx)
+	bm.stopMonitoring = cancel
+
+	go func() {
+		ticker := time.NewTicker(bm.monitorInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				bm.checkPendingBridges(ctx)
+			}
+		}
+	}()
+}
+
+// ETHBridgeWallet is an ETHWallet that supports bridging funds to other chains.
+type ETHBridgeWallet struct {
+	manager *bridgeManager
+
+	*ETHWallet
+}
+
+var _ asset.Bridger = (*ETHBridgeWallet)(nil)
+
+// TokenBridgeWallet is a TokenWallet that supports bridging funds to other
+// chains.
+type TokenBridgeWallet struct {
+	manager *bridgeManager
+
+	*TokenWallet
+}
+
+var _ asset.Bridger = (*TokenBridgeWallet)(nil)
+
 // OpenTokenWallet creates a new TokenWallet.
 func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, error) {
 	token, found := w.tokens[tokenCfg.AssetID]
@@ -1289,8 +1506,8 @@ func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, 
 		emit:               tokenCfg.Emit,
 		peersChange:        tokenCfg.PeersChange,
 		findRedemptionReqs: make(map[string]*findRedemptionRequest),
-		pendingApprovals:   make(map[uint32]*pendingApproval),
-		approvalCache:      make(map[uint32]bool),
+		pendingApprovals:   make(map[common.Address]*pendingApproval),
+		approvalCache:      make(map[common.Address]bool),
 		evmify:             token.AtomicToEVM,
 		atomize:            token.EVMToAtomic,
 		ui:                 token.UnitInfo,
@@ -1307,13 +1524,21 @@ func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, 
 	w.baseWallet.wallets[tokenCfg.AssetID] = aw
 	w.baseWallet.walletsMtx.Unlock()
 
-	return &TokenWallet{
+	tokenWallet := &TokenWallet{
 		assetWallet: aw,
 		cfg:         cfg,
 		parent:      w.assetWallet,
 		token:       token,
 		netToken:    netToken,
-	}, nil
+	}
+
+	if isUSDCBridgeSupported(tokenCfg.AssetID, w.net) || IsPolygonBridgeSupported(tokenCfg.AssetID, w.net) {
+		return &TokenBridgeWallet{
+			TokenWallet: tokenWallet,
+		}, nil
+	}
+
+	return tokenWallet, nil
 }
 
 // OwnsDepositAddress indicates if an address belongs to the wallet. The address
@@ -1713,7 +1938,7 @@ func (w *TokenWallet) FundOrder(ord *asset.Order) (asset.Coins, []dex.Bytes, uin
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
 
-	approvalStatus, err := w.approvalStatus(ord.AssetVersion)
+	approvalStatus, err := w.swapContractApprovalStatus(ord.AssetVersion)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
 	}
@@ -1803,7 +2028,7 @@ func (w *TokenWallet) FundMultiOrder(ord *asset.MultiOrder, maxLock uint64) ([]a
 			dex.BipIDSymbol(w.assetID), ord.MaxFeeRate, w.gasFeeLimit())
 	}
 
-	approvalStatus, err := w.approvalStatus(ord.AssetVersion)
+	approvalStatus, err := w.swapContractApprovalStatus(ord.AssetVersion)
 	if err != nil {
 		return nil, nil, 0, fmt.Errorf("error getting approval status: %v", err)
 	}
@@ -2545,39 +2770,42 @@ func (w *assetWallet) tokenAllowance(contractVer uint32) (allowance *big.Int, er
 
 // approveToken approves the token swap contract to spend tokens on behalf of
 // account handled by the wallet.
-func (w *assetWallet) approveToken(ctx context.Context, amount *big.Int, gasLimit uint64, maxFeeRate, tipRate *big.Int, contractVer uint32) (tx *types.Transaction, err error) {
-	return tx, w.withNonce(ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
+func (w *assetWallet) approveToken(ctx context.Context, amount *big.Int, gasLimit uint64, maxFeeRate, tipRate *big.Int, contractVer uint32) (*types.Transaction, error) {
+	res := &genTxResult{
+		tx:     nil,
+		txType: asset.ApproveToken,
+		amt:    w.atomize(amount),
+	}
+
+	return res.tx, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(w.ctx, 0, gasLimit, maxFeeRate, tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, fmt.Errorf("addSignerToOpts error: %w", err)
+			return nil, fmt.Errorf("addSignerToOpts error: %w", err)
 		}
 
-		return tx, asset.ApproveToken, w.atomize(amount), nil, w.withTokenContractor(w.assetID, contractVer, func(c tokenContractor) error {
-			tx, err = c.approve(txOpts, amount)
+		return res, w.withTokenContractor(w.assetID, contractVer, func(c tokenContractor) error {
+			res.tx, err = c.approve(txOpts, amount)
 			if err != nil {
 				return err
 			}
 			w.log.Infof("Approval sent for %s at token address %s, nonce = %s, txID = %s",
-				dex.BipIDSymbol(w.assetID), c.tokenAddress(), txOpts.Nonce, tx.Hash().Hex())
+				dex.BipIDSymbol(w.assetID), c.tokenAddress(), txOpts.Nonce, res.tx.Hash().Hex())
 			return nil
 		})
 	})
 }
 
-func (w *assetWallet) approvalStatus(assetVer uint32) (asset.ApprovalStatus, error) {
+func (w *assetWallet) approvalStatus(contract common.Address, checkAllowance func() (*big.Int, error)) (asset.ApprovalStatus, error) {
 	if w.assetID == w.baseChainID {
 		return asset.Approved, nil
 	}
 
-	contractVer := contractVersion(assetVer)
-
 	// If the result has been cached, return what is in the cache.
 	// The cache is cleared if an approval/unapproval tx is done.
-	w.approvalsMtx.RLock()
-	approved, cached := w.approvalCache[contractVer]
-	_, pending := w.pendingApprovals[contractVer]
-	w.approvalsMtx.RUnlock()
-	if cached {
+	w.approvalsMtx.Lock()
+	defer w.approvalsMtx.Unlock()
+
+	if approved, cached := w.approvalCache[contract]; cached {
 		if approved {
 			return asset.Approved, nil
 		} else {
@@ -2585,23 +2813,31 @@ func (w *assetWallet) approvalStatus(assetVer uint32) (asset.ApprovalStatus, err
 		}
 	}
 
-	if pending {
+	if _, pending := w.pendingApprovals[contract]; pending {
 		return asset.Pending, nil
 	}
 
-	w.approvalsMtx.Lock()
-	defer w.approvalsMtx.Unlock()
-
-	currentAllowance, err := w.tokenAllowance(contractVer)
+	currentAllowance, err := checkAllowance()
 	if err != nil {
 		return asset.NotApproved, fmt.Errorf("error retrieving current allowance: %w", err)
 	}
 	if currentAllowance.Cmp(unlimitedAllowanceReplenishThreshold) >= 0 {
-		w.approvalCache[contractVer] = true
+		w.approvalCache[contract] = true
 		return asset.Approved, nil
 	}
-	w.approvalCache[contractVer] = false
+	w.approvalCache[contract] = false
+
 	return asset.NotApproved, nil
+}
+
+func (w *TokenWallet) swapContractApprovalStatus(assetVer uint32) (asset.ApprovalStatus, error) {
+	contract, found := w.versionedContracts[assetVer]
+	if !found {
+		return asset.NotApproved, fmt.Errorf("no contract address found for asset %d contract version %d", w.assetID, assetVer)
+	}
+	return w.approvalStatus(contract, func() (*big.Int, error) {
+		return w.tokenAllowance(assetVer)
+	})
 }
 
 // ApproveToken sends an approval transaction for a specific version of
@@ -2609,7 +2845,12 @@ func (w *assetWallet) approvalStatus(assetVer uint32) (asset.ApprovalStatus, err
 // already been done or is pending. The onConfirm callback is called
 // when the approval transaction is confirmed.
 func (w *TokenWallet) ApproveToken(assetVer uint32, onConfirm func()) (string, error) {
-	approvalStatus, err := w.approvalStatus(assetVer)
+	contract, found := w.versionedContracts[assetVer]
+	if !found {
+		return "", fmt.Errorf("no contract address found for asset %d contract version %d", w.assetID, assetVer)
+	}
+
+	approvalStatus, err := w.swapContractApprovalStatus(assetVer)
 	if err != nil {
 		return "", fmt.Errorf("error checking approval status: %w", err)
 	}
@@ -2647,8 +2888,8 @@ func (w *TokenWallet) ApproveToken(assetVer uint32, onConfirm func()) (string, e
 	w.approvalsMtx.Lock()
 	defer w.approvalsMtx.Unlock()
 
-	delete(w.approvalCache, assetVer)
-	w.pendingApprovals[assetVer] = &pendingApproval{
+	delete(w.approvalCache, contract)
+	w.pendingApprovals[contract] = &pendingApproval{
 		txHash:    tx.Hash(),
 		onConfirm: onConfirm,
 	}
@@ -2659,7 +2900,12 @@ func (w *TokenWallet) ApproveToken(assetVer uint32, onConfirm func()) (string, e
 // UnapproveToken removes the approval for a specific version of the token's
 // swap contract.
 func (w *TokenWallet) UnapproveToken(assetVer uint32, onConfirm func()) (string, error) {
-	approvalStatus, err := w.approvalStatus(assetVer)
+	contract, found := w.versionedContracts[assetVer]
+	if !found {
+		return "", fmt.Errorf("no contract address found for asset %d contract version %d", w.assetID, assetVer)
+	}
+
+	approvalStatus, err := w.swapContractApprovalStatus(assetVer)
 	if err != nil {
 		return "", fmt.Errorf("error checking approval status: %w", err)
 	}
@@ -2697,8 +2943,8 @@ func (w *TokenWallet) UnapproveToken(assetVer uint32, onConfirm func()) (string,
 	w.approvalsMtx.Lock()
 	defer w.approvalsMtx.Unlock()
 
-	delete(w.approvalCache, assetVer)
-	w.pendingApprovals[assetVer] = &pendingApproval{
+	delete(w.approvalCache, contract)
+	w.pendingApprovals[contract] = &pendingApproval{
 		txHash:    tx.Hash(),
 		onConfirm: onConfirm,
 	}
@@ -2732,7 +2978,7 @@ func (w *TokenWallet) ApprovalFee(assetVer uint32, approve bool) (uint64, error)
 func (w *TokenWallet) ApprovalStatus() map[uint32]asset.ApprovalStatus {
 	statuses := map[uint32]asset.ApprovalStatus{}
 	for _, assetVer := range w.wi.SupportedVersions {
-		status, err := w.approvalStatus(assetVer)
+		status, err := w.swapContractApprovalStatus(assetVer)
 		if err != nil {
 			w.log.Errorf("error checking approval status for swap contract version %d: %w", assetVer, err)
 			continue
@@ -2741,6 +2987,343 @@ func (w *TokenWallet) ApprovalStatus() map[uint32]asset.ApprovalStatus {
 	}
 
 	return statuses
+}
+
+func (w *assetWallet) bridgeContractApprovalStatus(ctx context.Context, bridge bridge) (asset.ApprovalStatus, error) {
+	if !bridge.requiresBridgeContractApproval() {
+		return asset.Approved, nil
+	}
+	return w.approvalStatus(bridge.bridgeContractAddr(), func() (*big.Int, error) {
+		return bridge.bridgeContractAllowance(ctx)
+	})
+}
+
+// BridgeContractApprovalStatus returns whether the bridge contract has been
+// approved to spend tokens on behalf of the account handled by the wallet.
+func (w *TokenBridgeWallet) BridgeContractApprovalStatus(ctx context.Context) (asset.ApprovalStatus, error) {
+	return w.bridgeContractApprovalStatus(ctx, w.manager.bridge)
+}
+
+// BridgeContractApprovalStatus returns whether the bridge contract has been
+// approved to spend tokens on behalf of the account handled by the wallet.
+func (w *ETHBridgeWallet) BridgeContractApprovalStatus(ctx context.Context) (asset.ApprovalStatus, error) {
+	return w.bridgeContractApprovalStatus(ctx, w.manager.bridge)
+}
+
+func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) (string, error) {
+	approvalStatus, err := w.bridgeContractApprovalStatus(ctx, bridge)
+	if err != nil {
+		return "", fmt.Errorf("error checking approval status: %w", err)
+	}
+	if approvalStatus == asset.Approved {
+		return "", fmt.Errorf("bridge contract is already approved")
+	}
+	if approvalStatus == asset.Pending {
+		return "", fmt.Errorf("approval is already pending")
+	}
+
+	maxFeeRate, tipRate, err := w.recommendedMaxFeeRate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error calculating approval fee rate: %w", err)
+	}
+	feeRateGwei := dexeth.WeiToGweiCeil(maxFeeRate)
+	approvalGas, err := w.approvalGas(unlimitedAllowance, dexeth.ContractVersionNewest)
+	if err != nil {
+		return "", fmt.Errorf("error calculating approval gas: %w", err)
+	}
+
+	ethBal, err := w.balance()
+	if err != nil {
+		return "", fmt.Errorf("error getting eth balance: %w", err)
+	}
+	if ethBal.Available < approvalGas*feeRateGwei {
+		return "", fmt.Errorf("insufficient fee balance for approval. required: %d, available: %d",
+			approvalGas*feeRateGwei, ethBal.Available)
+	}
+
+	var txID string
+	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
+		txOpts, err := w.node.txOpts(ctx, 0, approvalGas, maxFeeRate, tipRate, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("txOpts error: %w", err)
+		}
+
+		tx, err := bridge.approveBridgeContract(txOpts, unlimitedAllowance)
+		if err != nil {
+			return nil, fmt.Errorf("error approving bridge contract: %w", err)
+		}
+
+		txID = tx.Hash().Hex()
+
+		w.approvalsMtx.Lock()
+		delete(w.approvalCache, bridge.bridgeContractAddr())
+		w.pendingApprovals[bridge.bridgeContractAddr()] = &pendingApproval{
+			txHash:    tx.Hash(),
+			onConfirm: func() {},
+		}
+		w.approvalsMtx.Unlock()
+
+		return &genTxResult{
+			tx:     tx,
+			txType: asset.ApproveToken,
+			amt:    w.atomize(unlimitedAllowance),
+		}, nil
+	})
+}
+
+// ApproveBridgeContract approves the bridge contract to spend tokens on behalf
+// of the account handled by the wallet.
+func (w *ETHBridgeWallet) ApproveBridgeContract(ctx context.Context) (string, error) {
+	return w.approveBridgeContract(ctx, w.manager.bridge)
+}
+
+// ApproveBridgeContract approves the bridge contract to spend tokens on behalf
+// of the account handled by the wallet.
+func (w *TokenBridgeWallet) ApproveBridgeContract(ctx context.Context) (string, error) {
+	return w.approveBridgeContract(ctx, w.manager.bridge)
+}
+
+func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge) (string, error) {
+	approvalStatus, err := w.bridgeContractApprovalStatus(ctx, bridge)
+	if err != nil {
+		return "", fmt.Errorf("error checking approval status: %w", err)
+	}
+	if approvalStatus == asset.NotApproved {
+		return "", fmt.Errorf("bridge contract is not approved")
+	}
+	if approvalStatus == asset.Pending {
+		return "", fmt.Errorf("approval update is pending")
+	}
+
+	maxFeeRate, tipRate, err := w.recommendedMaxFeeRate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error calculating approval fee rate: %w", err)
+	}
+	feeRateGwei := dexeth.WeiToGweiCeil(maxFeeRate)
+	approvalGas, err := w.approvalGas(new(big.Int), dexeth.ContractVersionNewest)
+	if err != nil {
+		return "", fmt.Errorf("error calculating approval gas: %w", err)
+	}
+
+	ethBal, err := w.balance()
+	if err != nil {
+		return "", fmt.Errorf("error getting eth balance: %w", err)
+	}
+	if ethBal.Available < approvalGas*feeRateGwei {
+		return "", fmt.Errorf("insufficient fee balance for approval. required: %d, available: %d",
+			approvalGas*feeRateGwei, ethBal.Available)
+	}
+
+	var txID string
+	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
+		txOpts, err := w.node.txOpts(ctx, 0, approvalGas, maxFeeRate, tipRate, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("txOpts error: %w", err)
+		}
+
+		tx, err := bridge.approveBridgeContract(txOpts, new(big.Int))
+		if err != nil {
+			return nil, fmt.Errorf("error approving bridge contract: %w", err)
+		}
+
+		txID = tx.Hash().Hex()
+
+		w.approvalsMtx.Lock()
+		delete(w.approvalCache, bridge.bridgeContractAddr())
+		w.pendingApprovals[bridge.bridgeContractAddr()] = &pendingApproval{
+			txHash:    tx.Hash(),
+			onConfirm: func() {},
+		}
+		w.approvalsMtx.Unlock()
+
+		return &genTxResult{
+			tx:     tx,
+			txType: asset.ApproveToken,
+			amt:    w.atomize(new(big.Int)),
+		}, nil
+	})
+}
+
+// UnapproveBridgeContract removes the approval for the bridge contract.
+func (w *ETHBridgeWallet) UnapproveBridgeContract(ctx context.Context) (string, error) {
+	return w.unapproveBridgeContract(ctx, w.manager.bridge)
+}
+
+// UnapproveBridgeContract removes the approval for the bridge contract.
+func (w *TokenBridgeWallet) UnapproveBridgeContract(ctx context.Context) (string, error) {
+	return w.unapproveBridgeContract(ctx, w.manager.bridge)
+}
+
+func (w *assetWallet) initiateBridge(ctx context.Context, amt uint64, dest uint32, bridge bridge) (txID string, err error) {
+	approvalStatus, err := w.bridgeContractApprovalStatus(ctx, bridge)
+	if err != nil {
+		return "", fmt.Errorf("error checking approval status: %w", err)
+	}
+	if approvalStatus == asset.NotApproved {
+		return "", fmt.Errorf("bridge contract is not approved")
+	}
+	if approvalStatus == asset.Pending {
+		return "", fmt.Errorf("bridge contract approval is still pending")
+	}
+
+	maxFeeRate, tipRate, err := w.recommendedMaxFeeRate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error calculating bridge fee rate: %w", err)
+	}
+
+	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
+		txOpts, err := w.node.txOpts(ctx, 0, bridge.bridgeGas(), maxFeeRate, tipRate, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("txOpts error: %w", err)
+		}
+
+		tx, _, err := bridge.bridge(txOpts, dest, w.evmify(amt))
+		if err != nil {
+			return nil, err
+		}
+
+		txID = tx.Hash().Hex()
+		return &genTxResult{
+			tx:                       tx,
+			txType:                   asset.InitiateBridge,
+			amt:                      amt,
+			bridgeCounterpartAssetID: &dest,
+		}, nil
+	})
+}
+
+// Bridge initiates bridging funds from one chain to another.
+func (w *ETHBridgeWallet) Bridge(ctx context.Context, amt uint64, dest uint32) (txID string, err error) {
+	txID, err = w.initiateBridge(ctx, amt, dest, w.manager.bridge)
+	if err != nil {
+		return "", err
+	}
+	w.manager.addPendingBridge(txID, dest)
+	return txID, nil
+}
+
+// Bridge initiates bridging funds from one chain to another.
+func (w *TokenBridgeWallet) Bridge(ctx context.Context, amt uint64, dest uint32) (txID string, err error) {
+	txID, err = w.initiateBridge(ctx, amt, dest, w.manager.bridge)
+	if err != nil {
+		return "", err
+	}
+	w.manager.addPendingBridge(txID, dest)
+	return txID, nil
+}
+
+func (w *assetWallet) getMintInfo(ctx context.Context, burnTxID string, bridge bridge) ([]byte, error) {
+	return bridge.getMintInfo(ctx, burnTxID)
+}
+
+func (w *ETHBridgeWallet) GetMintData(ctx context.Context, burnTxID string) ([]byte, error) {
+	return w.manager.bridge.getMintInfo(ctx, burnTxID)
+}
+
+func (w *TokenBridgeWallet) GetMintData(ctx context.Context, burnTxID string) ([]byte, error) {
+	return w.manager.bridge.getMintInfo(ctx, burnTxID)
+}
+
+func (w *ETHBridgeWallet) MintComplete(burnTxID, mintTxID string) {
+	w.manager.markBridgeComplete(burnTxID, mintTxID, w.tipHeight())
+}
+
+func (w *TokenBridgeWallet) MintComplete(burnTxID, mintTxID string) {
+	w.manager.markBridgeComplete(burnTxID, mintTxID, w.tipHeight())
+}
+
+func (w *assetWallet) pendingBridges() ([]*asset.WalletTransaction, error) {
+	pendingBridges, err := w.txDB.getPendingBridges()
+	if err != nil {
+		return nil, fmt.Errorf("error getting pending bridges: %w", err)
+	}
+
+	wt := make([]*asset.WalletTransaction, 0, len(pendingBridges))
+	for _, pb := range pendingBridges {
+		wt = append(wt, pb.WalletTransaction)
+	}
+
+	return wt, nil
+}
+
+func (w *ETHBridgeWallet) PendingBridges() ([]*asset.WalletTransaction, error) {
+	return w.pendingBridges()
+}
+
+func (w *TokenBridgeWallet) PendingBridges() ([]*asset.WalletTransaction, error) {
+	return w.pendingBridges()
+}
+
+func (w *assetWallet) bridgeHistory(n int, refID *string, past bool) ([]*asset.WalletTransaction, error) {
+	var refHash *common.Hash
+	if refID != nil {
+		rh := common.HexToHash(*refID)
+		refHash = &rh
+	}
+	return w.txDB.getBridges(n, refHash, past)
+}
+
+func (w *ETHBridgeWallet) BridgeHistory(n int, refID *string, past bool) ([]*asset.WalletTransaction, error) {
+	return w.bridgeHistory(n, refID, past)
+}
+
+func (w *TokenBridgeWallet) BridgeHistory(n int, refID *string, past bool) ([]*asset.WalletTransaction, error) {
+	return w.bridgeHistory(n, refID, past)
+}
+
+// Mint sends a transaction to mint tokens on the destination chain.
+func (w *assetWallet) mint(ctx context.Context, mintData []byte, burnTxID string, burnAssetID uint32, bridge bridge) (txID string, err error) {
+	maxFeeRate, tipRate, err := w.recommendedMaxFeeRate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("error calculating bridge fee rate: %w", err)
+	}
+
+	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
+		txOpts, err := w.node.txOpts(ctx, 0, bridge.mintGas(), maxFeeRate, tipRate, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("txOpts error: %w", err)
+		}
+
+		tx, err := bridge.mint(txOpts, mintData)
+		if err != nil {
+			return nil, err
+		}
+
+		txID = tx.Hash().Hex()
+
+		// TODO: find amount of tokens minted, will be in logs
+		return &genTxResult{
+			tx:                       tx,
+			txType:                   asset.CompleteBridge,
+			amt:                      0,
+			bridgeCounterpartAssetID: &burnAssetID,
+			bridgeCounterpartTxID:    &burnTxID,
+		}, nil
+	})
+}
+
+func (w *ETHBridgeWallet) Mint(ctx context.Context, burnTxID string, burnAssetID uint32, mintData []byte) (txID string, err error) {
+	wt, err := w.txDB.getBridgeMint(burnTxID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge mint: %w", err)
+	}
+	if wt != nil {
+		return wt.ID, nil
+	}
+
+	return w.mint(ctx, mintData, burnTxID, burnAssetID, w.manager.bridge)
+}
+
+func (w *TokenBridgeWallet) Mint(ctx context.Context, burnTxID string, burnAssetID uint32, mintData []byte) (txID string, err error) {
+	wt, err := w.txDB.getBridgeMint(burnTxID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge mint: %w", err)
+	}
+	if wt != nil {
+		return wt.ID, nil
+	}
+
+	return w.mint(ctx, mintData, burnTxID, burnAssetID, w.manager.bridge)
 }
 
 // ReserveNRedemptions locks funds for redemption. It is an error if there
@@ -4277,7 +4860,7 @@ func (w *assetWallet) balanceWithTxPool() (*Balance, error) {
 // var nonceSkimped atomic.Bool
 
 // sendToAddr sends funds to the address.
-func (w *ETHWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipRate *big.Int) (tx *types.Transaction, err error) {
+func (w *ETHWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipRate *big.Int) (*types.Transaction, error) {
 
 	// Uncomment here and above to test actionTypeLostNonce.
 	// Also change txAgeOut to like 1 minute.
@@ -4285,7 +4868,18 @@ func (w *ETHWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipR
 	// 	defer w.borkNonce(tx)
 	// }
 
-	return tx, w.withNonce(w.ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
+	recipient := addr.Hex()
+	res := &genTxResult{
+		tx:        nil,
+		txType:    asset.Send,
+		amt:       amt,
+		recipient: &recipient,
+	}
+	if addr == w.addr {
+		res.txType = asset.SelfSend
+	}
+
+	return res.tx, w.withNonce(w.ctx, func(nonce *big.Int) (*genTxResult, error) {
 
 		// Uncomment here and above to test actionTypeMissingNonces.
 		// if nonceFuturized.CompareAndSwap(false, true) {
@@ -4302,39 +4896,41 @@ func (w *ETHWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipR
 
 		txOpts, err := w.node.txOpts(w.ctx, amt, defaultSendGasLimit, maxFeeRate, tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
-		tx, err = w.node.sendTransaction(w.ctx, txOpts, addr, nil)
+		res.tx, err = w.node.sendTransaction(w.ctx, txOpts, addr, nil)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
-		txType := asset.Send
-		if addr == w.addr {
-			txType = asset.SelfSend
-		}
-		recipient := addr.Hex()
-		return tx, txType, amt, &recipient, nil
+		return res, nil
 	})
 }
 
 // sendToAddr sends funds to the address.
-func (w *TokenWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipRate *big.Int) (tx *types.Transaction, err error) {
+func (w *TokenWallet) sendToAddr(addr common.Address, amt uint64, maxFeeRate, tipRate *big.Int) (*types.Transaction, error) {
 	g := w.gases(dexeth.ContractVersionERC20)
 	if g == nil {
 		return nil, fmt.Errorf("no gas table")
 	}
-	return tx, w.withNonce(w.ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
+
+	recipient := addr.Hex()
+	res := &genTxResult{
+		tx:        nil,
+		txType:    asset.Send,
+		amt:       amt,
+		recipient: &recipient,
+	}
+	if addr == w.addr {
+		res.txType = asset.SelfSend
+	}
+
+	return res.tx, w.withNonce(w.ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(w.ctx, 0, g.Transfer, maxFeeRate, tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
-		txType := asset.Send
-		if addr == w.addr {
-			txType = asset.SelfSend
-		}
-		recipient := addr.Hex()
-		return tx, txType, amt, &recipient, w.withTokenContractor(w.assetID, dexeth.ContractVersionERC20, func(c tokenContractor) error {
-			tx, err = c.transfer(txOpts, addr, w.evmify(amt))
+		return res, w.withTokenContractor(w.assetID, dexeth.ContractVersionERC20, func(c tokenContractor) error {
+			res.tx, err = c.transfer(txOpts, addr, w.evmify(amt))
 			if err != nil {
 				return err
 			}
@@ -4381,14 +4977,21 @@ func (w *assetWallet) initiate(
 			val += c.Value
 		}
 	}
-	return tx, w.withNonce(ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
+
+	res := &genTxResult{
+		tx:     nil,
+		txType: asset.Swap,
+		amt:    amt,
+	}
+
+	return res.tx, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(ctx, val, gasLimit, maxFeeRate, tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
 
-		return tx, asset.Swap, amt, nil, w.withContractor(contractVer, func(c contractor) error {
-			tx, err = c.initiate(txOpts, contracts)
+		return res, w.withContractor(contractVer, func(c contractor) error {
+			res.tx, err = c.initiate(txOpts, contracts)
 			return err
 		})
 	})
@@ -4527,7 +5130,7 @@ func (w *assetWallet) redeem(
 	tipRate *big.Int,
 	gasLimit uint64,
 	contractVer uint32,
-) (tx *types.Transaction, err error) {
+) (*types.Transaction, error) {
 
 	// // Uncomment here and above to test core's handling of ErrTxLost from
 	// if firstRedemptionLost.CompareAndSwap(false, true) {
@@ -4535,11 +5138,17 @@ func (w *assetWallet) redeem(
 	// 	return types.NewTransaction(10, w.addr, big.NewInt(dexeth.GweiFactor), gasLimit, dexeth.GweiToWei(maxFeeRate), nil), nil
 	// }
 
-	return tx, w.withNonce(ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
-		var amt uint64
+	res := &genTxResult{
+		tx:     nil,
+		txType: asset.Redeem,
+		amt:    0,
+	}
+
+	return res.tx, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
 		for _, r := range redemptions {
-			amt += r.Spends.Coin.Value()
+			res.amt += r.Spends.Coin.Value()
 		}
+
 		// Uncomment here and above to test rejected redemption handling.
 		// if firstRedemptionBorked.CompareAndSwap(false, true) {
 		// 	fmt.Printf("\n##### Borking gas limit for rejected tx testing\n\n")
@@ -4548,10 +5157,11 @@ func (w *assetWallet) redeem(
 
 		txOpts, err := w.node.txOpts(ctx, 0, gasLimit, dexeth.GweiToWei(maxFeeRate), tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
-		return tx, asset.Redeem, amt, nil, w.withContractor(contractVer, func(c contractor) error {
-			tx, err = c.redeem(txOpts, redemptions)
+
+		return res, w.withContractor(contractVer, func(c contractor) error {
+			res.tx, err = c.redeem(txOpts, redemptions)
 			return err
 		})
 	})
@@ -4560,18 +5170,25 @@ func (w *assetWallet) redeem(
 // refund refunds a swap contract using the account controlled by the wallet.
 // Any on-chain failure, such as the locktime not being past, will not cause
 // this to error.
-func (w *assetWallet) refund(locator []byte, amt uint64, maxFeeRate, tipRate *big.Int, contractVer uint32) (tx *types.Transaction, err error) {
+func (w *assetWallet) refund(locator []byte, amt uint64, maxFeeRate, tipRate *big.Int, contractVer uint32) (*types.Transaction, error) {
 	gas := w.gases(contractVer)
 	if gas == nil {
 		return nil, fmt.Errorf("no gas table for asset %d, version %d", w.assetID, contractVer)
 	}
-	return tx, w.withNonce(w.ctx, func(nonce *big.Int) (*types.Transaction, asset.TransactionType, uint64, *string, error) {
+
+	res := &genTxResult{
+		tx:     nil,
+		txType: asset.Refund,
+		amt:    amt,
+	}
+
+	return res.tx, w.withNonce(w.ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(w.ctx, 0, gas.Refund, maxFeeRate, tipRate, nonce)
 		if err != nil {
-			return nil, 0, 0, nil, err
+			return nil, err
 		}
-		return tx, asset.Refund, amt, nil, w.withContractor(contractVer, func(c contractor) error {
-			tx, err = c.refund(txOpts, locator)
+		return res, w.withContractor(contractVer, func(c contractor) error {
+			res.tx, err = c.refund(txOpts, locator)
 			return err
 		})
 	})
@@ -5002,7 +5619,22 @@ func (w *assetWallet) userActionBumpFees(actionB []byte) error {
 			return fmt.Errorf("error sending bumped-fee transaction: %w", err)
 		}
 
-		newPendingTx := w.extendedTx(newTx, pendingTx.Type, pendingTx.Amount, pendingTx.Recipient)
+		var bridgeDestAssetID *uint32
+		var bridgeDestTxID *string
+		if pendingTx.BridgeCounterpartTx != nil {
+			bridgeDestAssetID = &pendingTx.BridgeCounterpartTx.AssetID
+			bridgeDestTxID = &pendingTx.BridgeCounterpartTx.ID
+		}
+
+		res := &genTxResult{
+			tx:                       newTx,
+			txType:                   pendingTx.Type,
+			amt:                      pendingTx.Amount,
+			bridgeCounterpartAssetID: bridgeDestAssetID,
+			bridgeCounterpartTxID:    bridgeDestTxID,
+			recipient:                pendingTx.Recipient,
+		}
+		newPendingTx := w.extendedTx(res)
 
 		pendingTx.NonceReplacement = newPendingTx.ID
 		pendingTx.FeeReplacement = true
@@ -5071,12 +5703,18 @@ func (w *assetWallet) userActionNonceReplacement(actionB []byte) error {
 	if from != w.addr {
 		return fmt.Errorf("specified replacement tx originator %s is not you", from)
 	}
+
 	return w.amendPendingTx(action.TxID, func(txHash common.Hash, oldTx *types.Transaction, pendingTx *extendedWalletTx, idx int) error {
 		if replacementTx.Nonce() != pendingTx.Nonce.Uint64() {
 			return fmt.Errorf("nonce replacement doesn't have the right nonce. %d != %s", replacementTx.Nonce(), pendingTx.Nonce)
 		}
 		recipient := w.addr.Hex()
-		newPendingTx := w.extendedTx(replacementTx, asset.Unknown, 0, &recipient)
+		newPendingTx := w.extendedTx(&genTxResult{
+			tx:        replacementTx,
+			txType:    asset.Unknown,
+			amt:       0,
+			recipient: &recipient,
+		})
 		pendingTx.NonceReplacement = newPendingTx.ID
 		var oldTo, newTo common.Address
 		if oldAddr := oldTx.To(); oldAddr != nil {
@@ -5145,7 +5783,12 @@ func (w *assetWallet) userActionRecoverNonces(actionB []byte) error {
 			w.log.Warnf("skipping storing underpriced replacement tx for nonce %d", nonce)
 		} else {
 			recipient := w.addr.Hex()
-			pendingTx := w.extendAndStoreTx(tx, asset.SelfSend, 0, nil, &recipient)
+			pendingTx := w.extendAndStoreTx(&genTxResult{
+				tx:        tx,
+				txType:    asset.SelfSend,
+				amt:       0,
+				recipient: &recipient,
+			}, nil)
 			w.emitTransactionNote(pendingTx.WalletTransaction, true)
 			w.pendingTxs = append(w.pendingTxs, pendingTx)
 			sort.Slice(w.pendingTxs, func(i, j int) bool {
@@ -5224,25 +5867,25 @@ func transactionFeeLimit(tx *types.Transaction) *big.Int {
 
 // extendedTx generates an *extendedWalletTx for a newly-broadcasted tx and
 // stores it in the DB.
-func (w *assetWallet) extendedTx(tx *types.Transaction, txType asset.TransactionType, amt uint64, recipient *string) *extendedWalletTx {
+func (w *assetWallet) extendedTx(genTxResult *genTxResult) *extendedWalletTx {
 	var tokenAssetID *uint32
 	if w.assetID != w.baseChainID {
 		tokenAssetID = &w.assetID
 	}
-	return w.baseWallet.extendAndStoreTx(tx, txType, amt, tokenAssetID, recipient)
+	return w.baseWallet.extendAndStoreTx(genTxResult, tokenAssetID)
 }
 
-func (w *baseWallet) extendAndStoreTx(tx *types.Transaction, txType asset.TransactionType, amt uint64, tokenAssetID *uint32, recipient *string) *extendedWalletTx {
-	nonce := tx.Nonce()
-	rawTx, err := tx.MarshalBinary()
+func (w *baseWallet) extendAndStoreTx(genTxResult *genTxResult, tokenAssetID *uint32) *extendedWalletTx {
+	nonce := genTxResult.tx.Nonce()
+	rawTx, err := genTxResult.tx.MarshalBinary()
 	if err != nil {
-		w.log.Errorf("Error marshaling tx %q: %v", tx.Hash(), err)
+		w.log.Errorf("Error marshaling tx %q: %v", genTxResult.tx.Hash(), err)
 	}
 
-	if recipient == nil {
-		if to := tx.To(); to != nil {
+	if genTxResult.recipient == nil {
+		if to := genTxResult.tx.To(); to != nil {
 			s := to.String()
-			recipient = &s
+			genTxResult.recipient = &s
 		}
 	}
 
@@ -5250,12 +5893,12 @@ func (w *baseWallet) extendAndStoreTx(tx *types.Transaction, txType asset.Transa
 
 	wt := &extendedWalletTx{
 		WalletTransaction: &asset.WalletTransaction{
-			Type:      txType,
-			ID:        tx.Hash().String(),
-			Amount:    amt,
-			Fees:      dexeth.WeiToGweiCeil(transactionFeeLimit(tx)), // updated later
+			Type:      genTxResult.txType,
+			ID:        genTxResult.tx.Hash().String(),
+			Amount:    genTxResult.amt,
+			Fees:      dexeth.WeiToGweiCeil(transactionFeeLimit(genTxResult.tx)), // updated later
 			TokenID:   tokenAssetID,
-			Recipient: recipient,
+			Recipient: genTxResult.recipient,
 			AdditionalData: map[string]string{
 				txHistoryNonceKey: strconv.FormatUint(nonce, 10),
 			},
@@ -5263,10 +5906,25 @@ func (w *baseWallet) extendAndStoreTx(tx *types.Transaction, txType asset.Transa
 		SubmissionTime: uint64(now.Unix()),
 		RawTx:          rawTx,
 		Nonce:          big.NewInt(int64(nonce)),
-		txHash:         tx.Hash(),
+		txHash:         genTxResult.tx.Hash(),
 		savedToDB:      true,
 		lastBroadcast:  now,
 		lastFeeCheck:   now,
+	}
+
+	if genTxResult.bridgeCounterpartAssetID != nil || genTxResult.bridgeCounterpartTxID != nil {
+		var cpTxID string
+		var cpAssetID uint32
+		if genTxResult.bridgeCounterpartTxID != nil {
+			cpTxID = *genTxResult.bridgeCounterpartTxID
+		}
+		if genTxResult.bridgeCounterpartAssetID != nil {
+			cpAssetID = *genTxResult.bridgeCounterpartAssetID
+		}
+		wt.BridgeCounterpartTx = &asset.BridgeCounterpartTx{
+			AssetID: cpAssetID,
+			ID:      cpTxID,
+		}
 	}
 
 	w.tryStoreDBTx(wt)
