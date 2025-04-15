@@ -69,6 +69,10 @@ func (db *BoltDB) upgradeDB() error {
 		return err
 	}
 
+	if version <= 7 {
+		return nil
+	}
+
 	if version > DBVersion {
 		return fmt.Errorf("unknown database version %d, "+
 			"client recognizes up to %d", version, DBVersion)

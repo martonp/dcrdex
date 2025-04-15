@@ -59,10 +59,10 @@ var (
 		ServerTime: time.Now().Unix(),
 		RateLimits: []*bntypes.RateLimit{},
 		Symbols: []*bntypes.Market{
-			makeMarket("dcr", "btc"),
-			makeMarket("eth", "btc"),
-			makeMarket("dcr", "usdc"),
-			makeMarket("zec", "btc"),
+			makeMarket("dcr", "btc", 0.00001, 1, 0.000001, 1e6),
+			makeMarket("eth", "btc", 0.00001, 1, 0.000001, 1e6),
+			makeMarket("dcr", "usdc", 0.01, 10_000, 0.000001, 1e6),
+			makeMarket("zec", "btc", 0.00001, 1, 0.000001, 1e6),
 		},
 	}
 
@@ -85,7 +85,7 @@ var (
 	initialBalances = []*bntypes.Balance{
 		makeBalance("btc", 1.5),
 		makeBalance("dcr", 10000),
-		makeBalance("eth", 5),
+		makeBalance("eth", 50),
 		makeBalance("usdc", 1152),
 		makeBalance("zec", 10000),
 	}
@@ -101,7 +101,7 @@ func parseAssetID(asset string) uint32 {
 	return assetID
 }
 
-func makeMarket(baseSymbol, quoteSymbol string) *bntypes.Market {
+func makeMarket(baseSymbol, quoteSymbol string, rateStep, maxPrice, lotSize, maxQty float64) *bntypes.Market {
 	baseSymbol, quoteSymbol = strings.ToUpper(baseSymbol), strings.ToUpper(quoteSymbol)
 	return &bntypes.Market{
 		Symbol:              baseSymbol + quoteSymbol,
@@ -425,7 +425,7 @@ func (f *fakeBinance) run(ctx context.Context) {
 				}
 			}
 		}
-		const marketMinTick, marketTickRange = time.Second * 5, time.Second * 25
+		const marketMinTick, marketTickRange = time.Second * 60, time.Second * 120
 		for {
 			delay := marketMinTick + time.Duration(rand.Float64()*float64(marketTickRange))
 			select {
@@ -1079,31 +1079,93 @@ func (f *fakeBinance) handlePostOrder(w http.ResponseWriter, r *http.Request) {
 	slug := q.Get("symbol")
 	side := q.Get("side")
 	tradeID := q.Get("newClientOrderId")
-	qty, err := strconv.ParseFloat(q.Get("quantity"), 64)
-	if err != nil {
-		log.Errorf("Error parsing quantity %q for order from user %s: %v", q.Get("quantity"), apiKey, err)
-		http.Error(w, "Bad quantity formatting", http.StatusBadRequest)
+	market := q.Get("type") == "MARKET"
+
+	qtyStr := q.Get("quantity")
+	quoteQtyStr := q.Get("quoteOrderQty")
+	priceStr := q.Get("price")
+
+	if !market && quoteQtyStr != "" {
+		log.Errorf("Received quoteOrderQty for non-market order %s", tradeID)
+		http.Error(w, "QuoteOrderQty not allowed for non-market orders", http.StatusBadRequest)
 		return
 	}
-	price, err := strconv.ParseFloat(q.Get("price"), 64)
-	if err != nil {
-		log.Errorf("Error parsing price %q for order from user %s: %v", q.Get("price"), apiKey, err)
-		http.Error(w, "Missing price formatting", http.StatusBadRequest)
+	if !market && (priceStr == "" || qtyStr == "") {
+		log.Errorf("Received empty price or quantity for non-market order %s", tradeID)
+		http.Error(w, "Missing price or quantity", http.StatusBadRequest)
 		return
+	}
+	if quoteQtyStr != "" && qtyStr != "" {
+		log.Errorf("Received both quantity and quoteOrderQty for order %s", tradeID)
+		http.Error(w, "Received both quantity and quoteOrderQty", http.StatusBadRequest)
+		return
+	}
+
+	var qty, quoteQty, price float64
+	if qtyStr != "" {
+		var err error
+		qty, err = strconv.ParseFloat(qtyStr, 64)
+		if err != nil {
+			log.Errorf("Error parsing quantity %q for order from user %s: %v", q.Get("quantity"), apiKey, err)
+			http.Error(w, "Bad quantity formatting", http.StatusBadRequest)
+			return
+		}
+	}
+	if priceStr != "" {
+		var err error
+		price, err = strconv.ParseFloat(priceStr, 64)
+		if err != nil {
+			log.Errorf("Error parsing price %q for order from user %s: %v", priceStr, apiKey, err)
+			http.Error(w, "Missing price formatting", http.StatusBadRequest)
+			return
+		}
+	}
+	if quoteQtyStr != "" {
+		var err error
+		quoteQty, err = strconv.ParseFloat(quoteQtyStr, 64)
+		if err != nil {
+			log.Errorf("Error parsing quoteOrderQty %q for order from user %s: %v", quoteQtyStr, apiKey, err)
+			http.Error(w, "Bad quoteOrderQty formatting", http.StatusBadRequest)
+			return
+		}
 	}
 
 	resp := &bntypes.OrderResponse{
 		Symbol:       slug,
 		Price:        price,
 		OrigQty:      qty,
-		OrigQuoteQty: qty * price,
+		OrigQuoteQty: quoteQty,
 	}
 
-	bookIt := rand.Float32() < 0.2
+	bookIt := rand.Float32() < 0.2 && !market
 	if bookIt {
 		resp.Status = "NEW"
 		log.Tracef("Booking %s order on %s for %.8f for user %s", side, slug, qty, apiKey)
 		f.updateOrderBalances(slug, side == "SELL", qty, price, updateTypeBook)
+	} else if market {
+		log.Tracef("Filled market order on %s for user %s", slug, apiKey)
+		f.marketsMtx.RLock()
+		mkt := f.markets[slug]
+		var rate float64
+		if qty > 0 {
+			rate = mkt.buys[0].rate
+		} else {
+			rate = mkt.sells[0].rate
+		}
+		fmt.Println("~~~~~~~~~~~~ marketTradeOnCex ", slug, qty, quoteQty, rate)
+		f.marketsMtx.RUnlock()
+		var executedQty, executedQuoteQty float64
+		if qty > 0 {
+			executedQty = qty
+			executedQuoteQty = qty * rate
+		} else {
+			executedQty = quoteQty / rate
+			executedQuoteQty = quoteQty
+		}
+		resp.Status = "FILLED"
+		resp.ExecutedQty = executedQty
+		resp.CumulativeQuoteQty = executedQuoteQty
+		f.updateOrderBalances(slug, side == "SELL", executedQty, rate, updateTypeInstantFill)
 	} else {
 		log.Tracef("Filled %s order on %s for %.8f for user %s", side, slug, qty, apiKey)
 		resp.Status = "FILLED"

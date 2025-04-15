@@ -17,14 +17,15 @@ type Filter struct {
 }
 
 type Market struct {
-	Symbol              string    `json:"symbol"`
-	Status              string    `json:"status"`
-	BaseAsset           string    `json:"baseAsset"`
-	BaseAssetPrecision  int       `json:"baseAssetPrecision"`
-	QuoteAsset          string    `json:"quoteAsset"`
-	QuoteAssetPrecision int       `json:"quoteAssetPrecision"`
-	OrderTypes          []string  `json:"orderTypes"`
-	Filters             []*Filter `json:"filters"`
+	Symbol                     string    `json:"symbol"`
+	Status                     string    `json:"status"`
+	BaseAsset                  string    `json:"baseAsset"`
+	BaseAssetPrecision         int       `json:"baseAssetPrecision"`
+	QuoteAsset                 string    `json:"quoteAsset"`
+	QuoteAssetPrecision        int       `json:"quoteAssetPrecision"`
+	OrderTypes                 []string  `json:"orderTypes"`
+	QuoteOrderQtyMarketAllowed bool      `json:"quoteOrderQtyMarketAllowed"`
+	Filters                    []*Filter `json:"filters"`
 
 	// Below fields are parsed from Filters.
 	LotSize  uint64
@@ -124,6 +125,8 @@ type StreamUpdate struct {
 	CancelledOrderID   string       `json:"C"`
 	E                  int64        `json:"E"`
 	ListenKey          string       `json:"listenKey"`
+	Commission         float64      `json:"n,string"`
+	CommissionAsset    string       `json:"N"`
 }
 
 type RateLimit struct {
@@ -166,6 +169,13 @@ const (
 	DepositStatusWaitingUserConfirm = 8
 )
 
+type Fill struct {
+	Price           float64 `json:"price,string"`
+	Qty             float64 `json:"qty,string"`
+	Commission      float64 `json:"commission,string"`
+	CommissionAsset string  `json:"commissionAsset"`
+}
+
 type OrderResponse struct {
 	Symbol             string  `json:"symbol"`
 	Price              float64 `json:"price,string"`
@@ -174,6 +184,7 @@ type OrderResponse struct {
 	ExecutedQty        float64 `json:"executedQty,string"`
 	CumulativeQuoteQty float64 `json:"cummulativeQuoteQty,string"`
 	Status             string  `json:"status"`
+	Fills              []*Fill `json:"fills"`
 }
 
 type BookedOrder struct {
@@ -188,6 +199,8 @@ type BookedOrder struct {
 	Status             string  `json:"status"`
 	TimeInForce        string  `json:"timeInForce"`
 	Side               string  `json:"side"`
+	Type               string  `json:"type"`
+	Fills              []*Fill `json:"fills"`
 }
 
 type MarketTicker24 struct {

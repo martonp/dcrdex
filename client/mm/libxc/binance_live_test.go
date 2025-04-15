@@ -105,7 +105,7 @@ func (drv *spoofDriver) Info() *asset.WalletInfo {
 	}
 }
 
-func TestPlaceTrade(t *testing.T) {
+func TestLimitTrade(t *testing.T) {
 	if baseID == ^uint64(0) || quoteID == ^uint64(0) || rate < 0 || qty < 0 {
 		t.Fatalf("baseID, quoteID, rate, or qty not set")
 	}
@@ -148,7 +148,7 @@ func TestPlaceTrade(t *testing.T) {
 	msgQty := uint64(math.Round(qty * float64(baseUI.Conventional.ConversionFactor)))
 
 	t.Logf("msgRate: %v, msgQty: %v", msgRate, msgQty)
-	trade, err := bnc.Trade(ctx, uint32(baseID), uint32(quoteID), false, msgRate, msgQty, updaterID)
+	trade, err := bnc.Trade(ctx, uint32(baseID), uint32(quoteID), sell, msgRate, msgQty, updaterID)
 	if err != nil {
 		t.Fatalf("trade error: %v", err)
 	}
@@ -160,6 +160,62 @@ func TestPlaceTrade(t *testing.T) {
 			t.Fatalf("error cancelling trade: %v", err)
 		}
 	}
+
+	wg.Wait()
+}
+
+func TestMarketTrade(t *testing.T) {
+	if baseID == ^uint64(0) || quoteID == ^uint64(0) || qty < 0 || assetID == ^uint64(0) {
+		t.Fatalf("baseID, quoteID, rate, or qty not set")
+	}
+
+	bnc := tNewBinance()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour*23)
+	defer cancel()
+
+	_, err := bnc.Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	updates, unsubscribe, updaterID := bnc.SubscribeTradeUpdates()
+	defer unsubscribe()
+
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case tradeUpdate := <-updates:
+				if tradeUpdate.Complete {
+					// Sleep because context might get cancelled before
+					// Trade returns.
+					time.Sleep(1 * time.Second)
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var msgQty uint64
+	if assetID == baseID {
+		baseUI, _ := asset.UnitInfo(uint32(baseID))
+		msgQty = uint64(math.Round(qty * float64(baseUI.Conventional.ConversionFactor)))
+	} else {
+		quoteUI, _ := asset.UnitInfo(uint32(quoteID))
+		msgQty = uint64(math.Round(qty * float64(quoteUI.Conventional.ConversionFactor)))
+	}
+	t.Logf("msgQty: %v", msgQty)
+
+	trade, err := bnc.MarketTrade(ctx, uint32(baseID), uint32(quoteID), uint32(assetID), msgQty, updaterID)
+	if err != nil {
+		t.Fatalf("trade error: %v", err)
+	}
+	t.Logf("trade: %+v", trade)
 
 	wg.Wait()
 }
@@ -215,59 +271,19 @@ func TestVWAP(t *testing.T) {
 		t.Fatalf("Connect error: %v", err)
 	}
 
-	err = bnc.SubscribeMarket(ctx, 60, 60001)
+	err = bnc.SubscribeMarket(ctx, 42, 60002)
 	if err != nil {
 		t.Fatalf("failed to subscribe to market: %v", err)
 	}
 
-	err = bnc.SubscribeMarket(ctx, 60, 0)
-	if err != nil {
-		t.Fatalf("failed to subscribe to market: %v", err)
-	}
+	time.Sleep(10 * time.Second)
 
-	time.Sleep(30 * time.Second)
-
-	avg, extrema, filled, err := bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-	t.Logf("ethbtc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	avg, extrema, filled, err = bnc.VWAP(60, 60001, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-	t.Logf("ethusdc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	err = bnc.SubscribeMarket(ctx, 60, 0)
-	if err != nil {
-		t.Fatalf("failed to subscribe to market: %v", err)
-	}
-
-	avg, extrema, filled, err = bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-
-	t.Logf("ethbtc - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	bnc.UnsubscribeMarket(60, 0)
-
-	avg, extrema, filled, err = bnc.VWAP(60, 0, true, 2e9)
-	if err != nil {
-		t.Fatalf("VWAP failed: %v", err)
-	}
-
-	t.Logf("avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
-
-	err = bnc.UnsubscribeMarket(60, 0)
-	if err != nil {
-		t.Fatalf("error unsubscribing market")
-	}
-
-	_, _, _, err = bnc.VWAP(60, 0, true, 2e9)
-	if err == nil {
-		t.Fatalf("error should be returned since all subscribers have unsubscribed")
+	for i := 0; i < 10; i++ {
+		avg, extrema, filled, err := bnc.VWAP(42, 60002, true, 100e9)
+		if err != nil {
+			t.Fatalf("VWAP failed: %v", err)
+		}
+		t.Logf("dcrusdt - avg: %v, extrema: %v, filled: %v", avg, extrema, filled)
 	}
 }
 

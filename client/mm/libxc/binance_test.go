@@ -4,9 +4,11 @@
 package libxc
 
 import (
+	"net/url"
 	"testing"
 
 	_ "decred.org/dcrdex/client/asset/importall"
+	"decred.org/dcrdex/client/mm/libxc/bntypes"
 )
 
 func TestSubscribeTradeUpdates(t *testing.T) {
@@ -118,5 +120,158 @@ func TestBncAssetCfg(t *testing.T) {
 		if *expected != *cfg {
 			t.Fatalf("expected %v but got %v", expected, cfg)
 		}
+	}
+}
+
+func TestBuildTradeRequest(t *testing.T) {
+	baseCfg := &bncAssetConfig{
+		assetID:          60,
+		symbol:           "eth",
+		coin:             "ETH",
+		chain:            "ETH",
+		conversionFactor: 1e9,
+	}
+	quoteCfg := &bncAssetConfig{
+		assetID:          0,
+		symbol:           "btc",
+		coin:             "BTC",
+		chain:            "BTC",
+		conversionFactor: 1e8,
+	}
+	market := &bntypes.Market{
+		Symbol:   "ETHBTC",
+		MinPrice: 1000,   // 0.00001 ETH/BTC
+		MaxPrice: 100000, // 0.001 ETH/BTC
+		RateStep: 100,    // 0.000001 ETH
+		MinQty:   1e8,    // 0.1 ETH
+		MaxQty:   1e12,   // 1000 ETH
+		LotSize:  1e7,    // 0.01 ETH
+	}
+	tradeID := "test123"
+
+	tests := []struct {
+		name      string
+		sell      bool
+		orderType OrderType
+		rate      uint64
+		qty       uint64
+		wantErr   bool
+		wantVals  url.Values
+	}{
+		{
+			name:      "limit buy",
+			sell:      false,
+			orderType: OrderTypeLimit,
+			rate:      50000,
+			qty:       5e9,
+			wantVals: url.Values{
+				"symbol":           []string{"ETHBTC"},
+				"side":             []string{"BUY"},
+				"type":             []string{"LIMIT"},
+				"timeInForce":      []string{"GTC"},
+				"newClientOrderId": []string{"test123"},
+				"quantity":         []string{"5.00"},
+				"price":            []string{"0.0050000"},
+			},
+		},
+		{
+			name:      "limit sell",
+			sell:      true,
+			orderType: OrderTypeLimit,
+			rate:      50000, // 0.0005 BTC/ETH
+			qty:       5e9,   // 5 ETH
+			wantVals: url.Values{
+				"symbol":           []string{"ETHBTC"},
+				"side":             []string{"SELL"},
+				"type":             []string{"LIMIT"},
+				"timeInForce":      []string{"GTC"},
+				"newClientOrderId": []string{"test123"},
+				"quantity":         []string{"5.00"},
+				"price":            []string{"0.0050000"},
+			},
+		},
+		{
+			name:      "market buy",
+			sell:      false,
+			orderType: OrderTypeMarket,
+			qty:       5e7,
+			wantVals: url.Values{
+				"symbol":           []string{"ETHBTC"},
+				"side":             []string{"BUY"},
+				"type":             []string{"MARKET"},
+				"timeInForce":      []string{"IOC"},
+				"newClientOrderId": []string{"test123"},
+				"quoteOrderQty":    []string{"0.50000000"},
+			},
+		},
+		{
+			name:      "market sell",
+			sell:      true,
+			orderType: OrderTypeMarket,
+			qty:       5e9,
+			wantVals: url.Values{
+				"symbol":           []string{"ETHBTC"},
+				"side":             []string{"SELL"},
+				"type":             []string{"MARKET"},
+				"timeInForce":      []string{"IOC"},
+				"newClientOrderId": []string{"test123"},
+				"quantity":         []string{"5.00"},
+			},
+		},
+		{
+			name:      "rate too low",
+			sell:      false,
+			orderType: OrderTypeLimit,
+			rate:      500,
+			qty:       5e9,
+			wantErr:   true,
+		},
+		{
+			name:      "rate too high",
+			sell:      false,
+			orderType: OrderTypeLimit,
+			rate:      150000,
+			qty:       5e9,
+			wantErr:   true,
+		},
+		{
+			name:      "quantity too low",
+			sell:      false,
+			orderType: OrderTypeLimit,
+			rate:      50000,
+			qty:       5e7,
+			wantErr:   true,
+		},
+		{
+			name:      "quantity too high",
+			sell:      false,
+			orderType: OrderTypeLimit,
+			rate:      50000,
+			qty:       2e12,
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vals, err := buildTradeRequest(baseCfg, quoteCfg, market, tt.sell, tt.orderType, tt.rate, tt.qty, tradeID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("buildTradeRequest() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(vals) != len(tt.wantVals) {
+				t.Errorf("buildTradeRequest() got %d values, want %d", len(vals), len(tt.wantVals))
+				return
+			}
+			for k, want := range tt.wantVals {
+				got := vals[k]
+				if len(got) != 1 || got[0] != want[0] {
+					t.Errorf("buildTradeRequest() key %q = %v, want %v", k, got, want)
+				}
+			}
+		})
 	}
 }

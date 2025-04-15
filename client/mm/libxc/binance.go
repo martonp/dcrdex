@@ -334,6 +334,18 @@ func (b *binanceOrderBook) vwap(bids bool, qty uint64) (vwap, extrema uint64, fi
 	return
 }
 
+func (b *binanceOrderBook) invVWAP(bids bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+
+	if !b.synced.Load() {
+		return 0, 0, filled, ErrUnsyncedOrderbook
+	}
+
+	vwap, extrema, filled = b.book.invVWAP(bids, qty)
+	return
+}
+
 func (b *binanceOrderBook) midGap() uint64 {
 	return b.book.midGap()
 }
@@ -447,6 +459,7 @@ type tradeInfo struct {
 	sell      bool
 	rate      uint64
 	qty       uint64
+	market    bool
 }
 
 type withdrawInfo struct {
@@ -679,6 +692,13 @@ func (bnc *binance) getMarkets(ctx context.Context) (map[string]*bntypes.Market,
 	tokenIDs := bnc.tokenIDs.Load().(map[string][]uint32)
 
 	for _, market := range exchangeInfo.Symbols {
+		// Skip markets that are not trading or do not allow you to specify a
+		// quote order qty. All markets other than a few margin related markets
+		// allow quote order qty for market orders.
+		if market.Status != "TRADING" || !market.QuoteOrderQtyMarketAllowed {
+			continue
+		}
+
 		dexMarkets := binanceMarketToDexMarkets(market.BaseAsset, market.QuoteAsset, tokenIDs, bnc.isUS)
 		if len(dexMarkets) == 0 {
 			continue
@@ -837,58 +857,118 @@ func steppedRate(r, step uint64) uint64 {
 	return uint64(math.Round(steps * float64(step)))
 }
 
-// Trade executes a trade on the CEX. subscriptionID takes an ID returned from
-// SubscribeTradeUpdates.
-func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, subscriptionID int) (*Trade, error) {
+func buildTradeRequest(baseCfg, quoteCfg *bncAssetConfig, market *bntypes.Market, sell bool, orderType OrderType, rate, qty uint64, tradeID string) (url.Values, error) {
 	side := "BUY"
 	if sell {
 		side = "SELL"
 	}
+	orderTypeStr := "LIMIT"
+	if orderType == OrderTypeMarket {
+		orderTypeStr = "MARKET"
+	}
 
+	// Determine rate for limit orders
+	var rateStr string
+	if orderType == OrderTypeLimit {
+		if rate < market.MinPrice || rate > market.MaxPrice {
+			return nil, fmt.Errorf("rate %v is out of bounds for market %v", rate, market.Symbol)
+		}
+		rate = steppedRate(rate, market.RateStep)
+		convRate := calc.ConventionalRateAlt(rate, baseCfg.conversionFactor, quoteCfg.conversionFactor)
+		ratePrec := int(math.Round(math.Log10(calc.RateEncodingFactor * float64(baseCfg.conversionFactor) / float64(quoteCfg.conversionFactor) / float64(market.RateStep))))
+		rateStr = strconv.FormatFloat(convRate, 'f', ratePrec, 64)
+	}
+
+	// Determine quoteQty for market buys, and qty for all other orders
+	var qtyStr, quoteQtyStr string
+	isMarketBuy := orderType == OrderTypeMarket && !sell
+	if !isMarketBuy {
+		if qty < market.MinQty || qty > market.MaxQty {
+			return nil, fmt.Errorf("quantity %v is out of bounds for market %v", qty, market.Symbol)
+		}
+		steppedQty := steppedRate(qty, market.LotSize)
+		convQty := float64(steppedQty) / float64(baseCfg.conversionFactor)
+		qtyPrec := int(math.Round(math.Log10(float64(baseCfg.conversionFactor) / float64(market.LotSize))))
+		qtyStr = strconv.FormatFloat(convQty, 'f', qtyPrec, 64)
+	} else {
+		qtyPrec := int(math.Round(math.Log10(float64(quoteCfg.conversionFactor))))
+		convQty := float64(qty) / float64(quoteCfg.conversionFactor)
+		quoteQtyStr = strconv.FormatFloat(convQty, 'f', qtyPrec, 64)
+	}
+
+	// Set time in force based on order type
+	timeInForceStr := "GTC" // Good Till Cancelled for limit orders
+	if orderType == OrderTypeMarket {
+		timeInForceStr = "IOC" // Immediate Or Cancel for market orders
+	}
+
+	// Build the request body
+	v := url.Values{}
+	v.Add("symbol", market.Symbol)
+	v.Add("side", side)
+	v.Add("type", orderTypeStr)
+	v.Add("timeInForce", timeInForceStr)
+	v.Add("newClientOrderId", tradeID)
+	if qtyStr != "" {
+		v.Add("quantity", qtyStr)
+	}
+	if rateStr != "" {
+		v.Add("price", rateStr)
+	}
+	if quoteQtyStr != "" {
+		v.Add("quoteOrderQty", quoteQtyStr)
+	}
+
+	return v, nil
+}
+
+// calcFees returns the total base and quote fees for a trade based on the
+// fills. Only one of the two fees, the one the user is receiving in the trade,
+// will be non-zero.
+func (bnc *binance) calcFees(fills []*bntypes.Fill, baseCfg, quoteCfg *bncAssetConfig) (feeBase, feeQuote uint64) {
+	for _, fill := range fills {
+		if fill.CommissionAsset == baseCfg.coin {
+			feeBase += uint64(fill.Commission * float64(baseCfg.conversionFactor))
+		} else if fill.CommissionAsset == quoteCfg.coin {
+			feeQuote += uint64(fill.Commission * float64(quoteCfg.conversionFactor))
+		}
+	}
+
+	if feeBase > 0 && feeQuote > 0 {
+		bnc.log.Errorf("calcFees: both base and quote fees are non-zero: %d %d", feeBase, feeQuote)
+	}
+
+	return feeBase, feeQuote
+}
+
+// Trade executes a trade on the CEX.
+//   - subscriptionID takes an ID returned from SubscribeTradeUpdates.
+//   - Rate is ignored for market orders.
+//   - Qty is in unit of base asset, except for market buys where it is in units
+//     of quote asset.
+func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool, rate, qty uint64, orderType OrderType, subscriptionID int) (*Trade, error) {
 	baseCfg, err := bncAssetCfg(baseID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting asset cfg for %d: %w", baseID, err)
 	}
-
 	quoteCfg, err := bncAssetCfg(quoteID)
 	if err != nil {
 		return nil, fmt.Errorf("error getting asset cfg for %d: %w", quoteID, err)
 	}
 
 	slug := baseCfg.coin + quoteCfg.coin
-
 	marketsMap := bnc.markets.Load().(map[string]*bntypes.Market)
 	market, found := marketsMap[slug]
 	if !found {
 		return nil, fmt.Errorf("market not found: %v", slug)
 	}
 
-	if rate < market.MinPrice || rate > market.MaxPrice {
-		return nil, fmt.Errorf("rate %v is out of bounds for market %v", rate, slug)
-	}
-	rate = steppedRate(rate, market.RateStep)
-	convRate := calc.ConventionalRateAlt(rate, baseCfg.conversionFactor, quoteCfg.conversionFactor)
-	ratePrec := int(math.Round(math.Log10(calc.RateEncodingFactor * float64(baseCfg.conversionFactor) / float64(quoteCfg.conversionFactor) / float64(market.RateStep))))
-	rateStr := strconv.FormatFloat(convRate, 'f', ratePrec, 64)
-
-	if qty < market.MinQty || qty > market.MaxQty {
-		return nil, fmt.Errorf("quantity %v is out of bounds for market %v", qty, slug)
-	}
-	steppedQty := steppedRate(qty, market.LotSize)
-	convQty := float64(steppedQty) / float64(baseCfg.conversionFactor)
-	qtyPrec := int(math.Round(math.Log10(float64(baseCfg.conversionFactor) / float64(market.LotSize))))
-	qtyStr := strconv.FormatFloat(convQty, 'f', qtyPrec, 64)
-
 	tradeID := bnc.generateTradeID()
 
-	v := make(url.Values)
-	v.Add("symbol", slug)
-	v.Add("side", side)
-	v.Add("type", "LIMIT")
-	v.Add("timeInForce", "GTC")
-	v.Add("newClientOrderId", tradeID)
-	v.Add("quantity", qtyStr)
-	v.Add("price", rateStr)
+	v, err := buildTradeRequest(baseCfg, quoteCfg, market, sell, orderType, rate, qty, tradeID)
+	if err != nil {
+		return nil, fmt.Errorf("error building trade request: %w", err)
+	}
 
 	bnc.tradeUpdaterMtx.Lock()
 	_, found = bnc.tradeUpdaters[subscriptionID]
@@ -903,6 +983,7 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 		sell:      sell,
 		rate:      rate,
 		qty:       qty,
+		market:    orderType == OrderTypeMarket,
 	}
 	bnc.tradeUpdaterMtx.Unlock()
 
@@ -923,6 +1004,10 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 
 	success = true
 
+	baseFees, quoteFees := bnc.calcFees(orderResponse.Fills, baseCfg, quoteCfg)
+	baseFilled := uint64(orderResponse.ExecutedQty * float64(baseCfg.conversionFactor))
+	quoteFilled := uint64(orderResponse.CumulativeQuoteQty * float64(quoteCfg.conversionFactor))
+
 	return &Trade{
 		ID:          tradeID,
 		Sell:        sell,
@@ -930,8 +1015,9 @@ func (bnc *binance) Trade(ctx context.Context, baseID, quoteID uint32, sell bool
 		Qty:         qty,
 		BaseID:      baseID,
 		QuoteID:     quoteID,
-		BaseFilled:  uint64(orderResponse.ExecutedQty * float64(baseCfg.conversionFactor)),
-		QuoteFilled: uint64(orderResponse.CumulativeQuoteQty * float64(quoteCfg.conversionFactor)),
+		Market:      orderType == OrderTypeMarket,
+		BaseFilled:  utils.SafeSub(baseFilled, baseFees),
+		QuoteFilled: utils.SafeSub(quoteFilled, quoteFees),
 		Complete:    orderResponse.Status != "NEW" && orderResponse.Status != "PARTIALLY_FILLED",
 	}, err
 }
@@ -1451,13 +1537,27 @@ func (bnc *binance) handleExecutionReport(update *bntypes.StreamUpdate) {
 		return
 	}
 
+	baseFilled := uint64(update.Filled * float64(baseCfg.conversionFactor))
+	quoteFilled := uint64(update.QuoteFilled * float64(quoteCfg.conversionFactor))
+	var baseFee, quoteFee uint64
+	if update.Commission > 0 {
+		if update.CommissionAsset == baseCfg.coin {
+			baseFee = uint64(update.Commission * float64(baseCfg.conversionFactor))
+		} else if update.CommissionAsset == quoteCfg.coin {
+			quoteFee = uint64(update.Commission * float64(quoteCfg.conversionFactor))
+		} else {
+			bnc.log.Errorf("unknown commission asset %q", update.CommissionAsset)
+		}
+	}
+
 	updater <- &Trade{
 		ID:          id,
 		Complete:    complete,
 		Rate:        tradeInfo.rate,
 		Qty:         tradeInfo.qty,
-		BaseFilled:  uint64(update.Filled * float64(baseCfg.conversionFactor)),
-		QuoteFilled: uint64(update.QuoteFilled * float64(quoteCfg.conversionFactor)),
+		Market:      tradeInfo.market,
+		BaseFilled:  utils.SafeSub(baseFilled, baseFee),
+		QuoteFilled: utils.SafeSub(quoteFilled, quoteFee),
 		BaseID:      tradeInfo.baseID,
 		QuoteID:     tradeInfo.quoteID,
 		Sell:        tradeInfo.sell,
@@ -2108,6 +2208,17 @@ func (bnc *binance) VWAP(baseID, quoteID uint32, sell bool, qty uint64) (avgPric
 	return book.vwap(!sell, qty)
 }
 
+// InvVWAP returns the inverse volume weighted average price for a certain
+// quantity of the quote asset on a market. SubscribeMarket must be called,
+// and the market must be synced before results can be expected.
+func (bnc *binance) InvVWAP(baseID, quoteID uint32, sell bool, qty uint64) (vwap, extrema uint64, filled bool, err error) {
+	book, err := bnc.book(baseID, quoteID)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return book.invVWAP(sell, qty)
+}
+
 func (bnc *binance) MidGap(baseID, quoteID uint32) uint64 {
 	book, err := bnc.book(baseID, quoteID)
 	if err != nil {
@@ -2117,6 +2228,7 @@ func (bnc *binance) MidGap(baseID, quoteID uint32) uint64 {
 	return book.midGap()
 }
 
+// TODO: fees on trade status
 // TradeStatus returns the current status of a trade.
 func (bnc *binance) TradeStatus(ctx context.Context, tradeID string, baseID, quoteID uint32) (*Trade, error) {
 	baseAsset, err := bncAssetCfg(baseID)
@@ -2139,16 +2251,31 @@ func (bnc *binance) TradeStatus(ctx context.Context, tradeID string, baseID, quo
 		return nil, err
 	}
 
+	baseFees, quoteFees := bnc.calcFees(resp.Fills, baseAsset, quoteAsset)
+	baseFilled := uint64(resp.ExecutedQty * float64(baseAsset.conversionFactor))
+	quoteFilled := uint64(resp.CumulativeQuoteQty * float64(quoteAsset.conversionFactor))
+	market := resp.Type == "MARKET"
+	sell := resp.Side == "SELL"
+
+	var qty uint64
+	if market && !sell {
+		qty = uint64(resp.OrigQuoteQty * float64(quoteAsset.conversionFactor))
+	} else {
+		qty = uint64(resp.OrigQty * float64(baseAsset.conversionFactor))
+	}
+
 	return &Trade{
-		ID:          tradeID,
-		Sell:        resp.Side == "SELL",
-		Rate:        calc.MessageRateAlt(resp.Price, baseAsset.conversionFactor, quoteAsset.conversionFactor),
-		Qty:         uint64(resp.OrigQty * float64(baseAsset.conversionFactor)),
-		BaseID:      baseID,
-		QuoteID:     quoteID,
-		BaseFilled:  uint64(resp.ExecutedQty * float64(baseAsset.conversionFactor)),
-		QuoteFilled: uint64(resp.CumulativeQuoteQty * float64(quoteAsset.conversionFactor)),
+		ID:      tradeID,
+		Sell:    sell,
+		Rate:    calc.MessageRateAlt(resp.Price, baseAsset.conversionFactor, quoteAsset.conversionFactor),
+		Qty:     qty,
+		BaseID:  baseID,
+		QuoteID: quoteID,
+		// Fees are paid in the asset that you are receiving.
+		BaseFilled:  utils.SafeSub(baseFilled, baseFees),
+		QuoteFilled: utils.SafeSub(quoteFilled, quoteFees),
 		Complete:    resp.Status != "NEW" && resp.Status != "PARTIALLY_FILLED",
+		Market:      market,
 	}, nil
 }
 
