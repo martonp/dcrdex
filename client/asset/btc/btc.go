@@ -319,6 +319,10 @@ func RPCConfigOpts(name, rpcPort string) []*asset.ConfigOption {
 type TxInSigner func(tx *wire.MsgTx, idx int, subScript []byte, hashType txscript.SigHashType,
 	key *btcec.PrivateKey, vals []int64, prevScripts [][]byte) ([]byte, error)
 
+type RpcCaller interface {
+	Call(method string, args []any, thing any) error
+}
+
 // BTCCloneCFG holds clone specific parameters.
 type BTCCloneCFG struct {
 	WalletCFG          *asset.WalletConfig
@@ -428,6 +432,8 @@ type BTCCloneCFG struct {
 	OmitRPCOptionsArg bool
 	// AssetID is the asset ID of the clone.
 	AssetID uint32
+	// CustomGetBlock is an optional function that returns a block by hash.
+	CustomGetBlock func(rpcCaller RpcCaller, hash chainhash.Hash) (*wire.MsgBlock, error)
 }
 
 // PaymentScripter can be implemented to make non-standard payment scripts.
@@ -1210,6 +1216,7 @@ func newRPCWallet(requester RawRequester, cfg *BTCCloneCFG, parsedCfg *RPCWallet
 		legacySignTx:      cfg.LegacySignTxRPC,
 		booleanGetBlock:   cfg.BooleanGetBlockRPC,
 		unlockSpends:      cfg.UnlockSpends,
+		customGetBlock:    cfg.CustomGetBlock,
 
 		deserializeTx:      btc.deserializeTx,
 		serializeTx:        btc.serializeTx,

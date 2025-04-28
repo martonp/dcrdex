@@ -22,6 +22,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 )
 
@@ -176,8 +177,8 @@ func NewWallet(cfg *asset.WalletConfig, logger dex.Logger, network dex.Network) 
 		cloneCFG.PrivKeyFunc = func(addr string) (*btcec.PrivateKey, error) {
 			return privKeyForAddress(exw, addr)
 		}
-		cloneCFG.BlockDeserializer = func(blk []byte) (*wire.MsgBlock, error) {
-			return deserializeBlock(exw, params, blk)
+		cloneCFG.CustomGetBlock = func(rpcCaller btc.RpcCaller, hash chainhash.Hash) (*wire.MsgBlock, error) {
+			return getBlock(rpcCaller, params, hash)
 		}
 		var err error
 		exw, err = btc.BTCCloneWallet(cloneCFG)
@@ -214,12 +215,6 @@ func decodeAddress(address string, net *chaincfg.Params) (btcutil.Address, error
 		return nil, errors.New("wrong network")
 	}
 	return decAddr, nil
-}
-
-// rpcCaller is satisfied by ExchangeWalletFullNode (baseWallet), providing
-// direct RPC requests.
-type rpcCaller interface {
-	CallRPC(method string, args []any, thing any) error
 }
 
 // privKeyForAddress is Firo's dumpprivkey RPC which calls dumpprivkey once

@@ -7,6 +7,7 @@ import (
 	"math"
 	"time"
 
+	"decred.org/dcrdex/client/asset/btc"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
@@ -33,7 +34,7 @@ type firoBlock struct {
 // plus any Transparent transactions found parsed into a wire.MsgBlock.
 //
 // The other 10 transaction types are discarded; including coinbase.
-func deserializeBlock(c rpcCaller, net *chaincfg.Params, blk []byte) (*wire.MsgBlock, error) {
+func getBlock(c btc.RpcCaller, net *chaincfg.Params, hash chainhash.Hash) (*wire.MsgBlock, error) {
 	firoBlock := &firoBlock{}
 
 	// hash header
@@ -53,7 +54,7 @@ func deserializeBlock(c rpcCaller, net *chaincfg.Params, blk []byte) (*wire.MsgB
 	fmt.Printf("firo deserialized block hash: %s\n", firoBlock.hdrHash.String())
 
 	// get json block
-	jsonBlock, err := getJsonBlock(c, firoBlock.hdrHash)
+	jsonBlock, err := getJsonBlock(c, hash)
 	if err != nil {
 		return nil, err
 	}
