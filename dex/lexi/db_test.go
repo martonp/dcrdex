@@ -2,6 +2,7 @@ package lexi
 
 import (
 	"bytes"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -514,5 +515,148 @@ func TestNotIndexed(t *testing.T) {
 	}
 	if tableCount != 8 {
 		t.Fatalf("Expected 8 table entries after deletion, got %d", tableCount)
+	}
+}
+
+func TestDeleteIndex(t *testing.T) {
+	db, shutdown := newTestDB(t)
+	defer shutdown()
+
+	tbl, err := db.Table("DeleteIndexTest")
+	if err != nil {
+		t.Fatalf("Error creating table: %v", err)
+	}
+
+	idx, err := tbl.AddIndex("I", func(k, v KV) ([]byte, error) {
+		return v.(*tValue).idx, nil
+	})
+	if err != nil {
+		t.Fatalf("Error adding index: %v", err)
+	}
+
+	for i := range 10 {
+		k := []byte{byte(i)}
+		v := &tValue{
+			k:   k,
+			v:   append([]byte{byte(i)}, encode.RandomBytes(5)...),
+			idx: []byte{byte(i)},
+		}
+		if err := tbl.Set(k, v); err != nil {
+			t.Fatalf("Error setting value %d: %v", i, err)
+		}
+	}
+
+	var count int
+	idx.Iterate(nil, func(it *Iter) error {
+		count++
+		return nil
+	})
+	if count != 10 {
+		t.Fatalf("Expected 10 values, got %d", count)
+	}
+
+	err = db.DeleteIndex("DeleteIndexTest", "I")
+	if err != nil {
+		t.Fatalf("Error deleting index: %v", err)
+	}
+
+	count = 0
+	idx.Iterate(nil, func(it *Iter) error {
+		count++
+		return nil
+	})
+	if count != 0 {
+		t.Fatalf("Expected 0 values, got %d", count)
+	}
+}
+
+func TestReIndex(t *testing.T) {
+	db, shutdown := newTestDB(t)
+	defer shutdown()
+
+	// Create a table with no indexes.
+	tbl, err := db.Table("DeleteIndexTest")
+	if err != nil {
+		t.Fatalf("Error creating table: %v", err)
+	}
+
+	// Add 10 values to the table.
+	values := make([][]byte, 10)
+	for i := range 10 {
+		k := []byte{byte(i)}
+		v := &tValue{
+			k:   k,
+			v:   append([]byte{byte(i)}, encode.RandomBytes(5)...),
+			idx: []byte{byte(i)},
+		}
+		values[i] = v.v
+		if err := tbl.Set(k, v); err != nil {
+			t.Fatalf("Error setting value %d: %v", i, err)
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		return bytes.Compare(values[i], values[j]) < 0
+	})
+
+	// Create two indexes, one on the key and one on the value.
+	kIdx, err := tbl.AddIndex("K", func(k, v KV) ([]byte, error) {
+		return k.([]byte), nil
+	})
+	if err != nil {
+		t.Fatalf("Error adding index: %v", err)
+	}
+	vIdx, err := tbl.AddIndex("V", func(k, v KV) ([]byte, error) {
+		return v.([]byte), nil
+	})
+	if err != nil {
+		t.Fatalf("Error adding index: %v", err)
+	}
+
+	// Reindex the indexes.
+	db.ReIndex("DeleteIndexTest", "K", func(k, v []byte) ([]byte, error) {
+		return k, nil
+	})
+	db.ReIndex("DeleteIndexTest", "V", func(k, v []byte) ([]byte, error) {
+		return v, nil
+	})
+
+	// Check the key index.
+	var count int
+	var expKey int
+	kIdx.Iterate(nil, func(it *Iter) error {
+		k, err := it.K()
+		if err != nil {
+			return err
+		}
+		if int(k[0]) != expKey {
+			return fmt.Errorf("expected key %d, got %d", expKey, k[0])
+		}
+		count++
+		expKey++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Error iterating index: %v", err)
+	}
+	if count != 10 {
+		t.Fatalf("Expected 10 values, got %d", count)
+	}
+
+	// Check the value index.
+	count = 0
+	err = vIdx.Iterate(nil, func(it *Iter) error {
+		return it.V(func(v []byte) error {
+			if !bytes.Equal(v, values[count]) {
+				return fmt.Errorf("expected value %d, got %d", values[count], v)
+			}
+			count++
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("Error iterating index: %v", err)
+	}
+	if count != 10 {
+		t.Fatalf("Expected 10 values, got %d", count)
 	}
 }
