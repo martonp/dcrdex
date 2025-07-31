@@ -732,6 +732,9 @@ type Bridger interface {
 	// BridgeHistory retrieves a record of bridge transactions on the blockchain.
 	// For token wallets, this includes history for other tokens on the same chain.
 	BridgeHistory(n int, refID *string, past bool) ([]*WalletTransaction, error)
+
+	// BridgeFees returns the required fees for bridging.
+	BridgeFees(ctx context.Context) (initiationFee, completionFee uint64, err error)
 }
 
 // Sweeper is a wallet that can clear the entire balance of the wallet/account

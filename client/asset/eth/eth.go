@@ -3359,6 +3359,33 @@ func (w *TokenBridgeWallet) BridgeHistory(n int, refID *string, past bool) ([]*a
 	return w.bridgeHistory(n, refID, past)
 }
 
+func (w *assetWallet) bridgeFees(ctx context.Context, bridge bridge) (initiationFee, completionFee uint64, err error) {
+	maxFeeRate, _, err := w.recommendedMaxFeeRate(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("error getting max fee rate: %w", err)
+	}
+
+	maxFeeRateGwei := dexeth.WeiToGweiCeil(maxFeeRate)
+
+	initiationGas := bridge.initiateBridgeGas()
+	completionGas := bridge.completeBridgeGas()
+
+	initiationFee = initiationGas * maxFeeRateGwei
+	completionFee = completionGas * maxFeeRateGwei
+
+	return initiationFee, completionFee, nil
+}
+
+// BridgeFees returns the required fees for bridging.
+func (w *ETHBridgeWallet) BridgeFees(ctx context.Context) (initiationFee, completionFee uint64, err error) {
+	return w.bridgeFees(ctx, w.manager.bridge)
+}
+
+// BridgeFees returns the required fees for bridging.
+func (w *TokenBridgeWallet) BridgeFees(ctx context.Context) (initiationFee, completionFee uint64, err error) {
+	return w.bridgeFees(ctx, w.manager.bridge)
+}
+
 func (w *assetWallet) completeBridge(ctx context.Context, data []byte, bridgeTx *asset.BridgeCounterpartTx, amount uint64, bridge bridge) (txID string, err error) {
 	maxFeeRate, tipRate, err := w.recommendedMaxFeeRate(ctx)
 	if err != nil {
