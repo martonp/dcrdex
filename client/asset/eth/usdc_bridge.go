@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"decred.org/dcrdex/client/asset"
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/dexnet"
 	"decred.org/dcrdex/dex/encode"
@@ -24,24 +25,24 @@ import (
 type bridge interface {
 	// bridgeContractAddr is the address that must be approved to spend tokens
 	// in order to bridge.
-	bridgeContractAddr() common.Address
+	bridgeContractAddr(ctx context.Context, assetID uint32) (common.Address, error)
 
 	// bridgeContractAllowance returns the amount of tokens that have been
 	// approved to be spent by the bridge contract.
-	bridgeContractAllowance(ctx context.Context) (*big.Int, error)
+	bridgeContractAllowance(ctx context.Context, assetID uint32) (*big.Int, error)
 
 	// approveBridgeContract approves the bridge contract to spend the given
 	// amount of tokens.
-	approveBridgeContract(txOpts *bind.TransactOpts, amount *big.Int) (*types.Transaction, error)
+	approveBridgeContract(txOpts *bind.TransactOpts, amount *big.Int, assetID uint32) (*types.Transaction, error)
 
 	// requiresBridgeContractApproval returns true if the bridge contract must
 	// be approved to spend tokens in order to bridge.
-	requiresBridgeContractApproval() bool
+	requiresBridgeContractApproval(assetID uint32) bool
 
 	// initiateBridge burns or locks the asset in order to bridge it to the destination.
 	// requiresCompletion is true if a transaction must be executed on the destination
 	// chain to mint the asset.
-	initiateBridge(txOpts *bind.TransactOpts, destAssetID uint32, amount *big.Int) (tx *types.Transaction, err error)
+	initiateBridge(txOpts *bind.TransactOpts, sourceAssetID, destAssetID uint32, amount *big.Int) (tx *types.Transaction, err error)
 
 	// getCompletionData retrieves the data required by the destination chain
 	// to complete the bridge.
@@ -49,25 +50,25 @@ type bridge interface {
 
 	// completeBridge executes a transaction on the destination chain to complete
 	// the bridge.
-	completeBridge(txOpts *bind.TransactOpts, mintInfoB []byte) (tx *types.Transaction, err error)
+	completeBridge(txOpts *bind.TransactOpts, destAssetID uint32, mintInfo []byte) (tx *types.Transaction, err error)
 
 	// initiateBridgeGas returns the gas cost of the bridge transaction.
-	initiateBridgeGas() uint64
+	initiateBridgeGas(sourceAssetID uint32) uint64
 
 	// completeBridgeGas returns the gas cost of the mint transaction.
-	completeBridgeGas() uint64
+	completeBridgeGas(destAssetID uint32) uint64
 
 	// requiresCompletion is true if a transaction must be executed on the destination
 	// chain to mint the asset. This is called on the destination chain. If this
 	// returns false, verifyBridgeCompletion should be called.
-	requiresCompletion() bool
+	requiresCompletion(destAssetID uint32) bool
 
 	// verifyBridgeCompletion verifies that the bridge was completed successfully.
 	// This is required for bridges that do not require a completion transaction.
 	verifyBridgeCompletion(ctx context.Context, data []byte) (bool, error)
 
 	// supportedDestinations returns the list of asset IDs that are supported as destinations for the origin asset.
-	supportedDestinations() []uint32
+	supportedDestinations(sourceAssetID uint32) []uint32
 }
 
 var (
@@ -78,32 +79,37 @@ var (
 type usdcBridgeInfo struct {
 	tokenMessengerAddr     common.Address
 	messageTransmitterAddr common.Address
+	usdcAssetID            uint32
 	domainID               uint32
 }
 
 var usdcBridgeInfos = map[uint32]map[dex.Network]*usdcBridgeInfo{
-	usdcEthID: {
+	ethID: {
 		dex.Mainnet: {
 			tokenMessengerAddr:     common.HexToAddress("0xbd3fa81b58ba92a82136038b25adec7066af3155"),
 			messageTransmitterAddr: common.HexToAddress("0x0a992d191deec32afe36203ad87d7d289a738f81"),
 			domainID:               0,
+			usdcAssetID:            usdcEthID,
 		},
 		dex.Testnet: {
 			tokenMessengerAddr:     common.HexToAddress("0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5"),
 			messageTransmitterAddr: common.HexToAddress("0x7865fAfC2db2093669d92c0F33AeEF291086BEFD"),
 			domainID:               0,
+			usdcAssetID:            usdcEthID,
 		},
 	},
-	usdcPolygonID: {
+	polygonID: {
 		dex.Mainnet: {
 			tokenMessengerAddr:     common.HexToAddress("0x9daF8c91AEFAE50b9c0E69629D3F6Ca40cA3B3FE"),
 			messageTransmitterAddr: common.HexToAddress("0xF3be9355363857F3e001be68856A2f96b4C39Ba9"),
 			domainID:               7,
+			usdcAssetID:            usdcPolygonID,
 		},
 		dex.Testnet: {
 			tokenMessengerAddr:     common.HexToAddress("0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5"),
 			messageTransmitterAddr: common.HexToAddress("0x7865fAfC2db2093669d92c0F33AeEF291086BEFD"),
 			domainID:               7,
+			usdcAssetID:            usdcPolygonID,
 		},
 	},
 }
@@ -164,13 +170,13 @@ type usdcBridge struct {
 	net                    dex.Network
 	addr                   common.Address
 	node                   ethFetcher
-	assetID                uint32
+	usdcAssetID            uint32
 }
 
 var _ bridge = (*usdcBridge)(nil)
 
-func newUsdcBridge(assetID uint32, net dex.Network, tokenAddress common.Address, cb bind.ContractBackend, addr common.Address, node ethFetcher) (*usdcBridge, error) {
-	bridgeInfo, err := getUsdcBridgeInfo(assetID, net)
+func newUsdcBridge(chainAssetID uint32, net dex.Network, cb bind.ContractBackend, addr common.Address, node ethFetcher) (*usdcBridge, error) {
+	bridgeInfo, err := getUsdcBridgeInfo(chainAssetID, net)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +196,13 @@ func newUsdcBridge(assetID uint32, net dex.Network, tokenAddress common.Address,
 		return nil, err
 	}
 
+	tokenInfo := asset.TokenInfo(bridgeInfo.usdcAssetID)
+	if tokenInfo == nil {
+		return nil, fmt.Errorf("token info not found for assetID %d", bridgeInfo.usdcAssetID)
+	}
+
+	tokenAddress := common.HexToAddress(tokenInfo.ContractAddress)
+
 	tokenContract, err := erc20.NewIERC20(tokenAddress, cb)
 	if err != nil {
 		return nil, err
@@ -207,15 +220,22 @@ func newUsdcBridge(assetID uint32, net dex.Network, tokenAddress common.Address,
 		attestationUrl:         attestationUrl,
 		addr:                   addr,
 		node:                   node,
-		assetID:                assetID,
+		usdcAssetID:            bridgeInfo.usdcAssetID,
 	}, nil
 }
 
-func (b *usdcBridge) bridgeContractAddr() common.Address {
-	return b.tokenMessengerAddr
+func (b *usdcBridge) bridgeContractAddr(ctx context.Context, sourceAssetID uint32) (common.Address, error) {
+	if b.usdcAssetID != sourceAssetID {
+		return common.Address{}, fmt.Errorf("usdc bridge not supported for assetID %d", sourceAssetID)
+	}
+	return b.tokenMessengerAddr, nil
 }
 
-func (b *usdcBridge) bridgeContractAllowance(ctx context.Context) (*big.Int, error) {
+func (b *usdcBridge) bridgeContractAllowance(ctx context.Context, sourceAssetID uint32) (*big.Int, error) {
+	if b.usdcAssetID != sourceAssetID {
+		return nil, fmt.Errorf("usdc bridge not supported for assetID %d", sourceAssetID)
+	}
+
 	_, pendingUnavailable := b.cb.(*multiRPCClient)
 	callOpts := &bind.CallOpts{
 		Pending: !pendingUnavailable,
@@ -225,15 +245,22 @@ func (b *usdcBridge) bridgeContractAllowance(ctx context.Context) (*big.Int, err
 	return b.tokenContract.Allowance(callOpts, b.addr, b.tokenMessengerAddr)
 }
 
-func (b *usdcBridge) requiresBridgeContractApproval() bool {
+func (b *usdcBridge) requiresBridgeContractApproval(sourceAssetID uint32) bool {
 	return true
 }
 
-func (b *usdcBridge) approveBridgeContract(txOpts *bind.TransactOpts, amount *big.Int) (*types.Transaction, error) {
+func (b *usdcBridge) approveBridgeContract(txOpts *bind.TransactOpts, amount *big.Int, sourceAssetID uint32) (*types.Transaction, error) {
+	if b.usdcAssetID != sourceAssetID {
+		return nil, fmt.Errorf("usdc bridge not supported for assetID %d", sourceAssetID)
+	}
 	return b.tokenContract.Approve(txOpts, b.tokenMessengerAddr, amount)
 }
 
-func (b *usdcBridge) initiateBridge(txOpts *bind.TransactOpts, destAssetID uint32, amount *big.Int) (tx *types.Transaction, err error) {
+func (b *usdcBridge) initiateBridge(txOpts *bind.TransactOpts, sourceAssetID, destAssetID uint32, amount *big.Int) (tx *types.Transaction, err error) {
+	if b.usdcAssetID != sourceAssetID {
+		return nil, fmt.Errorf("usdc bridge not supported for assetID %d", sourceAssetID)
+	}
+
 	destBridgeInfo, err := getUsdcBridgeInfo(destAssetID, b.net)
 	if err != nil {
 		return nil, err
@@ -346,7 +373,7 @@ func (b *usdcBridge) getCompletionData(ctx context.Context, bridgeTxID string) (
 	}).serialize(), nil
 }
 
-func (b *usdcBridge) completeBridge(txOpts *bind.TransactOpts, mintInfoB []byte) (*types.Transaction, error) {
+func (b *usdcBridge) completeBridge(txOpts *bind.TransactOpts, destAssetID uint32, mintInfoB []byte) (*types.Transaction, error) {
 	mintInfo, err := deserializeUsdcMintInfo(mintInfoB)
 	if err != nil {
 		return nil, err
@@ -359,28 +386,28 @@ func (b *usdcBridge) completeBridge(txOpts *bind.TransactOpts, mintInfoB []byte)
 	return b.messasgeTransmitter.ReceiveMessage(txOpts, mintInfo.message, mintInfo.attestation)
 }
 
-func (b *usdcBridge) initiateBridgeGas() uint64 {
+func (b *usdcBridge) initiateBridgeGas(uint32) uint64 {
 	// burn for deposit generally requires 102k-103k gas
 	return 160_000
 }
 
-func (b *usdcBridge) completeBridgeGas() uint64 {
+func (b *usdcBridge) completeBridgeGas(uint32) uint64 {
 	// message received generally requires ~142k, but if this is the first
 	// time the user owns this asset, it will be ~160k
 	return 210_000
 }
 
-func (b *usdcBridge) requiresCompletion() bool {
+func (b *usdcBridge) requiresCompletion(uint32) bool {
 	return true
 }
 
 func (b *usdcBridge) verifyBridgeCompletion(ctx context.Context, data []byte) (bool, error) {
-	return false, fmt.Errorf("a completion transaction is for usdc")
+	return false, fmt.Errorf("a completion transaction is required for usdc")
 }
 
-func (b *usdcBridge) supportedDestinations() []uint32 {
-	if usdcEthID == b.assetID {
-		return []uint32{usdcPolygonID}
+func (b *usdcBridge) supportedDestinations(sourceAssetID uint32) []uint32 {
+	if b.usdcAssetID == usdcPolygonID {
+		return []uint32{usdcEthID}
 	}
-	return []uint32{usdcEthID}
+	return []uint32{usdcPolygonID}
 }

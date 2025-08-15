@@ -465,6 +465,9 @@ type baseWallet struct {
 	}
 
 	txDB txDB
+
+	bridges       map[string]bridge
+	bridgeManager *bridgeManager
 }
 
 // assetWallet is a wallet backend for Ethereum and Eth tokens. The backend is
@@ -1113,64 +1116,6 @@ func (w *TokenWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	return &wg, nil
 }
 
-// Connect connects the wallet and the bridge. Satisfies dex.Connector.
-func (w *ETHBridgeWallet) Connect(ctx context.Context) (*sync.WaitGroup, error) {
-	wg, err := w.ETHWallet.Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var bridge bridge
-	switch {
-	case w.assetID == BipID:
-		bridge, err = newAcrossBridge(ctx, w.node.contractBackend(), w.node, w.assetID, w.net, w.addr, common.Address{}, w.log)
-	case w.assetID == polygonID:
-		bridge, err = newPolygonBridgePolygonPOLToken(ctx, w.node.contractBackend(), w.net, w.addr, w.log)
-	default:
-		err = fmt.Errorf("bridge not supported for asset %d", w.assetID)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	w.manager, err = newBridgeManager(ctx, w.assetID, w.assetID, bridge, w.ETHWallet.emit, w.txDB, time.Minute, w.log)
-	if err != nil {
-		return nil, err
-	}
-
-	return wg, nil
-}
-
-// Connect connects the wallet and the bridge. Satisfies dex.Connector.
-func (w *TokenBridgeWallet) Connect(ctx context.Context) (wg *sync.WaitGroup, err error) {
-	wg, err = w.TokenWallet.Connect(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var bridge bridge
-	switch {
-	case isUSDCBridgeSupported(w.assetID, w.net):
-		bridge, err = newUsdcBridge(w.assetID, w.net, w.tokenAddr, w.node.contractBackend(), w.addr, w.node)
-	case isAcrossBridgeSupported(ctx, w.assetID, w.net, w.log):
-		bridge, err = newAcrossBridge(ctx, w.node.contractBackend(), w.node, w.assetID, w.net, w.addr, w.netToken.Address, w.log)
-	case w.assetID == maticEthID:
-		bridge, err = newPolygonBridgeEthPOL(ctx, w.node.contractBackend(), w.assetID, w.netToken.Address, w.net, w.addr, w.node, w.log)
-	default:
-		err = fmt.Errorf("bridge not supported for asset %d", w.assetID)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	w.manager, err = newBridgeManager(ctx, w.assetID, w.baseChainID, bridge, w.TokenWallet.emit, w.txDB, time.Minute, w.log)
-	if err != nil {
-		return nil, err
-	}
-
-	return wg, nil
-}
-
 func (w *baseWallet) tip() *types.Header {
 	w.tipMtx.RLock()
 	defer w.tipMtx.RUnlock()
@@ -1574,24 +1519,7 @@ func (bm *bridgeManager) startMonitoring() {
 	}()
 }
 
-// ETHBridgeWallet is an ETHWallet that supports bridging funds to other chains.
-type ETHBridgeWallet struct {
-	manager *bridgeManager
-
-	*ETHWallet
-}
-
-var _ asset.Bridger = (*ETHBridgeWallet)(nil)
-
-// TokenBridgeWallet is a TokenWallet that supports bridging funds to other
-// chains.
-type TokenBridgeWallet struct {
-	manager *bridgeManager
-
-	*TokenWallet
-}
-
-var _ asset.Bridger = (*TokenBridgeWallet)(nil)
+var _ asset.Bridger = (*assetWallet)(nil)
 
 // OpenTokenWallet creates a new TokenWallet.
 func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, error) {
@@ -1646,23 +1574,13 @@ func (w *ETHWallet) OpenTokenWallet(tokenCfg *asset.TokenConfig) (asset.Wallet, 
 	w.baseWallet.wallets[tokenCfg.AssetID] = aw
 	w.baseWallet.walletsMtx.Unlock()
 
-	tokenWallet := &TokenWallet{
+	return &TokenWallet{
 		assetWallet: aw,
 		cfg:         cfg,
 		parent:      w.assetWallet,
 		token:       token,
 		netToken:    netToken,
-	}
-
-	usdcBridgeSupported := isUSDCBridgeSupported(tokenCfg.AssetID, w.net)
-	_, polygonBridgeSupported := PolygonBridgeSupportedAsset(tokenCfg.AssetID, w.net)
-	if usdcBridgeSupported || polygonBridgeSupported {
-		return &TokenBridgeWallet{
-			TokenWallet: tokenWallet,
-		}, nil
-	}
-
-	return tokenWallet, nil
+	}, nil
 }
 
 // OwnsDepositAddress indicates if an address belongs to the wallet. The address
@@ -3410,24 +3328,26 @@ func (w *TokenWallet) ApprovalStatus() map[uint32]asset.ApprovalStatus {
 }
 
 func (w *assetWallet) bridgeContractApprovalStatus(ctx context.Context, bridge bridge) (asset.ApprovalStatus, error) {
-	if !bridge.requiresBridgeContractApproval() {
+	if !bridge.requiresBridgeContractApproval(w.assetID) {
 		return asset.Approved, nil
 	}
-	return w.approvalStatus(bridge.bridgeContractAddr(), func() (*big.Int, error) {
-		return bridge.bridgeContractAllowance(ctx)
+	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
+	if err != nil {
+		return asset.NotApproved, fmt.Errorf("error getting bridge contract address: %w", err)
+	}
+	return w.approvalStatus(bridgeAddr, func() (*big.Int, error) {
+		return bridge.bridgeContractAllowance(ctx, w.assetID)
 	})
 }
 
 // BridgeContractApprovalStatus returns whether the bridge contract has been
 // approved to spend tokens on behalf of the account handled by the wallet.
-func (w *TokenBridgeWallet) BridgeContractApprovalStatus(ctx context.Context) (asset.ApprovalStatus, error) {
-	return w.bridgeContractApprovalStatus(ctx, w.manager.bridge)
-}
-
-// BridgeContractApprovalStatus returns whether the bridge contract has been
-// approved to spend tokens on behalf of the account handled by the wallet.
-func (w *ETHBridgeWallet) BridgeContractApprovalStatus(ctx context.Context) (asset.ApprovalStatus, error) {
-	return w.bridgeContractApprovalStatus(ctx, w.manager.bridge)
+func (w *assetWallet) BridgeContractApprovalStatus(ctx context.Context, bridgeName string) (asset.ApprovalStatus, error) {
+	bridge, ok := w.bridges[bridgeName]
+	if !ok {
+		return asset.NotApproved, fmt.Errorf("bridge %s not found", bridgeName)
+	}
+	return w.bridgeContractApprovalStatus(ctx, bridge)
 }
 
 func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) (string, error) {
@@ -3461,6 +3381,11 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) 
 			approvalGas*feeRateGwei, ethBal.Available)
 	}
 
+	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge contract address: %w", err)
+	}
+
 	var txID string
 	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(ctx, 0, approvalGas, maxFeeRate, tipRate, nonce)
@@ -3468,7 +3393,7 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) 
 			return nil, fmt.Errorf("txOpts error: %w", err)
 		}
 
-		tx, err := bridge.approveBridgeContract(txOpts, unlimitedAllowance)
+		tx, err := bridge.approveBridgeContract(txOpts, unlimitedAllowance, w.assetID)
 		if err != nil {
 			return nil, fmt.Errorf("error approving bridge contract: %w", err)
 		}
@@ -3476,8 +3401,8 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) 
 		txID = tx.Hash().Hex()
 
 		w.approvalsMtx.Lock()
-		delete(w.approvalCache, bridge.bridgeContractAddr())
-		w.pendingApprovals[bridge.bridgeContractAddr()] = &pendingApproval{
+		delete(w.approvalCache, bridgeAddr)
+		w.pendingApprovals[bridgeAddr] = &pendingApproval{
 			txHash:    tx.Hash(),
 			onConfirm: func() {},
 		}
@@ -3493,14 +3418,12 @@ func (w *assetWallet) approveBridgeContract(ctx context.Context, bridge bridge) 
 
 // ApproveBridgeContract approves the bridge contract to spend tokens on behalf
 // of the account handled by the wallet.
-func (w *ETHBridgeWallet) ApproveBridgeContract(ctx context.Context) (string, error) {
-	return w.approveBridgeContract(ctx, w.manager.bridge)
-}
-
-// ApproveBridgeContract approves the bridge contract to spend tokens on behalf
-// of the account handled by the wallet.
-func (w *TokenBridgeWallet) ApproveBridgeContract(ctx context.Context) (string, error) {
-	return w.approveBridgeContract(ctx, w.manager.bridge)
+func (w *assetWallet) ApproveBridgeContract(ctx context.Context, bridgeName string) (string, error) {
+	bridge, ok := w.bridges[bridgeName]
+	if !ok {
+		return "", fmt.Errorf("bridge %s not found", bridgeName)
+	}
+	return w.approveBridgeContract(ctx, bridge)
 }
 
 func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge) (string, error) {
@@ -3531,6 +3454,11 @@ func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge
 			approvalGas*feeRateGwei, ethBal.Available)
 	}
 
+	bridgeAddr, err := bridge.bridgeContractAddr(ctx, w.assetID)
+	if err != nil {
+		return "", fmt.Errorf("error getting bridge contract address: %w", err)
+	}
+
 	var txID string
 	return txID, w.withNonce(ctx, func(nonce *big.Int) (*genTxResult, error) {
 		txOpts, err := w.node.txOpts(ctx, 0, approvalGas, maxFeeRate, tipRate, nonce)
@@ -3546,8 +3474,8 @@ func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge
 		txID = tx.Hash().Hex()
 
 		w.approvalsMtx.Lock()
-		delete(w.approvalCache, bridge.bridgeContractAddr())
-		w.pendingApprovals[bridge.bridgeContractAddr()] = &pendingApproval{
+		delete(w.approvalCache, bridgeAddr)
+		w.pendingApprovals[bridgeAddr] = &pendingApproval{
 			txHash:    tx.Hash(),
 			onConfirm: func() {},
 		}
@@ -3562,13 +3490,12 @@ func (w *assetWallet) unapproveBridgeContract(ctx context.Context, bridge bridge
 }
 
 // UnapproveBridgeContract removes the approval for the bridge contract.
-func (w *ETHBridgeWallet) UnapproveBridgeContract(ctx context.Context) (string, error) {
-	return w.unapproveBridgeContract(ctx, w.manager.bridge)
-}
-
-// UnapproveBridgeContract removes the approval for the bridge contract.
-func (w *TokenBridgeWallet) UnapproveBridgeContract(ctx context.Context) (string, error) {
-	return w.unapproveBridgeContract(ctx, w.manager.bridge)
+func (w *assetWallet) UnapproveBridgeContract(ctx context.Context, bridgeName string) (string, error) {
+	bridge, ok := w.bridges[bridgeName]
+	if !ok {
+		return "", fmt.Errorf("bridge %s not found", bridgeName)
+	}
+	return w.unapproveBridgeContract(ctx, bridge)
 }
 
 func (w *assetWallet) initiateBridge(ctx context.Context, amt uint64, dest uint32, bridge bridge) (txID string, err error) {
@@ -3609,39 +3536,26 @@ func (w *assetWallet) initiateBridge(ctx context.Context, amt uint64, dest uint3
 }
 
 // InitiateBridge initiates bridging funds from one chain to another.
-func (w *ETHBridgeWallet) InitiateBridge(ctx context.Context, amt uint64, dest uint32) (string, error) {
-	txID, err := w.initiateBridge(ctx, amt, dest, w.manager.bridge)
+func (w *assetWallet) InitiateBridge(ctx context.Context, amt uint64, dest uint32, bridgeName string) (string, error) {
+	bridge, ok := w.bridges[bridgeName]
+	if !ok {
+		return "", fmt.Errorf("bridge %s not found", bridgeName)
+	}
+
+	txID, err := w.initiateBridge(ctx, amt, dest, bridge)
 	if err != nil {
 		return "", err
 	}
 
-	w.manager.addPendingBridge(txID, dest, amt)
-
-	return txID, nil
-}
-
-// Bridge initiates bridging funds from one chain to another.
-func (w *TokenBridgeWallet) InitiateBridge(ctx context.Context, amt uint64, dest uint32) (string, error) {
-	txID, err := w.initiateBridge(ctx, amt, dest, w.manager.bridge)
-	if err != nil {
-		return "", err
-	}
-
-	w.manager.addPendingBridge(txID, dest, amt)
+	w.bridgeManager.addPendingBridge(txID, dest, amt)
 
 	return txID, nil
 }
 
 // MarkBridgeComplete is called when the bridge completion transaction has
 // been confirmed on the destination chain.
-func (w *ETHBridgeWallet) MarkBridgeComplete(initiationTxID, completionTxID string) {
-	w.manager.markBridgeComplete(initiationTxID, completionTxID)
-}
-
-// MarkBridgeComplete is called when the bridge completion transaction has
-// been confirmed on the destination chain.
-func (w *TokenBridgeWallet) MarkBridgeComplete(initiationTxID, completionTxID string) {
-	w.manager.markBridgeComplete(initiationTxID, completionTxID)
+func (w *assetWallet) MarkBridgeComplete(initiationTxID, completionTxID string) {
+	w.bridgeManager.markBridgeComplete(initiationTxID, completionTxID)
 }
 
 func (w *assetWallet) pendingBridges() ([]*asset.WalletTransaction, error) {

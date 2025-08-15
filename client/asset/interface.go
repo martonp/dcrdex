@@ -711,31 +711,31 @@ type Bridger interface {
 	// ApproveBridgeContract submits a transaction to authorize the bridge contract
 	// to manage the user's tokens. This step is optional for some assets.
 	// Use BridgeContractApprovalStatus to determine if approval is necessary.
-	ApproveBridgeContract(ctx context.Context) (string, error)
+	ApproveBridgeContract(ctx context.Context, bridgeName string) (string, error)
 
 	// UnapproveBridgeContract submits a transaction to revoke the bridge contract's
 	// permission to manage the user's tokens.
-	UnapproveBridgeContract(ctx context.Context) (string, error)
+	UnapproveBridgeContract(ctx context.Context, bridgeName string) (string, error)
 
 	// BridgeContractApprovalStatus retrieves the current approval state of the bridge contract.
 	// Returns Approved for assets that don't require explicit approval.
-	BridgeContractApprovalStatus(ctx context.Context) (ApprovalStatus, error)
+	BridgeContractApprovalStatus(ctx context.Context, bridgeName string) (ApprovalStatus, error)
 
 	// InitiateBridge starts a fund transfer to the specified destination chain.
 	// If a completion transaction is needed, a BridgeReadyToCompleteNote will
 	// be emitted. Some assets do not require a completion transaction.
-	InitiateBridge(ctx context.Context, amt uint64, dest uint32) (txID string, err error)
+	InitiateBridge(ctx context.Context, amt uint64, dest uint32, bridgeName string) (txID string, err error)
 
 	// CompleteBridge finalizes a bridge by executing a transaction on the
 	// destination chain to issue the user's tokens. Some assets require
 	// multiple transactions to complete the bridge. Once all the transactions
 	// are confirmed, a BridgeCompletedNote will be emitted.
-	CompleteBridge(ctx context.Context, bridgeTx *BridgeCounterpartTx, amount uint64, mintData []byte) error
+	CompleteBridge(ctx context.Context, bridgeTx *BridgeCounterpartTx, amount uint64, mintData []byte, bridgeName string) error
 
 	// MarkBridgeComplete should be invoked after the completion transaction
 	// is confirmed on the destination chain to update the bridge status.
 	// Without this, the bridge will still be in the pending state.
-	MarkBridgeComplete(initiationTxID string, completionTxID string)
+	MarkBridgeComplete(initiationTxID string, completionTxID string, bridgeName string)
 
 	// PendingBridges lists all uncompleted bridge transactions on the blockchain.
 	// For token wallets, this includes pending bridges for other tokens on the same chain.
@@ -746,7 +746,7 @@ type Bridger interface {
 	BridgeHistory(n int, refID *string, past bool) ([]*WalletTransaction, error)
 
 	// SupportedDestinations returns the list of asset IDs that are supported as destinations for the origin asset.
-	SupportedDestinations(assetID uint32) ([]uint32, error)
+	SupportedDestinations(assetID uint32, bridgeName string) ([]uint32, error)
 }
 
 // Sweeper is a wallet that can clear the entire balance of the wallet/account
