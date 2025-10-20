@@ -2347,7 +2347,16 @@ export default class WalletsPage extends BasePage {
     const url = new URL(window.location.href)
     url.search = search.toString()
     url.pathname = '/wallets/logfile'
-    window.open(url.toString())
+
+    // Check if we're in the Darwin desktop app (has webkit message handler)
+    const isDarwinApp = (window as any).webkit?.messageHandlers?.bwHandler
+    if (isDarwinApp) {
+      // In Darwin app, use window.location.href to trigger navigation handler
+      window.location.href = url.toString()
+    } else {
+      // In browser, use window.open to download the file
+      window.open(url.toString())
+    }
   }
 
   // displayExportWalletAuth displays a form to warn the user about the
