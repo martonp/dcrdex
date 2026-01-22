@@ -1910,15 +1910,18 @@ supported for DCR wallets.`,
 		num (int): The number of notifications to load.`,
 	},
 	startBotRoute: {
-		cmdSummary: `Start market making.`,
-		argsShort:  `(cfgPath) (host) (baseID) (quoteID) (dexBals) (dexBals)`,
+		pwArgsShort: `"appPass"`,
+		cmdSummary:  `Start market making.`,
+		argsShort:   `cfgPath host baseID quoteID dexBals cexBals`,
+		pwArgsLong: `Password Args:
+    appPass (string): The Bison Wallet password.`,
 		argsLong: `Args:
-		cfgPath (string): The path to the market maker config file.
-		host (string): The DEX address.
-		baseID (int): The base asset's BIP-44 registered coin index.
-		quoteID (int): The quote asset's BIP-44 registered coin index.
-		dexBalances (array): The DEX balances i.e. [[60,1000000],[42,10000000]].
-		cexBalances (array): The CEX balances i.e. [[60,1000000],[42,10000000]].`,
+    cfgPath (string): The path to the market maker config file.
+    host (string): The DEX address.
+    baseID (int): The base asset's BIP-44 registered coin index.
+    quoteID (int): The quote asset's BIP-44 registered coin index.
+    dexBalances (array): The DEX balances i.e. [[60,1000000],[42,10000000]].
+    cexBalances (array): The CEX balances i.e. [[60,1000000],[42,10000000]].`,
 	},
 	stopBotRoute: {
 		cmdSummary: `Stop market making.`,
