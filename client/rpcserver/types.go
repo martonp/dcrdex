@@ -1213,3 +1213,48 @@ func parseWalletTxArgs(params *RawParams) (*walletTxForm, error) {
 		txID:    params.Args[1],
 	}, nil
 }
+
+// mmProofForm is the arguments for the mmproof route.
+type mmProofForm struct {
+	host      string
+	baseID    uint32
+	quoteID   uint32
+	startTime uint64
+	endTime   uint64
+	outFile   string
+}
+
+func parseMMProofArgs(params *RawParams) (*mmProofForm, error) {
+	if err := checkNArgs(params, []int{0}, []int{6}); err != nil {
+		return nil, err
+	}
+
+	baseID, err := checkUIntArg(params.Args[1], "baseID", 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid baseID: %v", err)
+	}
+
+	quoteID, err := checkUIntArg(params.Args[2], "quoteID", 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid quoteID: %v", err)
+	}
+
+	startTime, err := checkUIntArg(params.Args[3], "startTime", 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid startTime: %v", err)
+	}
+
+	endTime, err := checkUIntArg(params.Args[4], "endTime", 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid endTime: %v", err)
+	}
+
+	return &mmProofForm{
+		host:      params.Args[0],
+		baseID:    uint32(baseID),
+		quoteID:   uint32(quoteID),
+		startTime: startTime,
+		endTime:   endTime,
+		outFile:   params.Args[5],
+	}, nil
+}

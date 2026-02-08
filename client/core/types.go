@@ -1201,3 +1201,20 @@ type PreAccelerate struct {
 	SuggestedRange    asset.XYRange            `json:"suggestedRange"`
 	EarlyAcceleration *asset.EarlyAcceleration `json:"earlyAcceleration,omitempty"`
 }
+
+// MarketMakingProof contains the proof data for market making activity
+// over a specified date range. This can be used to verify that a market maker
+// maintained a certain level of liquidity on the order books.
+type MarketMakingProof struct {
+	Orders []*OrderProof `json:"orders"`
+}
+
+// OrderProof contains the proof data for a single limit order: the order data
+// with the server signature (in Order.Prefix.Sig), plus optional match/cancel/
+// revoke proofs.
+type OrderProof struct {
+	Order   *msgjson.LimitOrder  `json:"order"`
+	Matches []*msgjson.Match     `json:"matches,omitempty"`
+	Cancel  *msgjson.CancelOrder `json:"cancel,omitempty"`
+	Revoke  *msgjson.RevokeOrder `json:"revoke,omitempty"`
+}

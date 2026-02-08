@@ -279,14 +279,16 @@ func CompareTrade(t1, t2 *order.Trade) error {
 // RandomUserMatch creates a random UserMatch.
 func RandomUserMatch() *order.UserMatch {
 	return &order.UserMatch{
-		OrderID:     RandomOrderID(),
-		MatchID:     RandomMatchID(),
-		Quantity:    randUint64(),
-		Rate:        randUint64(),
-		Address:     RandomAddress(),
-		Status:      order.MatchStatus(rnd.Intn(5)),
-		Side:        order.MatchSide(rnd.Intn(2)),
-		FeeRateSwap: randUint64(),
+		OrderID:      RandomOrderID(),
+		MatchID:      RandomMatchID(),
+		Quantity:     randUint64(),
+		Rate:         randUint64(),
+		Address:      RandomAddress(),
+		Status:       order.MatchStatus(rnd.Intn(5)),
+		Side:         order.MatchSide(rnd.Intn(2)),
+		FeeRateSwap:  randUint64(),
+		FeeRateBase:  randUint64(),
+		FeeRateQuote: randUint64(),
 	}
 }
 
@@ -316,6 +318,12 @@ func CompareUserMatch(m1, m2 *order.UserMatch) error {
 	}
 	if m1.FeeRateSwap != m2.FeeRateSwap {
 		return fmt.Errorf("FeeRateSwap mismatch. %d != %d", m1.FeeRateSwap, m2.FeeRateSwap)
+	}
+	if m1.FeeRateBase != m2.FeeRateBase {
+		return fmt.Errorf("FeeRateBase mismatch. %d != %d", m1.FeeRateBase, m2.FeeRateBase)
+	}
+	if m1.FeeRateQuote != m2.FeeRateQuote {
+		return fmt.Errorf("FeeRateQuote mismatch. %d != %d", m1.FeeRateQuote, m2.FeeRateQuote)
 	}
 	return nil
 }

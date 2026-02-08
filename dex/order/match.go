@@ -188,6 +188,11 @@ type UserMatch struct {
 	Status      MatchStatus
 	Side        MatchSide
 	FeeRateSwap uint64
+	// FeeRateBase and FeeRateQuote are the match notification's fee rates for
+	// the base and quote assets, respectively. These are required to recreate
+	// the signed match notification bytes for third-party verification.
+	FeeRateBase  uint64
+	FeeRateQuote uint64
 	// TODO: include Sell bool?
 }
 

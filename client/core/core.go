@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ import (
 	serverdex "decred.org/dcrdex/server/dex"
 	"decred.org/dcrdex/tatanka/client/mesh"
 	"decred.org/dcrdex/tatanka/tanka"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -8898,6 +8900,12 @@ func handleRevokeOrderMsg(c *Core, dc *dexConnection, msg *msgjson.Message) erro
 		return fmt.Errorf("revoke order unmarshal error: %w", err)
 	}
 
+	// Check the signature.
+	err = dc.acct.checkSig(revocation.Serialize(), revocation.Sig)
+	if err != nil {
+		return newError(signatureErr, "handleRevokeOrderMsg: DEX signature validation error: %w", err)
+	}
+
 	var oid order.OrderID
 	copy(oid[:], revocation.OrderID)
 
@@ -8916,10 +8924,19 @@ func handleRevokeOrderMsg(c *Core, dc *dexConnection, msg *msgjson.Message) erro
 		return nil
 	}
 
+	// Store the server-signed revocation proof so it can be audited later.
+	tracker.mtx.Lock()
+	tracker.metaData.Revoke = &db.RevokeProof{
+		Sig:  revocation.SigBytes(),
+		Time: revocation.Time,
+	}
+	tracker.mtx.Unlock()
+
 	if tracker.status() == order.OrderStatusRevoked {
 		// Already revoked is expected if entire book was purged in a suspend
 		// ntfn, which emits a gentler and more informative notification.
 		// However, we may not be subscribed to orderbook notifications.
+		_ = tracker.db.UpdateOrderMetaData(tracker.ID(), tracker.metaData)
 		return nil
 	}
 	tracker.revoke()
@@ -11380,4 +11397,160 @@ func (c *Core) TradingLimits(host string) (userParcels, parcelLimit uint32, err 
 	}
 
 	return userParcels, parcelLimit, nil
+}
+
+// CreateMarketMakingProof creates a proof of market making activity for a
+// specific market and date range. The proof contains all orders placed during
+// the specified period along with their DEX signatures and match information.
+// This can be used by third parties to verify that a market maker maintained
+// a certain level of liquidity on the order books.
+func (c *Core) CreateMarketMakingProof(host string, baseID, quoteID uint32, startTime, endTime uint64) (*MarketMakingProof, error) {
+	dc, _, err := c.dex(host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DEX connection: %w", err)
+	}
+
+	// Get the market configuration
+	var mktCfg *msgjson.Market
+	for _, mkt := range dc.config().Markets {
+		if mkt.Base == baseID && mkt.Quote == quoteID {
+			mktCfg = mkt
+			break
+		}
+	}
+	if mktCfg == nil {
+		return nil, fmt.Errorf("market (%d, %d) not found for host %s", baseID, quoteID, host)
+	}
+
+	// Check if we have the DEX public key
+	if dc.acct.dexPubKey == nil {
+		return nil, fmt.Errorf("DEX public key not available for %s", host)
+	}
+
+	dbOrders, err := c.db.MarketOrders(host, baseID, quoteID, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query orders: %w", err)
+	}
+
+	// Filter orders that are within the specified time range
+	var filteredOrders []*db.MetaOrder
+	for _, mOrd := range dbOrders {
+		orderTime := uint64(mOrd.Order.Time())
+		if orderTime <= endTime {
+			filteredOrders = append(filteredOrders, mOrd)
+		}
+	}
+
+	// Build the proof data
+	orderProofs := make([]*OrderProof, 0, len(filteredOrders))
+
+	for _, mOrd := range filteredOrders {
+		fmt.Println("Processing order", mOrd.Order.ID())
+
+		ord := mOrd.Order
+		meta := mOrd.MetaData
+
+		// Skip cancel orders here - they'll be included as part of their target order
+		if ord.Type() != order.LimitOrderType {
+			continue
+		}
+
+		lo, ok := ord.(*order.LimitOrder)
+		if !ok {
+			continue
+		}
+
+		msgLo := LimitOrderToMsgjson(lo)
+		msgLo.SetSig(meta.Proof.DEXSig)
+
+		op := &OrderProof{
+			Order: msgLo,
+		}
+
+		var completionTime uint64
+		updateCompletionTime := func(time uint64) {
+			if time > completionTime {
+				completionTime = time
+			}
+		}
+
+		if meta.Revoke != nil && len(meta.Revoke.Sig) > 0 && meta.Revoke.Time > 0 {
+			rev := &msgjson.RevokeOrder{
+				OrderID: lo.ID().Bytes(),
+				Time:    meta.Revoke.Time,
+			}
+			rev.SetSig(meta.Revoke.Sig)
+			op.Revoke = rev
+
+			updateCompletionTime(meta.Revoke.Time)
+		}
+
+		matches, err := c.db.MatchesForOrder(ord.ID(), true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get matches for order %s: %w", ord.ID(), err)
+		}
+
+		matchProofs := make([]*msgjson.Match, 0, len(matches))
+		for _, match := range matches {
+			if match.Quantity == 0 {
+				continue
+			}
+
+			msgMatch := &msgjson.Match{
+				OrderID:      match.OrderID[:],
+				MatchID:      match.MatchID[:],
+				Quantity:     match.Quantity,
+				Rate:         match.Rate,
+				ServerTime:   match.MetaData.Stamp,
+				Address:      match.Address,
+				FeeRateBase:  match.FeeRateBase,
+				FeeRateQuote: match.FeeRateQuote,
+			}
+			msgMatch.SetSig(match.MetaData.Proof.Auth.MatchSig)
+			matchProofs = append(matchProofs, msgMatch)
+			updateCompletionTime(match.MetaData.Stamp)
+		}
+		op.Matches = matchProofs
+
+		// Check if there's a linked cancel order
+		if !meta.LinkedOrder.IsZero() {
+			cancelOrd, err := c.db.Order(meta.LinkedOrder)
+			if err == nil && cancelOrd != nil && cancelOrd.Order.Type() == order.CancelOrderType {
+				co := cancelOrd.Order.(*order.CancelOrder)
+				msgCo := CancelOrderToMsgjson(co)
+				msgCo.SetSig(cancelOrd.MetaData.Proof.DEXSig)
+				op.Cancel = msgCo
+			}
+
+			updateCompletionTime(op.Cancel.ServerTime)
+		}
+
+		if completionTime < startTime {
+			continue
+		}
+
+		matchedQty := uint64(0)
+		for _, match := range matches {
+			matchedQty += match.Quantity
+		}
+		isFullyFilled := matchedQty >= ord.Trade().Quantity
+		isCancelledOrRevoked := (meta.Revoke != nil) || !meta.LinkedOrder.IsZero()
+		if !isFullyFilled && !isCancelledOrRevoked {
+			spew.Dump("ORDER NOT FULLY FILLED", matchedQty, ord.Trade().Quantity, mOrd)
+		} else {
+			spew.Dump("ORDER FULLY FILLED", matchedQty, ord.Trade().Quantity, mOrd)
+		}
+
+		orderProofs = append(orderProofs, op)
+	}
+
+	slices.SortFunc(orderProofs, func(a, b *OrderProof) int {
+		return int(a.Order.ServerTime - b.Order.ServerTime)
+	})
+
+	proof := &MarketMakingProof{
+		Orders: orderProofs,
+	}
+
+	return proof, nil
 }

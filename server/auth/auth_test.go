@@ -509,14 +509,16 @@ func userMatchData(takerUser account.AccountID) (*db.MatchData, *order.UserMatch
 	var oid order.OrderID
 	copy(oid[:], anyID[:])
 	takerUserMatch := &order.UserMatch{
-		OrderID:     oid,
-		MatchID:     mid,
-		Quantity:    1,
-		Rate:        2,
-		Address:     "makerSwapAddress", // counterparty
-		Status:      order.MakerRedeemed,
-		Side:        side,
-		FeeRateSwap: feeRateSwap,
+		OrderID:      oid,
+		MatchID:      mid,
+		Quantity:     1,
+		Rate:         2,
+		Address:      "makerSwapAddress", // counterparty
+		Status:       order.MakerRedeemed,
+		Side:         side,
+		FeeRateSwap:  feeRateSwap,
+		FeeRateBase:  baseRate,
+		FeeRateQuote: quoteRate,
 	}
 
 	var oid2 order.OrderID

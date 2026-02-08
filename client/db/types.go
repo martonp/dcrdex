@@ -413,6 +413,8 @@ type OrderMetaData struct {
 	Host string
 	// Proof is the signatures and other verification-related data for the order.
 	Proof OrderProof
+	// Revoke is the DEX server's revocation proof, if the order was revoked.
+	Revoke *RevokeProof
 	// ChangeCoin is a change coin from a match. Change coins are "daisy-chained"
 	// for matches. All funding coins go into the first match, and the change coin
 	// from the initiation transaction is used to fund the next match. The
@@ -752,7 +754,9 @@ type OrderProof struct {
 
 // Encode encodes the OrderProof to a versioned blob.
 func (p *OrderProof) Encode() []byte {
-	return versionedBytes(0).AddData(p.DEXSig).AddData(p.Preimage)
+	return versionedBytes(0).
+		AddData(p.DEXSig).
+		AddData(p.Preimage)
 }
 
 // DecodeOrderProof decodes the versioned blob to an *OrderProof.
@@ -761,20 +765,58 @@ func DecodeOrderProof(b []byte) (*OrderProof, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch ver {
-	case 0:
-		return decodeOrderProof_v0(pushes)
+	if ver != 0 {
+		return nil, fmt.Errorf("unknown OrderProof version %d", ver)
 	}
-	return nil, fmt.Errorf("unknown OrderProof version %d", ver)
-}
-
-func decodeOrderProof_v0(pushes [][]byte) (*OrderProof, error) {
 	if len(pushes) != 2 {
-		return nil, fmt.Errorf("decodeOrderProof: expected 2 push, got %d", len(pushes))
+		return nil, fmt.Errorf("decodeOrderProof: expected 2 pushes, got %d", len(pushes))
 	}
 	return &OrderProof{
 		DEXSig:   pushes[0],
 		Preimage: pushes[1],
+	}, nil
+}
+
+// RevokeProof contains the DEX server's signature on a revoke_order notification.
+type RevokeProof struct {
+	// Sig is the DEX server's signature on the revoke_order notification.
+	Sig []byte
+	// Time is the server timestamp (ms) included in the signed revoke_order message.
+	Time uint64
+}
+
+// Encode encodes the RevokeProof to a versioned blob.
+func (p *RevokeProof) Encode() []byte {
+	return versionedBytes(0).
+		AddData(p.Sig).
+		AddData(uint64Bytes(p.Time))
+}
+
+// DecodeRevokeProof decodes the versioned blob to a *RevokeProof.
+func DecodeRevokeProof(b []byte) (*RevokeProof, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	ver, pushes, err := encode.DecodeBlob(b)
+	if err != nil {
+		return nil, err
+	}
+	if ver != 0 {
+		return nil, fmt.Errorf("unknown RevokeProof version %d", ver)
+	}
+	if len(pushes) != 2 {
+		return nil, fmt.Errorf("decodeRevokeProof: expected 2 pushes, got %d", len(pushes))
+	}
+	if len(pushes[1]) != 8 && len(pushes[1]) != 0 {
+		return nil, fmt.Errorf("decodeRevokeProof: time wrong length %d", len(pushes[1]))
+	}
+	var revokeTime uint64
+	if len(pushes[1]) == 8 {
+		revokeTime = intCoder.Uint64(pushes[1])
+	}
+	return &RevokeProof{
+		Sig:  pushes[0],
+		Time: revokeTime,
 	}, nil
 }
 

@@ -1281,7 +1281,7 @@ func (m *Market) PurgeBook() {
 	// orderbook subscription, so the users will receive them whether or not
 	// they are subscribed for book updates.
 	for oid, aid := range removed {
-		m.sendRevokeOrderNote(oid, aid)
+		m.sendRevokeOrderNote(oid, aid, uint64(time.Now().UnixMilli()))
 	}
 }
 
@@ -2145,12 +2145,13 @@ func (m *Market) enqueueEpoch(eq *epochPump, epoch *EpochQueue) bool {
 	return true
 }
 
-func (m *Market) sendRevokeOrderNote(oid order.OrderID, user account.AccountID) {
+func (m *Market) sendRevokeOrderNote(oid order.OrderID, user account.AccountID, revTime uint64) {
 	// Send revoke_order notification to order owner.
 	route := msgjson.RevokeOrderRoute
 	log.Infof("Sending a '%s' notification to %v for order %v", route, user, oid)
 	revMsg := &msgjson.RevokeOrder{
 		OrderID: oid.Bytes(),
+		Time:    revTime,
 	}
 	m.auth.Sign(revMsg)
 	revNtfn, err := msgjson.NewNotification(route, revMsg)
@@ -2192,7 +2193,7 @@ func (m *Market) prepEpoch(orders []order.Order, epochEnd time.Time) (cSum []byt
 		// The user is most likely offline, but it is possible they have
 		// reconnected too late for the preimage request but after
 		// storage.RevokeOrder updated the order status. Try to notify.
-		go m.sendRevokeOrderNote(oid, user)
+		go m.sendRevokeOrderNote(oid, user, uint64(revTime.UnixMilli()))
 	}
 
 	// Register the preimage collection successes, potentially evicting preimage
@@ -2284,7 +2285,7 @@ func (m *Market) unbookedOrder(lo *order.LimitOrder) {
 	}
 
 	// Send revoke_order notification to order owner.
-	m.sendRevokeOrderNote(oid, user)
+	m.sendRevokeOrderNote(oid, user, uint64(revTime.UnixMilli()))
 
 	// Send "unbook" notification to order book subscribers.
 	m.sendToFeeds(&updateSignal{

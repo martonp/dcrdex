@@ -4501,6 +4501,7 @@ func TestHandleRevokeOrderMsg(t *testing.T) {
 	// Send a request for the unknown order.
 	payload := &msgjson.RevokeOrder{
 		OrderID: oid[:],
+		Time:    uint64(time.Now().UnixMilli()),
 	}
 	req, _ := msgjson.NewRequest(rig.dc.NextID(), msgjson.RevokeOrderRoute, payload)
 
@@ -4533,6 +4534,7 @@ func TestHandleRevokeOrderMsg(t *testing.T) {
 	// Revoke the cancel order, not the targeted order.
 	payloadC := &msgjson.RevokeOrder{
 		OrderID: coid[:],
+		Time:    uint64(time.Now().UnixMilli()),
 	}
 	reqC, _ := msgjson.NewRequest(rig.dc.NextID(), msgjson.RevokeOrderRoute, payloadC)
 	err = handleRevokeOrderMsg(rig.core, rig.dc, reqC)
@@ -9480,11 +9482,13 @@ func TestMaxSwapsRedeemsInTx(t *testing.T) {
 					},
 				},
 				UserMatch: &order.UserMatch{
-					MatchID:     ordertest.RandomMatchID(),
-					Side:        side,
-					Address:     ordertest.RandomAddress(),
-					Status:      status,
-					FeeRateSwap: tMaxFeeRate,
+					MatchID:      ordertest.RandomMatchID(),
+					Side:         side,
+					Address:      ordertest.RandomAddress(),
+					Status:       status,
+					FeeRateSwap:  tMaxFeeRate,
+					FeeRateBase:  tMaxFeeRate,
+					FeeRateQuote: tMaxFeeRate,
 				},
 			},
 		}
@@ -9606,11 +9610,13 @@ func TestSuspectTrades(t *testing.T) {
 					},
 				},
 				UserMatch: &order.UserMatch{
-					MatchID:     ordertest.RandomMatchID(),
-					Side:        side,
-					Address:     ordertest.RandomAddress(),
-					Status:      status,
-					FeeRateSwap: tMaxFeeRate,
+					MatchID:      ordertest.RandomMatchID(),
+					Side:         side,
+					Address:      ordertest.RandomAddress(),
+					Status:       status,
+					FeeRateSwap:  tMaxFeeRate,
+					FeeRateBase:  tMaxFeeRate,
+					FeeRateQuote: tMaxFeeRate,
 				},
 			},
 		}

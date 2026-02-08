@@ -79,6 +79,7 @@ const (
 	refundPaymentMultisigRoute = "refundpaymentmultisig"
 	viewPaymentMultisigRoute   = "viewpaymentmultisig"
 	sendPaymentMultisigRoute   = "sendpaymentmultisig"
+	mmProofRoute               = "mmproof"
 )
 
 const (
@@ -164,12 +165,7 @@ var routes = map[string]func(s *RPCServer, params *RawParams) *msgjson.ResponseP
 	bridgeHistoryRoute:         handleBridgeHistory,
 	supportedBridgesRoute:      handleSupportedBridges,
 	bridgeFeesAndLimitsRoute:   handleBridgeFeesAndLimits,
-	paymentMultisigPubkeyRoute: handlePaymentMultisigPubkey,
-	sendFundsToMultisigRoute:   handleSendFundsToMultisig,
-	signMultisigRoute:          handleSignMultisig,
-	refundPaymentMultisigRoute: handleRefundPaymentMultisig,
-	viewPaymentMultisigRoute:   handleViewPaymentMultisig,
-	sendPaymentMultisigRoute:   handleSendPaymentMultisig,
+	mmProofRoute:               handleMMProof,
 }
 
 // handleHelp handles requests for help. Returns general help for all commands
@@ -1405,6 +1401,40 @@ func handleSendPaymentMultisig(s *RPCServer, params *RawParams) *msgjson.Respons
 	return createResponse(refundPaymentMultisigRoute, &res, nil)
 }
 
+// handleMMProof handles requests for market making proof. It creates a proof
+// of market making activity for a specific market and date range, and writes
+// the result to a JSON file.
+func handleMMProof(s *RPCServer, params *RawParams) *msgjson.ResponsePayload {
+	form, err := parseMMProofArgs(params)
+	if err != nil {
+		return usage(mmProofRoute, err)
+	}
+
+	proof, err := s.core.CreateMarketMakingProof(form.host, form.baseID, form.quoteID, form.startTime, form.endTime)
+	if err != nil {
+		resErr := msgjson.NewError(msgjson.RPCMMProofError, "failed to create market making proof: %v", err)
+		return createResponse(mmProofRoute, nil, resErr)
+	}
+
+	// Write the proof to the output file
+	proofJSON, err := json.MarshalIndent(proof, "", "  ")
+	if err != nil {
+		resErr := msgjson.NewError(msgjson.RPCMMProofError, "failed to encode proof as JSON: %v", err)
+		return createResponse(mmProofRoute, nil, resErr)
+	}
+
+	if err := os.WriteFile(form.outFile, proofJSON, 0644); err != nil {
+		resErr := msgjson.NewError(msgjson.RPCMMProofError, "failed to write proof file: %v", err)
+		return createResponse(mmProofRoute, nil, resErr)
+	}
+
+	result := map[string]any{
+		"file":      form.outFile,
+		"numOrders": len(proof.Orders),
+	}
+	return createResponse(mmProofRoute, result, nil)
+}
+
 // format concatenates thing and tail. If thing is empty, returns an empty
 // string.
 func format(thing, tail string) string {
@@ -2293,5 +2323,16 @@ an spv wallet and enables options to view and set the vsp.
 		csvFilePath (string): The csv file path from the point of view of the client, not bwctl.`,
 		returns: `Returns:
 	string: the sent tx hash`,
+	},
+	mmProofRoute: {
+		argsShort:  `host baseID quoteID startTime endTime outFile`,
+		cmdSummary: "Create a market making proof for a date range.",
+		argsLong: `Args:
+		host (string): The DEX server host.
+		baseID (int): The base asset's BIP-44 registered coin index.
+		quoteID (int): The quote asset's BIP-44 registered coin index.
+		startTime (int): Start of the proof period as Unix timestamp in milliseconds.
+		endTime (int): End of the proof period as Unix timestamp in milliseconds.
+		outFile (string): Path to the output JSON file where the proof will be written.`,
 	},
 }

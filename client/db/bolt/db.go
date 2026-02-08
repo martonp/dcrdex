@@ -106,6 +106,7 @@ var (
 	redemptionFeesKey     = []byte("redeemFees")
 	fundingFeesKey        = []byte("fundingFees")
 	accelerationsKey      = []byte("accelerations")
+	revokeProofKey        = []byte("revokeProof")
 	typeKey               = []byte("type")
 	seedGenTimeKey        = []byte("seedGenTime")
 	encSeedKey            = []byte("encSeed")
@@ -1325,6 +1326,15 @@ func decodeOrderBucket(oid []byte, oBkt *bbolt.Bucket) (*dexdb.MetaOrder, error)
 		fundingFeesPaid = intCoder.Uint64(fundingFeesB)
 	}
 
+	var revoke *dexdb.RevokeProof
+	if revokeB := getCopy(oBkt, revokeProofKey); len(revokeB) > 0 {
+		var err error
+		revoke, err = dexdb.DecodeRevokeProof(revokeB)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding revoke proof: %w", err)
+		}
+	}
+
 	return &dexdb.MetaOrder{
 		MetaData: &dexdb.OrderMetaData{
 			Proof:              *proof,
@@ -1346,6 +1356,7 @@ func decodeOrderBucket(oid []byte, oBkt *bbolt.Bucket) (*dexdb.MetaOrder, error)
 			RefundReserves:     refundReserves,
 			AccelerationCoins:  accelerationCoinIDs,
 			FundingFeesPaid:    fundingFeesPaid,
+			Revoke:             revoke,
 		},
 		Order: ord,
 	}, nil
@@ -1421,6 +1432,11 @@ func updateOrderMetaData(bkt *bbolt.Bucket, md *dexdb.OrderMetaData) error {
 		}
 	}
 
+	var revokeProofB []byte
+	if md.Revoke != nil {
+		revokeProofB = md.Revoke.Encode()
+	}
+
 	return newBucketPutter(bkt).
 		put(statusKey, uint16Bytes(uint16(md.Status))).
 		put(updateTimeKey, uint64Bytes(timeNow())).
@@ -1434,6 +1450,7 @@ func updateOrderMetaData(bkt *bbolt.Bucket, md *dexdb.OrderMetaData) error {
 		put(refundReservesKey, uint64Bytes(md.RefundReserves)).
 		put(accelerationsKey, accelerationsB).
 		put(fundingFeesKey, uint64Bytes(md.FundingFeesPaid)).
+		put(revokeProofKey, revokeProofB).
 		err()
 }
 

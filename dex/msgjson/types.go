@@ -100,6 +100,7 @@ const (
 	RPCMMStatusError                     // 82
 	RPCBridgeError                       // 83
 	RPCPaymentMultisigError              // 84
+	RPCMMProofError                      // 84
 )
 
 // Routes are destinations for a "payload" of data. The type of data being
@@ -604,16 +605,18 @@ func (audit *Audit) Serialize() []byte {
 type RevokeOrder struct {
 	Signature
 	OrderID Bytes `json:"orderid"`
+	// Time is the DEX server's timestamp (ms) for the revocation notification.
+	Time uint64 `json:"timestamp"`
 }
 
-var _ Signable = (*RevokeMatch)(nil)
+var _ Signable = (*RevokeOrder)(nil)
 
 // Serialize serializes the RevokeOrder data.
 func (rev *RevokeOrder) Serialize() []byte {
-	// RevokeMatch serialization is order id (32) = 32 bytes
-	s := make([]byte, 64)
-	copy(s, rev.OrderID)
-	return s
+	// serialization: order id (32) + timestamp (8) = 40 bytes
+	s := make([]byte, 0, 40)
+	s = append(s, rev.OrderID...)
+	return append(s, uint64Bytes(rev.Time)...)
 }
 
 // RevokeMatch are the params for a DEX-originating RevokeMatchRoute request.
