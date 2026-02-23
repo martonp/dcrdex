@@ -33,30 +33,34 @@ var (
 		FeeRateDenom: "gas",
 	}
 
+	// Mainnet v1 swap evidence:
+	//   init:            0xf7c752f9217e359718dc9d9a17f3a04d3bfb3af6923fa43e2d668eda978319d0
+	//   redeem:          0x958268be6bfe6db7088440f7ba6a78ec718da5a575674a75f781975974e5f965
+	//   refund:          0xaf49b64a327051dcf304b418f43781bedd79680329b8503a0c3f91e900ba609f
+	//   gasless redeem:  0xf997a66ddb1f92e6b9011a168153d787940dd2b50b1c80701630f283265a994c
 	v1Gases = &dexeth.Gases{
-		// First swap used 49054 gas Recommended Gases.Swap = 63770
-		Swap: 63_770,
-		// 4 additional swaps averaged 26895 gas each. Recommended Gases.SwapAdd = 34963
-		// [49054 75949 102844 129728 156637]
-		SwapAdd: 34_963,
-		// First redeem used 40247 gas. Recommended Gases.Redeem = 52321
-		Redeem: 52_321,
-		// 4 additional redeems averaged 11115 gas each. recommended Gases.RedeemAdd = 14449
-		// [40247 51349 62476 73568 84710]
-		RedeemAdd: 14_449,
-		// Average of 5 refunds: 40589. Recommended Gases.Refund = 52765
-		// [40589 40589 40589 40589 40589]
-		Refund: 52_765,
+		// Mainnet measurements:
+		// Swaps (n=1..5):   [54296 84005 113714 143412 173111]
+		Swap:    70_584,
+		SwapAdd: 38_613,
+		// Redeems (n=1..5): [44911 58254 71598 84907 98254]
+		Redeem:    58_384,
+		RedeemAdd: 17_335,
+		// Refunds (n=1..6): [47987 47987 47987 47987 47975 42859]
+		Refund: 61_269,
 
-		// TODO: Fix these. Taken from polygon.
-		GaslessRedeemVerification:       83_000,
-		GaslessRedeemVerificationAdd:    11_000,
-		GaslessRedeemPreVerification:    70_000,
-		GaslessRedeemPreVerificationAdd: 6_000,
-		GaslessRedeemCall:               120_000,
-		// Must be >= MIN_CALL_GAS_PER_REDEMPTION in the contract's
-		// validateUserOp, otherwise batch redemptions will be rejected.
-		GaslessRedeemCallAdd: 25_000,
+		// Gasless redeem (mainnet, v0.7 EntryPoint):
+		// Verification (n=1..5): [176236 221701 273162 352264 394093]
+		GaslessRedeemVerification:    229_106,
+		GaslessRedeemVerificationAdd: 70_803,
+		// PreVerification (n=1..5): [47215 49385 51585 53783 55989]
+		GaslessRedeemPreVerification:    61_379,
+		GaslessRedeemPreVerificationAdd: 2_850,
+		// Call gas uses the contract's hard minimums from validateUserOp.
+		// The EntryPoint passes callGasLimit directly to the inner call
+		// (Exec.call), so the full amount is available to redeemAA.
+		GaslessRedeemCall:    100_000, // MIN_CALL_GAS_BASE (75k) + MIN_CALL_GAS_PER_REDEMPTION (25k)
+		GaslessRedeemCallAdd: 25_000,  // MIN_CALL_GAS_PER_REDEMPTION
 	}
 
 	VersionedGases = map[uint32]*dexeth.Gases{
@@ -68,9 +72,9 @@ var (
 			dex.Simnet: common.HexToAddress(""), // Filled in by MaybeReadSimnetAddrs
 		},
 		1: {
-			dex.Testnet: common.HexToAddress("0x4F8024dd716E4ec9AC8E0CD971616F73e3f6625d"), // txid: https://base-sepolia.blockscout.com/tx/0xa8137a8f84b28149f27045a4d6c15cceb784f3886f8a476790002e4da4728979
-			dex.Mainnet: common.HexToAddress(""),
-			dex.Simnet:  common.HexToAddress(""), // Filled in by MaybeReadSimnetAddrs
+			dex.Mainnet: common.HexToAddress("0x8Ff8D2291F9Ac863F2bb9Bb428B32795060dd07d"), // txid: 0xbeb298de7ea8bd464113eb24df8c9b9d483c6034a606466955c561c7b6f1daaa
+			dex.Testnet: common.HexToAddress("0x64a8eA1cBB4270df4C89d7e8706C7C10b68259e7"), // txid: 0xfc1fa2b8118fdba9ccc5e7d306a54927df58efaacfe434c2524ee65697bb08c5
+			dex.Simnet:  common.HexToAddress(""),                                           // Filled in by MaybeReadSimnetAddrs
 		},
 	}
 
@@ -108,12 +112,38 @@ var (
 		},
 		NetTokens: map[dex.Network]*dexeth.NetToken{
 			dex.Mainnet: {
-				Address:       common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Gas values are from usdt.base mainnet.
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Testnet: {
-				Address:       common.HexToAddress("0x036CbD53842c5426634e7929541eC2318f3dCF7e"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0x036CbD53842c5426634e7929541eC2318f3dCF7e"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Gas values are from usdt.base mainnet.
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Simnet: {
 				Address: common.Address{},
@@ -150,13 +180,49 @@ var (
 		},
 		NetTokens: map[dex.Network]*dexeth.NetToken{
 			dex.Mainnet: {
-				Address:       common.HexToAddress("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Mainnet v1 token swap evidence:
+							//   approve:   0x9b9e137d05f00a375f62eb644ddf06805716ddc4be5181669f61e39680cc5c64
+							//   transfer:  0x8251856dbe1360b52ab040946d6590b293c89a8a4aa00cd247a46e57a881f3fa
+							//   init:      0x3fb6a4bba5ce7a3b410b67a2488f83cfd497485c84ee99e2be5cf2665c7084fc
+							//   redeem:    0x3a7e69928361c2523682530c4a90302607f4912d378a295d9851b844803bdbd1
+							//   refund:    0xc0f051a4686e5eab54abd5b01f3a500a7b311ecbfb1113ad6f2881964dce01a9
+							// Mainnet measurements:
+							// Swaps (n=1):   [90132]
+							// Redeems (n=1): [49548]
+							// Refunds (n=1..2): [57628 47493]
+							// Approvals: [46717 46717]
+							// Transfers: [51814]
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Testnet: {
-				// Is USDCT tether?
-				Address:       common.HexToAddress("0xb72fdb9f8190d8e1141e6a8e9c0732b0f4d93c09"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0x8d9cb8f3191fd685e2c14d2ac3fb2b16d44eafc3"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Gas values are from usdt.base mainnet.
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Simnet: {
 				Address: common.Address{},
@@ -204,12 +270,38 @@ var (
 		},
 		NetTokens: map[dex.Network]*dexeth.NetToken{
 			dex.Mainnet: {
-				Address:       common.HexToAddress("0x0555E30da8f98308EdB960aa94C0Db47230d2B9c"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0x0555E30da8f98308EdB960aa94C0Db47230d2B9c"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Gas values are from usdt.base mainnet.
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Testnet: {
-				Address:       common.HexToAddress("0x78c8587b0b4d50b3a2110bc8188eef195cfa7f11"),
-				SwapContracts: map[uint32]*dexeth.SwapContract{},
+				Address: common.HexToAddress("0x78c8587b0b4d50b3a2110bc8188eef195cfa7f11"),
+				SwapContracts: map[uint32]*dexeth.SwapContract{
+					1: {
+						Gas: dexeth.Gases{
+							// Gas values are from usdt.base mainnet.
+							Swap:      117_171,
+							SwapAdd:   38_613,
+							Redeem:    64_412,
+							RedeemAdd: 17_335,
+							Refund:    68_328,
+							Approve:   60_732,
+							Transfer:  67_358,
+						},
+					},
+				},
 			},
 			dex.Simnet: {
 				Address:       common.Address{},
