@@ -72,7 +72,7 @@ var (
 			dex.Simnet: common.HexToAddress(""), // Filled in by MaybeReadSimnetAddrs
 		},
 		1: {
-			dex.Mainnet: common.HexToAddress("0x8Ff8D2291F9Ac863F2bb9Bb428B32795060dd07d"), // txid: 0xbeb298de7ea8bd464113eb24df8c9b9d483c6034a606466955c561c7b6f1daaa
+			dex.Mainnet: common.HexToAddress("0x28c7C4C762ce7e7Af18f68786A839a84cd910306"),
 			dex.Testnet: common.HexToAddress("0x64a8eA1cBB4270df4C89d7e8706C7C10b68259e7"), // txid: 0xfc1fa2b8118fdba9ccc5e7d306a54927df58efaacfe434c2524ee65697bb08c5
 			dex.Simnet:  common.HexToAddress(""),                                           // Filled in by MaybeReadSimnetAddrs
 		},

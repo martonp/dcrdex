@@ -11,6 +11,20 @@ module.exports = {
         url: process.env.SEPOLIA_RPC_URL,
         accounts: [process.env.PRIVATE_KEY]
       }
+    } : {}),
+    ...(process.env.POLYGON_RPC_URL ? {
+      polygon: {
+        url: process.env.POLYGON_RPC_URL,
+        chainId: 137,
+        accounts: [process.env.PRIVATE_KEY]
+      }
+    } : {}),
+    ...(process.env.BASE_RPC_URL ? {
+      base: {
+        url: process.env.BASE_RPC_URL,
+        chainId: 8453,
+        accounts: [process.env.PRIVATE_KEY]
+      }
     } : {})
   },
   solidity: {
@@ -21,5 +35,11 @@ module.exports = {
         runs: 1000
       }
     }
+  },
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_API_KEY || "",
+  },
+  sourcify: {
+    enabled: true,
   },
 };

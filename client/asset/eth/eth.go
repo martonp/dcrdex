@@ -2156,17 +2156,6 @@ func (w *ETHWallet) setPaymaster(endpoint string, pmContext interface{}) error {
 // getPaymasterStubData with a minimal dummy user op to verify the paymaster
 // endpoint and policy are valid.
 func (w *ETHWallet) checkBundler(ctx context.Context, b bundler, pm paymaster) error {
-	// On Polygon, the default provider (e.g. Alchemy) typically requires a
-	// paymaster for user operations. Require an explicit bundler endpoint
-	// to be configured so the user is not surprised by failures at redeem
-	// time.
-	w.settingsMtx.RLock()
-	explicitBundler := w.settings[bundlerKey] != ""
-	w.settingsMtx.RUnlock()
-	if w.assetID == polygonID && !explicitBundler {
-		return fmt.Errorf("a dedicated bundler endpoint is required for gasless redemptions on Polygon - set one in wallet settings")
-	}
-
 	if _, _, err := b.getGasPrice(ctx); err != nil {
 		return fmt.Errorf("bundler gas price check failed: %w", err)
 	}
@@ -5572,13 +5561,63 @@ func (w *ETHWallet) canRedeemWithBundler(lotSize uint64, gases *dexeth.Gases, n 
 		return false, asset.ErrBundlerRedemptionLotSizeTooSmall
 	}
 
-	// Validate the paymaster if one is configured, to catch configuration
-	// issues before funds are locked.
-	if err := w.checkBundler(w.ctx, bundler, pm); err != nil {
+	if err := w.testBundlerCompatibility(w.ctx, bundler, pm); err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// testBundlerCompatibility calls eth_estimateUserOperationGas with an empty
+// redemptions list.
+func (w *ETHWallet) testBundlerCompatibility(ctx context.Context, b bundler, pm paymaster) error {
+	contractAddr, ok := w.versionedContracts[1]
+	if !ok {
+		return fmt.Errorf("no v1 contract address")
+	}
+
+	contractor, is := w.contractorV1.(gaslessRedeemContractor)
+	if !is {
+		return fmt.Errorf("contractor does not support gasless redeems")
+	}
+
+	callData, err := contractor.gaslessRedeemCalldata(nil, big.NewInt(0))
+	if err != nil {
+		return fmt.Errorf("error creating test calldata: %w", err)
+	}
+
+	op := &userOp{
+		Sender:               contractAddr.Hex(),
+		Nonce:                "0x0",
+		CallData:             "0x" + hex.EncodeToString(callData),
+		Signature:            dummyUserOpSignature,
+		MaxFeePerGas:         "0x0",
+		MaxPriorityFeePerGas: "0x0",
+		CallGasLimit:         "0x0",
+		VerificationGasLimit: "0x0",
+		PreVerificationGas:   "0x0",
+	}
+
+	if pm != nil {
+		stubResult, err := pm.getPaymasterStubData(ctx, op)
+		if err != nil {
+			return fmt.Errorf("paymaster check failed: %w", err)
+		}
+		op.Paymaster = stubResult.Paymaster
+		op.PaymasterData = stubResult.PaymasterData
+		if stubResult.PaymasterVerificationGasLimit != "" {
+			op.PaymasterVerificationGasLimit = stubResult.PaymasterVerificationGasLimit
+		}
+		if stubResult.PaymasterPostOpGasLimit != "" {
+			op.PaymasterPostOpGasLimit = stubResult.PaymasterPostOpGasLimit
+		}
+	}
+
+	if _, err := b.estimateGas(ctx, op); err != nil {
+		return fmt.Errorf("bundler gas estimation failed: %w", err)
+	}
+
+	return nil
 }
 
 // ReserveNRedemptions locks funds for redemption. It is an error if there

@@ -274,7 +274,9 @@ contract ETHSwap is IAccount, ReentrancyGuard {
             bytes32 key = contractKey(token, v);
             require(swaps[key] == bytes32(0), "already exists");
 
-            bytes32 record = bytes32(block.number);
+            // We subtract 1 from the block.number to avoid failing a redemption
+            // if the swap is redeemed in the same block that it was initiated.
+            bytes32 record = bytes32(block.number - 1);
             require(!secretValidates(record, v.secretHash), "hash collision");
 
             swaps[key] = record;
@@ -307,7 +309,7 @@ contract ETHSwap is IAccount, ReentrancyGuard {
         senderIsOrigin
         nonReentrant
     {
-        require(redemptions.length > 0 && redemptions.length <= MAX_BATCH, "bad batch size");
+        require(redemptions.length <= MAX_BATCH, "bad batch size");
 
         uint256 total;
 
@@ -415,7 +417,7 @@ contract ETHSwap is IAccount, ReentrancyGuard {
 
         if (opNonce != userOp.nonce) return SIG_VALIDATION_FAILED;
 
-        if (reds.length == 0 || reds.length > MAX_BATCH) return SIG_VALIDATION_FAILED;
+        if (reds.length > MAX_BATCH) return SIG_VALIDATION_FAILED;
 
         address participant;
         uint256 total;
@@ -468,13 +470,13 @@ contract ETHSwap is IAccount, ReentrancyGuard {
             total += r.v.value;
         }
 
-        if (missingAccountFunds > total) return SIG_VALIDATION_FAILED;
-
         // Pay prefund before callGasLimit and signature checks. During gas
         // estimation, the bundler sends zero gas limits and a dummy signature,
         // both of which would fail checks below. The EntryPoint requires the
         // prefund to be paid regardless of validation result (AA21 otherwise).
         _payPrefund(missingAccountFunds);
+
+        if (missingAccountFunds > total) return SIG_VALIDATION_FAILED;
 
         // Ensure callGasLimit is sufficient to prevent out-of-gas attacks.
         uint256 minCallGas = MIN_CALL_GAS_BASE + (reds.length * MIN_CALL_GAS_PER_REDEMPTION);
@@ -509,7 +511,7 @@ contract ETHSwap is IAccount, ReentrancyGuard {
         senderIsEntryPoint
         nonReentrant
     {
-        require(redemptions.length > 0 && redemptions.length <= MAX_BATCH, "bad batch size");
+        require(redemptions.length <= MAX_BATCH, "bad batch size");
 
         uint256 total;
         address recipient;
