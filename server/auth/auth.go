@@ -1829,3 +1829,17 @@ func (auth *AuthManager) VerifyUserSig(user account.AccountID, msg, sig []byte) 
 	}
 	return checkSigS256(msg, sig, pubKey)
 }
+
+// ConnectedAmong returns the subset of the given users that are currently
+// connected to this node.
+func (auth *AuthManager) ConnectedAmong(users []account.AccountID) []account.AccountID {
+	var connected []account.AccountID
+	auth.connMtx.RLock()
+	defer auth.connMtx.RUnlock()
+	for _, user := range users {
+		if _, found := auth.users[user]; found {
+			connected = append(connected, user)
+		}
+	}
+	return connected
+}
