@@ -40,12 +40,14 @@ type MatchNegotiator interface {
 // redemptions.
 type DEXBalancer struct {
 	assets          map[uint32]*backedBalancer
+	markets         map[string]PendingAccounter
 	matchNegotiator MatchNegotiator
 }
 
 // NewDEXBalancer is a constructor for a DEXBalancer. Provided assets will
 // be filtered for those that are account-based. The matchNegotiator is
-// satisfied by the *Swapper.
+// satisfied by the *Swapper. tunnels is stored, not copied, so markets
+// added after construction are visible to CheckBalance.
 func NewDEXBalancer(tunnels map[string]PendingAccounter, assets map[uint32]*asset.BackedAsset, matchNegotiator MatchNegotiator) (*DEXBalancer, error) {
 	balancers := make(map[uint32]*backedBalancer)
 
@@ -56,18 +58,10 @@ func NewDEXBalancer(tunnels map[string]PendingAccounter, assets map[uint32]*asse
 			return nil
 		}
 
-		var markets []PendingAccounter
-		for _, mkt := range tunnels {
-			if mkt.Base() == assetID || mkt.Quote() == assetID {
-				markets = append(markets, mkt)
-			}
-		}
-
 		bb := &backedBalancer{
 			balancer:  balancer,
 			assetInfo: &ba.Asset,
 			feeFamily: make(map[uint32]*dex.Asset),
-			markets:   markets,
 		}
 		balancers[assetID] = bb
 
@@ -122,8 +116,15 @@ func NewDEXBalancer(tunnels map[string]PendingAccounter, assets map[uint32]*asse
 
 	return &DEXBalancer{
 		assets:          balancers,
+		markets:         tunnels,
 		matchNegotiator: matchNegotiator,
 	}, nil
+}
+
+// CheckReserved reports whether the account can still fund its existing DEX
+// commitments for this asset. No new order is being placed.
+func (b *DEXBalancer) CheckReserved(acctAddr string, assetID uint32) bool {
+	return b.CheckBalance(acctAddr, assetID, assetID, 0, 0, 0)
 }
 
 // CheckBalance checks if there is sufficient balance to support the specified
@@ -213,7 +214,10 @@ func (b *DEXBalancer) CheckBalance(acctAddr string, assetID, redeemAssetID uint3
 
 		var l uint64
 		var r int
-		for _, mt := range ba.markets {
+		for _, mt := range b.markets {
+			if mt.Base() != assetID && mt.Quote() != assetID {
+				continue
+			}
 			newQty, newLots, newRedeems := mt.AccountPending(acctAddr, assetID)
 			l += newLots
 			q += newQty
@@ -279,5 +283,4 @@ type backedBalancer struct {
 	assetInfo   *dex.Asset
 	feeBalancer *backedBalancer       // feeBalancer != nil implies that this is a token
 	feeFamily   map[uint32]*dex.Asset // Excluding self
-	markets     []PendingAccounter
 }

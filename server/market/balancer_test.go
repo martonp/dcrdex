@@ -8,6 +8,7 @@ import (
 
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/calc"
+	"decred.org/dcrdex/server/asset"
 )
 
 func TestBalancer(t *testing.T) {
@@ -24,9 +25,6 @@ func TestBalancer(t *testing.T) {
 	ethBalancer := &backedBalancer{
 		balancer:  ethBackend,
 		assetInfo: &assetETH.Asset,
-		markets: []PendingAccounter{
-			ethTunnel,
-		},
 		feeFamily: map[uint32]*dex.Asset{
 			assetToken.ID: &assetToken.Asset,
 		},
@@ -36,16 +34,17 @@ func TestBalancer(t *testing.T) {
 		assets: map[uint32]*backedBalancer{
 			assetETH.ID: ethBalancer,
 			assetToken.ID: {
-				balancer:  tokenBackend,
-				assetInfo: &assetToken.Asset,
-				markets: []PendingAccounter{
-					tokenTunnel,
-				},
+				balancer:    tokenBackend,
+				assetInfo:   &assetToken.Asset,
 				feeBalancer: ethBalancer,
 				feeFamily: map[uint32]*dex.Asset{
 					assetETH.ID: &assetETH.Asset,
 				},
 			},
+		},
+		markets: map[string]PendingAccounter{
+			"eth":   ethTunnel,
+			"token": tokenTunnel,
 		},
 		matchNegotiator: swapper,
 	}
@@ -286,5 +285,32 @@ func TestBalancer(t *testing.T) {
 		if balancer.CheckBalance("a", assetID, tt.redeemID, newQLR.qty, newQLR.lots, newQLR.redeems) != tt.pass {
 			t.Fatalf("%s: expected %t, got %t", tt.name, tt.pass, !tt.pass)
 		}
+	}
+}
+
+func TestDEXBalancerSeesMarketsAddedAfterConstruction(t *testing.T) {
+	const lotSize = 1e10
+	oneLot := calc.RequiredOrderFunds(lotSize, 0, 1, tInitTxSize, tInitTxSize, assetETH.Asset.MaxFeeRate)
+
+	eth := *assetETH
+	eth.Backend = &tAccountBackend{bal: oneLot}
+	tunnels := make(map[string]PendingAccounter)
+	balancer, err := NewDEXBalancer(tunnels, map[uint32]*asset.BackedAsset{
+		assetETH.ID: &eth,
+	}, tNewMatchNegotiator())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tunnels["eth_btc"] = &TMarketTunnel{
+		base:     assetETH.ID,
+		acctQty:  lotSize,
+		acctLots: 1,
+	}
+	if !balancer.CheckReserved("a", assetETH.ID) {
+		t.Fatal("CheckReserved rejected an account funded at 1x existing reservation")
+	}
+	if balancer.CheckBalance("a", assetETH.ID, 0, lotSize, 1, 0) {
+		t.Fatal("CheckBalance ignored a market inserted after construction")
 	}
 }
