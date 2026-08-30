@@ -21,6 +21,7 @@ const (
 	bondsTableName        = "bonds"
 	prepaidBondsTableName = "prepaid_bonds"
 	pointsTableName       = "points"
+	eventLogTableName     = "event_log"
 
 	indexBondsOnAccountName  = "idx_bonds_on_acct"
 	indexBondsOnLockTimeName = "idx_bonds_on_locktime"
@@ -46,6 +47,7 @@ var createDEXTableStatements = []tableStmt{
 	{marketsTableName, internal.CreateMarketsTable},
 	{metaTableName, internal.CreateMetaTable},
 	{pointsTableName, internal.CreatePointsTable},
+	{eventLogTableName, internal.CreateEventLogTable},
 }
 
 var createAccountTableStatements = []tableStmt{
@@ -193,6 +195,9 @@ func prepareTables(ctx context.Context, db *sql.DB, mktConfig []*dex.MarketInfo)
 	}
 	if _, err = db.Exec(fmt.Sprintf(internal.CreatePointsIndex, publicSchema+"."+pointsTableName)); err != nil {
 		return nil, fmt.Errorf("error creating index on points table: %w", err)
+	}
+	if _, err = createTable(db, publicSchema, eventLogTableName); err != nil {
+		return nil, fmt.Errorf("error creating event log table: %w", err)
 	}
 	// Prepare the account and registration key counter tables.
 	if err = createAccountTables(db); err != nil {
