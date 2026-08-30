@@ -6,18 +6,63 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
-	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/davecgh/go-spew/spew"
 )
 
 const cancelThreshWindow = 100 // spec
+
+// revokeOrderForTest revokes ord with a generated (pseudo) cancel order via
+// the shared revokeOrder helper, the same path the orders_revoked and
+// epoch_processed event appliers take.
+func revokeOrderForTest(ord order.Order, exempt bool) (order.OrderID, time.Time, error) {
+	timeStamp := time.Now().Truncate(time.Millisecond).UTC()
+	cancelID, err := archie.revokeOrder(archie.db, ord, exempt, timeStamp)
+	return cancelID, timeStamp, err
+}
+
+func seedMarketLifecycle(t *testing.T, lc *db.MarketLifecycle) {
+	t.Helper()
+	if lc.RunParams.LotSize == 0 {
+		// Seed a valid set for rows that predate run params.
+		lc.RunParams = meshevents.MarketRunParams{
+			LotSize:                LotSize,
+			RateStep:               RateStep,
+			ParcelSize:             10,
+			MaxUserCancelsPerEpoch: math.MaxUint32, // historical unlimited-cancels default
+		}
+	}
+	tx, err := archie.db.Begin()
+	if err != nil {
+		t.Fatalf("Begin error: %v", err)
+	}
+	defer tx.Rollback()
+	if err := archie.upsertMarketLifecycleTx(tx, lc); err != nil {
+		t.Fatalf("upsertMarketLifecycleTx error: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit error: %v", err)
+	}
+}
+
+// storeOrderForTest seeds an order directly into persistent storage for the
+// specified epoch ID (idx:dur) with the provided status, bypassing the event
+// appliers. It is test-only: in production all durable order writes flow
+// exclusively through the event appliers. The order is validated via
+// validateOrder so only sensible orders reach storage.
+func storeOrderForTest(a *Archiver, ord order.Order, epochIdx, epochDur int64, status order.OrderStatus) error {
+	return a.storeOrder(a.db, ord, epochIdx, epochDur, db.EpochGapNA, marketToPgStatus(status))
+}
 
 func TestStoreOrder(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
@@ -96,8 +141,7 @@ func TestStoreOrder(t *testing.T) {
 				ord:    limitA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in orders_archived: primary key
 		},
 		{
 			name: "limit duplicate by commit only",
@@ -105,8 +149,7 @@ func TestStoreOrder(t *testing.T) {
 				ord:    limitAx,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: false, // new OID, commit only in archive
 		},
 		{
 			name: "limit bad quantity (lot size)",
@@ -166,13 +209,12 @@ func TestStoreOrder(t *testing.T) {
 				ord:    marketSellA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in orders_archived: primary key
 		},
 		{
 			name: "market sell - duplicate archived order",
 			args: args{
-				ord:    marketSellB, // dd64e2ae2845d281ba55a6d46eceb9297b2bdec5c5bada78f9ae9e373164df0d
+				ord:    marketSellB, // still live in orders_active from the epoch insert
 				status: order.OrderStatusExecuted,
 			},
 			wantErr:     true,
@@ -192,24 +234,570 @@ func TestStoreOrder(t *testing.T) {
 				ord:    cancelA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in cancels_archived: primary key
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := archie.StoreOrder(tt.args.ord, epochIdx, epochDur, tt.args.status)
+			err := storeOrderForTest(archie, tt.args.ord, epochIdx, epochDur, tt.args.status)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("StoreOrder() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if err != nil {
 				t.Logf("%s: %v", tt.name, err)
-				if !db.SameErrorTypes(err, tt.wantErrType) {
+				if tt.wantErrType != nil && !db.SameErrorTypes(err, tt.wantErrType) {
 					t.Errorf("Wrong error. Got %v, expected %v", err, tt.wantErrType)
 				}
 			}
 		})
 	}
+}
+
+func TestApplyOrderAcceptedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	ord := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	update := &db.OrderAcceptedUpdate{
+		Order:    ord,
+		EpochIdx: 13245678,
+		EpochDur: 6000,
+		EpochGap: db.EpochGapNA,
+	}
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		Market:        "dcr_btc",
+		State:         db.MarketStateRunning,
+		StartEpochIdx: update.EpochIdx,
+		StartEpochDur: update.EpochDur,
+		PendingAction: db.MarketPendingNone,
+	})
+
+	applyOrderAccepted := func(meta *db.EventLogMeta, update *db.OrderAcceptedUpdate) *db.EventLogEntry {
+		t.Helper()
+
+		log, err := archie.ApplyOrderAcceptedEvent(ctx, meta, update)
+		if err != nil {
+			t.Fatalf("ApplyOrderAcceptedEvent error: %v", err)
+		}
+		if log == nil {
+			t.Fatalf("ApplyOrderAcceptedEvent returned nil log")
+		}
+		return log
+	}
+
+	requireStoredEpochOrder := func(ord order.Order) {
+		t.Helper()
+
+		stored, status, err := archie.Order(ord.ID(), ord.Base(), ord.Quote())
+		if err != nil {
+			t.Fatalf("Order error: %v", err)
+		}
+		if stored.ID() != ord.ID() {
+			t.Fatalf("stored order id = %v, want %v", stored.ID(), ord.ID())
+		}
+		if status != order.OrderStatusEpoch {
+			t.Fatalf("stored order status = %v, want %v", status, order.OrderStatusEpoch)
+		}
+	}
+
+	// A new accepted order stores the epoch order and appends the first
+	// order_accepted event log entry.
+	firstEvent := []byte("order-accepted-event")
+	firstTip := testEventApplyTip(t, nil, 1, meshevents.EventKindOrderAccepted, firstEvent, update)
+	firstLog := applyOrderAccepted(&db.EventLogMeta{Event: firstEvent}, update)
+	requireEventApplyLog(t, firstLog, 1, meshevents.EventKindOrderAccepted, firstEvent, firstTip, update)
+	requireStoredEpochOrder(ord)
+
+	// Reapplying the same order is idempotent for the order table, but the
+	// replicated event is still recorded in the event log.
+	duplicateEvent := []byte("order-accepted-duplicate")
+	duplicateTip := testEventApplyTip(t, firstLog.TipHash, 2, meshevents.EventKindOrderAccepted, duplicateEvent, update)
+	duplicateLog := applyOrderAccepted(&db.EventLogMeta{
+		Seq:             2,
+		Event:           duplicateEvent,
+		ExpectedTipHash: duplicateTip,
+	}, update)
+	requireEventApplyLog(t, duplicateLog, 2, meshevents.EventKindOrderAccepted, duplicateEvent, duplicateTip, update)
+	requireStoredEpochOrder(ord)
+
+	// A different order cannot reuse the same commitment, and the rejected
+	// apply must not advance the log.
+	conflicting := new(order.LimitOrder)
+	*conflicting = *ord
+	conflicting.SetTime(ord.ServerTime.Add(time.Second))
+	conflictUpdate := &db.OrderAcceptedUpdate{
+		Order:    conflicting,
+		EpochIdx: update.EpochIdx,
+		EpochDur: update.EpochDur,
+		EpochGap: update.EpochGap,
+	}
+	_, err := archie.ApplyOrderAcceptedEvent(ctx, &db.EventLogMeta{
+		Seq:   3,
+		Event: []byte("order-accepted-conflict"),
+	}, conflictUpdate)
+	var archiveErr db.ArchiveError
+	if !errors.As(err, &archiveErr) || archiveErr.Code != db.ErrReusedCommit {
+		t.Fatalf("ApplyOrderAcceptedEvent error = %v, want reused commit", err)
+	}
+	if _, status, err := archie.Order(conflicting.ID(), conflicting.Base(), conflicting.Quote()); err == nil || status != order.OrderStatusUnknown {
+		t.Fatalf("conflicting order status = %v, err = %v, want unknown order", status, err)
+	}
+	frontier, err := archie.EventLogFrontier(ctx)
+	if err != nil {
+		t.Fatalf("EventLogFrontier error: %v", err)
+	}
+	if frontier.Seq != 2 || !bytes.Equal(frontier.TipHash, duplicateLog.TipHash) {
+		t.Fatalf("frontier = (%d, %x), want (2, %x)", frontier.Seq, frontier.TipHash, duplicateLog.TipHash)
+	}
+}
+
+func TestApplyOrderAcceptedEventReusesArchivedCommit(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	if err := assertNoArchivedCommitUnique(archie.db); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	archived := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	if err := storeOrderForTest(archie, archived, 100, 6000, order.OrderStatusExecuted); err != nil {
+		t.Fatalf("store archived order: %v", err)
+	}
+
+	reuse := new(order.LimitOrder)
+	*reuse = *archived
+	reuse.SetTime(archived.ServerTime.Add(time.Second))
+	update := &db.OrderAcceptedUpdate{
+		Order:    reuse,
+		EpochIdx: 13245678,
+		EpochDur: 6000,
+		EpochGap: db.EpochGapNA,
+	}
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		Market:        "dcr_btc",
+		State:         db.MarketStateRunning,
+		StartEpochIdx: update.EpochIdx,
+		StartEpochDur: update.EpochDur,
+		PendingAction: db.MarketPendingNone,
+	})
+
+	event := []byte("order-accepted-reused-commit")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindOrderAccepted, event, update)
+	logEntry, err := archie.ApplyOrderAcceptedEvent(ctx, &db.EventLogMeta{Event: event}, update)
+	if err != nil {
+		t.Fatalf("ApplyOrderAcceptedEvent reuse archived commit: %v", err)
+	}
+	requireEventApplyLog(t, logEntry, 1, meshevents.EventKindOrderAccepted, event, tip, update)
+	stored, status, err := archie.Order(reuse.ID(), reuse.Base(), reuse.Quote())
+	if err != nil || stored.ID() != reuse.ID() || status != order.OrderStatusEpoch {
+		t.Fatalf("reused-commit order status = %v (err %v), want epoch", status, err)
+	}
+
+	// Completing the second life must copy commit+preimage into archive.
+	preimage := make([]byte, order.PreimageSize)
+	copy(preimage, []byte("0123456789abcdef0123456789abcdef"))
+	schema, err := archie.marketSchema(reuse.Base(), reuse.Quote())
+	if err != nil {
+		t.Fatalf("marketSchema: %v", err)
+	}
+	activeTable := fullOrderTableName(archie.dbName, schema, true)
+	archivedTable := fullOrderTableName(archie.dbName, schema, false)
+	if _, err := archie.db.Exec(fmt.Sprintf("UPDATE %s SET preimage = $1 WHERE oid = $2", archivedTable),
+		preimage, archived.ID()); err != nil {
+		t.Fatalf("set archived preimage: %v", err)
+	}
+	if _, err := archie.db.Exec(fmt.Sprintf("UPDATE %s SET preimage = $1 WHERE oid = $2", activeTable),
+		preimage, reuse.ID()); err != nil {
+		t.Fatalf("set active preimage: %v", err)
+	}
+	if err := archie.updateOrderStatusWithExecutor(archie.db, reuse, orderStatusExecuted); err != nil {
+		t.Fatalf("archive reused-commit order: %v", err)
+	}
+	if _, status, err := archie.Order(reuse.ID(), reuse.Base(), reuse.Quote()); err != nil || status != order.OrderStatusExecuted {
+		t.Fatalf("archived reused-commit order status = %v (err %v)", status, err)
+	}
+}
+
+func TestOrdersWithCommit(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const epochIdx, epochDur int64 = 13245678, 6000
+
+	requireIDs := func(got []db.CommitOrder, want ...db.CommitOrder) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("OrdersWithCommit returned %d rows, want %d", len(got), len(want))
+		}
+		byID := make(map[order.OrderID]order.OrderStatus, len(got))
+		for _, row := range got {
+			byID[row.Order.ID()] = row.Status
+		}
+		for _, w := range want {
+			st, ok := byID[w.Order.ID()]
+			if !ok || st != w.Status {
+				t.Fatalf("missing or wrong status for %v: got %v, want %v", w.Order.ID(), st, w.Status)
+			}
+		}
+	}
+
+	older := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	newer := newLimitOrder(false, 4_900_000, 2, order.StandingTiF, 10)
+	newer.Commit = older.Commit
+	base, quote := older.Base(), older.Quote()
+	commit := older.Commit
+
+	got, err := archie.OrdersWithCommit(ctx, base, quote, commit, older.ServerTime)
+	if err != nil {
+		t.Fatalf("empty lookup: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty lookup returned %d rows", len(got))
+	}
+
+	if err := storeOrderForTest(archie, older, epochIdx, epochDur, order.OrderStatusEpoch); err != nil {
+		t.Fatalf("store active: %v", err)
+	}
+	got, err = archie.OrdersWithCommit(ctx, base, quote, commit, older.ServerTime)
+	if err != nil {
+		t.Fatalf("active lookup: %v", err)
+	}
+	requireIDs(got, db.CommitOrder{Order: older, Status: order.OrderStatusEpoch})
+
+	if err := archie.updateOrderStatusWithExecutor(archie.db, older, orderStatusExecuted); err != nil {
+		t.Fatalf("archive older: %v", err)
+	}
+	if err := storeOrderForTest(archie, newer, epochIdx+1, epochDur, order.OrderStatusExecuted); err != nil {
+		t.Fatalf("store newer archived: %v", err)
+	}
+
+	got, err = archie.OrdersWithCommit(ctx, base, quote, commit, older.ServerTime)
+	if err != nil {
+		t.Fatalf("both archived: %v", err)
+	}
+	requireIDs(got,
+		db.CommitOrder{Order: older, Status: order.OrderStatusExecuted},
+		db.CommitOrder{Order: newer, Status: order.OrderStatusExecuted},
+	)
+
+	got, err = archie.OrdersWithCommit(ctx, base, quote, commit, newer.ServerTime)
+	if err != nil {
+		t.Fatalf("cutoff lookup: %v", err)
+	}
+	requireIDs(got, db.CommitOrder{Order: newer, Status: order.OrderStatusExecuted})
+
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	older = newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	active := newLimitOrder(false, 4_900_000, 2, order.StandingTiF, 10)
+	active.Commit = older.Commit
+	base, quote, commit = older.Base(), older.Quote(), older.Commit
+	if err := storeOrderForTest(archie, older, epochIdx, epochDur, order.OrderStatusExecuted); err != nil {
+		t.Fatalf("store archived life: %v", err)
+	}
+	if err := storeOrderForTest(archie, active, epochIdx+1, epochDur, order.OrderStatusEpoch); err != nil {
+		t.Fatalf("store active life: %v", err)
+	}
+	got, err = archie.OrdersWithCommit(ctx, base, quote, commit, older.ServerTime)
+	if err != nil {
+		t.Fatalf("active plus archived: %v", err)
+	}
+	requireIDs(got,
+		db.CommitOrder{Order: active, Status: order.OrderStatusEpoch},
+		db.CommitOrder{Order: older, Status: order.OrderStatusExecuted},
+	)
+}
+
+func TestApplyOrderAcceptedEventRejectsPendingSuspendBoundary(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const (
+		finalEpochIdx = 13245678
+		epochDur      = 6000
+	)
+	persistBook := true
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		Market:          "dcr_btc",
+		State:           db.MarketStateRunning,
+		StartEpochIdx:   finalEpochIdx - 10,
+		StartEpochDur:   epochDur,
+		FinalEpochIdx:   finalEpochIdx,
+		FinalEpochDur:   epochDur,
+		PendingAction:   db.MarketPendingSuspend,
+		PendingEpochIdx: finalEpochIdx,
+		PendingEpochDur: epochDur,
+		PersistBook:     &persistBook,
+	})
+
+	ord := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	ord.SetTime(time.UnixMilli((finalEpochIdx + 1) * epochDur))
+	update := &db.OrderAcceptedUpdate{
+		Order:    ord,
+		EpochIdx: finalEpochIdx,
+		EpochDur: epochDur,
+		EpochGap: db.EpochGapNA,
+	}
+	_, err := archie.ApplyOrderAcceptedEvent(ctx, &db.EventLogMeta{
+		Event: []byte("order-accepted-boundary"),
+	}, update)
+	if err == nil {
+		t.Fatalf("ApplyOrderAcceptedEvent succeeded for boundary-stamped order")
+	}
+	if _, status, err := archie.Order(ord.ID(), ord.Base(), ord.Quote()); err == nil || status != order.OrderStatusUnknown {
+		t.Fatalf("boundary order status = %v, err = %v, want unknown order", status, err)
+	}
+	frontier, err := archie.EventLogFrontier(ctx)
+	if err != nil {
+		t.Fatalf("EventLogFrontier error: %v", err)
+	}
+	if frontier.Seq != 0 || len(frontier.TipHash) != 0 {
+		t.Fatalf("frontier = (%d, %x), want empty", frontier.Seq, frontier.TipHash)
+	}
+}
+
+func TestApplyAdvanceEpochEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	update := &db.AdvanceEpochUpdate{
+		Market:         "dcr_btc",
+		ClosedEpochIdx: 42,
+		OpenedEpochIdx: 43,
+		EpochDur:       6000,
+		ClosedOrderIDs: []order.OrderID{randomOrderID()},
+	}
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		Market:            update.Market,
+		State:             db.MarketStateRunning,
+		StartEpochIdx:     update.ClosedEpochIdx,
+		StartEpochDur:     update.EpochDur,
+		PendingAction:     db.MarketPendingNone,
+		ActiveEpochIdx:    update.ClosedEpochIdx,
+		ProcessedEpochIdx: update.ClosedEpochIdx - 1,
+	})
+
+	// advance_epoch records the authoritative transition event and moves the
+	// lifecycle row's active epoch cursor so a restarting node can rebuild its
+	// epoch memory from storage alone.
+	event := []byte("advance-epoch-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindAdvanceEpoch, event, update)
+	log, err := archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{Event: event}, update)
+	if err != nil {
+		t.Fatalf("ApplyAdvanceEpochEvent error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindAdvanceEpoch, event, tip, update)
+	assertEventLogFrontier(t, 1, tip)
+	lc, err := archie.MarketLifecycle(update.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle error: %v", err)
+	}
+	if lc.ActiveEpochIdx != update.OpenedEpochIdx {
+		t.Fatalf("active epoch cursor = %d, want %d", lc.ActiveEpochIdx, update.OpenedEpochIdx)
+	}
+
+	// An advance closing an epoch other than the cursor is rejected: every
+	// event that moves the current epoch must move the cursor with it, so a
+	// mismatch means cursor maintenance is broken.
+	stale := *update
+	stale.ClosedEpochIdx, stale.OpenedEpochIdx = 42, 43
+	if _, err := archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{
+		Seq:   2,
+		Event: []byte("advance-epoch-stale"),
+	}, &stale); err == nil {
+		t.Fatalf("ApplyAdvanceEpochEvent accepted a closed epoch behind the cursor")
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	// A wrong expected tip on a state-consistent event (the shape of a real
+	// fork: identical committed prefix, divergent next event) rejects the
+	// append and leaves the frontier pinned at the last committed event.
+	forked := *update
+	forked.ClosedEpochIdx, forked.OpenedEpochIdx = 43, 44
+	_, err = archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("advance-epoch-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, &forked)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyAdvanceEpochEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	assertEventLogFrontier(t, 1, tip)
+	// The rolled-back divergent apply must not have moved the cursor.
+	lc, err = archie.MarketLifecycle(update.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle error: %v", err)
+	}
+	if lc.ActiveEpochIdx != update.OpenedEpochIdx {
+		t.Fatalf("active epoch cursor after rollback = %d, want %d", lc.ActiveEpochIdx, update.OpenedEpochIdx)
+	}
+}
+
+// TestApplyEpochProcessedPreimageOutcomes applies an epoch_processed event's
+// preimage outcomes under suspend-drain for a pre-final epoch — the
+// pipelined-straggler case the drain gate must accept (an epoch's close can
+// land after the final close parks the lifecycle row in drain).
+func TestApplyEpochProcessedPreimageOutcomes(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const epochIdx, epochDur int64 = 13245678, 6000
+	persist := true
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		Market:          "dcr_btc",
+		State:           db.MarketStateRunning,
+		StartEpochIdx:   epochIdx,
+		StartEpochDur:   epochDur,
+		FinalEpochIdx:   epochIdx + 1,
+		FinalEpochDur:   epochDur,
+		PendingAction:   db.MarketPendingSuspendDrain,
+		PendingEpochIdx: epochIdx + 1,
+		PendingEpochDur: epochDur,
+		PersistBook:     &persist,
+		// Neither the straggler epoch nor the final epoch is processed yet.
+		ProcessedEpochIdx: epochIdx - 1,
+	})
+	revealed, pi := newLimitOrderRevealed(false, 4_900_000, 1, order.StandingTiF, 0)
+	missed, _ := newLimitOrderRevealed(true, 4_800_000, 1, order.StandingTiF, 10)
+	for _, ord := range []order.Order{revealed, missed} {
+		if err := storeOrderForTest(archie, ord, epochIdx, epochDur, order.OrderStatusEpoch); err != nil {
+			t.Fatalf("StoreOrder %v error: %v", ord.ID(), err)
+		}
+	}
+
+	epochEnd := time.UnixMilli(1670000000000).UTC()
+	revokeTime := epochEnd.Add(500 * time.Millisecond)
+	epochResults := func(idx int64) *db.EpochResults {
+		return &db.EpochResults{
+			MktBase:   AssetDCR,
+			MktQuote:  AssetBTC,
+			Idx:       idx,
+			Dur:       epochDur,
+			MatchTime: epochEnd.UnixMilli(),
+			CSum:      []byte{0x0c},
+			Seed:      []byte{0x5e},
+		}
+	}
+	update := &db.EpochProcessedUpdate{
+		Epoch: epochResults(epochIdx),
+		Misses: []*db.PreimageMissUpdate{{
+			Order:      missed,
+			RevokeTime: revokeTime,
+		}},
+		Reveals: []*db.PreimageRevealUpdate{{
+			Order:    revealed,
+			Preimage: pi,
+		}},
+		// Every epoch order must leave epoch status in the close.
+		TradesBooked: []*order.LimitOrder{revealed},
+	}
+
+	// Apply one event and verify its durable DB effects.
+	event := []byte("epoch-processed-event")
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, OrderLimit: 1}
+	logEntry, err := archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{Event: event}, policy, update)
+	if err != nil {
+		t.Fatalf("ApplyEpochProcessedEvent error: %v", err)
+	}
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindEpochProcessed, event, update)
+	requireEventApplyLog(t, logEntry, 1, meshevents.EventKindEpochProcessed, event, tip, update)
+	assertEventLogFrontier(t, 1, tip)
+
+	// Reveals store preimages; misses revoke the order.
+	gotPI, err := archie.OrderPreimage(revealed)
+	if err != nil {
+		t.Fatalf("OrderPreimage error: %v", err)
+	}
+	if gotPI != pi {
+		t.Fatalf("stored preimage = %x, want %x", gotPI, pi)
+	}
+	if _, status, err := archie.Order(missed.ID(), missed.Base(), missed.Quote()); err != nil || status != order.OrderStatusRevoked {
+		t.Fatalf("missed order status = %v, err = %v, want revoked", status, err)
+	}
+
+	// The event facts are translated into reputation outcomes by the DB layer.
+	missedPimgs, _, missedOrds, err := archie.GetUserReputationData(ctx, missed.User(), 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData missed user error: %v", err)
+	}
+	if len(missedPimgs) != 1 || !missedPimgs[0].Miss || len(missedOrds) != 1 || missedOrds[0].Canceled {
+		t.Fatalf("missed user reputation data pimgs=%+v ords=%+v, want miss and non-canceled revoke", missedPimgs, missedOrds)
+	}
+	revealPimgs, _, revealOrds, err := archie.GetUserReputationData(ctx, revealed.User(), 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData revealed user error: %v", err)
+	}
+	if len(revealPimgs) != 1 || revealPimgs[0].Miss || len(revealOrds) != 0 {
+		t.Fatalf("revealed user reputation data pimgs=%+v ords=%+v, want one success preimage only", revealPimgs, revealOrds)
+	}
+
+	// A close that leaves one of the epoch's orders in epoch status is
+	// rejected, and the rejection commits nothing.
+	strandedOrd, strandedPI := newLimitOrderRevealed(false, 5_100_000, 1, order.StandingTiF, 30)
+	omitted, _ := newLimitOrderRevealed(true, 5_200_000, 1, order.StandingTiF, 40)
+	for _, ord := range []order.Order{strandedOrd, omitted} {
+		if err := storeOrderForTest(archie, ord, epochIdx+1, epochDur, order.OrderStatusEpoch); err != nil {
+			t.Fatalf("StoreOrder %v error: %v", ord.ID(), err)
+		}
+	}
+	incompleteUpdate := &db.EpochProcessedUpdate{
+		Epoch: epochResults(epochIdx + 1),
+		Reveals: []*db.PreimageRevealUpdate{{
+			Order:    strandedOrd,
+			Preimage: strandedPI,
+		}},
+		TradesBooked: []*order.LimitOrder{strandedOrd},
+		// The omitted order has no disposition.
+	}
+	_, err = archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{Seq: 2, Event: []byte("epoch-processed-incomplete")},
+		policy, incompleteUpdate)
+	if err == nil || !strings.Contains(err.Error(), "in epoch status") {
+		t.Fatalf("incomplete close error = %v, want epoch-status rejection", err)
+	}
+	if pgStatus, _, _, err := archie.orderStatusByID(strandedOrd.ID(), strandedOrd.Base(), strandedOrd.Quote()); err != nil || pgStatus != orderStatusEpoch {
+		t.Fatalf("revealed order pg status after rejected close = %v (err %v), want unchanged epoch status", pgStatus, err)
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	// A divergent log append rolls back all DB work staged in the transaction.
+	rollbackUpdate := &db.EpochProcessedUpdate{
+		Epoch: epochResults(epochIdx + 1),
+		Misses: []*db.PreimageMissUpdate{{
+			Order:      omitted,
+			RevokeTime: revokeTime,
+		}},
+		Reveals: []*db.PreimageRevealUpdate{{
+			Order:    strandedOrd,
+			Preimage: strandedPI,
+		}},
+		TradesBooked: []*order.LimitOrder{strandedOrd},
+	}
+	_, err = archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("epoch-processed-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, policy, rollbackUpdate)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyEpochProcessedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	if gotPI, err := archie.OrderPreimage(strandedOrd); err == nil && gotPI == strandedPI {
+		t.Fatalf("rollback reveal preimage = %x, want not committed", gotPI)
+	}
+	assertEventLogFrontier(t, 1, tip)
 }
 
 func TestBookOrder(t *testing.T) {
@@ -224,15 +812,15 @@ func TestBookOrder(t *testing.T) {
 
 	// Store standing limit order in epoch status.
 	lo := newLimitOrder(true, 4200000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusEpoch)
+	err := storeOrderForTest(archie, lo, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Book the same limit order.
-	err = archie.BookOrder(lo)
+	err = archie.updateOrderStatusWithExecutor(archie.db, lo, orderStatusBooked)
 	if err != nil {
-		t.Fatalf("BookOrder failed: %v", err)
+		t.Fatalf("book status update failed: %v", err)
 	}
 }
 
@@ -248,15 +836,15 @@ func TestExecuteOrder(t *testing.T) {
 
 	// Store standing limit order in executed status.
 	lo := newLimitOrder(true, 4200000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusExecuted)
+	err := storeOrderForTest(archie, lo, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Execute the same limit order.
-	err = archie.ExecuteOrder(lo)
+	err = archie.updateOrderStatusWithExecutor(archie.db, lo, orderStatusExecuted)
 	if err != nil {
-		t.Fatalf("BookOrder failed: %v", err)
+		t.Fatalf("executed status update failed: %v", err)
 	}
 }
 
@@ -268,22 +856,22 @@ func TestCancelOrder(t *testing.T) {
 	// Standing limit == OK
 	var epochIdx, epochDur int64 = 13245678, 6000
 	lo := newLimitOrder(false, 4800000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusBooked)
+	err := storeOrderForTest(archie, lo, epochIdx, epochDur, order.OrderStatusBooked)
 	if err != nil {
 		t.Fatalf("BookOrder failed: %v", err)
 	}
 
-	// Execute the same limit order.
-	err = archie.CancelOrder(lo)
+	// Cancel the same limit order.
+	err = archie.updateOrderStatusWithExecutor(archie.db, lo, orderStatusCanceled)
 	if err != nil {
-		t.Fatalf("CancelOrder failed: %v", err)
+		t.Fatalf("canceled status update failed: %v", err)
 	}
 
 	// Cancel an order not in the tables yet
 	lo2 := newLimitOrder(true, 4600000, 1, order.StandingTiF, 0)
-	err = archie.CancelOrder(lo2)
+	err = archie.updateOrderStatusWithExecutor(archie.db, lo2, orderStatusCanceled)
 	if !db.IsErrOrderUnknown(err) {
-		t.Fatalf("CancelOrder should have failed for unknown order.")
+		t.Fatalf("canceled status update should have failed for unknown order.")
 	}
 }
 
@@ -295,15 +883,15 @@ func TestRevokeOrder(t *testing.T) {
 	// Standing limit == OK
 	var epochIdx, epochDur int64 = 13245678, 6000
 	lo := newLimitOrder(false, 4800000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusBooked)
+	err := storeOrderForTest(archie, lo, epochIdx, epochDur, order.OrderStatusBooked)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Revoke the same limit order.
-	cancelID, timeStamp, err := archie.RevokeOrder(lo)
+	cancelID, timeStamp, err := revokeOrderForTest(lo, false)
 	if err != nil {
-		t.Fatalf("RevokeOrder failed: %v", err)
+		t.Fatalf("revokeOrder failed: %v", err)
 	}
 
 	// Check for the server-generated cancel order.
@@ -318,10 +906,10 @@ func TestRevokeOrder(t *testing.T) {
 	if !ok {
 		t.Fatalf("not a cancel order")
 	}
-	if coT.ClientTime != timeStamp {
+	if !coT.ClientTime.Equal(timeStamp) {
 		t.Errorf("got ClientTime %v, expected %v", coT.ClientTime, timeStamp)
 	}
-	if coT.ServerTime != timeStamp {
+	if !coT.ServerTime.Equal(timeStamp) {
 		t.Errorf("got ServerTime %v, expected %v", coT.ServerTime, timeStamp)
 	}
 	if coStatus != order.OrderStatusRevoked {
@@ -334,14 +922,14 @@ func TestRevokeOrder(t *testing.T) {
 	// Market orders may be revoked too, while swap is in progress.
 	// NOTE: executed -> revoked status change may be odd.
 	mo := newMarketSellOrder(1, 0)
-	err = archie.StoreOrder(mo, epochIdx, epochDur, order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, mo, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
-	cancelID, timeStamp, err = archie.RevokeOrderUncounted(mo)
+	cancelID, timeStamp, err = revokeOrderForTest(mo, true)
 	if err != nil {
-		t.Fatalf("RevokeOrder failed: %v", err)
+		t.Fatalf("revokeOrder (uncounted) failed: %v", err)
 	}
 
 	co, coStatus, err = archie.Order(cancelID, mo.BaseAsset, mo.QuoteAsset)
@@ -355,10 +943,10 @@ func TestRevokeOrder(t *testing.T) {
 	if !ok {
 		t.Fatalf("not a cancel order")
 	}
-	if coT.ClientTime != timeStamp {
+	if !coT.ClientTime.Equal(timeStamp) {
 		t.Errorf("got ClientTime %v, expected %v", coT.ClientTime, timeStamp)
 	}
-	if coT.ServerTime != timeStamp {
+	if !coT.ServerTime.Equal(timeStamp) {
 		t.Errorf("got ServerTime %v, expected %v", coT.ServerTime, timeStamp)
 	}
 	if coStatus != order.OrderStatusRevoked {
@@ -370,139 +958,9 @@ func TestRevokeOrder(t *testing.T) {
 
 	// Revoke an order not in the tables yet
 	lo2 := newLimitOrder(true, 4600000, 1, order.StandingTiF, 0)
-	_, _, err = archie.RevokeOrder(lo2)
+	_, _, err = revokeOrderForTest(lo2, false)
 	if !db.IsErrOrderUnknown(err) {
-		t.Fatalf("RevokeOrder should have failed for unknown order.")
-	}
-}
-
-func TestFlushBook(t *testing.T) {
-	if err := cleanTables(archie.db); err != nil {
-		t.Fatalf("cleanTables: %v", err)
-	}
-
-	// Standing limit == OK as booked
-	var epochIdx, epochDur int64 = 13245678, 6000
-	lo := newLimitOrder(false, 4800000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusBooked)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	// A not booked order.
-	mo := newMarketSellOrder(1, 0)
-	mo.AccountID = lo.AccountID
-	err = archie.StoreOrder(mo, epochIdx, epochDur, order.OrderStatusExecuted)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	sellsRemoved, buysRemoved, err := archie.FlushBook(lo.BaseAsset, lo.QuoteAsset)
-	if err != nil {
-		t.Fatalf("FlushBook failed: %v", err)
-	}
-	if len(sellsRemoved) != 0 {
-		t.Fatalf("flushed %d book sell orders, expected 0", len(sellsRemoved))
-	}
-	if len(buysRemoved) != 1 {
-		t.Fatalf("flushed %d book buy orders, expected 1", len(buysRemoved))
-	}
-	if buysRemoved[0] != lo.ID() {
-		t.Errorf("flushed sell order has ID %v, expected %v", buysRemoved[0], lo.ID())
-	}
-
-	// Check for new status of the order.
-	loNow, loStatus, err := archie.Order(lo.ID(), lo.BaseAsset, lo.QuoteAsset)
-	if err != nil {
-		t.Fatalf("Failed to locate order: %v", err)
-	}
-	if loNow.ID() != lo.ID() {
-		t.Errorf("incorrect order ID retrieved")
-	}
-	_, ok := loNow.(*order.LimitOrder)
-	if !ok {
-		t.Fatalf("not a limit order")
-	}
-	if loStatus != order.OrderStatusRevoked {
-		t.Errorf("got order status %v, expected %v", loStatus, order.OrderStatusRevoked)
-	}
-
-	ordersOut, _, err := archie.UserOrders(context.Background(), lo.User(), lo.BaseAsset, lo.QuoteAsset)
-	if err != nil {
-		t.Fatalf("UserOrders failed: %v", err)
-	}
-
-	wantNumOrders := 2 // market and limit
-	if len(ordersOut) != wantNumOrders {
-		t.Fatalf("got %d user orders, expected %d", len(ordersOut), wantNumOrders)
-	}
-
-	cancels, err := archie.ExecutedCancelsForUser(lo.User(), cancelThreshWindow)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	// ExecutedCancelsForUser should not find the (exempt) cancels created by
-	// FlushBook.
-	if len(cancels) != 0 {
-		t.Fatalf("got %d cancels, expected 0", len(cancels))
-	}
-
-	// Query for the revoke associated cancels without the exemption filter.
-	cancelTableName := fullCancelOrderTableName(archie.dbName, mktInfo.Name, false)
-	stmt := fmt.Sprintf(internal.SelectRevokeCancels, cancelTableName)
-	rows, err := archie.db.QueryContext(context.Background(), stmt, lo.User(), orderStatusRevoked, cancelThreshWindow)
-	if err != nil {
-		t.Fatalf("QueryContext failed: %v", err)
-	}
-
-	var ords []*db.CancelRecord
-	for rows.Next() {
-		var oid, target order.OrderID
-		var revokeTime time.Time
-		var epochIdx int64
-		err = rows.Scan(&oid, &target, &revokeTime, &epochIdx)
-		if err != nil {
-			rows.Close()
-			t.Fatalf("rows Scan failed")
-		}
-
-		if epochIdx != exemptEpochIdx {
-			t.Errorf("got epoch index %d, expected %d", epochIdx, exemptEpochIdx)
-		}
-
-		ords = append(ords, &db.CancelRecord{
-			ID:        oid,
-			TargetID:  target,
-			MatchTime: revokeTime.UnixMilli(),
-		})
-	}
-
-	if err = rows.Err(); err != nil {
-		t.Fatalf("rows Scan failed")
-	}
-
-	if len(ords) != 1 {
-		t.Fatalf("found %d cancels, wanted 1", len(ords))
-	}
-
-	if ords[0].TargetID != lo.ID() {
-		t.Fatalf("cancel order is targeting %v, expected %v", ords[0].TargetID, lo.ID())
-	}
-
-	// Ensure market order is still there.
-	moNow, moStatus, err := archie.Order(mo.ID(), mo.BaseAsset, mo.QuoteAsset)
-	if err != nil {
-		t.Fatalf("Failed to locate order: %v", err)
-	}
-	if moNow.ID() != mo.ID() {
-		t.Errorf("incorrect order ID retrieved")
-	}
-	_, ok = moNow.(*order.MarketOrder)
-	if !ok {
-		t.Fatalf("not a market order")
-	}
-	if moStatus != order.OrderStatusExecuted {
-		t.Errorf("got order status %v, expected %v", loStatus, order.OrderStatusExecuted)
+		t.Fatalf("revokeOrder should have failed for unknown order.")
 	}
 }
 
@@ -541,7 +999,7 @@ func TestStoreLoadLimitOrderActive(t *testing.T) {
 
 	oid, base, quote := ordIn.ID(), ordIn.BaseAsset, ordIn.QuoteAsset
 
-	err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+	err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -581,7 +1039,7 @@ func TestStoreLoadLimitOrderArchived(t *testing.T) {
 
 	oid, base, quote := ordIn.ID(), ordIn.BaseAsset, ordIn.QuoteAsset
 
-	err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+	err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -621,7 +1079,7 @@ func TestStoreLoadMarketOrderActive(t *testing.T) {
 
 	oid, base, quote := ordIn.ID(), ordIn.BaseAsset, ordIn.QuoteAsset
 
-	err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+	err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -666,7 +1124,7 @@ func TestStoreLoadCancelOrder(t *testing.T) {
 
 	oid, base, quote := ordIn.ID(), ordIn.BaseAsset, ordIn.QuoteAsset
 
-	err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+	err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -771,7 +1229,7 @@ func TestActiveOrderCoins(t *testing.T) {
 	for i := range orderStatuses {
 		ordIn := orderStatuses[i].ord
 		statusIn := orderStatuses[i].status
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+		err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 		if err != nil {
 			t.Fatalf("StoreOrder failed: %v", err)
 		}
@@ -907,7 +1365,7 @@ func TestOrderStatus(t *testing.T) {
 		ordIn := orderStatuses[i].ord
 		trade := ordIn.Trade()
 		statusIn := orderStatuses[i].status
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+		err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 		if err != nil {
 			t.Fatalf("StoreOrder failed: %v", err)
 		}
@@ -952,7 +1410,7 @@ func TestCancelOrderStatus(t *testing.T) {
 
 	//oid, base, quote := ordIn.ID(), ordIn.BaseAsset, ordIn.QuoteAsset
 
-	err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+	err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -985,7 +1443,7 @@ func TestUpdateOrderUnknown(t *testing.T) {
 
 	ord := newLimitOrder(false, 4900000, 1, order.StandingTiF, 0) // not stored
 
-	err := archie.UpdateOrderStatus(ord, order.OrderStatusExecuted)
+	err := archie.updateOrderStatusWithExecutor(archie.db, ord, orderStatusExecuted)
 	if err == nil {
 		t.Fatalf("UpdateOrder succeeded to update nonexistent order!")
 	}
@@ -1077,7 +1535,7 @@ func TestUpdateOrder(t *testing.T) {
 	for i := range orderStatuses {
 		ordIn := orderStatuses[i].ord
 		statusIn := orderStatuses[i].status
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+		err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 		if err != nil {
 			t.Fatalf("StoreOrder failed: %v", err)
 		}
@@ -1090,9 +1548,9 @@ func TestUpdateOrder(t *testing.T) {
 		}
 
 		newStatus := orderStatuses[i].newStatus
-		err = archie.UpdateOrderStatus(ordIn, newStatus)
+		err = archie.updateOrderStatusWithExecutor(archie.db, ordIn, marketToPgStatus(newStatus))
 		if (err != nil) != orderStatuses[i].wantErr {
-			t.Fatalf("UpdateOrderStatus(%d:%v, %s) failed: %v", i, ordIn, newStatus, err)
+			t.Fatalf("updateOrderStatusWithExecutor(%d:%v, %s) failed: %v", i, ordIn, newStatus, err)
 		}
 	}
 }
@@ -1109,14 +1567,14 @@ func TestStorePreimage(t *testing.T) {
 	copy(targetOrderID[:], orderID0)
 
 	lo, pi := newLimitOrderRevealed(false, 4900000, 1, order.StandingTiF, 0)
-	err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusEpoch)
+	err := storeOrderForTest(archie, lo, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
-	err = archie.StorePreimage(lo, pi)
+	err = archie.storePreimage(archie.db, lo, pi)
 	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
+		t.Fatalf("storePreimage failed: %v", err)
 	}
 
 	piOut, err := archie.OrderPreimage(lo)
@@ -1130,7 +1588,7 @@ func TestStorePreimage(t *testing.T) {
 
 	// Now test OrderPreimage when preimage is NULL.
 	lo2, _ := newLimitOrderRevealed(false, 4900000, 1, order.StandingTiF, 0)
-	err = archie.StoreOrder(lo2, epochIdx, epochDur, order.OrderStatusEpoch)
+	err = storeOrderForTest(archie, lo2, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1157,14 +1615,14 @@ func TestFailCancelOrder(t *testing.T) {
 	copy(targetOrderID[:], orderID0)
 
 	co := newCancelOrder(targetOrderID, mktInfo.Base, mktInfo.Quote, 1)
-	err := archie.StoreOrder(co, epochIdx, epochDur, order.OrderStatusEpoch)
+	err := storeOrderForTest(archie, co, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
-	err = archie.FailCancelOrder(co)
+	err = archie.updateOrderStatusWithExecutor(archie.db, co, orderStatusFailed)
 	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
+		t.Fatalf("failed status update failed: %v", err)
 	}
 	_, status, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, co.ID())
 	if err != nil {
@@ -1217,128 +1675,21 @@ func TestUpdateOrderFilled(t *testing.T) {
 	for i := range orderStatuses {
 		ordIn := orderStatuses[i].ord
 		statusIn := orderStatuses[i].status
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+		err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 		if err != nil {
 			t.Fatalf("StoreOrder failed: %v", err)
 		}
 
 		ordIn.FillAmt = orderStatuses[i].newFilled
 
-		err = archie.UpdateOrderFilled(ordIn)
+		err = archie.updateOrderFilledByIDWithExecutor(archie.db, ordIn.ID(),
+			ordIn.Base(), ordIn.Quote(), int64(ordIn.Trade().Filled()))
 		if (err != nil) != orderStatuses[i].wantUpdateErr {
-			t.Fatalf("UpdateOrderFilled(%d:%v) failed: %v", i, ordIn, err)
+			t.Fatalf("updateOrderFilledByIDWithExecutor(%d:%v) failed: %v", i, ordIn, err)
 		}
 	}
 }
 
-func TestUserOrders(t *testing.T) {
-	if err := cleanTables(archie.db); err != nil {
-		t.Fatalf("cleanTables: %v", err)
-	}
-
-	var epochIdx, epochDur int64 = 13245678, 6000
-
-	limitSell := newLimitOrder(true, 4900000, 1, order.StandingTiF, 0)
-	limitBuy := newLimitOrder(false, 4100000, 1, order.StandingTiF, 0)
-	marketSell := newMarketSellOrder(2, 0)
-	marketBuy := newMarketBuyOrder(2000000000, 0)
-
-	// Make all of the above orders belong to the same user.
-	aid := limitSell.AccountID
-	limitBuy.AccountID = aid
-	limitBuy.AccountID = aid
-	marketSell.AccountID = aid
-	marketBuy.AccountID = aid
-
-	marketSellOtherGuy := newMarketSellOrder(2, 0)
-	marketSellOtherGuy.Address = "1MUz4VMYui5qY1mxUiG8BQ1Luv6tqkvaiL"
-
-	orderStatuses := []struct {
-		ord     order.Order
-		status  order.OrderStatus
-		ordType order.OrderType
-		wantErr bool
-	}{
-		{
-			limitSell,
-			order.OrderStatusBooked, // active
-			order.LimitOrderType,
-			false,
-		},
-		{
-			limitBuy,
-			order.OrderStatusCanceled, // archived
-			order.LimitOrderType,
-			false,
-		},
-		{
-			marketSell,
-			order.OrderStatusEpoch, // active
-			order.MarketOrderType,
-			false,
-		},
-		{
-			marketBuy,
-			order.OrderStatusExecuted, // archived
-			order.MarketOrderType,
-			false,
-		},
-		{
-			marketSellOtherGuy,
-			order.OrderStatusExecuted, // archived
-			order.MarketOrderType,
-			false,
-		},
-	}
-
-	for i := range orderStatuses {
-		ordIn := orderStatuses[i].ord
-		statusIn := orderStatuses[i].status
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
-		if err != nil {
-			t.Fatalf("StoreOrder failed: %v", err)
-		}
-	}
-
-	ordersOut, statusesOut, err := archie.UserOrders(context.Background(), aid, mktInfo.Base, mktInfo.Quote)
-	if err != nil {
-		t.Error(err)
-	}
-
-	if len(ordersOut) != len(statusesOut) {
-		t.Errorf("UserOrders returned %d orders, but %d order status. Should be equal.",
-			len(ordersOut), len(statusesOut))
-	}
-
-	numOrdersForGuy0 := len(orderStatuses) - 1
-	if len(ordersOut) != numOrdersForGuy0 {
-		t.Errorf("incorrect number of orders for user %d retrieved. "+
-			"got %d, expected %d", aid, len(ordersOut), numOrdersForGuy0)
-	}
-
-	findExpected := func(ord order.Order) int {
-		for i := range orderStatuses {
-			if orderStatuses[i].ord.ID() == ord.ID() {
-				return i
-			}
-		}
-		return -1
-	}
-
-	for i := range ordersOut {
-		j := findExpected(ordersOut[i])
-		if j == -1 {
-			t.Errorf("failed to find order %v", ordersOut[i])
-			continue
-		}
-		if ordersOut[i].Type() != orderStatuses[j].ordType {
-			t.Errorf("wrong type %v, wanted %v", ordersOut[i].Type(), orderStatuses[j].ordType)
-		}
-		if statusesOut[i] != orderStatuses[j].status {
-			t.Errorf("wrong status %v, wanted %v", statusesOut[i], orderStatuses[j].status)
-		}
-	}
-}
 func TestUserOrderStatuses(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
@@ -1394,7 +1745,7 @@ func TestUserOrderStatuses(t *testing.T) {
 			lo.BaseAsset, lo.QuoteAsset = AssetBTC, AssetLTC // swap the assets to test across different mkts
 		}
 		ordIn.Prefix().AccountID = accountID
-		err := archie.StoreOrder(ordIn, epochIdx, epochDur, statusIn)
+		err := storeOrderForTest(archie, ordIn, epochIdx, epochDur, statusIn)
 		if err != nil {
 			t.Fatalf("StoreOrder failed: %v", err)
 		}
@@ -1471,11 +1822,11 @@ func TestActiveUserOrderStatuses(t *testing.T) {
 	taker := newLimitOrder(true, 4490000, 1, order.StandingTiF, 10)
 
 	var epochIdx, epochDur int64 = 13245678, 6000
-	err := archie.StoreOrder(maker, epochIdx, epochDur, order.OrderStatusBooked)
+	err := storeOrderForTest(archie, maker, epochIdx, epochDur, order.OrderStatusBooked)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
-	err = archie.StoreOrder(taker, epochIdx, epochDur, order.OrderStatusBooked)
+	err = storeOrderForTest(archie, taker, epochIdx, epochDur, order.OrderStatusBooked)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1485,7 +1836,7 @@ func TestActiveUserOrderStatuses(t *testing.T) {
 	maker2.AccountID = maker.AccountID
 
 	// Store it.
-	err = archie.StoreOrder(maker2, epochIdx, epochDur, order.OrderStatusEpoch)
+	err = storeOrderForTest(archie, maker2, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1497,7 +1848,7 @@ func TestActiveUserOrderStatuses(t *testing.T) {
 	taker2.AccountID = taker.AccountID
 
 	// Store it.
-	err = archie.StoreOrder(taker2, epochIdx, epochDur, order.OrderStatusEpoch)
+	err = storeOrderForTest(archie, taker2, epochIdx, epochDur, order.OrderStatusEpoch)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1505,7 +1856,7 @@ func TestActiveUserOrderStatuses(t *testing.T) {
 	// Store cancel order for taker account.
 	taker2Incomplete := newLimitOrder(true, 4390000, 1, order.StandingTiF, 20)
 	taker2Incomplete.AccountID = taker.AccountID
-	err = archie.StoreOrder(taker2Incomplete, epochIdx, epochDur, order.OrderStatusCanceled)
+	err = storeOrderForTest(archie, taker2Incomplete, epochIdx, epochDur, order.OrderStatusCanceled)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1594,24 +1945,24 @@ func TestCompletedUserOrders(t *testing.T) {
 	taker := newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
 
 	var epochIdx, epochDur int64 = 13245678, 6000
-	err := archie.StoreOrder(maker, epochIdx, epochDur, order.OrderStatusExecuted)
+	err := storeOrderForTest(archie, maker, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
-	err = archie.StoreOrder(taker, epochIdx, epochDur, order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, taker, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Set the orders' swap completion times.
 	tSwapDoneMaker := nowMs()
-	if err = archie.SetOrderCompleteTime(maker, tSwapDoneMaker); err != nil {
-		t.Fatalf("SetOrderCompleteTime failed: %v", err)
+	if err = archie.setOrderCompleteTime(archie.db, maker, tSwapDoneMaker); err != nil {
+		t.Fatalf("setOrderCompleteTime failed: %v", err)
 	}
 
 	tSwapDoneTaker := tSwapDoneMaker + 10
-	if err = archie.SetOrderCompleteTime(taker, tSwapDoneTaker); err != nil {
-		t.Fatalf("SetOrderCompleteTime failed: %v", err)
+	if err = archie.setOrderCompleteTime(archie.db, taker, tSwapDoneTaker); err != nil {
+		t.Fatalf("setOrderCompleteTime failed: %v", err)
 	}
 
 	// Second order from the same maker account.
@@ -1619,14 +1970,14 @@ func TestCompletedUserOrders(t *testing.T) {
 	maker2.AccountID = maker.AccountID
 
 	// Store it.
-	err = archie.StoreOrder(maker2, epochIdx, epochDur, order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, maker2, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 	// Set swap complete time.
 	tSwapDoneMaker2 := nowMs()
-	if err = archie.SetOrderCompleteTime(maker2, tSwapDoneMaker2); err != nil {
-		t.Fatalf("SetOrderCompleteTime failed: %v", err)
+	if err = archie.setOrderCompleteTime(archie.db, maker2, tSwapDoneMaker2); err != nil {
+		t.Fatalf("setOrderCompleteTime failed: %v", err)
 	}
 
 	// Same taker account, different market (BTC-LTC).
@@ -1636,21 +1987,21 @@ func TestCompletedUserOrders(t *testing.T) {
 	taker2.AccountID = taker.AccountID
 
 	// Store it.
-	err = archie.StoreOrder(taker2, epochIdx, epochDur, order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, taker2, epochIdx, epochDur, order.OrderStatusExecuted)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Set swap complete time.
 	tSwapDoneTaker2 := nowMs()
-	if err = archie.SetOrderCompleteTime(taker2, tSwapDoneTaker2); err != nil {
-		t.Fatalf("SetOrderCompleteTime failed: %v", err)
+	if err = archie.setOrderCompleteTime(archie.db, taker2, tSwapDoneTaker2); err != nil {
+		t.Fatalf("setOrderCompleteTime failed: %v", err)
 	}
 
 	// Order without completion time set.
 	taker2Incomplete := newLimitOrder(true, 4390000, 1, order.StandingTiF, 20)
 	taker2Incomplete.AccountID = taker.AccountID
-	err = archie.StoreOrder(taker2Incomplete, epochIdx, epochDur, order.OrderStatusCanceled) // archived, but not complete
+	err = storeOrderForTest(archie, taker2Incomplete, epochIdx, epochDur, order.OrderStatusCanceled) // archived, but not complete
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
@@ -1658,15 +2009,15 @@ func TestCompletedUserOrders(t *testing.T) {
 
 	// Try and fail to set completion time for an order not in executed status.
 	taker3 := newLimitOrder(true, 4390000, 1, order.StandingTiF, 20)
-	err = archie.StoreOrder(taker3, epochIdx, epochDur, order.OrderStatusBooked)
+	err = storeOrderForTest(archie, taker3, epochIdx, epochDur, order.OrderStatusBooked)
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
 
 	// Set swap complete time.
 	tSwapDoneTaker3 := nowMs()
-	if err = archie.SetOrderCompleteTime(taker3, tSwapDoneTaker3); !db.IsErrOrderNotExecuted(err) {
-		t.Fatalf("SetOrderCompleteTime should have returned a ErrOrderNotExecuted error for booked (not executed) order")
+	if err = archie.setOrderCompleteTime(archie.db, taker3, tSwapDoneTaker3); !db.IsErrOrderNotExecuted(err) {
+		t.Fatalf("setOrderCompleteTime should have returned a ErrOrderNotExecuted error for booked (not executed) order")
 	}
 
 	// Maker should have 2 completed orders in 1 market.
@@ -1736,215 +2087,5 @@ func TestCompletedUserOrders(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestExecutedCancelsForUser(t *testing.T) {
-	if err := cleanTables(archie.db); err != nil {
-		t.Fatalf("cleanTables: %v", err)
-	}
-
-	var epochIdx, epochDur int64 = 13245678, 6000
-
-	// order ID for a cancel order
-	orderID0, _ := hex.DecodeString("dd64e2ae2845d281ba55a6d46eceb9297b2bdec5c5bada78f9ae9e373164df0d")
-	var targetOrderID order.OrderID
-	copy(targetOrderID[:], orderID0)
-
-	co := newCancelOrder(targetOrderID, mktInfo.Base, mktInfo.Quote, 1)
-	err := archie.StoreOrder(co, epochIdx, epochDur, order.OrderStatusEpoch)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	// Mark the cancel order executed.
-	err = archie.ExecuteOrder(co)
-	if err != nil {
-		t.Fatalf("ExecuteOrder failed: %v", err)
-	}
-	_, status, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, co.ID())
-	if err != nil {
-		t.Errorf("loadCancelOrder failed: %v", err)
-	}
-	if status != orderStatusExecuted {
-		t.Fatalf("cancel order should have been %s, got %s", orderStatusFailed, status)
-	}
-
-	// order ID for a revoked order
-	lo := newLimitOrder(true, 4900000, 1, order.StandingTiF, 0)
-	lo.AccountID = co.AccountID // same user
-	lo.BaseAsset, lo.QuoteAsset = mktInfo.Base, mktInfo.Quote
-	err = archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusBooked)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	// Revoke the order.
-	time.Sleep(time.Millisecond * 10) // ensure the resulting cancel order is newer than the other cancel order above.
-	coID, coTime, err := archie.RevokeOrder(lo)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-	coOut, coStatusOut, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, coID)
-	// loadCancelOrder does not set base and quote
-	coOut.BaseAsset, coOut.QuoteAsset = mktInfo.Base, mktInfo.Quote
-	if err != nil {
-		t.Errorf("loadCancelOrder failed: %v", err)
-	}
-	if coStatusOut != orderStatusRevoked {
-		t.Fatalf("cancel order should have been %s, got %s", orderStatusRevoked, status)
-	}
-	if coOut.ID() != coID {
-		t.Errorf("incorrect cancel order ID. got %v, expected %v", coOut.ID(), coID)
-	}
-	if coTimeMs := coTime.UnixMilli(); coOut.Time() != coTimeMs {
-		t.Errorf("incorrect cancel time. got %d, expected %d", coOut.Time(), coTimeMs)
-	}
-
-	// Store the epoch.
-	matchTime := time.Now().UnixMilli()
-	err = archie.InsertEpoch(&db.EpochResults{
-		MktBase:        mktInfo.Base,
-		MktQuote:       mktInfo.Quote,
-		Idx:            epochIdx,
-		Dur:            epochDur,
-		MatchTime:      matchTime,
-		OrdersRevealed: []order.OrderID{co.ID()}, // not needed, but would be the case if it were executed in this epoch
-	})
-	if err != nil {
-		t.Errorf("InsertEpoch failed: %v", err)
-	}
-
-	// A revoked order (exempt cancel), which should NOT be found with
-	// ExecutedCancelsForUser.
-	lo2 := newLimitOrder(true, 4900000, 1, order.StandingTiF, 1)
-	lo2.AccountID = co.AccountID // same user
-	lo2.BaseAsset, lo2.QuoteAsset = mktInfo.Base, mktInfo.Quote
-	err = archie.StoreOrder(lo2, epochIdx, epochDur, order.OrderStatusBooked)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	// Revoke the order.
-	time.Sleep(time.Millisecond * 10)
-	_, _, err = archie.RevokeOrderUncounted(lo2)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-
-	user := co.User()
-	cancels, err := archie.ExecutedCancelsForUser(user, cancelThreshWindow)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	if len(cancels) != 2 {
-		t.Fatalf("found %d orders, expected 1", len(cancels))
-	}
-	if cancels[0].ID != co.ID() {
-		t.Errorf("incorrect executed cancel %v, expected %v", cancels[0].ID, co.ID())
-	}
-	if cancels[0].TargetID != targetOrderID {
-		t.Errorf("incorrect target for executed cancel %v, expected %v", cancels[0].TargetID, targetOrderID)
-	}
-	if cancels[0].MatchTime != matchTime {
-		t.Errorf("incorrect exec time for executed cancel %v, expected %v", cancels[0].MatchTime, matchTime)
-	}
-	if cancels[1].ID != coID {
-		t.Errorf("incorrect executed cancel %v, expected %v", cancels[1].ID, coID)
-	}
-	if cancels[1].TargetID != lo.ID() {
-		t.Errorf("incorrect target for executed cancel %v, expected %v", cancels[1].TargetID, lo.ID())
-	}
-	if coTimeMs := coTime.UnixMilli(); cancels[1].MatchTime != coTimeMs {
-		t.Errorf("incorrect exec time for executed cancel %v, expected %v", cancels[1].MatchTime, coTimeMs)
-	}
-
-	// test the limit
-	cancels, err = archie.ExecutedCancelsForUser(user, 0)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	if len(cancels) > 0 {
-		t.Errorf("found executed orders for user")
-	}
-
-	// Cancel order in epoch status, and with no epochs table entry.
-	co2 := newCancelOrder(targetOrderID, mktInfo.Base, mktInfo.Quote, 1)
-	co2.AccountID = randomAccountID() // different user
-	epochIdx++
-	err = archie.StoreOrder(co2, epochIdx, epochDur, order.OrderStatusEpoch)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-	err = archie.FailCancelOrder(co2)
-	if err != nil {
-		t.Fatalf("FailCancelOrder failed: %v", err)
-	}
-
-	user2 := co2.User()
-	cancels, err = archie.ExecutedCancelsForUser(user2, cancelThreshWindow)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	if len(cancels) > 0 {
-		t.Errorf("found executed orders for user")
-	}
-
-	// Cancel order in failed status, with an epochs table entry.
-	co3 := newCancelOrder(targetOrderID, mktInfo.Base, mktInfo.Quote, 1)
-	co3.AccountID = randomAccountID() // different user
-	epochIdx++
-	err = archie.StoreOrder(co3, epochIdx, epochDur, order.OrderStatusEpoch)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-	err = archie.FailCancelOrder(co3)
-	if err != nil {
-		t.Fatalf("ExecuteOrder failed: %v", err)
-	}
-
-	// Store the epoch.
-	matchTime3 := time.Now().UnixMilli()
-	err = archie.InsertEpoch(&db.EpochResults{
-		MktBase:        mktInfo.Base,
-		MktQuote:       mktInfo.Quote,
-		Idx:            epochIdx,
-		Dur:            epochDur,
-		MatchTime:      matchTime3,
-		OrdersRevealed: []order.OrderID{co3.ID()}, // not needed, but would be the case if it were executed in this epoch
-	})
-	if err != nil {
-		t.Errorf("InsertEpoch failed: %v", err)
-	}
-
-	user3 := co3.User()
-	cancels, err = archie.ExecutedCancelsForUser(user3, cancelThreshWindow)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	if len(cancels) > 0 {
-		t.Errorf("found executed orders for user")
-	}
-
-	// Cancel order in executed status, but with no epochs table entry.
-	co4 := newCancelOrder(targetOrderID, mktInfo.Base, mktInfo.Quote, 1)
-	co4.AccountID = randomAccountID() // different user
-	epochIdx++
-	err = archie.StoreOrder(co4, epochIdx, epochDur, order.OrderStatusEpoch)
-	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
-	}
-	err = archie.ExecuteOrder(co4)
-	if err != nil {
-		t.Fatalf("ExecuteOrder failed: %v", err)
-	}
-
-	user4 := co4.User()
-	cancels, err = archie.ExecutedCancelsForUser(user4, cancelThreshWindow)
-	if err != nil {
-		t.Errorf("ExecutedCancelsForUser failed: %v", err)
-	}
-	if len(cancels) > 0 {
-		t.Errorf("found executed orders for user")
 	}
 }

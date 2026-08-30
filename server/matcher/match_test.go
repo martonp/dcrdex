@@ -1556,6 +1556,39 @@ func TestMatch_marketBuysOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestMatch_deterministicOutputOrder(t *testing.T) {
+	startLogger()
+	me := New()
+	rnd.Seed(1212121)
+
+	// Buy taker partial-fills bookSellOrders[9]; sell taker partial-fills
+	// bookBuyOrders[9].
+	queue := []*OrderRevealed{
+		newLimit(false, 4600000, 2, order.ImmediateTiF, 0),
+		newLimit(true, 4300000, 2, order.ImmediateTiF, 1),
+	}
+	wantPartial := []order.OrderID{bookSellOrders[9].ID(), bookBuyOrders[9].ID()}
+	if bytes.Compare(wantPartial[1][:], wantPartial[0][:]) < 0 {
+		wantPartial[0], wantPartial[1] = wantPartial[1], wantPartial[0]
+	}
+
+	for run := 0; run < 5; run++ {
+		for _, q := range queue {
+			q.Order.Trade().FillAmt = 0
+		}
+		_, _, _, _, _, _, _, _, _, updates, _ := me.Match(newBooker(), queue)
+		gotPartial := make([]order.OrderID, 0, len(updates.TradesPartial))
+		for _, lo := range updates.TradesPartial {
+			gotPartial = append(gotPartial, lo.ID())
+		}
+		if !reflect.DeepEqual(gotPartial, wantPartial) {
+			t.Fatalf("run %d: TradesPartial IDs = %v, want sorted %v",
+				run, gotPartial, wantPartial)
+		}
+	}
+}
+
 func Test_shuffleQueue(t *testing.T) {
 	// Setup the match package's logger.
 	startLogger()
