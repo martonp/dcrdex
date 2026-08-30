@@ -743,22 +743,23 @@ func (c *Core) sendCancelOrder(dc *dexConnection, oid order.OrderID, base, quote
 	// Create and send the order message. Check the response before using it.
 	route, msgOrder, _ := messageOrder(co, nil)
 	var result = new(msgjson.OrderResult)
-	err = dc.signAndRequest(msgOrder, route, result, DefaultResponseTimeout)
-	if err != nil {
-		// At this point there is a possibility that the server got the request
-		// and created the cancel order, but we lost the connection before
-		// receiving the response with the cancel's order ID. Any preimage
-		// request will be unrecognized. This order is ABANDONED.
+
+	abandon := func() {
 		c.sentCommitsMtx.Lock()
 		delete(c.sentCommits, co.Commit)
 		c.sentCommitsMtx.Unlock()
+		close(commitSig)
+	}
+
+	err = dc.signAndRequest(msgOrder, route, result, DefaultResponseTimeout)
+	if err != nil {
+		// A definite refusal or ladder exhaustion. This cancel is ABANDONED.
+		abandon()
 		return preImg, nil, nil, nil, fmt.Errorf("failed to submit cancel order targeting trade %v: %w", oid, err)
 	}
 	err = validateOrderResponse(dc, result, co, msgOrder)
 	if err != nil {
-		c.sentCommitsMtx.Lock()
-		delete(c.sentCommits, co.Commit)
-		c.sentCommitsMtx.Unlock()
+		abandon()
 		return preImg, nil, nil, nil, fmt.Errorf("Abandoning order. preimage: %x, server time: %d: %w",
 			preImg[:], result.ServerTime, err)
 	}
@@ -788,29 +789,23 @@ func (c *Core) tryCancelTrade(dc *dexConnection, tracker *trackedTrade) error {
 		return newError(marketErr, "unknown market %q", tracker.mktID)
 	}
 
+	if err := tracker.beginCancelSend(); err != nil {
+		return err
+	}
+
+	// Construct and send the order without the tracker mutex: the send ladder
+	// can span minutes during an outage, and holding mtx across it would
+	// freeze settlement ticks and every trade listing.
+	preImg, co, sig, commitSig, err := c.sendCancelOrder(dc, oid, tracker.Base(), tracker.Quote())
+
 	tracker.mtx.Lock()
 	defer tracker.mtx.Unlock()
-
-	if status := tracker.metaData.Status; status != order.OrderStatusEpoch && status != order.OrderStatusBooked {
-		return fmt.Errorf("order %v not cancellable in status %v", oid, status)
-	}
-
-	if tracker.cancel != nil {
-		// Existing cancel might be stale. Deleting it now allows this
-		// cancel attempt to proceed.
-		tracker.deleteStaleCancelOrder()
-
-		if tracker.cancel != nil {
-			return fmt.Errorf("order %s - only one cancel order can be submitted per order per epoch. "+
-				"still waiting on cancel order %s to match", oid, tracker.cancel.ID())
-		}
-	}
-
-	// Construct and send the order.
-	preImg, co, sig, commitSig, err := c.sendCancelOrder(dc, oid, tracker.Base(), tracker.Quote())
+	tracker.cancelInFlight = false
 	if err != nil {
 		return err
 	}
+	// The cancel is recorded regardless of any status change during the
+	// send: the server accepted it against its own state.
 	defer close(commitSig)
 
 	// Store the cancel order with the tracker.
@@ -846,14 +841,68 @@ func (c *Core) tryCancelTrade(dc *dexConnection, tracker *trackedTrade) error {
 	return nil
 }
 
+// tryAgainRetryDelays is the backoff between signAndRequest retries during a
+// mesh failover (~55s total), sized past the server's 30s promotion delay plus
+// master preparation.
+var tryAgainRetryDelays = []time.Duration{
+	time.Second, 2 * time.Second, 4 * time.Second,
+	8 * time.Second, 8 * time.Second, 8 * time.Second,
+	8 * time.Second, 8 * time.Second, 8 * time.Second,
+}
+
+func isTryAgainError(err error) bool {
+	var msgErr *msgjson.Error
+	return errors.As(err, &msgErr) && msgErr.Code == msgjson.TryAgainLaterError
+}
+
+// isRetryableSendErr is true when the same signed payload is safe to resend.
+// Every signAndRequest route must land on a server handler that answers a
+// byte-identical resend.
+func isRetryableSendErr(err error) bool {
+	var msgErr *msgjson.Error
+	if errors.As(err, &msgErr) {
+		switch msgErr.Code {
+		case msgjson.TryAgainLaterError, msgjson.ResultUnavailableError, msgjson.UnauthorizedConnection:
+			return true
+		}
+		return false
+	}
+	return errors.Is(err, errTimeout) || strings.Contains(err.Error(), "broken connection")
+}
+
 // signAndRequest signs and sends the request, unmarshaling the response into
-// the provided interface.
+// the provided interface. Retryable failures (see isRetryableSendErr) are
+// resent on tryAgainRetryDelays.
 func (dc *dexConnection) signAndRequest(signable msgjson.Signable, route string, result any, timeout time.Duration) error {
 	if dc.acct.locked() {
 		return fmt.Errorf("cannot sign: %s account locked", dc.acct.host)
 	}
 	sign(dc.acct.privKey, signable)
-	return sendRequest(dc.WsConn, route, signable, result, timeout)
+
+	for attempt := 0; ; attempt++ {
+		err := sendRequest(dc.FailoverWsConn, route, signable, result, timeout)
+		if err == nil || attempt >= len(tryAgainRetryDelays) || !isRetryableSendErr(err) {
+			return err
+		}
+		delay := tryAgainRetryDelays[attempt]
+		reason := "connection down"
+		if isTryAgainError(err) {
+			reason = "failover in progress"
+		} else if errors.Is(err, errTimeout) {
+			reason = "response lost"
+		}
+		dc.log.Warnf("Server %s cannot process %q yet (%s), retrying in %s: %v",
+			dc.acct.host, route, reason, delay, err)
+		ctx := dc.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return err
+		}
+	}
 }
 
 // ack sends an Acknowledgement for a match-related request.
@@ -888,24 +937,58 @@ type serverMatches struct {
 	perMatchAddrs map[string]string
 }
 
+// parsedMatch is an accepted match ready for ack: message, trade, and sig.
+// tracker is per entry so self-trades ack the correct order's address.
+type parsedMatch struct {
+	msgMatch *msgjson.Match
+	tracker  *trackedTrade
+	isCancel bool
+	sig      []byte
+}
+
+// buildMatchAcks builds match acks in request order from stored addresses.
+// Cancel matches ack with no address. Empty trade addr fails the batch.
+func buildMatchAcks(parsed []*parsedMatch) ([]msgjson.Acknowledgement, error) {
+	acks := make([]msgjson.Acknowledgement, 0, len(parsed))
+	for _, pm := range parsed {
+		ack := msgjson.Acknowledgement{MatchID: pm.msgMatch.MatchID, Sig: pm.sig}
+		if !pm.isCancel {
+			var mid order.MatchID
+			copy(mid[:], pm.msgMatch.MatchID)
+			addr, isCancel := pm.tracker.negotiatedSwapAddr(mid)
+			if !isCancel {
+				if addr == "" {
+					return nil, fmt.Errorf("negotiate did not store match %v; withholding acks for a re-request", mid)
+				}
+				ack.Address = addr
+			}
+		}
+		acks = append(acks, ack)
+	}
+	return acks, nil
+}
+
 // parseMatches sorts the list of matches and associates them with a trade. This
 // may be called from handleMatchRoute on receipt of a new 'match' request, or
 // by authDEX with the list of active matches returned by the 'connect' request.
-func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []msgjson.Acknowledgement, error) {
-	var acks []msgjson.Acknowledgement
+// failed holds reported match IDs that could not be processed — not "missing"
+// for compareServerMatches.
+func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []*parsedMatch, map[order.MatchID]struct{}, error) {
+	var accepted []*parsedMatch
 	matches := make(map[order.OrderID]*serverMatches)
 	var errs []string
+	failed := make(map[order.MatchID]struct{})
+	fail := func(msgMatch *msgjson.Match, reason string) {
+		var mid order.MatchID
+		copy(mid[:], msgMatch.MatchID)
+		failed[mid] = struct{}{}
+		errs = append(errs, reason)
+	}
 
 	// Phase 1: Find all orders and verify/sign signatures. This is fast
 	// and must complete before phase 2's slow wallet RPCs, which could
 	// otherwise allow cancel orders to be retired by concurrent trade
 	// ticks before findOrder is called for them.
-	type parsedMatch struct {
-		msgMatch *msgjson.Match
-		tracker  *trackedTrade
-		isCancel bool
-		sig      []byte
-	}
 	var parsed []*parsedMatch
 	for _, msgMatch := range msgMatches {
 		var oid order.OrderID
@@ -930,7 +1013,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			swapRate = msgMatch.FeeRateBase
 		}
 		if !isCancel && swapRate > tracker.metaData.MaxFeeRate {
-			errs = append(errs, fmt.Sprintf("rejecting match %s for order %s because assigned rate (%d) is > MaxFeeRate (%d)",
+			fail(msgMatch, fmt.Sprintf("rejecting match %s for order %s because assigned rate (%d) is > MaxFeeRate (%d)",
 				msgMatch.MatchID, msgMatch.OrderID, swapRate, tracker.metaData.MaxFeeRate))
 			continue
 		}
@@ -941,12 +1024,12 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			if err != nil {
 				// If the caller (e.g. handleMatchRoute) requests signature
 				// verification, this is fatal.
-				return nil, nil, fmt.Errorf("parseMatches: match signature verification failed: %w", err)
+				return nil, nil, nil, fmt.Errorf("parseMatches: match signature verification failed: %w", err)
 			}
 		}
 		sig, err := dc.acct.sign(sigMsg)
 		if err != nil {
-			errs = append(errs, err.Error())
+			fail(msgMatch, err.Error())
 			continue
 		}
 
@@ -972,6 +1055,19 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			addrCh <- addrResult{idx: i}
 			continue
 		}
+		// Known match: re-ack stored address; never mint a replacement.
+		var mid order.MatchID
+		copy(mid[:], pm.msgMatch.MatchID)
+		if addr, known := pm.tracker.knownSwapAddr(mid); known {
+			if addr == "" {
+				addrCh <- addrResult{idx: i, err: fmt.Sprintf(
+					"known match %v has no swap address; refusing to mint a replacement", mid)}
+				continue
+			}
+			dc.log.Debugf("Re-acking known match %v with swap address %s", mid, addr)
+			addrCh <- addrResult{idx: i, addr: addr}
+			continue
+		}
 		if pm.tracker.wallets == nil || pm.tracker.wallets.toWallet == nil {
 			addrCh <- addrResult{idx: i, err: fmt.Sprintf("no wallet for non-cancel order %v", pm.tracker.ID())}
 			continue
@@ -995,7 +1091,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	for range parsed {
 		res := <-addrCh
 		if res.err != "" {
-			errs = append(errs, res.err)
+			fail(parsed[res.idx].msgMatch, res.err)
 			addrFailed[res.idx] = true
 			continue
 		}
@@ -1009,12 +1105,8 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 		}
 		perMatchAddr := addrs[i]
 
-		// Success. Add the serverMatch and the Acknowledgement.
-		acks = append(acks, msgjson.Acknowledgement{
-			MatchID: pm.msgMatch.MatchID,
-			Sig:     pm.sig,
-			Address: perMatchAddr,
-		})
+		// Success. Add the serverMatch.
+		accepted = append(accepted, pm)
 
 		trackerID := pm.tracker.ID()
 		match := matches[trackerID]
@@ -1045,9 +1137,9 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	if len(errs) > 0 {
 		err = fmt.Errorf("parseMatches errors: %s", strings.Join(errs, ", "))
 	}
-	// A non-nil error only means that at least one match failed to parse, so we
-	// must return the successful matches and acks for further processing.
-	return matches, acks, err
+	// A non-nil error only means that at least one match failed to parse, so
+	// we must return the successful matches for further processing.
+	return matches, accepted, failed, err
 }
 
 // matchDiscreps specifies a trackedTrades's missing and extra matches compared
@@ -1071,8 +1163,8 @@ type matchStatusConflict struct {
 // for each serverMatch.
 // Reported matches with missing trackers are already checked by parseMatches,
 // but we also must check for incomplete matches that the server is not
-// reporting.
-func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serverMatches) (
+// reporting. failed (reported but unprocessed) is not missing.
+func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serverMatches, failed map[order.MatchID]struct{}) (
 	exceptions map[order.OrderID]*matchDiscreps, statusConflicts map[order.OrderID]*matchStatusConflict) {
 
 	exceptions = make(map[order.OrderID]*matchDiscreps)
@@ -1184,6 +1276,9 @@ func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serv
 			if m.Status >= order.MatchComplete || m.MetaData.Proof.IsRevoked() {
 				continue
 			}
+			if _, ok := failed[m.MatchID]; ok {
+				continue // failed parse, not missing
+			}
 			activeMatches = append(activeMatches, m)
 		}
 		if len(activeMatches) == 0 {
@@ -1280,7 +1375,7 @@ func (dc *dexConnection) syncOrderStatuses(orders []*trackedTrade) (reconciledOr
 
 	// Send the 'order_status' request.
 	var orderStatusResults []*msgjson.OrderStatus
-	err := sendRequest(dc.WsConn, msgjson.OrderStatusRoute, orderStatusRequests,
+	err := sendRequest(dc.FailoverWsConn, msgjson.OrderStatusRoute, orderStatusRequests,
 		&orderStatusResults, DefaultResponseTimeout)
 	if err != nil {
 		dc.log.Errorf("Error retrieving order statuses from DEX %s: %v", dc.acct.host, err)
@@ -7154,10 +7249,9 @@ func (c *Core) sendTradeRequest(tr *tradeRequest) (*Order, error) {
 	result := new(msgjson.OrderResult)
 	err := dc.signAndRequest(msgOrder, route, result, fundingTxWait+DefaultResponseTimeout)
 	if err != nil {
-		// At this point there is a possibility that the server got the request
-		// and created the trade order, but we lost the connection before
-		// receiving the response with the trade's order ID. Any preimage
-		// request will be unrecognized. This order is ABANDONED.
+		// A definite refusal or ladder exhaustion. In the latter case the
+		// server may still hold the order, which then dies as a preimage
+		// miss. This order is ABANDONED.
 		return nil, fmt.Errorf("new order request with DEX server %v market %v failed: %w", dc.acct.host, mktID, err)
 	}
 
@@ -7713,12 +7807,12 @@ func (c *Core) authDEX(dc *dexConnection) error {
 	}
 
 	// Associate the matches with known trades.
-	matches, _, err := dc.parseMatches(result.ActiveMatches, false)
+	matches, _, failed, err := dc.parseMatches(result.ActiveMatches, false)
 	if err != nil {
 		c.log.Error(err)
 	}
 
-	exceptions, matchConflicts := dc.compareServerMatches(matches)
+	exceptions, matchConflicts := dc.compareServerMatches(matches, failed)
 	for oid, matchAnomalies := range exceptions {
 		trade := matchAnomalies.trade
 		missing, extras := matchAnomalies.missing, matchAnomalies.extra
@@ -10237,6 +10331,10 @@ func handlePreimageRequest(c *Core, dc *dexConnection, msg *msgjson.Message) err
 	// Go async while waiting.
 	go func() {
 		// Order request success OR fail closes the channel.
+		// TODO(mesh): Answer from the in-flight preimage; do not wait for
+		// OrderResult. A lost result on a live link (mesh, or an expired
+		// handler) can miss the server's ≤20s preimage window. If we
+		// reveal, do not abandon or return coins.
 		<-commitSig
 		if err := processPreimageRequest(c, dc, msg.ID, oid, req.CommitChecksum); err != nil {
 			c.log.Errorf("async processPreimageRequest for %v failed: %v", oid, err)
@@ -10341,7 +10439,7 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	// request handling.
 
 	// Acknowledgements MUST be in the same orders as the msgjson.Matches.
-	matches, acks, err := dc.parseMatches(msgMatches, true)
+	matches, parsed, _, err := dc.parseMatches(msgMatches, true)
 	if err != nil {
 		// Even one failed match fails them all since the server requires acks
 		// for them all, and in the same order. TODO: consider lifting this
@@ -10367,7 +10465,29 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 		}
 	}
 
-	resp, err := msgjson.NewResponse(msg.ID, acks, nil)
+	// Negotiate before acking so acks use stored addresses (audit-bound).
+	var wg sync.WaitGroup
+	for oid, sm := range matches {
+		wg.Add(1)
+		dc.dispatchTradeWork(oid, func() {
+			defer wg.Done()
+			updatedAssets, err := c.negotiateMatches(sm)
+			if len(updatedAssets) > 0 {
+				c.updateBalances(updatedAssets)
+			}
+			if err != nil {
+				c.log.Errorf("negotiateMatches for order %v: %v", sm.tracker.ID(), err)
+			}
+		})
+	}
+	wg.Wait()
+
+	ackMsgs, err := buildMatchAcks(parsed)
+	if err != nil {
+		return err
+	}
+
+	resp, err := msgjson.NewResponse(msg.ID, ackMsgs, nil)
 	if err != nil {
 		return err
 	}
@@ -10377,23 +10497,6 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	if err != nil {
 		// Do not bail on the matches on error, just log it.
 		c.log.Errorf("Send match response: %v", err)
-	}
-
-	// Dispatch per-trade negotiate work to the per-trade message
-	// queues. Each trade's negotiate runs sequentially with other
-	// messages for that trade (e.g. audit, redemption), preserving
-	// the ordering the server sent while allowing different trades
-	// to be processed concurrently.
-	for oid, sm := range matches {
-		dc.dispatchTradeWork(oid, func() {
-			updatedAssets, err := c.negotiateMatches(sm)
-			if len(updatedAssets) > 0 {
-				c.updateBalances(updatedAssets)
-			}
-			if err != nil {
-				c.log.Errorf("negotiateMatches for order %v: %v", sm.tracker.ID(), err)
-			}
-		})
 	}
 
 	for mktID := range mktIDs {
@@ -11169,11 +11272,17 @@ func stampAndSign(privKey *secp256k1.PrivateKey, payload msgjson.Stampable) {
 	sign(privKey, payload)
 }
 
+type requestConn interface {
+	NextID() uint64
+	RequestWithTimeout(*msgjson.Message, func(*msgjson.Message), time.Duration, func()) error
+	IsDown() bool
+}
+
 // sendRequest sends a request via the specified ws connection and unmarshals
 // the response into the provided interface.
 // TODO: Modify to accept a context.Context argument so callers can pass core's
 // context to break out of the reply wait when Core starts shutting down.
-func sendRequest(conn comms.WsConn, route string, request, response any, timeout time.Duration) error {
+func sendRequest(conn requestConn, route string, request, response any, timeout time.Duration) error {
 	reqMsg, err := msgjson.NewRequest(conn.NextID(), route, request)
 	if err != nil {
 		return fmt.Errorf("error encoding %q request: %w", route, err)
@@ -11183,7 +11292,12 @@ func sendRequest(conn comms.WsConn, route string, request, response any, timeout
 	err = conn.RequestWithTimeout(reqMsg, func(msg *msgjson.Message) {
 		errChan <- msg.UnmarshalResult(response)
 	}, timeout, func() {
-		errChan <- fmt.Errorf("timed out waiting for %q response (%w)", route, errTimeout) // code this as a timeout! like today!!!
+		// abortRequests runs this callback after marking the conn down.
+		if conn.IsDown() {
+			errChan <- fmt.Errorf("cannot send on a broken connection")
+			return
+		}
+		errChan <- fmt.Errorf("timed out waiting for %q response (%w)", route, errTimeout)
 	})
 	// Check the request error.
 	if err != nil {

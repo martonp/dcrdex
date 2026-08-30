@@ -2220,6 +2220,197 @@ func TestGetFee(t *testing.T) {
 }
 */
 
+func TestSignAndRequestTryAgainRetry(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc := rig.dc
+
+	oldDelays := tryAgainRetryDelays
+	tryAgainRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { tryAgainRetryDelays = oldDelays }()
+
+	tryAgainErr := msgjson.NewError(msgjson.TryAgainLaterError, "mesh command waiting for established master")
+	queueTryAgain := func(n int) {
+		for range n {
+			rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+				resp, _ := msgjson.NewResponse(msg.ID, nil, tryAgainErr)
+				f(resp)
+				return nil
+			})
+		}
+	}
+	queueSuccess := func() {
+		rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+			resp, _ := msgjson.NewResponse(msg.ID, &msgjson.OrderResult{}, nil)
+			f(resp)
+			return nil
+		})
+	}
+	unconsumed := func() int {
+		rig.ws.mtx.RLock()
+		defer rig.ws.mtx.RUnlock()
+		return len(rig.ws.handlers[msgjson.CancelRoute])
+	}
+
+	co := &msgjson.CancelOrder{}
+	res := new(msgjson.OrderResult)
+
+	// Rejected once during a failover window, then accepted on retry.
+	queueTryAgain(1)
+	queueSuccess()
+	if err := dc.signAndRequest(co, msgjson.CancelRoute, res, time.Second); err != nil {
+		t.Fatalf("signAndRequest error after one try-again rejection: %v", err)
+	}
+	if n := unconsumed(); n != 0 {
+		t.Fatalf("%d unconsumed responses after retry success", n)
+	}
+
+	// Rejections beyond the retry schedule surface the error.
+	queueTryAgain(len(tryAgainRetryDelays) + 1)
+	err := dc.signAndRequest(co, msgjson.CancelRoute, res, time.Second)
+	if !isTryAgainError(err) {
+		t.Fatalf("wrong error after exhausted retries: %v", err)
+	}
+	if n := unconsumed(); n != 0 {
+		t.Fatalf("%d unconsumed responses after exhausted retries", n)
+	}
+
+	// Non-retryable errors are returned immediately, with no retry.
+	rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+		resp, _ := msgjson.NewResponse(msg.ID, nil, msgjson.NewError(msgjson.AccountNotFoundError, "nope"))
+		f(resp)
+		return nil
+	})
+	err = dc.signAndRequest(co, msgjson.CancelRoute, res, time.Second)
+	if err == nil || isTryAgainError(err) {
+		t.Fatalf("wrong error for non-retryable rejection: %v", err)
+	}
+	if n := unconsumed(); n != 0 {
+		t.Fatalf("%d unconsumed responses after non-retryable rejection", n)
+	}
+
+	for _, tt := range []struct {
+		name string
+		fail func(*msgjson.Message, msgFunc) error
+	}{
+		{"broken-connection", func(*msgjson.Message, msgFunc) error {
+			return fmt.Errorf("cannot send on a broken connection")
+		}},
+		{"down-link expire", func(*msgjson.Message, msgFunc) error {
+			rig.ws.setDown(true)
+			rig.ws.fireExpire()
+			return nil
+		}},
+		{"up-link expire", func(*msgjson.Message, msgFunc) error {
+			rig.ws.setDown(false)
+			rig.ws.fireExpire()
+			return nil
+		}},
+		{"timeout", func(*msgjson.Message, msgFunc) error {
+			return fmt.Errorf("timed out waiting for %q response (%w)", msgjson.CancelRoute, errTimeout)
+		}},
+		{"unknown-outcome", func(msg *msgjson.Message, f msgFunc) error {
+			resp, _ := msgjson.NewResponse(msg.ID, nil, msgjson.NewError(msgjson.ResultUnavailableError, "outcome unknown"))
+			f(resp)
+			return nil
+		}},
+		{"unauthorized-connection", func(msg *msgjson.Message, f msgFunc) error {
+			resp, _ := msgjson.NewResponse(msg.ID, nil, msgjson.NewError(msgjson.UnauthorizedConnection, "not authed yet"))
+			f(resp)
+			return nil
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig.ws.queueResponse(msgjson.CancelRoute, tt.fail)
+			queueSuccess()
+			if err := dc.signAndRequest(co, msgjson.CancelRoute, res, time.Second); err != nil {
+				t.Fatalf("signAndRequest error after one %s: %v", tt.name, err)
+			}
+			if n := unconsumed(); n != 0 {
+				t.Fatalf("%d unconsumed responses after %s retry", n, tt.name)
+			}
+		})
+	}
+}
+
+func TestIsActiveCancelInFlight(t *testing.T) {
+	// A retired-status trade with a cancel submission in flight must stay
+	// active so checkTrades cannot retire it while the tracker mutex is
+	// released across the send ladder.
+	tracker := &trackedTrade{
+		metaData: &db.OrderMetaData{Status: order.OrderStatusRevoked},
+	}
+	if tracker.isActive() {
+		t.Fatal("revoked trade with no in-flight cancel reported active")
+	}
+	tracker.cancelInFlight = true
+	if !tracker.isActive() {
+		t.Fatal("revoked trade with an in-flight cancel reported inactive")
+	}
+}
+
+func TestSignAndRequestCtxAbort(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc := rig.dc
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dc.ctx = ctx
+
+	// Restore the real backoff so an un-aborted ladder would visibly stall.
+	defer func(delays []time.Duration) { tryAgainRetryDelays = delays }(tryAgainRetryDelays)
+	tryAgainRetryDelays = []time.Duration{time.Minute}
+
+	rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+		resp, _ := msgjson.NewResponse(msg.ID, nil, msgjson.NewError(msgjson.TryAgainLaterError, "later"))
+		f(resp)
+		return nil
+	})
+
+	lo, _, _, _ := makeLimitOrder(dc, true, 0, 0)
+	co := &msgjson.CancelOrder{
+		Prefix:   msgjson.Prefix{ServerTime: uint64(time.Now().UnixMilli())},
+		TargetID: lo.ID().Bytes(),
+	}
+	start := time.Now()
+	err := dc.signAndRequest(co, msgjson.CancelRoute, &struct{}{}, time.Second)
+	if err == nil || !isTryAgainError(err) {
+		t.Fatalf("aborted ladder error = %v, want the TryAgainLater failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("canceled context did not abort the ladder backoff (took %v)", elapsed)
+	}
+}
+
+type expireConn struct {
+	down bool
+}
+
+func (c *expireConn) NextID() uint64 { return 1 }
+func (c *expireConn) IsDown() bool   { return c.down }
+func (c *expireConn) RequestWithTimeout(_ *msgjson.Message, _ func(*msgjson.Message), _ time.Duration, expire func()) error {
+	expire()
+	return nil
+}
+
+func TestSendRequestExpireClassification(t *testing.T) {
+	var resp struct{}
+
+	err := sendRequest(&expireConn{down: true}, msgjson.CancelRoute, nil, &resp, time.Second)
+	if err == nil || errors.Is(err, errTimeout) || !isRetryableSendErr(err) {
+		t.Fatalf("down expire: %v", err)
+	}
+	if !strings.Contains(err.Error(), "broken connection") {
+		t.Fatalf("down expire text: %v", err)
+	}
+
+	err = sendRequest(&expireConn{down: false}, msgjson.CancelRoute, nil, &resp, time.Second)
+	if !errors.Is(err, errTimeout) || !isRetryableSendErr(err) {
+		t.Fatalf("up expire: %v", err)
+	}
+}
+
 func TestHandleReconnect(t *testing.T) {
 	rig := newTestRig()
 	defer rig.shutdown()
@@ -5318,6 +5509,49 @@ func TestTradeTracking(t *testing.T) {
 		}
 	}
 
+	resendPending := func() {
+		tracker.mtx.RLock()
+		tCore.resendPendingRequests(tracker)
+		tracker.mtx.RUnlock()
+	}
+
+	// resendPendingTryAgain exhausts signAndRequest's in-call try-again
+	// schedule on route, then waits for resendPendingRequests to finish.
+	resendPendingTryAgain := func(route string) {
+		oldDelays := tryAgainRetryDelays
+		tryAgainRetryDelays = []time.Duration{time.Millisecond}
+		defer func() { tryAgainRetryDelays = oldDelays }()
+		tryAgainErr := msgjson.NewError(msgjson.TryAgainLaterError,
+			"mesh command waiting for established master or slave state")
+		for i := 0; i < len(tryAgainRetryDelays)+1; i++ {
+			rig.ws.queueResponse(route, func(msg *msgjson.Message, f msgFunc) error {
+				resp, _ := msgjson.NewResponse(msg.ID, nil, tryAgainErr)
+				f(resp)
+				return nil
+			})
+		}
+		resendPending()
+		for {
+			pending := false
+			tracker.mtx.RLock()
+			for _, match := range tracker.matches {
+				if route == msgjson.InitRoute {
+					pending = atomic.LoadUint32(&match.sendingInitAsync) != 0
+				} else {
+					pending = atomic.LoadUint32(&match.sendingRedeemAsync) != 0
+				}
+				if pending {
+					break
+				}
+			}
+			tracker.mtx.RUnlock()
+			if !pending {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	// MAKER MATCH
 	matchTime := time.Now()
 	msgMatch := &msgjson.Match{
@@ -5396,7 +5630,7 @@ func TestTradeTracking(t *testing.T) {
 		name: "resend pending init (invalid ack)",
 		fn: func() error {
 			rig.ws.queueResponse(msgjson.InitRoute, invalidAcker)
-			tCore.resendPendingRequests(tracker)
+			resendPending()
 			return nil
 		},
 		expectError:          false,
@@ -5409,13 +5643,28 @@ func TestTradeTracking(t *testing.T) {
 		t.Fatalf("init sig recorded for second invalid init ack")
 	}
 
+	// Try-again init after in-call retries: no ERROR note.
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending init (failover try-again)",
+		fn: func() error {
+			resendPendingTryAgain(msgjson.InitRoute)
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 0,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.InitSig) != 0 {
+		t.Fatalf("init sig recorded for try-again rejected init")
+	}
+
 	// queue a valid DEX init ack and re-send pending init request
 	// a valid ack should produce a db update otherwise it's an error
 	testSwapRelatedAction(swapRelatedAction{
 		name: "resend pending init (valid ack)",
 		fn: func() error {
 			rig.ws.queueResponse(msgjson.InitRoute, initAcker)
-			tCore.resendPendingRequests(tracker)
+			resendPending()
 			return nil
 		},
 		expectError:          false,
@@ -5710,6 +5959,37 @@ func TestTradeTracking(t *testing.T) {
 	if len(auth.RedeemSig) == 0 {
 		t.Fatalf("redeem ack sig not set for taker")
 	}
+
+	// Lost redeem ack + try-again: no ERROR note; valid ack recovers.
+	auth.RedeemSig = nil
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending redeem (failover try-again)",
+		fn: func() error {
+			resendPendingTryAgain(msgjson.RedeemRoute)
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 0,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.RedeemSig) != 0 {
+		t.Fatalf("redeem sig recorded for try-again rejected redeem")
+	}
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending redeem (valid ack)",
+		fn: func() error {
+			rig.ws.queueResponse(msgjson.RedeemRoute, redeemAcker)
+			resendPending()
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 1,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.RedeemSig) == 0 {
+		t.Fatalf("redeem sig not recorded for valid redeem ack")
+	}
+
 	rig.db.updateMatchChan = nil
 	tBtcWallet.redeemErrChan = nil
 
@@ -6960,7 +7240,7 @@ func TestCompareServerMatches(t *testing.T) {
 		oidMissing: trackerMissing,
 	}
 
-	exceptions, _ := dc.compareServerMatches(srvMatches)
+	exceptions, _ := dc.compareServerMatches(srvMatches, nil)
 	if len(exceptions) != 2 {
 		t.Fatalf("exceptions did not include both trades, just %d", len(exceptions))
 	}
@@ -13292,17 +13572,12 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, parsed, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
-	if len(acks) != 1 {
-		t.Fatalf("expected 1 ack, got %d", len(acks))
-	}
-
-	// The ack should contain the per-match address.
-	if acks[0].Address == "" {
-		t.Fatal("expected per-match address in ack, got empty")
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed match, got %d", len(parsed))
 	}
 
 	// The serverMatches should have the per-match address stored.
@@ -13319,11 +13594,7 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 
 	// Test RedemptionAddress error.
 	tBtcWallet.addrErr = tErr
-	_, _, err = dc.parseMatches([]*msgjson.Match{msgMatch}, true)
-	// parseMatches returns errors as a joined string, not as an error return.
-	// But the match should be skipped and not appear in the acks.
-	// Actually, parseMatches returns the error string. Let me check the
-	// actual behavior.
+	_, _, _, err = dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err == nil {
 		t.Fatal("expected error when RedemptionAddress fails")
 	}
@@ -13376,13 +13647,15 @@ func TestTradePerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, _, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
-	if acks[0].Address != "our-per-match-addr" {
-		t.Fatalf("expected per-match addr %q in ack, got %q",
-			"our-per-match-addr", acks[0].Address)
+	for _, sm := range matches {
+		if sm.perMatchAddrs[mid.String()] != "our-per-match-addr" {
+			t.Fatalf("expected per-match addr %q, got %q",
+				"our-per-match-addr", sm.perMatchAddrs[mid.String()])
+		}
 	}
 
 	// Step 2: Call negotiate to store the match with per-match address.
@@ -13439,4 +13712,203 @@ func TestTradePerMatchAddr(t *testing.T) {
 	}
 
 	_ = tBtcWallet
+}
+
+// TestConnectParseFailureNotMissing checks that a match that fails parsing
+// on the connect path is not treated as missing (and revoked).
+func TestConnectParseFailureNotMissing(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc, tCore := rig.dc, rig.core
+
+	lo, dbOrder, preImg, _ := makeLimitOrder(dc, true, dcrBtcLotSize, dcrBtcRateStep*10)
+	dcrWallet, _ := newTWallet(tUTXOAssetA.ID)
+	btcWallet, _ := newTWallet(tUTXOAssetB.ID)
+	tCore.wallets[tUTXOAssetA.ID], tCore.wallets[tUTXOAssetB.ID] = dcrWallet, btcWallet
+	walletSet, _, _, _ := tCore.walletSet(dc, tUTXOAssetA.ID, tUTXOAssetB.ID, true)
+
+	tracker := newTrackedTrade(dbOrder, preImg, dc, tCore.lockTimeTaker, tCore.lockTimeMaker,
+		rig.db, rig.queue, walletSet, nil, tCore.notify, tCore.formatDetails, &tCore.wg)
+	dc.trades[lo.ID()] = tracker
+
+	// A known match with no stored address fails parsing rather than
+	// minting a replacement.
+	mid := ordertest.RandomMatchID()
+	tracker.matches[mid] = &matchTracker{MetaMatch: db.MetaMatch{
+		MetaData:  &db.MatchMetaData{},
+		UserMatch: &order.UserMatch{MatchID: mid},
+	}}
+
+	msgMatch := &msgjson.Match{
+		OrderID: lo.ID().Bytes(), MatchID: mid[:],
+		Quantity: dcrBtcLotSize, Rate: dcrBtcRateStep * 10,
+		Address: "counterparty", Side: uint8(order.Maker),
+		ServerTime: uint64(time.Now().UnixMilli()),
+	}
+	sign(tDexPriv, msgMatch)
+
+	srvMatches, _, failed, err := dc.parseMatches([]*msgjson.Match{msgMatch}, false)
+	if err == nil {
+		t.Fatal("parseMatches succeeded for known match with no swap address")
+	}
+	if _, ok := failed[mid]; !ok {
+		t.Fatalf("failed set = %v, want %v in it", failed, mid)
+	}
+
+	// Control: without the failed set, the match reads as missing.
+	exceptions, _ := dc.compareServerMatches(srvMatches, nil)
+	if disc := exceptions[lo.ID()]; disc == nil || len(disc.missing) != 1 {
+		t.Fatalf("control: exceptions = %+v, want 1 missing", exceptions)
+	}
+
+	// With the failed set, it does not.
+	exceptions, _ = dc.compareServerMatches(srvMatches, failed)
+	if disc := exceptions[lo.ID()]; disc != nil {
+		t.Fatalf("failed match treated as discrepancy: %+v", disc)
+	}
+}
+
+// TestMatchAckAddresses checks the addresses handleMatchRoute acks and
+// stores: fresh mint, redelivery, self-trade pairing, and the two no-ack
+// cases (storage failure, known match without an address).
+func TestMatchAckAddresses(t *testing.T) {
+	const buyAddr = "dcr-side-addr" // buy side redeems the base asset
+
+	type matchSpec struct {
+		orderIdx int
+		side     order.MatchSide
+	}
+	type delivery struct {
+		matches  []matchSpec
+		btcAddr  string   // sell-side wallet's next minted address
+		dbErr    error    // injected match-storage failure
+		wantErr  bool     // handler error; implies no response sent
+		wantAcks []string // ack addresses in request order
+	}
+	for _, tt := range []struct {
+		name           string
+		orders         []bool // sell flag per order
+		seedEmptyMatch bool   // pre-track the match with no stored address
+		deliveries     []delivery
+		wantStored     []string // stored SwapAddr per order, "" = none
+	}{{
+		name:       "fresh match acks the stored minted address",
+		orders:     []bool{true},
+		deliveries: []delivery{{matches: []matchSpec{{0, order.Maker}}, btcAddr: "minted-1", wantAcks: []string{"minted-1"}}},
+		wantStored: []string{"minted-1"},
+	}, {
+		name:   "redelivery re-acks the stored address, not the wallet's next",
+		orders: []bool{true},
+		deliveries: []delivery{
+			{matches: []matchSpec{{0, order.Maker}}, btcAddr: "minted-1", wantAcks: []string{"minted-1"}},
+			{matches: []matchSpec{{0, order.Maker}}, btcAddr: "minted-2", wantAcks: []string{"minted-1"}},
+		},
+		wantStored: []string{"minted-1"},
+	}, {
+		name:   "self-trade acks each side's own redeem-asset address",
+		orders: []bool{true, false},
+		deliveries: []delivery{{
+			matches:  []matchSpec{{0, order.Maker}, {1, order.Taker}},
+			btcAddr:  "btc-side-addr",
+			wantAcks: []string{"btc-side-addr", buyAddr},
+		}},
+		wantStored: []string{"btc-side-addr", buyAddr},
+	}, {
+		name:       "unstorable match withholds the ack batch",
+		orders:     []bool{true},
+		deliveries: []delivery{{matches: []matchSpec{{0, order.Maker}}, btcAddr: "minted-1", dbErr: tErr, wantErr: true}},
+		wantStored: []string{""},
+	}, {
+		name:           "known match without a stored address refuses to ack",
+		orders:         []bool{true},
+		seedEmptyMatch: true,
+		deliveries:     []delivery{{matches: []matchSpec{{0, order.Maker}}, btcAddr: "minted-1", wantErr: true}},
+		wantStored:     []string{""},
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newTestRig()
+			defer rig.shutdown()
+			dc, tCore := rig.dc, rig.core
+
+			dcrWallet, tDcrWallet := newTWallet(tUTXOAssetA.ID)
+			btcWallet, tBtcWallet := newTWallet(tUTXOAssetB.ID)
+			tCore.wallets[tUTXOAssetA.ID], tCore.wallets[tUTXOAssetB.ID] = dcrWallet, btcWallet
+			tDcrWallet.redemptionAddr, tDcrWallet.validAddr = buyAddr, true
+			tBtcWallet.validAddr = true
+
+			trackers := make([]*trackedTrade, len(tt.orders))
+			for i, sell := range tt.orders {
+				lo, dbOrder, preImg, _ := makeLimitOrder(dc, sell, dcrBtcLotSize*3, dcrBtcRateStep*10)
+				walletSet, _, _, _ := tCore.walletSet(dc, tUTXOAssetA.ID, tUTXOAssetB.ID, sell)
+				trackers[i] = newTrackedTrade(dbOrder, preImg, dc, tCore.lockTimeTaker, tCore.lockTimeMaker,
+					rig.db, rig.queue, walletSet, nil, tCore.notify, tCore.formatDetails, &tCore.wg)
+				dc.trades[lo.ID()] = trackers[i]
+			}
+
+			mid := ordertest.RandomMatchID()
+			if tt.seedEmptyMatch {
+				trackers[0].matches[mid] = &matchTracker{MetaMatch: db.MetaMatch{
+					MetaData:  &db.MatchMetaData{},
+					UserMatch: &order.UserMatch{MatchID: mid},
+				}}
+			}
+
+			for di, d := range tt.deliveries {
+				tBtcWallet.redemptionAddr = d.btcAddr
+				rig.db.updateMatchErr = d.dbErr
+
+				msgMatches := make([]*msgjson.Match, len(d.matches))
+				for j, ms := range d.matches {
+					m := &msgjson.Match{
+						OrderID: trackers[ms.orderIdx].ID().Bytes(), MatchID: mid[:],
+						Quantity: dcrBtcLotSize, Rate: dcrBtcRateStep * 10,
+						Address: "counterparty", Side: uint8(ms.side),
+						ServerTime: uint64(time.Now().UnixMilli()),
+					}
+					sign(tDexPriv, m)
+					msgMatches[j] = m
+				}
+				reqID := uint64(7000 + di)
+				req, _ := msgjson.NewRequest(reqID, msgjson.MatchRoute, msgMatches)
+
+				err := handleMatchRoute(tCore, dc, req)
+				rig.db.updateMatchErr = nil
+				if d.wantErr != (err != nil) {
+					t.Fatalf("delivery %d: handleMatchRoute error = %v, wantErr %v", di, err, d.wantErr)
+				}
+				msg := rig.ws.sentResponse(reqID)
+				if d.wantErr {
+					if msg != nil {
+						t.Fatalf("delivery %d: acks sent despite error: %+v", di, msg)
+					}
+					continue
+				}
+				if msg == nil {
+					t.Fatalf("delivery %d: no response sent", di)
+				}
+				resp, err := msg.Response()
+				if err != nil {
+					t.Fatalf("delivery %d: Response: %v", di, err)
+				}
+				var acks []msgjson.Acknowledgement
+				if err := json.Unmarshal(resp.Result, &acks); err != nil {
+					t.Fatalf("delivery %d: unmarshal acks: %v", di, err)
+				}
+				if len(acks) != len(d.wantAcks) {
+					t.Fatalf("delivery %d: %d acks, want %d", di, len(acks), len(d.wantAcks))
+				}
+				for j, want := range d.wantAcks {
+					if acks[j].Address != want {
+						t.Fatalf("delivery %d: ack %d address = %q, want %q", di, j, acks[j].Address, want)
+					}
+				}
+			}
+
+			for i, want := range tt.wantStored {
+				if got, _ := trackers[i].knownSwapAddr(mid); got != want {
+					t.Fatalf("order %d stored addr = %q, want %q", i, got, want)
+				}
+			}
+		})
+	}
 }
