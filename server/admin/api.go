@@ -143,10 +143,7 @@ func (s *Server) apiMarkets(w http.ResponseWriter, r *http.Request) {
 			ActiveEpoch:   status.ActiveEpoch,
 			StartEpoch:    status.StartEpoch,
 			SuspendEpoch:  status.SuspendEpoch,
-		}
-		if status.SuspendEpoch != 0 {
-			persist := status.PersistBook
-			mktStatus.PersistBook = &persist
+			PersistBook:   status.PersistBook,
 		}
 		mktStatuses[name] = mktStatus
 	}
@@ -163,11 +160,6 @@ func (s *Server) apiMarketInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var persist *bool
-	if status.SuspendEpoch != 0 {
-		persistLocal := status.PersistBook
-		persist = &persistLocal
-	}
 	mktStatus := &MarketStatus{
 		Name:          mkt,
 		Running:       status.Running,
@@ -175,11 +167,7 @@ func (s *Server) apiMarketInfo(w http.ResponseWriter, r *http.Request) {
 		ActiveEpoch:   status.ActiveEpoch,
 		StartEpoch:    status.StartEpoch,
 		SuspendEpoch:  status.SuspendEpoch,
-		PersistBook:   persist,
-	}
-	if status.SuspendEpoch != 0 {
-		persist := status.PersistBook
-		mktStatus.PersistBook = &persist
+		PersistBook:   status.PersistBook,
 	}
 	writeJSON(w, mktStatus)
 }

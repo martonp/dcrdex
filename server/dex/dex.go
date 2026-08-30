@@ -4,6 +4,7 @@
 package dex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"decred.org/dcrdex/dex"
@@ -33,6 +35,7 @@ import (
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg"
 	"decred.org/dcrdex/server/market"
+	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/noderelay"
 	"decred.org/dcrdex/server/swap"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -413,6 +416,17 @@ func ValidateConfigFile(cfgPath string, net dex.Network, log dex.Logger) error {
 // RPCConfig is an alias for the comms Server's RPC config struct.
 type RPCConfig = comms.RPCConfig
 
+// MeshConfig contains mesh transport and client advertisement configuration.
+type MeshConfig struct {
+	PeerAddr string
+	PeerCert []byte
+	// ListenAddr is the mesh transport listen address.
+	ListenAddr string
+	// ClientAddr is this node's public client-facing address advertised to
+	// the peer so wallets can fail over. It is not the mesh listen address.
+	ClientAddr string
+}
+
 // DexConf is the configuration data required to create a new DEX.
 type DexConf struct {
 	DataDir          string
@@ -430,6 +444,11 @@ type DexConf struct {
 	CommsCfg         *RPCConfig
 	NoResumeSwaps    bool
 	NodeRelayAddr    string
+	MeshCfg          *MeshConfig
+	// MeshForkReset is the operator's confirmation token for the manual mesh
+	// fork reset (--meshforkreset), normally empty. See maybeMeshForkReset.
+	MeshForkReset   string
+	RequestShutdown func(string)
 }
 
 type signer struct {
@@ -462,14 +481,18 @@ func (ss *subsystem) stop() {
 type DEX struct {
 	network     dex.Network
 	markets     map[string]*market.Market
+	marketRuns  map[string]*marketRunWorker
 	assets      map[uint32]*swap.SwapperAsset
 	storage     db.DEXArchivist
 	authMgr     *auth.AuthManager
 	swapper     *swap.Swapper
 	orderRouter *market.OrderRouter
 	bookRouter  *market.BookRouter
+	meshSvc     *mesh.Service
 	subsystems  []subsystem
 	server      *comms.Server
+	broadcast   func(*msgjson.Message)
+	stopping    atomic.Bool
 
 	configRespMtx sync.RWMutex
 	configResp    *configResponse
@@ -517,29 +540,139 @@ func newConfigResponse(cfg *DexConf, bondAssets map[string]*msgjson.BondAsset,
 	}, nil
 }
 
-func (cr *configResponse) setMktSuspend(name string, finalEpoch uint64, persist bool) {
+func meshClientEndpoint(clientAddr string, noTLS bool, certPath string) (string, []byte, error) {
+	host := strings.TrimSpace(clientAddr)
+	if host == "" || noTLS || strings.Contains(strings.ToLower(host), ".onion") {
+		return host, nil, nil
+	}
+	cert, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read RPC cert for mesh client endpoint: %w", err)
+	}
+	return host, cert, nil
+}
+
+// setMktLifecycle projects a market's durable lifecycle row into the served
+// market status.
+func (cr *configResponse) setMktLifecycle(lc *db.MarketLifecycle) {
+	if lc == nil {
+		return
+	}
 	for _, mkt := range cr.configMsg.Markets {
-		if mkt.Name == name {
-			mkt.MarketStatus.FinalEpoch = finalEpoch
-			mkt.MarketStatus.Persist = &persist
+		if mkt.Name == lc.Market {
+			mkt.MarketStatus.StartEpoch = uint64(lc.StartEpochIdx)
+			mkt.MarketStatus.FinalEpoch = uint64(lc.FinalEpochIdx)
+			mkt.MarketStatus.Persist = lc.PersistBook
+			if lc.RunParams.LotSize != 0 {
+				mkt.LotSize = lc.RunParams.LotSize
+				mkt.RateStep = lc.RunParams.RateStep
+				mkt.ParcelSize = lc.RunParams.ParcelSize
+				mkt.EpochLen = uint64(lc.StartEpochDur)
+			}
 			cr.remarshal()
+			return
+		}
+	}
+	log.Errorf("Failed to update MarketStatus for market %q", lc.Market)
+}
+
+// MeshStatus reports the mesh service's operator status snapshot.
+func (dm *DEX) MeshStatus() mesh.Status {
+	return dm.meshSvc.Status()
+}
+
+func (dm *DEX) updateConfigMarketLifecycle(lc *db.MarketLifecycle) {
+	dm.configRespMtx.Lock()
+	defer dm.configRespMtx.Unlock()
+	dm.configResp.setMktLifecycle(lc)
+}
+
+// updateConfigMarketStatus projects a market's current status into the served
+// config response. Used once after startup readiness: the statuses baked at
+// construction are placeholders, since market lifecycles only load via the
+// mesh state loaders.
+func (dm *DEX) updateConfigMarketStatus(status *market.Status) {
+	name, err := dex.MarketName(status.Base, status.Quote)
+	if err != nil {
+		log.Errorf("updateConfigMarketStatus: bad market %d-%d: %v", status.Base, status.Quote, err)
+		return
+	}
+	dm.configRespMtx.Lock()
+	defer dm.configRespMtx.Unlock()
+	for _, mkt := range dm.configResp.configMsg.Markets {
+		if mkt.Name == name {
+			mkt.MarketStatus.StartEpoch = uint64(status.StartEpoch)
+			mkt.MarketStatus.FinalEpoch = uint64(status.SuspendEpoch)
+			mkt.MarketStatus.Persist = status.PersistBook
+			mkt.LotSize = status.LotSize
+			mkt.RateStep = status.RateStep
+			mkt.ParcelSize = status.ParcelSize
+			mkt.EpochLen = status.EpochDuration
+			dm.configResp.remarshal()
 			return
 		}
 	}
 	log.Errorf("Failed to update MarketStatus for market %q", name)
 }
 
-func (cr *configResponse) setMktResume(name string, startEpoch uint64) (epochLen uint64) {
-	for _, mkt := range cr.configMsg.Markets {
-		if mkt.Name == name {
-			mkt.MarketStatus.StartEpoch = startEpoch
-			mkt.MarketStatus.FinalEpoch = 0
-			cr.remarshal()
-			return mkt.EpochLen
+// publishMeshClientEndpoints advertises this node's and the peer's
+// client-facing endpoints in the config response, and notifies connected
+// clients when the set changes. ownHost is required so a mesh node always
+// publishes at least itself.
+func (dm *DEX) publishMeshClientEndpoints(ownHost string, ownCert []byte, peerHost string, peerCert []byte) {
+	if dm.configResp == nil {
+		log.Errorf("Publishing mesh client endpoints before config response is ready")
+		return
+	}
+	if ownHost == "" {
+		log.Errorf("Publishing mesh client endpoints with empty own host")
+		return
+	}
+
+	endpoints := []*msgjson.MeshEndpoint{{
+		Host: ownHost,
+		Cert: append(dex.Bytes(nil), ownCert...),
+	}}
+	if peerHost != "" && peerHost != ownHost {
+		endpoints = append(endpoints, &msgjson.MeshEndpoint{
+			Host: peerHost,
+			Cert: append(dex.Bytes(nil), peerCert...),
+		})
+	}
+
+	dm.configRespMtx.Lock()
+	if meshEndpointsEqual(dm.configResp.configMsg.MeshEndpoints, endpoints) {
+		dm.configRespMtx.Unlock()
+		return
+	}
+	dm.configResp.configMsg.MeshEndpoints = endpoints
+	dm.configResp.remarshal()
+	dm.configRespMtx.Unlock()
+
+	note, err := msgjson.NewNotification(msgjson.MeshEndpointsRoute, &msgjson.MeshEndpointsNotification{
+		MeshEndpoints: endpoints,
+	})
+	if err != nil {
+		log.Errorf("Failed to create mesh endpoints notification: %v", err)
+		return
+	}
+	if dm.broadcast != nil {
+		dm.broadcast(note)
+	}
+}
+
+// meshEndpointsEqual compares two advertised mesh endpoint sets by host and
+// certificate.
+func meshEndpointsEqual(a, b []*msgjson.MeshEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Host != b[i].Host || !bytes.Equal(a[i].Cert, b[i].Cert) {
+			return false
 		}
 	}
-	log.Errorf("Failed to update MarketStatus for market %q", name)
-	return 0
+	return true
 }
 
 func (cr *configResponse) remarshal() {
@@ -554,6 +687,7 @@ func (cr *configResponse) remarshal() {
 // Stop shuts down the DEX. Stop returns only after all components have
 // completed their shutdown.
 func (dm *DEX) Stop() {
+	dm.stopping.Store(true)
 	log.Infof("Stopping all DEX subsystems.")
 	for _, ss := range dm.subsystems {
 		log.Infof("Stopping %s...", ss.name)
@@ -563,6 +697,28 @@ func (dm *DEX) Stop() {
 	log.Infof("Stopping storage...")
 	if err := dm.storage.Close(); err != nil {
 		log.Errorf("DEXArchivist.Close: %v", err)
+	}
+}
+
+func meshHaltShutdownCallback(isStopping func() bool, requestShutdown func(string)) func(error) {
+	if requestShutdown == nil {
+		return nil
+	}
+
+	return func(err error) {
+		if isStopping != nil && isStopping() {
+			return
+		}
+
+		reason := "mesh halted"
+		if err != nil {
+			log.Warnf("Mesh subsystem halted: %v. Requesting DEX shutdown.", err)
+			reason = fmt.Sprintf("mesh halted: %v", err)
+		} else {
+			log.Warnf("Mesh subsystem halted. Requesting DEX shutdown.")
+		}
+
+		requestShutdown(reason)
 	}
 }
 
@@ -596,17 +752,126 @@ type Bonder interface {
 		bondPubKeyHash []byte, lockTime int64, acct account.AccountID, err error)
 }
 
+// meshStartupMaintenance runs pre-start DB checks before subsystems load
+// state: refuse trading state at event-log tip zero, then maybeMeshForkReset.
+func meshStartupMaintenance(ctx context.Context, cfg *DexConf, storage db.DEXArchivist) error {
+	frontier, err := storage.EventLogFrontier(ctx)
+	if err != nil {
+		return fmt.Errorf("event log frontier: %w", err)
+	}
+	// Tip zero with trading state means a half-finished mesh schema upgrade.
+	if frontier.Seq == 0 {
+		empty, err := storage.HasNoEventSourcedState(ctx)
+		if err != nil {
+			return fmt.Errorf("event-sourced state check: %w", err)
+		}
+		if !empty {
+			return fmt.Errorf("this database holds trading state but its event log is " +
+				"empty; the mesh schema upgrade did not complete — refusing to start")
+		}
+	}
+
+	_, err = maybeMeshForkReset(ctx, cfg, storage, frontier)
+	return err
+}
+
+// broadcastLifecycleNote sends a suspend/resume schedule note to clients.
+func (dm *DEX) broadcastLifecycleNote(kind, route string, payload any) {
+	note, err := msgjson.NewNotification(route, payload)
+	if err != nil {
+		log.Errorf("Failed to create %s notification: %v", kind, err)
+		return
+	}
+	dm.server.Broadcast(note)
+}
+
+// newLifecycleUpdated keeps served market config current and notifies clients
+// of scheduled suspend/resume. getDEX may be nil during NewDEX construction.
+func newLifecycleUpdated(getDEX func() *DEX) market.LifecycleUpdated {
+	return func(transition market.LifecycleTransition, lc *db.MarketLifecycle) {
+		dexMgr := getDEX()
+		if dexMgr == nil || lc == nil {
+			return
+		}
+		dexMgr.updateConfigMarketLifecycle(lc)
+		switch transition {
+		case market.LifecycleTransitionScheduleSuspend:
+			if lc.PersistBook == nil {
+				return
+			}
+			dexMgr.broadcastLifecycleNote("suspend", msgjson.SuspensionRoute, msgjson.TradeSuspension{
+				MarketID:    lc.Market,
+				FinalEpoch:  uint64(lc.FinalEpochIdx),
+				SuspendTime: uint64(lc.SuspendTime().UnixMilli()),
+				Persist:     *lc.PersistBook,
+			})
+		case market.LifecycleTransitionScheduleResume:
+			dexMgr.broadcastLifecycleNote("resume", msgjson.ResumptionRoute, msgjson.TradeResumption{
+				MarketID:   lc.Market,
+				ResumeTime: uint64(lc.ResumeTime().UnixMilli()),
+				StartEpoch: uint64(lc.PendingEpochIdx),
+			})
+		}
+	}
+}
+
+// maybeMeshForkReset runs the operator --meshforkreset path: validate the
+// token, wipe event-sourced state, return an empty frontier for reseed.
+// See the fork-recovery section of server/mesh/doc.go. Must run before any
+// subsystem reads the database into memory.
+func maybeMeshForkReset(ctx context.Context, cfg *DexConf, storage db.DEXArchivist,
+	frontier *db.EventLogPosition) (*db.EventLogPosition, error) {
+	if cfg.MeshForkReset == "" {
+		return frontier, nil
+	}
+	if cfg.MeshCfg == nil || cfg.MeshCfg.PeerAddr == "" {
+		return nil, fmt.Errorf("--meshforkreset requires a configured mesh peer to reseed from")
+	}
+	if err := mesh.ValidateForkResetToken(cfg.MeshForkReset, frontier); err != nil {
+		return nil, fmt.Errorf("mesh fork reset refused: %w", err)
+	}
+	log.Warnf("MESH FORK RESET: wiping all event-sourced state at operator request (token %s, frontier %s). "+
+		"Any pre-wipe backup was the operator's step.", cfg.MeshForkReset, frontier)
+	if err := storage.WipeEventSourcedState(ctx); err != nil {
+		return nil, fmt.Errorf("mesh fork reset: wipe failed: %w", err)
+	}
+	log.Warnf("Mesh fork reset complete: event log and all projections wiped. " +
+		"Continuing startup; the mesh join will seed this node from the serving master.")
+	return &db.EventLogPosition{}, nil
+}
+
+// lockersForBackend returns book and swap lockers for OutputTracker backends.
+func lockersForBackend(be asset.Backend, master *coinlock.MasterCoinLocker) (book, swap coinlock.CoinLocker) {
+	if be == nil {
+		return nil, nil
+	}
+	if _, ok := be.(asset.OutputTracker); !ok {
+		return nil, nil
+	}
+	return master.Book(), master.Swap()
+}
+
+func newSwapperAsset(ba *asset.BackedAsset, master *coinlock.MasterCoinLocker) *swap.SwapperAsset {
+	_, swapLocker := lockersForBackend(ba.Backend, master)
+	return &swap.SwapperAsset{BackedAsset: ba, Locker: swapLocker}
+}
+
 // NewDEX creates the dex manager and starts all subsystems. Use Stop to
 // shutdown cleanly. The Context is used to abort setup.
+//
 //  1. Validate each specified asset.
 //  2. Create CoinLockers for each asset.
 //  3. Create and start asset backends.
 //  4. Create the archivist and connect to the storage backend.
 //  5. Create the authentication manager.
-//  6. Create and start the Swapper.
-//  7. Create and start the markets.
+//  6. Create the Swapper.
+//  7. Create the markets (their Run loops start as mesh master workers in
+//     step 10; state loads via the mesh state loaders).
 //  8. Create and start the book router, and create the order router.
-//  9. Create and start the comms server.
+//  9. Create the mesh node.
+//
+// 10. Start the mesh subsystem, which starts master workers when this node is master.
+// 11. Start the comms server.
 func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	var subsystems []subsystem
 	startSubSys := func(name string, rc any) (err error) {
@@ -706,6 +971,24 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	storage, err := db.Open(ctxDB, "pg", pgCfg)
 	if err != nil {
 		return nil, fmt.Errorf("db.Open: %w", err)
+	}
+
+	// Mesh client endpoint + compat for meshCfg, built once before subsystem load.
+	var meshCompat *mesh.CompatSnapshot
+	var ownClientHost string
+	var ownClientCert []byte
+	if cfg.MeshCfg != nil {
+		if meshCompat, err = buildMeshCompatSnapshot(cfg); err != nil {
+			return nil, fmt.Errorf("buildMeshCompatSnapshot: %w", err)
+		}
+		ownClientHost, ownClientCert, err = meshClientEndpoint(cfg.MeshCfg.ClientAddr, cfg.CommsCfg.NoTLS, cfg.CommsCfg.RPCCert)
+		if err != nil {
+			return nil, fmt.Errorf("mesh client endpoint: %w", err)
+		}
+	}
+
+	if err := meshStartupMaintenance(ctx, cfg, storage); err != nil {
+		return nil, err
 	}
 
 	relayAddrs := make(map[string]string, len(nodeRelayIDs))
@@ -826,11 +1109,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			return err
 		}
 
-		var coinLocker coinlock.CoinLocker
-		if _, isAccountRedeemer := be.(asset.AccountBalancer); isAccountRedeemer {
-			coinLocker = dexCoinLocker.AssetLocker(assetID).Swap()
-		}
-
 		ba := &asset.BackedAsset{
 			Asset: dex.Asset{
 				ID:         assetID,
@@ -844,10 +1122,12 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		}
 
 		backedAssets[assetID] = ba
-		lockableAssets[assetID] = &swap.SwapperAsset{
-			BackedAsset: ba,
-			Locker:      coinLocker,
+		lockableAssets[assetID] = newSwapperAsset(ba, dexCoinLocker.AssetLocker(assetID))
+		swapLockerKind := "nil"
+		if lockableAssets[assetID].Locker != nil {
+			swapLockerKind = "utxo"
 		}
+		log.Infof("asset %s (%d) swap_locker=%s", symbol, assetID, swapLockerKind)
 		feeMgr.AddFetcher(ba)
 
 		// Prepare assets portion of config response.
@@ -892,13 +1172,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, err
 	}
 
-	// Create the user order unbook dispatcher for the AuthManager.
 	markets := make(map[string]*market.Market, len(cfg.Markets))
-	userUnbookFun := func(user account.AccountID) {
-		for _, mkt := range markets {
-			mkt.UnbookUserOrders(user)
-		}
-	}
 
 	bondChecker := func(ctx context.Context, assetID uint32, version uint16, coinID []byte) (amt, lockTime, confs int64,
 		acct account.AccountID, err error) {
@@ -931,6 +1205,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, fmt.Errorf("NewServer failed: %w", err)
 	}
 
+	// Candle caches read event-sourced tables; their loads run as a mesh
+	// state loader so a fresh node's snapshot seed lands first.
 	dataAPI := apidata.NewDataAPI(storage, server.RegisterHTTP)
 
 	authCfg := auth.Config{
@@ -940,8 +1216,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		BondTxParser:     bondTxParser,
 		BondChecker:      bondChecker,
 		BondExpiry:       uint64(dex.BondExpiry(cfg.Network)),
-		UserUnbooker:     userUnbookFun,
-		MiaUserTimeout:   cfg.BroadcastTimeout,
 		CancelThreshold:  cfg.CancelThreshold,
 		FreeCancels:      cfg.FreeCancels,
 		PenaltyThreshold: cfg.PenaltyThreshold,
@@ -958,8 +1232,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	log.Infof("Penalty threshold is %v", cfg.PenaltyThreshold)
 
-	// Create a swapDone dispatcher for the Swapper.
-	swapDone := func(ord order.Order, match *order.Match, fail bool) {
+	// Create a post-commit swapDone dispatcher for the Swapper.
+	swapDone := func(ord order.Order, match *order.Match, faulted bool) {
 		name, err := dex.MarketName(ord.Base(), ord.Quote())
 		if err != nil {
 			log.Errorf("bad market for order %v: %v", ord.ID(), err)
@@ -967,14 +1241,11 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		}
 		mkt := markets[name]
 		if mkt == nil {
-			// markets are populated after the Swapper is created, so
-			// this is expected for matches revoked during startup.
-			log.Warnf("swapDone: no market %q for order %v (match may have been revoked during initialization)", name, ord.ID())
+			log.Errorf("swapDone: no market %q for order %v", name, ord.ID())
 			return
 		}
-		mkt.SwapDone(ord, match, fail)
+		mkt.SwapDone(ord, match, faulted)
 	}
-
 	// Create the swapper.
 	swapperCfg := &swap.Config{
 		Assets:           lockableAssets,
@@ -985,9 +1256,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		LockTimeTaker:    dex.LockTimeTaker(cfg.Network),
 		LockTimeMaker:    dex.LockTimeMaker(cfg.Network),
 		SwapDone:         swapDone,
-		NoResume:         cfg.NoResumeSwaps,
-		// TODO: set the AllowPartialRestore bool to allow startup with a
-		// missing asset backend if necessary in an emergency.
+		// The active-swap projection loads via the swapper's mesh state
+		// loader (RestoreActiveSwaps), after any snapshot seed. Operator
+		// NoResumeSwaps skips it there entirely.
 	}
 
 	swapper, err := swap.NewSwapper(swapperCfg)
@@ -1028,17 +1299,11 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	// Markets
 	var orderRouter *market.OrderRouter
-	usersWithOrders := make(map[account.AccountID]struct{})
 	for _, mktInf := range cfg.Markets {
 		// nilness of the coin locker signals account-based asset.
-		var baseCoinLocker, quoteCoinLocker coinlock.CoinLocker
 		b, q := backedAssets[mktInf.Base], backedAssets[mktInf.Quote]
-		if _, ok := b.Backend.(asset.OutputTracker); ok {
-			baseCoinLocker = dexCoinLocker.AssetLocker(mktInf.Base).Book()
-		}
-		if _, ok := q.Backend.(asset.OutputTracker); ok {
-			quoteCoinLocker = dexCoinLocker.AssetLocker(mktInf.Quote).Book()
-		}
+		baseCoinLocker, _ := lockersForBackend(b.Backend, dexCoinLocker.AssetLocker(mktInf.Base))
+		quoteCoinLocker, _ := lockersForBackend(q.Backend, dexCoinLocker.AssetLocker(mktInf.Quote))
 
 		// Calculate a minimum market rate that avoids dust.
 		// quote_dust = base_lot * min_rate / rate_encoding_factor
@@ -1057,8 +1322,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			CoinLockerQuote: quoteCoinLocker,
 			DataCollector:   dataAPI,
 			Balancer:        dexBalancer,
-			CheckParcelLimit: func(user account.AccountID, calcParcels market.MarketParcelCalculator) bool {
-				return orderRouter.CheckParcelLimit(user, mktInf.Name, calcParcels)
+			CheckParcelLimit: func(user account.AccountID, asOf time.Time, calcParcels market.MarketParcelCalculator) (bool, error) {
+				return orderRouter.CheckParcelLimit(user, mktInf.Name, asOf, calcParcels)
 			},
 			MinimumRate: minRate,
 		})
@@ -1073,35 +1338,20 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DataSource.AddMarketSource: %w", err)
 		}
-
-		// Having loaded the book, get the accounts owning the orders.
-		_, buys, sells := mkt.Book()
-		for _, lo := range buys {
-			usersWithOrders[lo.AccountID] = struct{}{}
-		}
-		for _, lo := range sells {
-			usersWithOrders[lo.AccountID] = struct{}{}
-		}
 	}
 
-	// Having enumerated all users with booked orders, configure the AuthManager
-	// to expect them to connect in a certain time period.
-	authMgr.ExpectUsers(usersWithOrders, cfg.BroadcastTimeout)
-
-	// Start the AuthManager and Swapper subsystems after populating the markets
-	// map used by the unbook callbacks, and setting the AuthManager's unbook
-	// timers for the users with currently booked orders.
+	// Start the AuthManager. Swapper runtime work starts as a mesh master
+	// worker, and disconnected-user unbooking is handled by the presence
+	// unbooker's master worker.
 	startSubSys("Auth manager", authMgr)
-	startSubSys("Swapper", swapper)
 
-	// Set start epoch index for each market. Also create BookSources for the
-	// BookRouter, and MarketTunnels for the OrderRouter.
-	now := time.Now().UnixMilli()
+	// The market statuses here are placeholders: the lifecycle only loads via
+	// the mesh state loaders (market.LoadState), so the served statuses are
+	// refreshed after WaitUntilReadyForComms, before comms start.
 	bookSources := make(map[string]market.BookSource, len(cfg.Markets))
 	cfgMarkets := make([]*msgjson.Market, 0, len(cfg.Markets))
 	for name, mkt := range markets {
-		startEpochIdx := 1 + now/int64(mkt.EpochDuration())
-		mkt.SetStartEpochIdx(startEpochIdx)
+		status := mkt.Status()
 		bookSources[name] = mkt
 		cfgMarkets = append(cfgMarkets, &msgjson.Market{
 			Name:            name,
@@ -1113,7 +1363,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			MarketBuyBuffer: mkt.MarketBuyBuffer(),
 			ParcelSize:      mkt.ParcelSize(),
 			MarketStatus: msgjson.MarketStatus{
-				StartEpoch: uint64(startEpochIdx),
+				StartEpoch: uint64(status.StartEpoch),
+				FinalEpoch: uint64(status.SuspendEpoch),
+				Persist:    status.PersistBook,
 			},
 		})
 	}
@@ -1147,11 +1399,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	// The data API gets the order book from the book router.
 	dataAPI.SetBookSource(bookRouter)
 
-	// Market, now that book router is running.
-	for name, mkt := range markets {
-		startSubSys(marketSubSysName(name), mkt)
-	}
-
 	// Order router
 	orderRouter = market.NewOrderRouter(&market.OrderRouterConfig{
 		Assets:       backedAssets,
@@ -1163,6 +1410,130 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	})
 	startSubSys("OrderRouter", orderRouter)
 
+	commands := make(map[string]mesh.CommandExecutor)
+	if err := mergeMeshCommands(commands, authMgr.Commands()); err != nil {
+		return nil, fmt.Errorf("auth mesh commands: %w", err)
+	}
+	if err := mergeMeshCommands(commands, orderRouter.Commands()); err != nil {
+		return nil, fmt.Errorf("market mesh commands: %w", err)
+	}
+	if err := mergeMeshCommands(commands, market.LifecycleCommands(markets)); err != nil {
+		return nil, fmt.Errorf("market lifecycle mesh commands: %w", err)
+	}
+	if err := mergeMeshCommands(commands, swapper.Commands()); err != nil {
+		return nil, fmt.Errorf("swap mesh commands: %w", err)
+	}
+
+	var dexMgr *DEX
+	lifecycleUpdated := newLifecycleUpdated(func() *DEX { return dexMgr })
+
+	events := make(map[string]mesh.EventApplier)
+	if err := mergeMeshEvents(events, authMgr.Events()); err != nil {
+		return nil, fmt.Errorf("auth mesh events: %w", err)
+	}
+	if err := mergeMeshEvents(events, market.Events(markets, bookRouter, authMgr.SendIfLocal, lifecycleUpdated)); err != nil {
+		return nil, fmt.Errorf("market mesh events: %w", err)
+	}
+	if err := mergeMeshEvents(events, swapper.Events()); err != nil {
+		return nil, fmt.Errorf("swap mesh events: %w", err)
+	}
+
+	marketRuns, masterWorkers := newMasterWorkers(swapper.Run, swapper.MarketsReady, markets)
+
+	// The presence unbooker polls mesh-wide client connectivity and, as the
+	// last master worker (after books are restored by the market workers),
+	// revokes booked orders of users disconnected from every node for too
+	// long.
+	unbooker := newPresenceUnbooker(cfg.LogBackend.NewLogger("PRES", log.Level()), markets, authMgr, cfg.BroadcastTimeout)
+	masterWorkers = append(masterWorkers, unbooker.masterWorker())
+
+	// State loaders build the in-memory projections from the database — after
+	// any mesh snapshot seed, before any event applies, any master worker
+	// starts, or comms open. Registration order is contractual: the book
+	// router seeds from the markets' loaded books.
+	mktNames := make([]string, 0, len(markets))
+	for name := range markets {
+		mktNames = append(mktNames, name)
+	}
+	sort.Strings(mktNames)
+	stateLoaders := make([]mesh.StateLoader, 0, len(markets)+3)
+	for _, name := range mktNames {
+		mkt := markets[name]
+		stateLoaders = append(stateLoaders, mesh.StateLoader{
+			Name: "market " + name,
+			Load: func(context.Context) error { return mkt.LoadState() },
+		})
+	}
+	stateLoaders = append(stateLoaders,
+		mesh.StateLoader{Name: "Swapper", Load: func(context.Context) error {
+			if cfg.NoResumeSwaps {
+				return nil
+			}
+			// TODO(mesh): set the allowPartial bool to allow startup with a missing
+			// asset backend if necessary in an emergency.
+			return swapper.RestoreActiveSwaps(false)
+		}},
+		mesh.StateLoader{Name: "BookRouter", Load: func(context.Context) error {
+			bookRouter.SeedBooks()
+			return nil
+		}},
+		mesh.StateLoader{Name: "DataAPI", Load: func(context.Context) error {
+			return dataAPI.LoadCaches()
+		}},
+	)
+
+	meshCfg := &mesh.ServiceConfig{
+		Commands:      commands,
+		Events:        events,
+		MasterWorkers: masterWorkers,
+		StateLoaders:  stateLoaders,
+		ClientProxyHandler: func(ctx context.Context, msg *mesh.ClientProxyMessage) error {
+			if msg.Broadcast {
+				server.Broadcast(msg.Msg)
+				return nil
+			}
+			return authMgr.HandleProxiedClientMessage(ctx, msg)
+		},
+		ClientConnectedHandler: authMgr.ConnectedAmong,
+		EventLogReader:         storage,
+		Logger:                 cfg.LogBackend.NewLogger("MSH", log.Level()),
+		PeerClientEndpointChanged: func(host string, cert []byte) {
+			if dexMgr != nil {
+				dexMgr.publishMeshClientEndpoints(ownClientHost, ownClientCert, host, cert)
+			}
+		},
+		OnHalt: meshHaltShutdownCallback(func() bool {
+			return dexMgr != nil && dexMgr.stopping.Load()
+		}, cfg.RequestShutdown),
+	}
+	if cfg.MeshCfg != nil {
+		meshCfg.DataDir = cfg.DataDir
+		meshCfg.ListenAddr = cfg.MeshCfg.ListenAddr
+		meshCfg.PeerAddr = cfg.MeshCfg.PeerAddr
+		meshCfg.PeerCert = cfg.MeshCfg.PeerCert
+		meshCfg.ClientHost = ownClientHost
+		meshCfg.ClientCert = ownClientCert
+		meshCfg.Compat = meshCompat
+		meshCfg.DEXPrivKey = cfg.DEXPrivKey
+		meshCfg.RPCKey = cfg.CommsCfg.RPCKey
+		meshCfg.RPCCert = cfg.CommsCfg.RPCCert
+		meshCfg.NoTLS = cfg.CommsCfg.NoTLS
+		// Snapshot seeding: a fresh node (empty event log) seeds its database
+		// from the peer's snapshot before the state loaders run.
+		meshCfg.SnapshotStore = storage
+	}
+	meshSvc, err := mesh.NewService(meshCfg)
+	if err != nil {
+		return nil, fmt.Errorf("mesh.NewService: %w", err)
+	}
+	authMgr.SetMeshService(meshSvc)
+	orderRouter.SetMeshService(meshSvc)
+	swapper.SetMeshService(meshSvc)
+	unbooker.setMesh(meshSvc)
+	for _, mkt := range markets {
+		mkt.SetMeshService(meshSvc)
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1172,17 +1543,20 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, err
 	}
 
-	dexMgr := &DEX{
+	dexMgr = &DEX{
 		network:     cfg.Network,
 		markets:     markets,
+		marketRuns:  marketRuns,
 		assets:      lockableAssets,
 		swapper:     swapper,
 		authMgr:     authMgr,
 		storage:     storage,
 		orderRouter: orderRouter,
 		bookRouter:  bookRouter,
+		meshSvc:     meshSvc,
 		subsystems:  subsystems,
 		server:      server,
+		broadcast:   server.Broadcast,
 		configResp:  cfgResp,
 	}
 
@@ -1205,7 +1579,21 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		rr.With(orderBookParamsParser).Get("/orderbook/{baseSymbol}/{quoteSymbol}", server.NewRouteHandler(msgjson.OrderBookRoute))
 	})
 
+	if err := startSubSys("Mesh", meshSvc); err != nil {
+		return nil, fmt.Errorf("error starting mesh: %w", err)
+	}
+	if err := meshSvc.WaitUntilReadyForComms(ctx); err != nil {
+		return nil, err
+	}
+
+	// In-memory projections are loaded now, so refresh the config
+	// status based on them.
+	for _, mkt := range markets {
+		dexMgr.updateConfigMarketStatus(mkt.Status())
+	}
+
 	startSubSys("Comms Server", server)
+	dexMgr.subsystems = subsystems
 
 	ready = true // don't shut down on return
 
@@ -1251,14 +1639,14 @@ func (dm *DEX) ConfigMsg() json.RawMessage {
 	return dm.configResp.configEnc
 }
 
-// TODO: for just market running status, the DEX manager should use its
-// knowledge of Market subsystem state.
-func (dm *DEX) MarketRunning(mktName string) (found, running bool) {
+// MarketLifecyclePhase reports the named market's suspend/resume control
+// phase. found is false when the market is unknown.
+func (dm *DEX) MarketLifecyclePhase(mktName string) (found bool, phase market.LifecyclePhase) {
 	mkt := dm.markets[mktName]
 	if mkt == nil {
-		return
+		return false, market.LifecyclePhaseUnknown
 	}
-	return true, mkt.Running()
+	return true, mkt.LifecyclePhase()
 }
 
 // MarketStatus returns the market.Status for the named market. If the market is
@@ -1281,66 +1669,19 @@ func (dm *DEX) MarketStatuses() map[string]*market.Status {
 	return statuses
 }
 
-// SuspendMarket schedules a suspension of a given market, with the option to
-// persist the orders on the book (or purge the book automatically on market
-// shutdown). The scheduled final epoch and suspend time are returned. This is a
-// passthrough to the OrderRouter. A TradeSuspension notification is broadcasted
-// to all connected clients.
+// SuspendMarket schedules a market suspend through mesh. A slave forwards
+// the command; the master emits the market_lifecycle event.
 func (dm *DEX) SuspendMarket(name string, tSusp time.Time, persistBooks bool) (suspEpoch *market.SuspendEpoch, err error) {
 	name = strings.ToLower(name)
-
-	// Locate the (running) subsystem for this market.
-	i := dm.findSubsys(marketSubSysName(name))
-	if i == -1 {
-		err = fmt.Errorf("market subsystem %s not found", name)
+	if dm.markets[name] == nil {
+		err = fmt.Errorf("unknown market %s", name)
 		return
 	}
-	if !dm.subsystems[i].ssw.On() {
-		err = fmt.Errorf("market subsystem %s is not running", name)
-		return
-	}
-
-	// Go through the order router since OrderRouter is likely to have market
-	// status tracking built into it to facilitate resume.
-	suspEpoch = dm.orderRouter.SuspendMarket(name, tSusp, persistBooks)
-	if suspEpoch == nil {
-		err = fmt.Errorf("unable to locate market %s", name)
-		return
-	}
-
-	// Update config message with suspend schedule.
-	dm.configRespMtx.Lock()
-	dm.configResp.setMktSuspend(name, uint64(suspEpoch.Idx), persistBooks)
-	dm.configRespMtx.Unlock()
-
-	// Broadcast a TradeSuspension notification to all connected clients.
-	note, errMsg := msgjson.NewNotification(msgjson.SuspensionRoute, msgjson.TradeSuspension{
-		MarketID:    name,
-		FinalEpoch:  uint64(suspEpoch.Idx),
-		SuspendTime: uint64(suspEpoch.End.UnixMilli()),
-		Persist:     persistBooks,
-	})
-	if errMsg != nil {
-		log.Errorf("Failed to create suspend notification: %v", errMsg)
-		// Notification or not, the market is resuming, so do not return error.
-	} else {
-		dm.server.Broadcast(note)
-	}
-	return
+	return market.ExecuteScheduleSuspend(context.Background(), dm.meshSvc, name, tSusp, persistBooks)
 }
 
-func (dm *DEX) findSubsys(name string) int {
-	for i := range dm.subsystems {
-		if dm.subsystems[i].name == name {
-			return i
-		}
-	}
-	return -1
-}
-
-// ResumeMarket launches a stopped market subsystem as early as the given time.
-// The actual time the market will resume depends on the configure epoch
-// duration, as the market only starts at the beginning of an epoch.
+// ResumeMarket schedules a market resume through mesh. A slave forwards
+// the command; the master emits the market_lifecycle event.
 func (dm *DEX) ResumeMarket(name string, asSoonAs time.Time) (startEpoch int64, startTime time.Time, err error) {
 	name = strings.ToLower(name)
 	mkt := dm.markets[name]
@@ -1348,58 +1689,7 @@ func (dm *DEX) ResumeMarket(name string, asSoonAs time.Time) (startEpoch int64, 
 		err = fmt.Errorf("unknown market %s", name)
 		return
 	}
-
-	// Get the next available start epoch given the earliest allowed time.
-	// Requires the market to be stopped already.
-	startEpoch = mkt.ResumeEpoch(asSoonAs)
-	if startEpoch == 0 {
-		err = fmt.Errorf("unable to resume market %s at time %v", name, asSoonAs)
-		return
-	}
-
-	// Locate the (stopped) subsystem for this market.
-	i := dm.findSubsys(marketSubSysName(name))
-	if i == -1 {
-		err = fmt.Errorf("market subsystem %s not found", name)
-		return
-	}
-	if dm.subsystems[i].ssw.On() {
-		err = fmt.Errorf("market subsystem %s not stopped", name)
-		return
-	}
-
-	// Update config message with resume schedule.
-	dm.configRespMtx.Lock()
-	epochLen := dm.configResp.setMktResume(name, uint64(startEpoch))
-	dm.configRespMtx.Unlock()
-	if epochLen == 0 {
-		return // couldn't set the new start epoch
-	}
-
-	// Configure the start epoch with the Market.
-	startTimeMS := int64(epochLen) * startEpoch
-	startTime = time.UnixMilli(startTimeMS)
-	mkt.SetStartEpochIdx(startEpoch)
-
-	// Relaunch the market.
-	ssw := dex.NewStartStopWaiter(mkt)
-	dm.subsystems[i].ssw = ssw
-	ssw.Start(context.Background())
-
-	// Broadcast a TradeResumption notification to all connected clients.
-	note, errMsg := msgjson.NewNotification(msgjson.ResumptionRoute, msgjson.TradeResumption{
-		MarketID:   name,
-		ResumeTime: uint64(startTimeMS),
-		StartEpoch: uint64(startEpoch),
-	})
-	if errMsg != nil {
-		log.Errorf("Failed to create resume notification: %v", errMsg)
-		// Notification or not, the market is resuming, so do not return error.
-	} else {
-		dm.server.Broadcast(note)
-	}
-
-	return
+	return market.ExecuteScheduleResume(context.Background(), dm.meshSvc, name, asSoonAs)
 }
 
 // AccountInfo returns data for an account.
@@ -1409,12 +1699,20 @@ func (dm *DEX) AccountInfo(aid account.AccountID) (*db.Account, error) {
 	return dm.storage.AccountInfo(aid)
 }
 
-// ForgiveMatchFail forgives a user for a specific match failure, potentially
-// allowing them to resume trading if their score becomes passing.
+// ForgiveMatchFail forgives one match failure. Not supported on a meshed
+// node: apply looks up the match in this node's matches table, and a
+// seeded peer's snapshot omits inactive matches older than the history
+// window, so the same forgive can delete points on one node and not the
+// other. Use ForgiveUser.
 func (dm *DEX) ForgiveMatchFail(aid account.AccountID, mid order.MatchID) (forgiven, unbanned bool, err error) {
+	if dm.meshSvc != nil && dm.meshSvc.Status().Mode != "single_server" {
+		return false, false, fmt.Errorf("forgive_match is not supported on a meshed node; use forgive_user")
+	}
 	return dm.authMgr.ForgiveMatchFail(aid, mid)
 }
 
+// CreatePrepaidBonds submits a mesh command to issue prepaid bond tokens.
+// See AuthManager.CreatePrepaidBonds.
 func (dm *DEX) CreatePrepaidBonds(n int, strength uint32, durSecs int64) ([][]byte, error) {
 	return dm.authMgr.CreatePrepaidBonds(n, strength, durSecs)
 }
@@ -1427,14 +1725,24 @@ func (dm *DEX) UserMatchFails(aid account.AccountID, n int) ([]*auth.MatchFail, 
 	return dm.authMgr.UserMatchFails(aid, n)
 }
 
-// Notify sends a text notification to a connected client.
-func (dm *DEX) Notify(acctID account.AccountID, msg *msgjson.Message) {
-	dm.authMgr.Notify(acctID, msg)
+// Notify sends a text notification to a connected client on this node or
+// the mesh peer.
+func (dm *DEX) Notify(acctID account.AccountID, msg *msgjson.Message) error {
+	return dm.authMgr.Notify(acctID, msg)
 }
 
-// NotifyAll sends a text notification to all connected clients.
+// NotifyAll sends a text notification to all connected clients, including
+// clients connected to the mesh peer.
 func (dm *DEX) NotifyAll(msg *msgjson.Message) {
 	dm.server.Broadcast(msg)
+	err := dm.meshSvc.ProxyClientMessage(context.Background(), &mesh.ClientProxyMessage{
+		Msg:       msg,
+		Broadcast: true,
+	})
+	if err != nil {
+		log.Errorf("Failed to relay %q broadcast to the mesh peer: %v. Clients connected "+
+			"to the peer did NOT receive it; re-send once the mesh is healthy.", msg.Route, err)
+	}
 }
 
 // BookOrders returns booked orders for market with base and quote.
