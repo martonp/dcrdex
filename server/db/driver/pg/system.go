@@ -4,6 +4,7 @@
 package pg
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -109,6 +110,7 @@ type sqlExecutor interface {
 type sqlQueryer interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 // sqlExec executes the SQL statement string with any optional arguments, and

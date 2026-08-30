@@ -5,6 +5,7 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"time"
@@ -96,6 +97,9 @@ type DEXArchivist interface {
 	MatchArchiver
 	SwapArchiver
 	ReputationArchiver
+	EventLogReader
+	SnapshotStore
+	EventSourcedStateChecker
 }
 
 // OrderArchiver is the interface required for storage and retrieval of all
@@ -367,6 +371,20 @@ type MarketMatchID struct {
 	Base, Quote uint32 // market
 }
 
+const EventLogTipHashSize = sha256.Size
+
+type EventLogMeta struct {
+	// Seq is zero when storage should allocate the next durable event-log
+	// sequence. It is non-zero when storage must enforce a master-assigned
+	// sequence.
+	Seq uint64
+	// Event is the canonical mesh event payload stored in the event log.
+	Event []byte
+	// ExpectedTipHash is nil for master allocation. Slave and catch-up applies
+	// set it so storage can verify the computed hash-chain tip before commit.
+	ExpectedTipHash []byte
+}
+
 // EventLogEntry is a row in the event log.
 type EventLogEntry struct {
 	// Seq is the entry's sequence number. Stored entries start at 1 and
@@ -465,6 +483,14 @@ func (e *EventLogDivergenceError) Unwrap() error {
 type SnapshotStore interface {
 	WriteSnapshot(ctx context.Context, w io.Writer) (*EventLogPosition, error)
 	LoadSnapshot(ctx context.Context, r io.Reader) (*EventLogPosition, error)
+}
+
+// EventSourcedStateChecker probes and clears event-sourced tables.
+type EventSourcedStateChecker interface {
+	// HasNoEventSourcedState reports whether every event-sourced table is empty.
+	HasNoEventSourcedState(ctx context.Context) (bool, error)
+	// WipeEventSourcedState truncates the event log and all event projections.
+	WipeEventSourcedState(ctx context.Context) error
 }
 
 // EventLogReader allows callers to read the event log.

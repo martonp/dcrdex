@@ -2,6 +2,7 @@ package pg
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"fmt"
 	"os"
 	"time"
@@ -32,6 +33,62 @@ var (
 	AssetBTC uint32
 	AssetLTC uint32
 )
+
+func assertNoArchivedCommitUnique(db *sql.DB) error {
+	const q = `
+		SELECT n.nspname || '.' || con.conname
+		FROM pg_constraint con
+		JOIN pg_class rel ON rel.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = rel.relnamespace
+		WHERE con.contype = 'u'
+		  AND rel.relname IN ('orders_archived', 'cancels_archived')
+		  AND (con.conname LIKE '%_commit_key' OR con.conname LIKE '%_preimage_key')`
+	rows, err := db.Query(q)
+	if err != nil {
+		return fmt.Errorf("query archived unique constraints: %w", err)
+	}
+	defer rows.Close()
+	var leftover []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		leftover = append(leftover, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(leftover) > 0 {
+		return fmt.Errorf("archived unique constraints still present: %v", leftover)
+	}
+	return nil
+}
+
+func assertArchivedCommitIndexes(db *sql.DB) error {
+	mkts, err := loadMarkets(db, marketsTableName)
+	if err != nil {
+		return fmt.Errorf("load markets: %w", err)
+	}
+	const q = `
+		SELECT 1 FROM pg_indexes
+		WHERE schemaname = $1 AND tablename = $2 AND indexname = $3`
+	for _, mkt := range mkts {
+		schema := marketSchema(mkt.Name)
+		for _, idx := range []struct{ table, name string }{
+			{ordersArchivedTableName, indexArchivedOrdersCommitName},
+			{cancelsArchivedTableName, indexArchivedCancelsCommitName},
+		} {
+			var one int
+			err := db.QueryRow(q, schema, idx.table, idx.name).Scan(&one)
+			if err != nil {
+				return fmt.Errorf("archived commit index %s.%s on %s: %w",
+					schema, idx.name, idx.table, err)
+			}
+		}
+	}
+	return nil
+}
 
 func randomBytes(len int) []byte {
 	bytes := make([]byte, len)

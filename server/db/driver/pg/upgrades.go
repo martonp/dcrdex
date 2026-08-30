@@ -5,20 +5,27 @@ package pg
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"regexp"
 	"strings"
+	"time"
 
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/calc"
 	"decred.org/dcrdex/server/asset"
+	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
 )
 
-const dbVersion = 8
+// DBVersion is the latest version of the database that is understood. Databases
+// with recorded versions higher than this will fail to open (meaning any
+// upgrades prevent reverting to older software).
+const dbVersion = 9
 
 // The number of upgrades defined MUST be equal to dbVersion.
 var upgrades = []func(db *sql.Tx) error{
@@ -57,6 +64,12 @@ var upgrades = []func(db *sql.Tx) error{
 
 	// v8 upgrade adds per-match swap address columns to the matches tables.
 	v8Upgrade,
+
+	// v9: mesh transition — remove the legacy account fee asset, add
+	// active-match indexes, drop archived commit/preimage uniqueness, add
+	// non-unique archived commit indexes, and stamp genesis for non-empty
+	// pre-mesh DBs.
+	v9Upgrade,
 }
 
 // v1Upgrade adds the schema_version column and removes the state_hash column
@@ -409,6 +422,164 @@ func v8Upgrade(tx *sql.Tx) error {
 			return fmt.Errorf("error adding takerSwapAddr column to %s: %w", tableName, err)
 		}
 	}
+	return nil
+}
+
+// v9Upgrade applies the mesh-transition schema: remove the legacy account fee
+// asset, add active-match indexes, drop archived commit/preimage uniqueness,
+// add non-unique archived commit indexes, and stamp mesh genesis.
+func v9Upgrade(tx *sql.Tx) error {
+	accountsTable := qualifySchemaTable(publicSchema, accountsTableName)
+	if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS fee_asset;", accountsTable)); err != nil {
+		return fmt.Errorf("drop legacy accounts.fee_asset column: %w", err)
+	}
+
+	mkts, err := loadMarkets(tx, marketsTableName)
+	if err != nil {
+		return fmt.Errorf("failed to read markets table: %w", err)
+	}
+
+	log.Infof("Applying mesh schema (indexes + drop archived commit uniqueness) for %d markets", len(mkts))
+
+	for _, mkt := range mkts {
+		schema := marketSchema(mkt.Name)
+		if !safeIdentRE.MatchString(schema) {
+			return fmt.Errorf("market schema %q (from %q) contains disallowed characters", schema, mkt.Name)
+		}
+		if err := createMarketMatchIndexes(tx, schema); err != nil {
+			return fmt.Errorf("error creating active-match indexes for %s: %w", schema, err)
+		}
+		if err := dropArchivedCommitUniques(tx, schema); err != nil {
+			return err
+		}
+		if err := createMarketArchivedCommitIndexes(tx, schema); err != nil {
+			return fmt.Errorf("error creating archived commit indexes for %s: %w", schema, err)
+		}
+	}
+
+	return stampMeshGenesis(tx)
+}
+
+func dropArchivedCommitUniques(tx *sql.Tx, schema string) error {
+	drops := []struct{ table, constraint string }{
+		{ordersArchivedTableName, "orders_archived_commit_key"},
+		{ordersArchivedTableName, "orders_archived_preimage_key"},
+		{cancelsArchivedTableName, "cancels_archived_commit_key"},
+		{cancelsArchivedTableName, "cancels_archived_preimage_key"},
+	}
+	for _, drop := range drops {
+		stmt := fmt.Sprintf("ALTER TABLE %s.%s DROP CONSTRAINT IF EXISTS %s;",
+			schema, drop.table, drop.constraint)
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("drop %s on %s.%s: %w", drop.constraint, schema, drop.table, err)
+		}
+	}
+	return nil
+}
+
+// meshGenesisPayload is stored on the genesis event-log row. Nonce makes each
+// upgraded DB's tip hash unique; UnixMs is forensics only.
+type meshGenesisPayload struct {
+	Nonce  dex.Bytes `json:"nonce"`
+	UnixMs int64     `json:"unixMs"`
+}
+
+const meshGenesisSeq = 1
+
+// stampMeshGenesis writes a mesh_genesis row at seq 1 when this DB already has
+// trading state but an empty event log (pre-mesh upgrade). That gives a
+// nonzero frontier so the node is not mistaken for a virgin peer. Empty DBs
+// are left at seq 0 so they can still seed/join as new nodes.
+func stampMeshGenesis(tx *sql.Tx) error {
+	if err := ensureMeshEraTables(tx); err != nil {
+		return err
+	}
+	ok, err := shouldStampMeshGenesis(tx)
+	if err != nil || !ok {
+		return err
+	}
+	tipHash, err := insertMeshGenesisRow(tx)
+	if err != nil {
+		return err
+	}
+	return logMeshGenesisStamp(tx, tipHash)
+}
+
+// ensureMeshEraTables creates mesh public tables if missing.
+func ensureMeshEraTables(tx *sql.Tx) error {
+	for _, tbl := range []struct{ stmt, name string }{
+		{internal.CreateEventLogTable, eventLogTableName},
+		{internal.CreateMarketLifecycleTable, marketLifecycleTableName},
+		{internal.CreatePointsTable, pointsTableName},
+		{internal.CreatePrepaidBondsTable, prepaidBondsTableName},
+	} {
+		if _, err := createTableStmt(tx, tbl.stmt, publicSchema, tbl.name); err != nil {
+			return fmt.Errorf("create %s: %w", tbl.name, err)
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf(internal.CreatePointsIndex, publicSchema+"."+pointsTableName)); err != nil {
+		return fmt.Errorf("create points index: %w", err)
+	}
+	return nil
+}
+
+// shouldStampMeshGenesis is true for pre-mesh DBs that already hold trading state.
+func shouldStampMeshGenesis(tx *sql.Tx) (bool, error) {
+	eventLog := qualifySchemaTable(publicSchema, eventLogTableName)
+	frontier, err := scanEventLogFrontier(tx.QueryRow(
+		fmt.Sprintf(internal.SelectEventLogFrontier, eventLog)))
+	if err != nil {
+		return false, fmt.Errorf("read event log frontier: %w", err)
+	}
+	if frontier.Seq > 0 {
+		return false, nil // already mesh-era
+	}
+	// Shared helper is context-aware (LoadSnapshot / public API); upgrades pass Background.
+	empty, err := hasNoEventSourcedState(context.Background(), tx)
+	if err != nil {
+		return false, fmt.Errorf("event-sourced state check: %w", err)
+	}
+	if empty {
+		return false, nil // virgin; nothing to anchor
+	}
+	return true, nil
+}
+
+// insertMeshGenesisRow inserts the seq-1 mesh_genesis row and returns its tip hash.
+func insertMeshGenesisRow(tx *sql.Tx) ([]byte, error) {
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("generate genesis nonce: %w", err)
+	}
+	payload, err := json.Marshal(&meshGenesisPayload{
+		Nonce:  nonce[:],
+		UnixMs: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode genesis payload: %w", err)
+	}
+	tipHash := eventLogHash(nil, meshGenesisSeq, db.MeshGenesisKind, payload, nil)
+	eventLog := qualifySchemaTable(publicSchema, eventLogTableName)
+	if _, err := tx.Exec(fmt.Sprintf(internal.InsertEventLog, eventLog),
+		int64(meshGenesisSeq), db.MeshGenesisKind, payload, []byte{}, tipHash); err != nil {
+		return nil, fmt.Errorf("insert genesis row: %w", err)
+	}
+	return tipHash, nil
+}
+
+// logMeshGenesisStamp reports the new tip and how many dormant pre-v7 accounts start fresh.
+func logMeshGenesisStamp(tx *sql.Tx, tipHash []byte) error {
+	// Points already carry reputation (v7+). reputation_ver=0 accounts never
+	// finished that migration; they are not converted.
+	var amnestied int64
+	if err := tx.QueryRow(fmt.Sprintf(
+		"SELECT count(*) FROM %s WHERE reputation_ver = 0",
+		qualifySchemaTable(publicSchema, accountsTableName))).Scan(&amnestied); err != nil {
+		return fmt.Errorf("count unmigrated-reputation accounts: %w", err)
+	}
+	log.Infof("Stamped mesh genesis (tip %x): trading state anchors event-log seq 1; "+
+		"peers must join by snapshot. %d dormant pre-v7 reputation accounts start fresh.",
+		tipHash, amnestied)
 	return nil
 }
 
