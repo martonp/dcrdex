@@ -56,7 +56,6 @@ type Config struct {
 
 // Some frequently used long-form table names.
 type archiverTables struct {
-	feeKeys         string
 	accounts        string
 	bonds           string
 	prepaidBonds    string
@@ -68,18 +67,19 @@ type archiverTables struct {
 // Archiver must implement server/db.DEXArchivist.
 // So far: OrderArchiver, AccountArchiver.
 type Archiver struct {
-	repListenerMtx sync.RWMutex
-	repListener    func(users ...account.AccountID)
-	ctx            context.Context
-	queryTimeout   time.Duration
-	db             *sql.DB
-	dbName         string
-	markets        map[string]*dex.MarketInfo
-	tables         archiverTables
+	ctx          context.Context
+	queryTimeout time.Duration
+	db           *sql.DB
+	dbName       string
+	markets      map[string]*dex.MarketInfo
+	tables       archiverTables
 
 	queries struct {
 		selectPoints *sql.Stmt // internal.SelectPoints
 	}
+
+	repListenerMtx sync.RWMutex
+	repListener    func(users ...account.AccountID)
 
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
@@ -162,7 +162,6 @@ func NewArchiverForRead(ctx context.Context, cfg *Config) (*Archiver, error) {
 		queryTimeout: queryTimeout,
 		markets:      mktMap,
 		tables: archiverTables{
-			feeKeys:         fullTableName(cfg.DBName, publicSchema, feeKeysTableName),
 			accounts:        fullTableName(cfg.DBName, publicSchema, accountsTableName),
 			bonds:           fullTableName(cfg.DBName, publicSchema, bondsTableName),
 			prepaidBonds:    fullTableName(cfg.DBName, publicSchema, prepaidBondsTableName),

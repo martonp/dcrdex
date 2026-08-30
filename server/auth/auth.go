@@ -378,13 +378,6 @@ func (auth *AuthManager) GraceLimit() int {
 	return int(math.Round(1e8*auth.cancelThresh/(1-auth.cancelThresh))) / 1e8
 }
 
-// These callbacks are retained until market and swap record reputation through mesh events.
-func (auth *AuthManager) RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time) {
-}
-
-func (auth *AuthManager) RecordCompletedOrder(user account.AccountID, oid order.OrderID, t time.Time) {
-}
-
 // Connect runs the AuthManager until the context is canceled. Satisfies the
 // dex.Connector interface.
 func (auth *AuthManager) Connect(ctx context.Context) (*sync.WaitGroup, error) {
@@ -810,11 +803,6 @@ func (auth *AuthManager) UserReputationAt(user account.AccountID, asOf time.Time
 	return r.EffectiveTier(), r.Score, maxScore, nil
 }
 
-// UserReputation returns the user's tier, score, and maximum score at the current time.
-func (auth *AuthManager) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
-	return auth.UserReputationAt(user, time.Now())
-}
-
 // userReputation computes the breakdown of a user's tier and score.
 func (auth *AuthManager) userReputation(bondTier int64, score int32) *account.Reputation {
 	var penalties int32
@@ -895,18 +883,6 @@ func (auth *AuthManager) AcctRepStatus(user account.AccountID) (connected bool, 
 	connected = auth.user(user) != nil
 	rep, err = auth.loadUserReputation(auth.ctx, user)
 	return
-}
-
-func (auth *AuthManager) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, redeemTime time.Time) {
-}
-
-func (auth *AuthManager) Inaction(user account.AccountID, outcome Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-}
-
-func (auth *AuthManager) PreimageSuccess(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
-}
-
-func (auth *AuthManager) MissedPreimage(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
 }
 
 // AcctStatus indicates if the user is presently connected and their tier.
