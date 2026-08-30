@@ -3,7 +3,6 @@
   - [What is Bison Wallet](Home#what-is-bison-wallet)
   - [What is DCRDEX?](Home#what-is-dcrdex)
   - [New Users](Home#new-users)
-  - [Tatanka Mesh](Home#tatanka-mesh)
   - [Project History](Home#project-history)
 - [Getting Started](Getting-Started)
   - [Download and Install](Download-and-Install)

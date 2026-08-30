@@ -45,8 +45,6 @@ import (
 	"decred.org/dcrdex/dex/wait"
 	"decred.org/dcrdex/server/account"
 	serverdex "decred.org/dcrdex/server/dex"
-	"decred.org/dcrdex/tatanka/client/mesh"
-	"decred.org/dcrdex/tatanka/tanka"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -1615,7 +1613,6 @@ type Config struct {
 
 	TheOneHost string
 
-	Mesh bool
 	// MaxActiveMatches is the maximum number of active swap matches allowed
 	// per DEX connection before new orders are deferred. Zero means use the
 	// default (48).
@@ -1696,10 +1693,6 @@ type Core struct {
 
 	requestedActionMtx sync.RWMutex
 	requestedActions   map[string]*asset.ActionRequiredNote
-
-	meshMtx sync.RWMutex
-	mesh    *mesh.Mesh
-	meshCM  *dex.ConnectionMaster
 }
 
 // New is the constructor for a new Core.
@@ -2718,7 +2711,6 @@ func (c *Core) assetMap() map[uint32]*SupportedAsset {
 
 // User is a thread-safe getter for the User.
 func (c *Core) User() *User {
-	m := c.coreMesh()
 	return &User{
 		Assets:             c.assetMap(),
 		Exchanges:          c.Exchanges(),
@@ -2728,7 +2720,6 @@ func (c *Core) User() *User {
 		Net:                c.net,
 		ExtensionConfig:    c.extensionModeConfig,
 		Actions:            c.requestedActionsList(),
-		Mesh:               m,
 	}
 }
 
@@ -4827,7 +4818,6 @@ func (c *Core) Login(pw []byte) error {
 		}
 	}
 
-	var meshPriv *secp256k1.PrivateKey
 	login := func() (needInit bool, err error) {
 		c.loginMtx.Lock()
 		defer c.loginMtx.Unlock()
@@ -4842,44 +4832,9 @@ func (c *Core) Login(pw []byte) error {
 			if err != nil {
 				return false, fmt.Errorf("error deriving bond private key: %w", err)
 			}
-			meshPriv, err = deriveMeshPriv(seed)
-			if err != nil {
-				return false, fmt.Errorf("error deriving mesh private key: %w", err)
-			}
 			c.multisigXPriv, err = deriveMultisigXPriv(seed)
 			if err != nil {
 				return false, fmt.Errorf("error deriving multisig private key: %w", err)
-			}
-
-			if c.cfg.Mesh && c.net == dex.Simnet {
-				mesh, err := mesh.New(&mesh.Config{
-					DataDir:    filepath.Join(filepath.Dir(c.cfg.DBPath), "mesh"),
-					PrivateKey: meshPriv,
-					Logger:     c.log.SubLogger("MESH"),
-					EntryNode: &mesh.TatankaCredentials{
-						PeerID: tanka.SimnetTatankaPeerID,
-						Addr:   "127.0.0.1:7323",
-						// Cert: ,
-						NoTLS: true,
-					},
-				})
-				if err != nil {
-					return false, err
-				}
-				c.meshMtx.Lock()
-				c.mesh = mesh
-				c.meshCM = dex.NewConnectionMaster(c.mesh)
-				c.meshMtx.Unlock()
-				go func() {
-					for {
-						select {
-						case n := <-mesh.Next():
-							c.handleMeshNotification(n)
-						case <-c.ctx.Done():
-							return
-						}
-					}
-				}()
 			}
 
 			c.loggedIn = true
@@ -4900,7 +4855,6 @@ func (c *Core) Login(pw []byte) error {
 		c.connectWallets(crypter) // initialize reserves
 		c.notify(newLoginNote("Resuming active trades..."))
 		c.resolveActiveTrades(crypter)
-		c.connectMesh()
 		c.notify(newLoginNote("Connecting to DEX servers..."))
 		c.initializeDEXConnections(crypter)
 	}
