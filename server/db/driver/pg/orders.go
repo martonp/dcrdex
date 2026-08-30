@@ -805,6 +805,62 @@ func (a *Archiver) storePreimage(dbe sqlQueryExecutor, ord order.Order, pi order
 	return nil
 }
 
+func (a *Archiver) setOrderCompleteTimeByID(dbe sqlQueryExecutor, oid order.OrderID, base, quote uint32, compTimeMs int64) error {
+	status, orderType, _, err := a.orderStatusByID(dbe, oid, base, quote)
+	if err != nil {
+		return err
+	}
+
+	if status != orderStatusExecuted {
+		log.Warnf("Attempting to set swap completion time for order %v in status %v, not executed",
+			oid, status)
+		return db.ArchiveError{
+			Code: db.ErrOrderNotExecuted,
+			Detail: fmt.Sprintf("unable to set completed time for order %v in status %v, not executed",
+				oid, status),
+		}
+	}
+
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return db.ArchiveError{
+			Code: db.ErrInvalidOrder,
+			Detail: fmt.Sprintf("unknown market (%d, %d) for order %v",
+				base, quote, oid),
+		}
+	}
+
+	var tableName string
+	switch orderType {
+	case order.MarketOrderType, order.LimitOrderType:
+		tableName = fullOrderTableName(a.dbName, marketSchema, status.active())
+	case order.CancelOrderType:
+		tableName = fullCancelOrderTableName(a.dbName, marketSchema, status.active())
+	default:
+		return db.ArchiveError{
+			Code:   db.ErrInvalidOrder,
+			Detail: fmt.Sprintf("unknown type for order %v: %v", oid, orderType),
+		}
+	}
+
+	stmt := fmt.Sprintf(internal.SetOrderCompleteTime, tableName)
+	N, err := sqlExec(dbe, stmt, compTimeMs, oid)
+	if err != nil {
+		a.fatalBackendErr(err)
+		return db.ArchiveError{
+			Code:   db.ErrGeneralFailure,
+			Detail: fmt.Sprintf("error setting completion time for order %v", oid),
+		}
+	}
+	if N != 1 {
+		return db.ArchiveError{
+			Code:   db.ErrUnknownOrder,
+			Detail: fmt.Sprintf("update count = %d for order %v, expected 1", N, oid),
+		}
+	}
+	return nil
+}
+
 // StorePreimage stores the preimage associated with an existing order.
 func (a *Archiver) StorePreimage(ord order.Order, pi order.Preimage) error {
 	return a.storePreimage(a.db, ord, pi)

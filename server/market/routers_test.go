@@ -290,7 +290,7 @@ func (a *TAuth) AcctStatus(user account.AccountID) (connected bool, tier int64) 
 	return true, 1
 }
 func (a *TAuth) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
-	return &db.ReputationOutcomePolicy{PreimageLimit: 40, OrderLimit: 100, FreeCancelThreshold: 2}
+	return &db.ReputationOutcomePolicy{PreimageLimit: 40, MatchLimit: 60, OrderLimit: 100, FreeCancelThreshold: 2}
 }
 
 type TMarketTunnel struct {

@@ -205,6 +205,12 @@ type reputationPreimageOutcome struct {
 	miss bool
 }
 
+type reputationMatchOutcome struct {
+	user    account.AccountID
+	mid     db.MarketMatchID
+	outcome db.Outcome
+}
+
 type reputationOrderOutcome struct {
 	user            account.AccountID
 	oid             order.OrderID
@@ -214,6 +220,7 @@ type reputationOrderOutcome struct {
 // reputationOutcomeBatch contains the reputation outcomes to record for one event.
 type reputationOutcomeBatch struct {
 	preimages []*reputationPreimageOutcome
+	matches   []*reputationMatchOutcome
 	orders    []*reputationOrderOutcome
 }
 
@@ -278,6 +285,11 @@ func (a *Archiver) storeReputationOutcomeBatch(
 			return handleDBError(err)
 		}
 	}
+	for _, update := range batch.matches {
+		if err := a.insertPoints(ctx, tx, update.user, update.mid.MatchID, db.OutcomeClassMatch, update.outcome); err != nil {
+			return handleDBError(err)
+		}
+	}
 	for _, update := range batch.orders {
 		outcome := db.OutcomeOrderComplete
 		if update.penalizedCancel {
@@ -312,6 +324,8 @@ func outcomeRetentionLimit(policy *db.ReputationOutcomePolicy, class db.OutcomeC
 	switch class {
 	case db.OutcomeClassPreimage:
 		return policy.PreimageLimit
+	case db.OutcomeClassMatch:
+		return policy.MatchLimit
 	case db.OutcomeClassOrder:
 		return policy.OrderLimit
 	default:
@@ -327,6 +341,11 @@ func reputationClassKeys(batch *reputationOutcomeBatch) []reputationClassKey {
 	for _, update := range batch.preimages {
 		if update != nil {
 			keys[reputationClassKey{user: update.user, class: db.OutcomeClassPreimage}] = struct{}{}
+		}
+	}
+	for _, update := range batch.matches {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassMatch}] = struct{}{}
 		}
 	}
 	for _, update := range batch.orders {

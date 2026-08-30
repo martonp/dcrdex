@@ -1012,6 +1012,7 @@ type OrdersRevokedUpdate struct {
 // per account and which successful cancellations count as penalties.
 type ReputationOutcomePolicy struct {
 	PreimageLimit int
+	MatchLimit    int
 	OrderLimit    int
 
 	// Successful cancellations with a nonnegative epoch gap below this
