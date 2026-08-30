@@ -98,6 +98,7 @@ type DEXArchivist interface {
 	SwapArchiver
 	ReputationArchiver
 	EventLogReader
+	SnapshotStore
 	EventSourcedStateChecker
 }
 
