@@ -83,10 +83,19 @@ func Test_swapLocker_LockOrderCoins(t *testing.T) {
 		}
 	}
 
-	// Try and fail to relock coins.
+	// Relocking the same orders' coins is an idempotent no-op, not a
+	// failure: swap tracking re-locks a standing maker on every fill.
 	failed := swapLock.LockOrdersCoins(orders)
-	if len(failed) != len(orders) {
-		t.Fatalf("should have failed to lock %d coins, got %d failed", len(orders), len(failed))
+	if len(failed) != 0 {
+		t.Fatalf("same-order relock should succeed, got %d failed", len(failed))
+	}
+
+	// A different order contending for an already-locked coin still fails.
+	lo2, _ := test.WriteLimitOrder(w, 1000, 3, order.StandingTiF, 0)
+	lo2.Coins = []order.CoinID{lo0.Coins[0]}
+	failed = swapLock.LockOrdersCoins([]order.Order{lo2})
+	if len(failed) != 1 {
+		t.Fatalf("contending order should fail to lock, got %d failed", len(failed))
 	}
 
 	// Now lock some in the book lock.
@@ -186,11 +195,21 @@ func Test_bookLocker_LockCoins(t *testing.T) {
 		t.Errorf("swapLock indicated coins were locked that should have been unlocked")
 	}
 
-	// Attempt relock of the already-locked coins.
+	// Relocking already-locked coins under the same orders is an idempotent
+	// no-op, not a failure.
 	delete(coinMap, oid)
 	failed := bookLock.LockCoins(coinMap)
-	if len(failed) != len(coinMap) {
-		t.Fatalf("should have failed to lock %d coins, got %d failed", len(coinMap), len(failed))
+	if len(failed) != 0 {
+		t.Fatalf("same-order relock should succeed, got %d failed", len(failed))
+	}
+
+	// A different order contending for an already-locked coin still fails.
+	contender := randomOrderID()
+	failed = bookLock.LockCoins(map[order.OrderID][]CoinID{
+		contender: {coinMap[allOrderIDs[1]][0]},
+	})
+	if len(failed) != 1 {
+		t.Fatalf("contending order should fail to lock, got %d failed", len(failed))
 	}
 
 	// Relock the coins for the removed order.
@@ -203,9 +222,4 @@ func Test_bookLocker_LockCoins(t *testing.T) {
 		t.Errorf("bookLock indicated coins were unlocked that should have been locked")
 	}
 
-	bookLock.UnlockAll()
-
-	if !verifyLocked(bookLock, orderCoins, false) {
-		t.Errorf("bookLock indicated coins were locked that should have been unlocked")
-	}
 }

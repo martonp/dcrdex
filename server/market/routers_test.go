@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -25,6 +26,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -55,6 +58,16 @@ const (
 
 	clientPreimageDelay = 75 * time.Millisecond
 )
+
+type emptyEventLogReader struct{}
+
+func (emptyEventLogReader) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
+	return &db.EventLogPosition{}, nil
+}
+
+func (emptyEventLogReader) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
+	return nil, nil
+}
 
 var (
 	oRig       *tOrderRig
@@ -135,8 +148,6 @@ type TAuth struct {
 	handlePreimageDone chan struct{}
 	handleMatchDone    chan *msgjson.Message
 	suspensions        map[account.AccountID]bool
-	canceledOrder      order.OrderID
-	cancelOrder        order.OrderID
 	rep                struct {
 		tier            int64
 		score, maxScore int32
@@ -153,6 +164,9 @@ func (a *TAuth) Suspended(user account.AccountID) (found, suspended bool) {
 }
 func (a *TAuth) Auth(user account.AccountID, msg, sig []byte) error {
 	//log.Infof("Auth for user %v", user)
+	return a.authErr
+}
+func (a *TAuth) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
 	return a.authErr
 }
 func (a *TAuth) Sign(...msgjson.Signable) {}
@@ -202,6 +216,9 @@ func (a *TAuth) Send(user account.AccountID, msg *msgjson.Message) error {
 
 	return nil
 }
+func (a *TAuth) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
+	return a.Send(user, msg)
+}
 func (a *TAuth) getSend() *msgjson.Message {
 	a.sendsMtx.Lock()
 	defer a.sendsMtx.Unlock()
@@ -214,6 +231,9 @@ func (a *TAuth) getSend() *msgjson.Message {
 }
 func (a *TAuth) Request(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message)) error {
 	return a.RequestWithTimeout(user, msg, f, time.Hour, func() {})
+}
+func (a *TAuth) RequestIfLocal(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message)) error {
+	return a.Request(user, msg, f)
 }
 func (a *TAuth) RequestWithTimeout(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message), expDur time.Duration, exp func()) error {
 	log.Infof("Request for user %v", user)
@@ -253,13 +273,7 @@ func (a *TAuth) RequestWithTimeout(user account.AccountID, msg *msgjson.Message,
 	return nil
 }
 
-func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)  {}
-func (a *TAuth) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
-}
-func (a *TAuth) Inaction(user account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-}
-func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
+func (a *TAuth) UserReputationAt(user account.AccountID, _ time.Time) (tier int64, score, maxScore int32, err error) {
 	if a.rep.maxScore == 0 {
 		return 1, 30, 60, a.rep.err
 	}
@@ -268,29 +282,29 @@ func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxSc
 func (a *TAuth) AcctStatus(user account.AccountID) (connected bool, tier int64) {
 	return true, 1
 }
-func (a *TAuth) RecordCompletedOrder(account.AccountID, order.OrderID, time.Time) {}
-func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epochGap int32, t time.Time) {
-	a.cancelOrder = coid
-	a.canceledOrder = oid
+func (a *TAuth) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
+	return &db.ReputationOutcomePolicy{PreimageLimit: 40, MatchLimit: 60, OrderLimit: 100, FreeCancelThreshold: 2}
 }
 
 type TMarketTunnel struct {
-	adds        []*orderRecord
-	added       chan struct{}
-	auth        *TAuth
-	midGap      uint64
-	lotSize     uint64
-	rateStep    uint64
-	mbBuffer    float64
-	epochIdx    uint64
-	epochDur    uint64
-	locked      bool
-	cancelable  bool
-	acctQty     uint64
-	acctLots    uint64
-	acctRedeems int
-	base, quote uint32
-	parcels     float64
+	adds          []*orderRecord
+	added         chan struct{}
+	auth          *TAuth
+	mesh          *tMesh
+	midGap        uint64
+	lotSize       uint64
+	rateStep      uint64
+	mbBuffer      float64
+	epochIdx      uint64
+	epochDur      uint64
+	locked        bool
+	cancelable    bool
+	resendHandled bool
+	acctQty       uint64
+	acctLots      uint64
+	acctRedeems   int
+	base, quote   uint32
+	parcels       float64
 }
 
 func tNewMarket(auth *TAuth) *TMarketTunnel {
@@ -307,29 +321,32 @@ func tNewMarket(auth *TAuth) *TMarketTunnel {
 	}
 }
 
-func (m *TMarketTunnel) SubmitOrder(o *orderRecord) error {
-	// set the server time
+func (m *TMarketTunnel) ResendOfKnownOrder(_ context.Context, _ *orderRecord, _ *mesh.CommandCompletion) (bool, *msgjson.Error) {
+	return m.resendHandled, nil
+}
+
+func (m *TMarketTunnel) AcceptOrderCommand(ctx context.Context, o *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
 	now := nowMs()
 	o.order.SetTime(now)
-
 	m.adds = append(m.adds, o)
 
-	// Send the order, but skip the signature
 	oid := o.order.ID()
-	resp, _ := msgjson.NewResponse(1, &msgjson.OrderResult{
+	result := &msgjson.OrderResult{
 		Sig:        msgjson.Bytes{},
 		OrderID:    oid[:],
 		ServerTime: uint64(now.UnixMilli()),
-	}, nil)
-	err := m.auth.Send(account.AccountID{}, resp)
-	if err != nil {
-		log.Debug("Send:", err)
 	}
-
+	event, err := mesh.NewEvent(meshevents.NewOrderAcceptedEvent(o.order))
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "new order accepted event error: %v", err)
+	}
+	err = completion.Emit(ctx, event, func() any { return result })
 	if m.added != nil {
 		m.added <- struct{}{}
 	}
-
+	if err != nil {
+		return marketOrderError(err)
+	}
 	return nil
 }
 
@@ -364,11 +381,6 @@ func (m *TMarketTunnel) pop() *orderRecord {
 
 func (m *TMarketTunnel) Cancelable(order.OrderID) bool {
 	return m.cancelable
-}
-
-func (m *TMarketTunnel) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	// no suspension
-	return -1, time.Time{}
 }
 
 func (m *TMarketTunnel) Running() bool {
@@ -761,6 +773,20 @@ func TestMain(m *testing.M) {
 		DEXBalancer:  balancer,
 		MatchSwapper: swapper,
 	})
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands:       oRig.router.Commands(),
+		Events: map[string]mesh.EventApplier{
+			meshevents.EventKindOrderAccepted: func(*mesh.EventApplyContext, *mesh.Event) (*db.EventLogEntry, error) {
+				return new(db.EventLogEntry), nil
+			},
+		},
+	})
+	if err != nil {
+		panic("mesh.NewService error:" + err.Error())
+	}
+	oRig.router.SetMeshService(meshSvc)
 	rig = newTestRig()
 	src1 := rig.source1
 	src2 := rig.source2
@@ -786,6 +812,7 @@ func TestMain(m *testing.M) {
 		var shutdown context.CancelFunc
 		testCtx, shutdown = context.WithCancel(context.Background())
 		rig.router = NewBookRouter(rig.sources(), &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+		rig.router.SeedBooks()
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -797,7 +824,7 @@ func TestMain(m *testing.M) {
 			oRig.router.Run(testCtx)
 			wg.Done()
 		}()
-		time.Sleep(100 * time.Millisecond) // let the router actually start in runBook
+		time.Sleep(100 * time.Millisecond) // let the routers actually start
 		defer func() {
 			shutdown()
 			wg.Wait()
@@ -903,6 +930,15 @@ func TestLimit(t *testing.T) {
 	testPrefixTrade(&limit.Prefix, &limit.Trade, oRig.dcr.TBackend, oRig.btc.TBackend,
 		func(tag string, code int) { t.Helper(); ensureErr(tag, sendLimit(), code) },
 	)
+
+	oRig.market.resendHandled = true
+	defer func() { oRig.market.resendHandled = false }()
+	ogTime := limit.ClientTime
+	limit.ClientTime = ogTime - maxClockOffset - 1
+	staleMsg, _ := msgjson.NewRequest(reqID, msgjson.LimitRoute, limit)
+	ensureErr("resend of too-old", oRig.router.handleLimit(user.acct, staleMsg), -1)
+	limit.ClientTime = ogTime
+	oRig.market.resendHandled = false
 
 	// Zero-conf fails fee rate validation.
 	oRig.dcr.confsMinus2 = -2
@@ -1031,6 +1067,357 @@ func TestLimit(t *testing.T) {
 	// None needed to redeem.
 	oRig.polygon.bal = 0
 	ensureSuccess("enough to redeem account-based quote")
+}
+
+func TestOrderHandlersSubmitCommand(t *testing.T) {
+	user := oRig.user
+
+	type handlerCase struct {
+		name   string
+		route  string
+		kind   string
+		handle func(account.AccountID, *msgjson.Message) *msgjson.Error
+	}
+
+	tests := []handlerCase{
+		{
+			name:   "limit",
+			route:  msgjson.LimitRoute,
+			kind:   commandKindLimit,
+			handle: oRig.router.handleLimit,
+		},
+		{
+			name:   "market",
+			route:  msgjson.MarketRoute,
+			kind:   commandKindMarket,
+			handle: oRig.router.handleMarket,
+		},
+		{
+			name:   "cancel",
+			route:  msgjson.CancelRoute,
+			kind:   commandKindCancel,
+			handle: oRig.router.handleCancel,
+		},
+	}
+
+	prevMesh := oRig.router.mesh
+	prevSends := oRig.auth.sends
+	defer func() {
+		oRig.router.SetMeshService(prevMesh)
+		oRig.auth.sends = prevSends
+	}()
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meshReq := &tMesh{}
+			oRig.router.SetMeshService(meshReq)
+			oRig.auth.sends = nil
+
+			reqID := uint64(55 + i)
+			msg, err := msgjson.NewRequest(reqID, tt.route, map[string]string{"test": tt.name})
+			if err != nil {
+				t.Fatalf("NewRequest(%q): %v", tt.route, err)
+			}
+			if rpcErr := tt.handle(user.acct, msg); rpcErr != nil {
+				t.Fatalf("handler error: %v", rpcErr)
+			}
+			if meshReq.calls != 1 {
+				t.Fatalf("mesh request calls = %d, want 1", meshReq.calls)
+			}
+			if meshReq.req.Kind != tt.kind {
+				t.Fatalf("wrong command kind. got %q, want %q", meshReq.req.Kind, tt.kind)
+			}
+			if meshReq.user != user.acct {
+				t.Fatalf("mesh request user = %v, want %v", meshReq.user, user.acct)
+			}
+			if meshReq.msg != msg {
+				t.Fatal("mesh request msg pointer mismatch")
+			}
+			if meshReq.req.Respond == nil {
+				t.Fatal("mesh request missing response callback")
+			}
+			if len(oRig.auth.sends) != 0 {
+				t.Fatalf("unexpected immediate local responses: %d", len(oRig.auth.sends))
+			}
+		})
+	}
+}
+
+func TestExecuteOrderAcceptedCommand(t *testing.T) {
+	user := oRig.user
+	const lots = 10
+	qty := uint64(dcrLotSize) * lots
+	rate := uint64(1000) * dcrRateStep
+	targetID := order.OrderID{244}
+
+	newRequest := func(t *testing.T, reqID uint64, route string, payload any) *msgjson.Message {
+		t.Helper()
+		msg, err := msgjson.NewRequest(reqID, route, payload)
+		if err != nil {
+			t.Fatalf("NewRequest(%q): %v", route, err)
+		}
+		return msg
+	}
+
+	newPrefix := func(orderType uint8) msgjson.Prefix {
+		pi := ordertest.RandomPreimage()
+		commit := pi.Commit()
+		return msgjson.Prefix{
+			AccountID:  user.acct[:],
+			Base:       dcrID,
+			Quote:      btcID,
+			OrderType:  orderType,
+			ClientTime: uint64(nowMs().UnixMilli()),
+			Commit:     commit[:],
+		}
+	}
+
+	newSellTrade := func() msgjson.Trade {
+		return msgjson.Trade{
+			Side:     msgjson.SellOrderNum,
+			Quantity: qty,
+			Coins: []*msgjson.Coin{
+				oRig.signedUTXO(dcrID, qty-dcrLotSize, 1),
+				oRig.signedUTXO(dcrID, 2*dcrLotSize, 2),
+			},
+			Address: btcAddr,
+		}
+	}
+
+	makeLimitMsg := func(t *testing.T, reqID uint64) *msgjson.Message {
+		t.Helper()
+		return newRequest(t, reqID, msgjson.LimitRoute, msgjson.LimitOrder{
+			Prefix: newPrefix(msgjson.LimitOrderNum),
+			Trade:  newSellTrade(),
+			Rate:   rate,
+			TiF:    msgjson.StandingOrderNum,
+		})
+	}
+
+	makeMarketMsg := func(t *testing.T, reqID uint64) *msgjson.Message {
+		t.Helper()
+		return newRequest(t, reqID, msgjson.MarketRoute, msgjson.MarketOrder{
+			Prefix: newPrefix(msgjson.MarketOrderNum),
+			Trade:  newSellTrade(),
+		})
+	}
+
+	makeCancelMsg := func(t *testing.T, reqID uint64) *msgjson.Message {
+		t.Helper()
+		return newRequest(t, reqID, msgjson.CancelRoute, msgjson.CancelOrder{
+			Prefix:   newPrefix(msgjson.CancelOrderNum),
+			TargetID: targetID[:],
+		})
+	}
+
+	newCapturingService := func(t *testing.T) (*mesh.Service, *[]*mesh.Event) {
+		t.Helper()
+		var events []*mesh.Event
+		meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+			EventLogReader: emptyEventLogReader{},
+			OnHalt:         func(error) {},
+			Commands:       oRig.router.Commands(),
+			Events: map[string]mesh.EventApplier{
+				meshevents.EventKindOrderAccepted: func(_ *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+					cpy := cloneTestMeshEvent(event)
+					events = append(events, cpy)
+					return &db.EventLogEntry{
+						Seq:     uint64(len(events)),
+						Kind:    cpy.Kind,
+						Event:   append([]byte(nil), cpy.Payload...),
+						TipHash: []byte{byte(len(events))},
+					}, nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewService error: %v", err)
+		}
+		return meshSvc, &events
+	}
+
+	executeCommand := func(t *testing.T, meshSvc *mesh.Service, kind string, user account.AccountID, msg *msgjson.Message) *msgjson.Message {
+		t.Helper()
+		var response *msgjson.Message
+		rpcErr := meshSvc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+			Kind: kind,
+			User: user,
+			Msg:  msg,
+			Respond: func(resp *msgjson.Message) error {
+				if response != nil {
+					t.Fatalf("multiple command responses")
+				}
+				response = resp
+				return nil
+			},
+		})
+		if rpcErr != nil {
+			t.Fatalf("ExecuteCommand error: %v", rpcErr)
+		}
+		if response == nil {
+			t.Fatalf("missing command response")
+		}
+		return response
+	}
+
+	orderFromAcceptedEvent := func(t *testing.T, entry *mesh.Event) order.Order {
+		t.Helper()
+		if entry.Kind != meshevents.EventKindOrderAccepted {
+			t.Fatalf("wrong event kind. got %q, want %q", entry.Kind, meshevents.EventKindOrderAccepted)
+		}
+		accepted, err := meshevents.DecodeOrderAcceptedEvent(entry.Payload)
+		if err != nil {
+			t.Fatalf("DecodeOrderAcceptedEvent error: %v", err)
+		}
+		ord, err := accepted.Order()
+		if err != nil {
+			t.Fatalf("accepted order error: %v", err)
+		}
+		return ord
+	}
+
+	requireOrderAcceptedEvent := func(t *testing.T, events []*mesh.Event) order.Order {
+		t.Helper()
+		if len(events) != 1 {
+			t.Fatalf("events = %d, want 1", len(events))
+		}
+		return orderFromAcceptedEvent(t, events[0])
+	}
+
+	requireResponseOrderID := func(t *testing.T, resp *msgjson.Message, ord order.Order) {
+		t.Helper()
+		var result msgjson.OrderResult
+		if err := resp.UnmarshalResult(&result); err != nil {
+			t.Fatalf("response result: %v", err)
+		}
+		var resultOrderID order.OrderID
+		copy(resultOrderID[:], result.OrderID)
+		if resultOrderID != ord.ID() {
+			t.Fatalf("response order id = %v, want event order id %v", resultOrderID, ord.ID())
+		}
+	}
+
+	type commandCase struct {
+		name    string
+		kind    string
+		makeMsg func(*testing.T, uint64) *msgjson.Message
+	}
+
+	tests := []commandCase{
+		{
+			name:    "limit",
+			kind:    commandKindLimit,
+			makeMsg: makeLimitMsg,
+		},
+		{
+			name:    "market",
+			kind:    commandKindMarket,
+			makeMsg: makeMarketMsg,
+		},
+		{
+			name:    "cancel",
+			kind:    commandKindCancel,
+			makeMsg: makeCancelMsg,
+		},
+	}
+
+	prevAdds := oRig.market.adds
+	defer func() { oRig.market.adds = prevAdds }()
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			meshSvc, events := newCapturingService(t)
+			oRig.market.adds = nil
+
+			reqID := uint64(77 + i)
+			msg := tt.makeMsg(t, reqID)
+			resp := executeCommand(t, meshSvc, tt.kind, user.acct, msg)
+			if resp.ID != reqID {
+				t.Fatalf("response id = %d, want %d", resp.ID, reqID)
+			}
+			ord := requireOrderAcceptedEvent(t, *events)
+			requireResponseOrderID(t, resp, ord)
+		})
+	}
+
+	t.Run("response waits for event apply", func(t *testing.T) {
+		var events []*mesh.Event
+		applierEntered := make(chan struct{})
+		releaseApplier := make(chan struct{})
+		meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+			EventLogReader: emptyEventLogReader{},
+			OnHalt:         func(error) {},
+			Commands:       oRig.router.Commands(),
+			Events: map[string]mesh.EventApplier{
+				meshevents.EventKindOrderAccepted: func(_ *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+					close(applierEntered)
+					<-releaseApplier
+					cpy := cloneTestMeshEvent(event)
+					events = append(events, cpy)
+					return &db.EventLogEntry{
+						Seq:     1,
+						Kind:    cpy.Kind,
+						Event:   append([]byte(nil), cpy.Payload...),
+						TipHash: []byte{1},
+					}, nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewService error: %v", err)
+		}
+		oRig.market.adds = nil
+
+		reqID := uint64(101)
+		msg := makeLimitMsg(t, reqID)
+		responses := make(chan *msgjson.Message, 1)
+		rpcErrs := make(chan *msgjson.Error, 1)
+		go func() {
+			rpcErrs <- meshSvc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+				Kind: commandKindLimit,
+				User: user.acct,
+				Msg:  msg,
+				Respond: func(resp *msgjson.Message) error {
+					responses <- resp
+					return nil
+				},
+			})
+		}()
+
+		select {
+		case <-applierEntered:
+		case rpcErr := <-rpcErrs:
+			t.Fatalf("command returned before event apply: %v", rpcErr)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for command execution to reach event apply")
+		}
+		select {
+		case resp := <-responses:
+			t.Fatalf("response delivered before event apply returned: %v", resp)
+		default:
+		}
+
+		close(releaseApplier)
+		select {
+		case rpcErr := <-rpcErrs:
+			if rpcErr != nil {
+				t.Fatalf("ExecuteCommand error: %v", rpcErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for command execution")
+		}
+		var resp *msgjson.Message
+		select {
+		case resp = <-responses:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for command response")
+		}
+		if resp.ID != reqID {
+			t.Fatalf("response id = %d, want %d", resp.ID, reqID)
+		}
+		ord := requireOrderAcceptedEvent(t, events)
+		requireResponseOrderID(t, resp, ord)
+	})
 }
 
 func TestMarketStartProcessStop(t *testing.T) {
@@ -1465,11 +1852,12 @@ func makeCORevealed(writer *ordertest.Writer, targetID order.OrderID) (*order.Ca
 }
 
 type TBookSource struct {
-	buys  []*order.LimitOrder
-	sells []*order.LimitOrder
-	feed  chan *updateSignal
-	base  uint32
-	quote uint32
+	buys      []*order.LimitOrder
+	sells     []*order.LimitOrder
+	unbookMtx sync.Mutex
+	unbook    func(*order.LimitOrder)
+	base      uint32
+	quote     uint32
 }
 
 func (s *TBookSource) Base() uint32 {
@@ -1482,7 +1870,6 @@ func (s *TBookSource) Quote() uint32 {
 
 func tNewBookSource(base, quote uint32) *TBookSource {
 	return &TBookSource{
-		feed:  make(chan *updateSignal, 16),
 		base:  base,
 		quote: quote,
 	}
@@ -1491,8 +1878,19 @@ func tNewBookSource(base, quote uint32) *TBookSource {
 func (s *TBookSource) Book() (eidx int64, buys []*order.LimitOrder, sells []*order.LimitOrder) {
 	return 13241324, s.buys, s.sells
 }
-func (s *TBookSource) OrderFeed() <-chan *updateSignal {
-	return s.feed
+func (s *TBookSource) SetUnbookNotifier(f func(*order.LimitOrder)) {
+	s.unbookMtx.Lock()
+	s.unbook = f
+	s.unbookMtx.Unlock()
+}
+
+func (s *TBookSource) notifyUnbooked(lo *order.LimitOrder) {
+	s.unbookMtx.Lock()
+	notify := s.unbook
+	s.unbookMtx.Unlock()
+	if notify != nil {
+		notify(lo)
+	}
 }
 
 type TLink struct {
@@ -1518,7 +1916,7 @@ func tNewLink() *TLink {
 		ip:          dex.NewIPKey("[1:800:dead:cafe::]"),
 		addr:        "testaddr",
 		sends:       make([]*msgjson.Message, 0),
-		sendTrigger: make(chan struct{}, 1),
+		sendTrigger: make(chan struct{}, 32),
 	}
 }
 
@@ -1817,14 +2215,8 @@ func TestRouter(t *testing.T) {
 	// An epoch notification sent on market 1's channel should arrive at both
 	// clients.
 	lo := makeLO(buyer1, mkRate1(0.8, 1.0), randLots(10), order.ImmediateTiF)
-	sig := &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    lo,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	const epochIdx = 12345678
+	router.applyOrderAcceptedEvent(router.books[mktName1], epochOrderNote(lo, mktName1, epochIdx), epochIdx)
 
 	epochNote := getEpochNoteFromLink(t, link1)
 	compareLO(&epochNote.BookOrderNote, lo, msgjson.ImmediateOrderNum, "epoch notification, link1")
@@ -1836,9 +2228,8 @@ func TestRouter(t *testing.T) {
 	compareLO(&epochNote.BookOrderNote, lo, msgjson.ImmediateOrderNum, "epoch notification, link2")
 
 	// just for kicks, checks the epoch is as expected.
-	wantIdx := sig.data.(sigDataEpochOrder).epochIdx
-	if epochNote.Epoch != uint64(wantIdx) {
-		t.Fatalf("wrong epoch. wanted %d, got %d", wantIdx, epochNote.Epoch)
+	if epochNote.Epoch != uint64(epochIdx) {
+		t.Fatalf("wrong epoch. wanted %d, got %d", epochIdx, epochNote.Epoch)
 	}
 
 	// Have both subscribers subscribe to market 2.
@@ -1856,14 +2247,7 @@ func TestRouter(t *testing.T) {
 
 	// Send an epoch update for a market order.
 	mo := makeMO(buyer2, randLots(10))
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    mo,
-			epochIdx: 12345678,
-		},
-	}
-	src2.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName2], epochOrderNote(mo, mktName2, epochIdx), epochIdx)
 
 	epochNote = getEpochNoteFromLink(t, link1)
 	compareTrade(&epochNote.BookOrderNote, mo, "link 1 market 2 epoch update (market order)")
@@ -1877,14 +2261,7 @@ func TestRouter(t *testing.T) {
 	lo = makeLO(seller2, mkRate2(1.0, 1.2), randLots(10)+1, order.StandingTiF)
 	lo.FillAmt = mkt2.LotSize
 
-	sig = &updateSignal{
-		action: bookAction,
-		data: sigDataBookedOrder{
-			order:    lo,
-			epochIdx: 12344365,
-		},
-	}
-	src2.feed <- sig
+	router.applyBookedOrder(router.books[mktName2], lo)
 
 	bookNote := getBookNoteFromLink(t, link1)
 	compareLO(bookNote, lo, msgjson.StandingOrderNum, "book notification, link1, market 2")
@@ -1902,15 +2279,7 @@ func TestRouter(t *testing.T) {
 	// Update the order's remaining quantity. Leave one lot remaining.
 	lo.FillAmt = lo.Quantity - mkt2.LotSize
 
-	sig = &updateSignal{
-		action: updateRemainingAction,
-		data: sigDataUpdateRemaining{
-			order:    lo,
-			epochIdx: 12344365,
-		},
-	}
-
-	src2.feed <- sig
+	router.applyUpdateRemainingEvent(router.books[mktName2], lo)
 
 	urNote := getUpdateRemainingNoteFromLink(t, link2)
 	if urNote.Remaining != lo.Remaining() {
@@ -1919,15 +2288,8 @@ func TestRouter(t *testing.T) {
 	// clear the send from client 1
 	link1.getSend()
 
-	// Now unbook the order.
-	sig = &updateSignal{
-		action: unbookAction,
-		data: sigDataUnbookedOrder{
-			order:    lo,
-			epochIdx: 12345678,
-		},
-	}
-	src2.feed <- sig
+	// Now unbook the order through the market's registered unbook notifier.
+	src2.notifyUnbooked(lo)
 
 	unbookNote := getUnbookNoteFromLink(t, link1)
 	if lo.ID().String() != unbookNote.OrderID.String() {
@@ -1968,14 +2330,7 @@ func TestRouter(t *testing.T) {
 	}
 
 	mo = makeMO(seller1, randLots(10))
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    mo,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName1], epochOrderNote(mo, mktName1, epochIdx), epochIdx)
 
 	if link2.getSend() == nil {
 		t.Fatalf("client 2 didn't receive an update after client 1 unsubbed")
@@ -1991,14 +2346,8 @@ func TestRouter(t *testing.T) {
 	// Now epoch a cancel order to client 2.
 	targetID := src1.buys[0].ID()
 	co := makeCO(buyer1, targetID)
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    co,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	coNote := epochOrderNote(co, mktName1, epochIdx)
+	router.applyOrderAcceptedEvent(router.books[mktName1], coNote, epochIdx)
 
 	epochNote = getEpochNoteFromLink(t, link2)
 	if epochNote.OrderType != msgjson.CancelOrderNum {
@@ -2013,7 +2362,7 @@ func TestRouter(t *testing.T) {
 
 	// Send another, but err on the send. Check for unsubscribed
 	link2.sendRawErr = dummyError
-	src1.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName1], coNote, epochIdx)
 
 	// Wait for (*BookRouter).sendNote to remove the erroring link from the
 	// subscription conns map.
@@ -2026,6 +2375,143 @@ func TestRouter(t *testing.T) {
 	if l != nil {
 		t.Fatalf("client not removed from subscription list")
 	}
+}
+
+func TestBookRouterApplyOrderAcceptedEvent(t *testing.T) {
+	rig := newTestRig()
+	rig.router = NewBookRouter(rig.sources(), &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+
+	link, sub := newSubscriber(mkt1)
+	if err := rig.router.handleOrderBook(link, sub); err != nil {
+		t.Fatalf("handleOrderBook: %v", err)
+	}
+	_ = link.getSend() // initial order book response
+
+	lo := makeLO(buyer1, mkRate1(0.8, 1.0), randLots(10), order.ImmediateTiF)
+	const epochIdx = 4321
+
+	preparedEpochNote := epochOrderNote(lo, mktName1, epochIdx)
+	book := rig.router.books[mktName1]
+	if book == nil {
+		t.Fatalf("missing book for market %s", mktName1)
+	}
+	rig.router.applyOrderAcceptedEvent(book, preparedEpochNote, epochIdx)
+
+	epochNote := getEpochNoteFromLink(t, link)
+	if epochNote.MarketID != mktName1 {
+		t.Fatalf("wrong market id. got %s, wanted %s", epochNote.MarketID, mktName1)
+	}
+	if epochNote.Epoch != epochIdx {
+		t.Fatalf("wrong epoch. got %d, wanted %d", epochNote.Epoch, epochIdx)
+	}
+	if epochNote.Seq == 0 {
+		t.Fatal("expected non-zero epoch note sequence")
+	}
+	if epochNote.OrderType != msgjson.LimitOrderNum {
+		t.Fatalf("wrong order type. got %d, wanted %d", epochNote.OrderType, msgjson.LimitOrderNum)
+	}
+	if epochNote.Rate != lo.Rate {
+		t.Fatalf("wrong rate. got %d, wanted %d", epochNote.Rate, lo.Rate)
+	}
+	if epochNote.Quantity != lo.Remaining() {
+		t.Fatalf("wrong quantity. got %d, wanted %d", epochNote.Quantity, lo.Remaining())
+	}
+	if epochNote.TiF != msgjson.ImmediateOrderNum {
+		t.Fatalf("wrong time-in-force. got %d, wanted %d", epochNote.TiF, msgjson.ImmediateOrderNum)
+	}
+	if got := book.epoch(); got != epochIdx {
+		t.Fatalf("wrong book epoch. got %d, wanted %d", got, epochIdx)
+	}
+}
+
+func TestApplyNewEpoch(t *testing.T) {
+	rig := newTestRig()
+	rig.router = NewBookRouter(rig.sources(), &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+
+	const epochIdx = 9876
+	book := rig.router.books[mktName1]
+	if book == nil {
+		t.Fatalf("missing book for market %s", mktName1)
+	}
+	rig.router.applyAdvanceEpochEvent(book, epochIdx)
+
+	if got := book.epoch(); got != epochIdx {
+		t.Fatalf("wrong book epoch. got %d, wanted %d", got, epochIdx)
+	}
+}
+
+func TestApplyBookedOrder(t *testing.T) {
+	rig := newTestRig()
+	rig.router = NewBookRouter(rig.sources(), &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+
+	link, sub := newSubscriber(mkt1)
+	if err := rig.router.handleOrderBook(link, sub); err != nil {
+		t.Fatalf("handleOrderBook: %v", err)
+	}
+	_ = link.getSend() // initial order book response
+
+	lo := makeLO(buyer1, mkRate1(0.8, 1.0), randLots(10), order.StandingTiF)
+
+	book := rig.router.books[mktName1]
+	if book == nil {
+		t.Fatalf("missing book for market %s", mktName1)
+	}
+	rig.router.applyBookedOrder(book, lo)
+
+	bookNote := getBookNoteFromLink(t, link)
+	if bookNote.MarketID != mktName1 {
+		t.Fatalf("wrong market id. got %s, wanted %s", bookNote.MarketID, mktName1)
+	}
+	if bookNote.Seq == 0 {
+		t.Fatal("expected non-zero book note sequence")
+	}
+	if bookNote.OrderID.String() != lo.ID().String() {
+		t.Fatalf("wrong order id. got %s, wanted %s", bookNote.OrderID, lo.ID())
+	}
+	if bookNote.Rate != lo.Rate {
+		t.Fatalf("wrong rate. got %d, wanted %d", bookNote.Rate, lo.Rate)
+	}
+	if bookNote.Quantity != lo.Remaining() {
+		t.Fatalf("wrong quantity. got %d, wanted %d", bookNote.Quantity, lo.Remaining())
+	}
+	book.mtx.RLock()
+	got := book.orders[lo.ID()]
+	book.mtx.RUnlock()
+	if got == nil {
+		t.Fatalf("booked order %v missing from router book", lo.ID())
+	}
+}
+
+func TestEventApplyPreflightMissingBookDoesNotMutateMarket(t *testing.T) {
+	mkt, storage, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	defer cleanup()
+
+	coin := order.CoinID([]byte{0x01, 0x02, 0x03})
+	lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	lo.Coins = []order.CoinID{coin}
+	oid := lo.ID()
+	commit := lo.Commitment()
+
+	event, err := mesh.NewEvent(meshevents.NewOrderAcceptedEvent(lo))
+	if err != nil {
+		t.Fatalf("order accepted event error: %v", err)
+	}
+	router := NewBookRouter(map[string]BookSource{
+		mktName1: tNewBookSource(btcID, ltcID),
+	}, &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+
+	before := snapshotAcceptedLimit(mkt, storage, oid, commit, coin)
+	_, err = applyOrderAcceptedEvent(&mesh.EventApplyContext{Context: context.Background()}, map[string]*Market{
+		mktName3: mkt,
+	}, router, event)
+	if err == nil {
+		t.Fatal("expected missing book market error")
+	}
+	after := snapshotAcceptedLimit(mkt, storage, oid, commit, coin)
+	assertAcceptedLimitSnapshotsEqual(t, after, before)
 }
 
 // func TestFeeRateRequest(t *testing.T) {
@@ -2162,13 +2648,10 @@ func TestPriceFeed(t *testing.T) {
 		t.Fatal("spot volume not communicated")
 	}
 
-	rig.source1.feed <- &updateSignal{
-		action: epochReportAction,
-		data: sigDataEpochReport{
-			spot:  &msgjson.Spot{Vol24: 12345},
-			stats: &matcher.MatchCycleStats{},
-		},
-	}
+	rig.router.applyEpochReportEvent(rig.router.books[mktName1], &epochReport{
+		spot:  &msgjson.Spot{Vol24: 12345},
+		stats: &matcher.MatchCycleStats{},
+	})
 
 	update := link.getSend()
 	spot = new(msgjson.Spot)
@@ -2217,14 +2700,14 @@ func TestParcelLimits(t *testing.T) {
 	ensureSuccess := func() {
 		t.Helper()
 		// Single lot should definitely be ok.
-		if ok := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", calcParcels); !ok {
-			t.Fatalf("not ok")
+		if ok, err := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", time.Now(), calcParcels); err != nil || !ok {
+			t.Fatalf("not ok (err = %v)", err)
 		}
 	}
 
 	ensureErr := func() {
 		t.Helper()
-		if ok := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", calcParcels); ok {
+		if ok, _ := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", time.Now(), calcParcels); ok {
 			t.Fatalf("not error")
 		}
 	}
@@ -2238,6 +2721,13 @@ func TestParcelLimits(t *testing.T) {
 	rep.tier = 0
 	ensureErr()
 	rep.tier = 1
+
+	// A reputation load failure propagates as an error, never as a verdict.
+	rep.err = errors.New("db down")
+	if ok, err := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", time.Now(), calcParcels); err == nil || ok {
+		t.Fatalf("reputation load failure: ok=%v err=%v, want propagated error", ok, err)
+	}
+	rep.err = nil
 
 	var maxParcels uint64 = dex.PerTierBaseParcelLimit // based on score of 0
 	maxMakerQty := lotSize * maxParcels

@@ -1818,3 +1818,27 @@ func coinIDString(assetID uint32, coinID []byte) string {
 	}
 	return s
 }
+
+// VerifyUserSig validates the signature/message pair with the user's public
+// key, using the live session when the user is connected and falling back to
+// stored account data otherwise.
+func (auth *AuthManager) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
+	client := auth.user(user)
+	if client != nil {
+		return checkSigS256(msg, sig, client.acct.PubKey)
+	}
+
+	acctInfo, err := auth.storage.AccountInfo(user)
+	if err != nil {
+		return err
+	}
+	if acctInfo == nil {
+		return fmt.Errorf("account %s not found", user)
+	}
+
+	pubKey, err := secp256k1.ParsePubKey(acctInfo.Pubkey)
+	if err != nil {
+		return fmt.Errorf("error decoding secp256k1 public key: %w", err)
+	}
+	return checkSigS256(msg, sig, pubKey)
+}

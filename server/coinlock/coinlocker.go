@@ -25,8 +25,6 @@ type CoinLockChecker interface {
 // coins.
 type CoinLocker interface {
 	CoinLockChecker
-	// UnlockAll releases all locked coins.
-	UnlockAll()
 	// UnlockOrderCoins unlocks all locked coins associated with an order.
 	UnlockOrderCoins(oid order.OrderID)
 	// UnlockOrdersCoins is like UnlockOrderCoins for multiple orders.
@@ -103,11 +101,6 @@ func (bl *bookLocker) LockCoins(orderCoins map[order.OrderID][]CoinID) map[order
 	return bl.bookLock.LockCoins(orderCoins)
 }
 
-// UnlockAll releases all locked coins.
-func (bl *bookLocker) UnlockAll() {
-	bl.bookLock.UnlockAll()
-}
-
 // UnlockOrdersCoins unlocks all locked coins associated with an order.
 func (bl *bookLocker) UnlockOrdersCoins(oids []order.OrderID) {
 	bl.bookLock.UnlockOrdersCoins(oids)
@@ -134,11 +127,6 @@ func (sl *swapLocker) LockCoins(orderCoins map[order.OrderID][]CoinID) map[order
 	return sl.swapLock.LockCoins(orderCoins)
 }
 
-// UnlockAll releases all locked coins.
-func (sl *swapLocker) UnlockAll() {
-	sl.swapLock.UnlockAll()
-}
-
 // UnlockOrderCoins unlocks all locked coins associated with an order.
 func (sl *swapLocker) UnlockOrderCoins(oid order.OrderID) {
 	sl.swapLock.UnlockOrderCoins(oid)
@@ -156,25 +144,19 @@ type coinIDKey string
 // AssetCoinLocker is a coin locker for a single asset. Do not use this for more
 // than one asset.
 type AssetCoinLocker struct {
-	coinMtx            sync.RWMutex
-	lockedCoins        map[coinIDKey]struct{}
+	coinMtx sync.RWMutex
+	// lockedCoins maps each locked coin to the order holding the lock, so
+	// a re-lock by the same order is distinguishable from a conflict.
+	lockedCoins        map[coinIDKey]order.OrderID
 	lockedCoinsByOrder map[order.OrderID][]CoinID
 }
 
 // NewAssetCoinLocker constructs a new AssetCoinLocker.
 func NewAssetCoinLocker() *AssetCoinLocker {
 	return &AssetCoinLocker{
-		lockedCoins:        make(map[coinIDKey]struct{}),
+		lockedCoins:        make(map[coinIDKey]order.OrderID),
 		lockedCoinsByOrder: make(map[order.OrderID][]CoinID),
 	}
-}
-
-// UnlockAll releases all locked coins.
-func (ac *AssetCoinLocker) UnlockAll() {
-	ac.coinMtx.Lock()
-	ac.lockedCoins = make(map[coinIDKey]struct{})
-	ac.lockedCoinsByOrder = make(map[order.OrderID][]CoinID)
-	ac.coinMtx.Unlock()
 }
 
 // CoinLocked indicates if a coin identifier (e.g. UTXO) is locked.
@@ -192,11 +174,15 @@ func (ac *AssetCoinLocker) OrderCoinsLocked(oid order.OrderID) []CoinID {
 	return ac.lockedCoinsByOrder[oid]
 }
 
-// unlockOrderCoins should be called with the coinMtx locked.
+// unlockOrderCoins should be called with the coinMtx locked. Only locks the
+// order itself holds are released.
 func (ac *AssetCoinLocker) unlockOrderCoins(oid order.OrderID) {
 	coins := ac.lockedCoinsByOrder[oid]
 	for i := range coins {
-		delete(ac.lockedCoins, coinIDKey(coins[i]))
+		key := coinIDKey(coins[i])
+		if owner, locked := ac.lockedCoins[key]; locked && owner == oid {
+			delete(ac.lockedCoins, key)
+		}
 	}
 }
 
@@ -216,11 +202,26 @@ func (ac *AssetCoinLocker) UnlockOrdersCoins(oids []order.OrderID) {
 	ac.coinMtx.Unlock()
 }
 
-// LockCoins locks all coins (e.g. UTXOS) connected with certain orders.
+// orderCoinsLocked reports whether the order already holds locks on all the
+// given coins. coinMtx must be held.
+func (ac *AssetCoinLocker) orderCoinsLocked(oid order.OrderID, coinIDs []CoinID) bool {
+	for i := range coinIDs {
+		if owner, locked := ac.lockedCoins[coinIDKey(coinIDs[i])]; !locked || owner != oid {
+			return false
+		}
+	}
+	return true
+}
+
+// LockCoins locks all coins connected with certain orders. An order that
+// already holds locks on all the given coins is a no-op, not a failure.
 func (ac *AssetCoinLocker) LockCoins(orderCoins map[order.OrderID][]CoinID) (failed map[order.OrderID][]CoinID) {
 	failed = make(map[order.OrderID][]CoinID)
 	ac.coinMtx.Lock()
 	for oid, coins := range orderCoins {
+		if ac.orderCoinsLocked(oid, coins) {
+			continue // idempotent re-lock
+		}
 		var fail bool
 		for i := range coins {
 			_, locked := ac.lockedCoins[coinIDKey(coins[i])]
@@ -236,14 +237,15 @@ func (ac *AssetCoinLocker) LockCoins(orderCoins map[order.OrderID][]CoinID) (fai
 
 		ac.lockedCoinsByOrder[oid] = coins
 		for i := range coins {
-			ac.lockedCoins[coinIDKey(coins[i])] = struct{}{}
+			ac.lockedCoins[coinIDKey(coins[i])] = oid
 		}
 	}
 	ac.coinMtx.Unlock()
 	return
 }
 
-// LockOrdersCoins locks all coins associated with certain orders.
+// LockOrdersCoins locks all coins associated with certain orders. An order
+// that already holds locks on all of its coins is a no-op, not a failure.
 func (ac *AssetCoinLocker) LockOrdersCoins(orders []order.Order) (failed []order.Order) {
 	ac.coinMtx.Lock()
 ordersLoop:
@@ -251,6 +253,10 @@ ordersLoop:
 		coinIDs := ord.Trade().Coins
 		if len(coinIDs) == 0 {
 			continue // e.g. CancelOrder
+		}
+
+		if ac.orderCoinsLocked(ord.ID(), coinIDs) {
+			continue // idempotent re-lock
 		}
 
 		for i := range coinIDs {
@@ -263,7 +269,7 @@ ordersLoop:
 
 		ac.lockedCoinsByOrder[ord.ID()] = coinIDs
 		for i := range coinIDs {
-			ac.lockedCoins[coinIDKey(coinIDs[i])] = struct{}{}
+			ac.lockedCoins[coinIDKey(coinIDs[i])] = ord.ID()
 		}
 	}
 	ac.coinMtx.Unlock()
