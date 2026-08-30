@@ -13,11 +13,37 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 )
 
-const newReputationVersion int16 = 1
-
 var _ db.ReputationArchiver = (*Archiver)(nil)
+
+// SetReputationInputsListener implements db.ReputationArchiver.
+func (a *Archiver) SetReputationInputsListener(listener func(users ...account.AccountID)) {
+	a.repListenerMtx.Lock()
+	defer a.repListenerMtx.Unlock()
+	if a.repListener != nil {
+		panic("reputation inputs listener already registered")
+	}
+	a.repListener = listener
+}
+
+func commitMayHaveLanded(err error) bool {
+	return err == nil || errors.As(err, new(*db.EventCommitUnknownError))
+}
+
+// notifyRepInputsOnCommit fires the reputation inputs listener if needed.
+func (a *Archiver) notifyRepInputsOnCommit(err error, users ...account.AccountID) {
+	if len(users) == 0 || !commitMayHaveLanded(err) {
+		return
+	}
+	a.repListenerMtx.RLock()
+	listener := a.repListener
+	a.repListenerMtx.RUnlock()
+	if listener != nil {
+		listener(users...)
+	}
+}
 
 func (a *Archiver) GetUserReputationData(
 	ctx context.Context,
@@ -82,6 +108,7 @@ func (a *Archiver) GetUserReputationData(
 
 func (a *Archiver) insertPoints(
 	ctx context.Context,
+	dbe sqlQueryer,
 	user account.AccountID,
 	link [32]byte,
 	outcomeClass db.OutcomeClass,
@@ -89,130 +116,311 @@ func (a *Archiver) insertPoints(
 ) (dbID int64, _ error) {
 	var oid order.OrderID // need a sql.Scanner
 	copy(oid[:], link[:])
-	return dbID, a.queries.insertPoints.QueryRowContext(ctx, user, oid, outcomeClass, outcome).Scan(&dbID)
+	stmt := fmt.Sprintf(internal.InsertPoints, a.tables.points)
+	return dbID, dbe.QueryRowContext(ctx, stmt, user, oid, outcomeClass, outcome).Scan(&dbID)
 }
 
-func (a *Archiver) AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*db.PreimageOutcome, error) {
-	outcome := db.OutcomePreimageSuccess
-	if miss {
-		outcome = db.OutcomePreimageMiss
+// applyUserForgivenessTx applies user-scoped reputation forgiveness by
+// deleting every non-success outcome for the account, exactly as the legacy
+// ForgiveUser did. It reports whether any rows were deleted.
+func (a *Archiver) applyUserForgivenessTx(ctx context.Context, tx *sql.Tx, accountID account.AccountID) (forgiven bool, err error) {
+	stmt := fmt.Sprintf(internal.ForgiveUser, a.tables.points)
+	res, err := tx.ExecContext(ctx, stmt, accountID, db.OutcomeSwapSuccess, db.OutcomePreimageSuccess, db.OutcomeOrderComplete)
+	if err != nil {
+		return false, err
 	}
-	dbID, err := a.insertPoints(ctx, user, oid, db.OutcomeClassPreimage, outcome)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// applyMatchForgivenessTx applies match-scoped reputation forgiveness. As with
+// the legacy ForgiveMatchFail, the match row is marked forgiven if it is
+// inactive, with the burden on the operator to ensure the match should
+// actually be forgiven. The account's failure points for the match are also
+// deleted so the forgiveness is reflected in the conduct score. It reports
+// whether a match row was updated.
+func (a *Archiver) applyMatchForgivenessTx(ctx context.Context, tx *sql.Tx, accountID account.AccountID, matchID order.MatchID) (forgiven bool, err error) {
+	for schema := range a.markets {
+		stmt := fmt.Sprintf(internal.ForgiveMatchFail, fullMatchesTableName(a.dbName, schema))
+		res, err := tx.ExecContext(ctx, stmt, matchID)
+		if err != nil {
+			return false, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if n > 0 { // at most one market has the match, matchid is the primary key
+			forgiven = true
+			break
+		}
+	}
+	if !forgiven {
+		return false, nil
+	}
+
+	stmt := fmt.Sprintf(internal.ForgiveMatchFailures, a.tables.points)
+	var link order.OrderID // need a sql driver Valuer
+	copy(link[:], matchID[:])
+	if _, err := tx.ExecContext(ctx, stmt, accountID, link, db.OutcomeClassMatch, db.OutcomeSwapSuccess); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ApplyReputationForgivenEvent applies the reputation_forgiven event in one
+// database transaction.
+func (a *Archiver) ApplyReputationForgivenEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.ReputationForgivenEvent) (*db.ReputationForgivenResult, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	txData, err := event.EventTxData()
 	if err != nil {
 		return nil, err
 	}
-	return &db.PreimageOutcome{
-		DBID:    dbID,
-		OrderID: oid,
-		Miss:    miss,
+	accountID := event.AccountID
+	matchID := event.Match()
+
+	var forgiven bool
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindReputationForgiven, txData, func(tx *sql.Tx) error {
+		var err error
+		switch event.Scope {
+		case meshevents.ReputationForgivenessScopeUser:
+			forgiven, err = a.applyUserForgivenessTx(ctx, tx, accountID)
+		case meshevents.ReputationForgivenessScopeMatch:
+			forgiven, err = a.applyMatchForgivenessTx(ctx, tx, accountID, matchID)
+		default:
+			err = fmt.Errorf("invalid reputation forgiveness scope %d", event.Scope)
+		}
+		return err
+	})
+	a.notifyRepInputsOnCommit(err, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &db.ReputationForgivenResult{
+		Forgiven: forgiven,
+		Log:      logEntry,
 	}, nil
 }
 
-func (a *Archiver) AddMatchOutcome(ctx context.Context, user account.AccountID, mid order.MatchID, outcome db.Outcome) (*db.MatchResult, error) {
+type reputationClassKey struct {
+	user  account.AccountID
+	class db.OutcomeClass
+}
+
+type reputationPreimageOutcome struct {
+	user account.AccountID
+	oid  order.OrderID
+	miss bool
+}
+
+type reputationMatchOutcome struct {
+	user    account.AccountID
+	mid     db.MarketMatchID
+	outcome db.Outcome
+}
+
+type reputationOrderOutcome struct {
+	user            account.AccountID
+	oid             order.OrderID
+	penalizedCancel bool
+}
+
+type reputationOutcomeBatch struct {
+	preimages []*reputationPreimageOutcome
+	matches   []*reputationMatchOutcome
+	orders    []*reputationOrderOutcome
+}
+
+func reputationClassKeys(updates *reputationOutcomeBatch) []reputationClassKey {
+	if updates == nil {
+		return nil
+	}
+	keys := make(map[reputationClassKey]struct{})
+	for _, update := range updates.preimages {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassPreimage}] = struct{}{}
+		}
+	}
+	for _, update := range updates.matches {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassMatch}] = struct{}{}
+		}
+	}
+	for _, update := range updates.orders {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassOrder}] = struct{}{}
+		}
+	}
+	distinct := make([]reputationClassKey, 0, len(keys))
+	for key := range keys {
+		distinct = append(distinct, key)
+	}
+	return distinct
+}
+
+func reputationLimit(policy *db.ReputationOutcomePolicy, class db.OutcomeClass) int {
+	if policy == nil {
+		return 0
+	}
+	switch class {
+	case db.OutcomeClassPreimage:
+		return policy.PreimageLimit
+	case db.OutcomeClassMatch:
+		return policy.MatchLimit
+	case db.OutcomeClassOrder:
+		return policy.OrderLimit
+	default:
+		return 0
+	}
+}
+
+func validMatchOutcome(outcome db.Outcome) bool {
 	switch outcome {
 	case db.OutcomeSwapSuccess, db.OutcomeNoSwapAsMaker, db.OutcomeNoSwapAsTaker,
 		db.OutcomeNoRedeemAsMaker, db.OutcomeNoRedeemAsTaker, db.OutcomeNoAddrAsTaker:
+		return true
 	default:
-		return nil, fmt.Errorf("invalid outcome for a match: %d", outcome)
+		return false
 	}
-	dbID, err := a.insertPoints(ctx, user, mid, db.OutcomeClassMatch, outcome)
-	if err != nil {
-		return nil, err
-	}
-	return &db.MatchResult{
-		DBID:         dbID,
-		MatchID:      mid,
-		MatchOutcome: outcome,
-	}, nil
 }
 
-func (a *Archiver) AddOrderOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, canceled bool) (*db.OrderOutcome, error) {
-	outcome := db.OutcomeOrderComplete
-	if canceled {
-		outcome = db.OutcomeOrderCanceled
+func validateReputationOutcomeUpdates(policy *db.ReputationOutcomePolicy, updates *reputationOutcomeBatch) ([]reputationClassKey, error) {
+	if updates == nil {
+		return nil, fmt.Errorf("nil reputation outcome updates")
 	}
-	dbID, err := a.insertPoints(ctx, user, oid, db.OutcomeClassOrder, outcome)
-	if err != nil {
-		return nil, err
-	}
-	return &db.OrderOutcome{
-		DBID:     dbID,
-		OrderID:  oid,
-		Canceled: canceled,
-	}, nil
-}
-
-func (a *Archiver) PruneOutcomes(ctx context.Context, user account.AccountID, outcomeClass db.OutcomeClass, fromDBID int64) (err error) {
-	_, err = a.queries.prunePoints.ExecContext(ctx, user, outcomeClass, fromDBID)
-	return err
-}
-
-func (a *Archiver) GetUserReputationVersion(ctx context.Context, user account.AccountID) (ver int16, err error) {
-	if err := a.queries.selectReputationVersion.QueryRowContext(ctx, user).Scan(&ver); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// New user.
-			return newReputationVersion, nil
+	var zeroUser account.AccountID
+	var zeroOID order.OrderID
+	var zeroMID order.MatchID
+	for i, update := range updates.preimages {
+		if update == nil {
+			return nil, fmt.Errorf("nil preimage reputation update at index %d", i)
 		}
-		return 0, err
+		if update.user == zeroUser {
+			return nil, fmt.Errorf("zero user in preimage reputation update")
+		}
+		if update.oid == zeroOID {
+			return nil, fmt.Errorf("zero order id in preimage reputation update")
+		}
 	}
-	return ver, nil
+	for i, update := range updates.matches {
+		if update == nil {
+			return nil, fmt.Errorf("nil match reputation update at index %d", i)
+		}
+		if update.user == zeroUser {
+			return nil, fmt.Errorf("zero user in match reputation update")
+		}
+		if update.mid.MatchID == zeroMID {
+			return nil, fmt.Errorf("zero match id in match reputation update")
+		}
+		if !validMatchOutcome(update.outcome) {
+			return nil, fmt.Errorf("invalid match reputation outcome %d", update.outcome)
+		}
+	}
+	for i, update := range updates.orders {
+		if update == nil {
+			return nil, fmt.Errorf("nil order reputation update at index %d", i)
+		}
+		if update.user == zeroUser {
+			return nil, fmt.Errorf("zero user in order reputation update")
+		}
+		if update.oid == zeroOID {
+			return nil, fmt.Errorf("zero order id in order reputation update")
+		}
+	}
+	keys := reputationClassKeys(updates)
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	for _, key := range keys {
+		if reputationLimit(policy, key.class) <= 0 {
+			return nil, fmt.Errorf("missing reputation outcome limit for class %d", key.class)
+		}
+	}
+	return keys, nil
 }
 
-func (a *Archiver) UpgradeUserReputationV1(
-	ctx context.Context, user account.AccountID, pimgs []*db.PreimageOutcome, matches []*db.MatchResult, orders []*db.OrderOutcome, /* Without DB IDs */
-) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) /* With DB IDs */ {
-	tx, err := a.db.Begin()
-	if err != nil {
+func outcomeBatchUsers(updates *reputationOutcomeBatch) []account.AccountID {
+	keys := reputationClassKeys(updates)
+	seen := make(map[account.AccountID]struct{}, len(keys))
+	users := make([]account.AccountID, 0, len(keys))
+	for _, key := range keys {
+		if _, found := seen[key.user]; found {
+			continue
+		}
+		seen[key.user] = struct{}{}
+		users = append(users, key.user)
+	}
+	return users
+}
+
+// applyRepEventTx is applyEventTx for events that write reputation outcomes.
+// apply stages the batch; outcomes are inserted in-tx and the rep-inputs
+// listener is notified after commit. Call insertReputationOutcomeRows only here.
+func (a *Archiver) applyRepEventTx(ctx context.Context, meta *db.EventLogMeta, kind string, txData []byte,
+	policy *db.ReputationOutcomePolicy, apply func(*sql.Tx, *reputationOutcomeBatch) error) (*db.EventLogEntry, error) {
+
+	batch := new(reputationOutcomeBatch)
+	logEntry, err := a.applyEventTx(ctx, meta, kind, txData, func(tx *sql.Tx) error {
+		if err := apply(tx, batch); err != nil {
+			return err
+		}
+		return a.insertReputationOutcomeRows(tx, policy, batch)
+	})
+	if commitMayHaveLanded(err) {
+		a.notifyRepInputsOnCommit(err, outcomeBatchUsers(batch)...)
+	}
+	return logEntry, err
+}
+
+// insertReputationOutcomeRows writes and prunes outcome rows for the batch.
+func (a *Archiver) insertReputationOutcomeRows(
+	dbe *sql.Tx,
+	policy *db.ReputationOutcomePolicy,
+	updates *reputationOutcomeBatch,
+) error {
+	keys, err := validateReputationOutcomeUpdates(policy, updates)
+	if err != nil || len(keys) == 0 {
+		return err
+	}
+	failDBErr := func(err error) error {
 		a.fatalBackendErr(err)
-		return nil, nil, nil, err
+		return err
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback() // rollback on error
-		} else {
-			tx.Commit() // commit if all went well
-		}
-	}()
-
-	stmt, err := tx.Prepare(fmt.Sprintf(internal.InsertPoints, a.tables.points))
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("error constructing prepared statement for reputation points selection: %w", err)
-	}
-	defer stmt.Close()
-	for _, o := range pimgs {
+	for _, update := range updates.preimages {
 		outcome := db.OutcomePreimageSuccess
-		if o.Miss {
+		if update.miss {
 			outcome = db.OutcomePreimageMiss
 		}
-		if err = stmt.QueryRowContext(ctx, user, o.OrderID, db.OutcomeClassPreimage, outcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting preimage row during reputation upgrade: %w", err)
+		if _, err := a.insertPoints(a.ctx, dbe, update.user, update.oid, db.OutcomeClassPreimage, outcome); err != nil {
+			return failDBErr(err)
 		}
 	}
-	for _, o := range matches {
-		if err = stmt.QueryRowContext(ctx, user, o.MatchID, db.OutcomeClassMatch, o.MatchOutcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting match row during reputation upgrade: %w", err)
+	for _, update := range updates.matches {
+		if _, err := a.insertPoints(a.ctx, dbe, update.user, update.mid.MatchID, db.OutcomeClassMatch, update.outcome); err != nil {
+			return failDBErr(err)
 		}
 	}
-	for _, o := range orders {
+	for _, update := range updates.orders {
 		outcome := db.OutcomeOrderComplete
-		if o.Canceled {
+		if update.penalizedCancel {
 			outcome = db.OutcomeOrderCanceled
 		}
-		if err = stmt.QueryRowContext(ctx, user, o.OrderID, db.OutcomeClassOrder, outcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting order row during reputation upgrade: %w", err)
+		if _, err := a.insertPoints(a.ctx, dbe, update.user, update.oid, db.OutcomeClassOrder, outcome); err != nil {
+			return failDBErr(err)
 		}
 	}
-	query := fmt.Sprintf(internal.UpdateReputationVersion, a.tables.accounts)
-	if _, err = tx.ExecContext(ctx, query, newReputationVersion, user); err != nil {
-		return nil, nil, nil, fmt.Errorf("error updating reputation version: %w", err)
-	}
-	return pimgs, matches, orders, nil
-}
 
-func (a *Archiver) ForgiveUser(ctx context.Context, user account.AccountID) error {
-	query := fmt.Sprintf(internal.ForgiveUser, a.tables.points)
-	if _, err := a.db.ExecContext(ctx, query, user, db.OutcomeSwapSuccess, db.OutcomePreimageSuccess, db.OutcomeOrderComplete); err != nil {
-		return fmt.Errorf("error forgiving user: %w", err)
+	pruneStmt := fmt.Sprintf(internal.PrunePointsPastLimit, a.tables.points)
+	for _, key := range keys {
+		if _, err := dbe.Exec(pruneStmt, key.user, key.class, reputationLimit(policy, key.class)); err != nil {
+			return failDBErr(err)
+		}
 	}
 	return nil
 }

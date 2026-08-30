@@ -14,6 +14,7 @@ import (
 	"decred.org/dcrdex/dex/candles"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 // EpochResults represents the outcome of epoch order processing, including
@@ -227,7 +228,9 @@ type Account struct {
 	Pubkey    dex.Bytes         `json:"pubkey"`
 }
 
-// Bond represents a time-locked fidelity bond posted by a user.
+// Bond represents a time-locked fidelity bond posted by a user. Rows
+// must never be pruned: UserReputationAt still needs expired bonds when
+// replaying at a past as-of.
 type Bond struct {
 	Version  uint16
 	AssetID  uint32
@@ -246,33 +249,32 @@ type Bond struct {
 // AccountArchiver is the interface required for storage and retrieval of all
 // account data.
 type AccountArchiver interface {
-	// Account retrieves the account information for the specified account ID. A
-	// nil pointer will be returned for unknown or closed accounts. Bond and
-	// registration fee payment status is returned as well. A bond is active if
-	// its lockTime is after the lockTimeThresh Time, which should be
-	// time.Now().Add(bondExpiry). The legacy bool return refers to the legacy
-	// registration fee system, and legacyPaid indicates if the account has a
-	// recorded fee coin (paid legacy fee).
-	Account(acctID account.AccountID, lockTimeThresh time.Time) (acct *account.Account, activeBonds []*Bond)
+	// Account retrieves the account for the given ID. A nil account with a nil
+	// error means unknown; a non-nil error means existence could not be
+	// determined and must not be treated as unknown. Bonds are active when
+	// lockTime >= lockTimeThresh (typically time.Now().Add(bondExpiry)).
+	Account(acctID account.AccountID, lockTimeThresh time.Time) (acct *account.Account, activeBonds []*Bond, err error)
 
-	// CreateAccountWithBond creates a new account with the given bond. This is
-	// used for the new postbond request protocol. The bond tx should be
-	// fully-confirmed.
-	CreateAccountWithBond(acct *account.Account, bond *Bond) error
+	// ApplyBondPostedEvent is called from the mesh event applier on every
+	// node. It projects an already-decided bond_posted onto this node's DB
+	// and event log: creates the account if missing, stores the bond, and
+	// for a prepaid bond consumes the matching token. Same-account
+	// duplicates are already-applied; another account's duplicate key errors.
+	ApplyBondPostedEvent(ctx context.Context, meta *EventLogMeta, update *BondPostedUpdate) (*BondPostedResult, error)
 
-	// AddBond stores a new Bond, which is uniquely identified by (asset ID,
-	// coin ID), for an existing account.
-	AddBond(acct account.AccountID, bond *Bond) error
-
-	// DeleteBond deletes a bond which should generally be expired.
-	DeleteBond(assetID uint32, coinID []byte) error
+	// ApplyPrepaidBondsCreatedEvent is called from the mesh event applier on
+	// every node. It stores the prepaid-bond tokens and the event-log row.
+	ApplyPrepaidBondsCreatedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.PrepaidBondsCreatedEvent) (*EventLogEntry, error)
 
 	FetchPrepaidBond(bondCoinID []byte) (strength uint32, lockTime int64, err error)
-	DeletePrepaidBond(coinID []byte) error
-	StorePrepaidBonds(coinIDs [][]byte, strength uint32, lockTime int64) error
 
 	// AccountInfo returns data for an account.
 	AccountInfo(account.AccountID) (*Account, error)
+}
+
+type CommitOrder struct {
+	Order  order.Order
+	Status order.OrderStatus
 }
 
 // MatchData represents an order pair match, but with just the order IDs instead
@@ -369,6 +371,21 @@ type SwapDataFull struct {
 type MarketMatchID struct {
 	order.MatchID
 	Base, Quote uint32 // market
+}
+
+type BondPostedUpdate struct {
+	Acct *account.Account
+	Bond *Bond
+}
+
+type BondPostedResult struct {
+	BondAdded bool
+	Log       *EventLogEntry
+}
+
+type ReputationForgivenResult struct {
+	Forgiven bool
+	Log      *EventLogEntry
 }
 
 const EventLogTipHashSize = sha256.Size
@@ -666,32 +683,20 @@ func ValidateOrder(ord order.Order, status order.OrderStatus, mkt *dex.MarketInf
 // reason to consider the epoch gap.
 const EpochGapNA int32 = -1
 
-// CancelRecord is info about a cancel order and when it matched.
-type CancelRecord struct {
-	ID        order.OrderID
-	TargetID  order.OrderID
-	MatchTime int64
-	// EpochGap is the number of epochs passed since the targeted trade order
-	// was placed, where 0 means canceled in the same epoch, 1 means canceled in
-	// the next epoch, etc.
-	EpochGap int32
-}
-
 // Reputation
 
-// ReputationArchiver handles interactions with the points table as well as
-// upgrading the reputation version in the accounts table.
+// ReputationArchiver handles interactions with the reputation points table.
 type ReputationArchiver interface {
 	GetUserReputationData(ctx context.Context, user account.AccountID, pimgSz, matchSz, orderSz int) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error)
-	AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*PreimageOutcome, error)
-	AddMatchOutcome(ctx context.Context, user account.AccountID, mid order.MatchID, outcome Outcome) (*MatchResult, error)
-	AddOrderOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, canceled bool) (*OrderOutcome, error)
-	PruneOutcomes(ctx context.Context, user account.AccountID, outcomeClass OutcomeClass, fromDBID int64) error
-	GetUserReputationVersion(ctx context.Context, user account.AccountID) (int16, error)
-	UpgradeUserReputationV1(
-		ctx context.Context, user account.AccountID, pimgOutcomes []*PreimageOutcome, matchOutcomes []*MatchResult, orderOutcomes []*OrderOutcome, /* Without DB IDs */
-	) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error) /* With DB IDs */
-	ForgiveUser(ctx context.Context, user account.AccountID) error
+	// ApplyReputationForgivenEvent is called from the mesh event applier on
+	// every node. It projects an already-decided reputation_forgiven onto
+	// this node's DB and event log.
+	ApplyReputationForgivenEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.ReputationForgivenEvent) (*ReputationForgivenResult, error)
+	// SetReputationInputsListener registers the single listener notified after
+	// any commit that may have changed a user's reputation inputs, including
+	// commits whose outcome is unknown. Must not block. Registering a second
+	// listener panics.
+	SetReputationInputsListener(func(users ...account.AccountID))
 }
 
 // OutcomeClass is the type of interaction for which the user's reputation
