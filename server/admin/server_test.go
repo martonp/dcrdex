@@ -32,6 +32,7 @@ import (
 	"decred.org/dcrdex/server/db"
 	dexsrv "decred.org/dcrdex/server/dex"
 	"decred.org/dcrdex/server/market"
+	"decred.org/dcrdex/server/mesh"
 	"github.com/decred/dcrd/certgen"
 	"github.com/decred/slog"
 	"github.com/go-chi/chi/v5"
@@ -70,9 +71,11 @@ type TCore struct {
 	marketMatches    []*dexsrv.MatchData
 	marketMatchesErr error
 	dataEnabled      uint32
+	notifyErr        error
 }
 
 func (c *TCore) ConfigMsg() json.RawMessage { return nil }
+func (c *TCore) MeshStatus() mesh.Status    { return mesh.Status{Mode: "single_server"} }
 
 func (c *TCore) Suspend(tSusp time.Time, persistBooks bool) map[string]*market.SuspendEpoch {
 	return nil
@@ -238,9 +241,11 @@ func (c *TCore) CreatePrepaidBonds(n int, strength uint32, durSecs int64) ([][]b
 func (c *TCore) AccountMatchOutcomesN(user account.AccountID, n int) ([]*auth.MatchOutcome, error) {
 	return nil, nil
 }
-func (c *TCore) Notify(_ account.AccountID, _ *msgjson.Message) {}
-func (c *TCore) NotifyAll(_ *msgjson.Message)                   {}
-func (c *TCore) ForgiveUser(account.AccountID) error            { return nil }
+func (c *TCore) Notify(_ account.AccountID, _ *msgjson.Message) error {
+	return c.notifyErr
+}
+func (c *TCore) NotifyAll(_ *msgjson.Message)        {}
+func (c *TCore) ForgiveUser(account.AccountID) error { return nil }
 
 // genCertPair generates a key/cert pair to the paths provided.
 func genCertPair(certFile, keyFile string) error {
@@ -1290,12 +1295,19 @@ func TestNotify(t *testing.T) {
 	msgStr := "Hello world.\nAll your base are belong to us."
 	tests := []struct {
 		name, txt, acctID string
+		notifyErr         error
 		wantCode          int
 	}{{
 		name:     "ok",
 		acctID:   acctIDStr,
 		txt:      msgStr,
 		wantCode: http.StatusOK,
+	}, {
+		name:      "user not connected",
+		acctID:    acctIDStr,
+		txt:       msgStr,
+		notifyErr: auth.ErrUserNotConnected,
+		wantCode:  http.StatusNotFound,
 	}, {
 		name:     "ok at max size",
 		acctID:   acctIDStr,
@@ -1322,6 +1334,7 @@ func TestNotify(t *testing.T) {
 		wantCode: http.StatusBadRequest,
 	}}
 	for _, test := range tests {
+		core.notifyErr = test.notifyErr
 		w := httptest.NewRecorder()
 		br := bytes.NewReader([]byte(test.txt))
 		r, _ := http.NewRequest("POST", "https://localhost/account/"+test.acctID+"/notify", br)
