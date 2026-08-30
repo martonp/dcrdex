@@ -98,6 +98,7 @@ type DEXArchivist interface {
 	SwapArchiver
 	ReputationArchiver
 	EventLogReader
+	EventSourcedStateChecker
 }
 
 // OrderArchiver is the interface required for storage and retrieval of all
@@ -483,6 +484,18 @@ func (e *EventLogDivergenceError) Unwrap() error {
 type SnapshotStore interface {
 	WriteSnapshot(ctx context.Context, w io.Writer) (*EventLogPosition, error)
 	LoadSnapshot(ctx context.Context, r io.Reader) (*EventLogPosition, error)
+}
+
+// EventSourcedStateChecker checks and clears the event log and event projections
+// while preserving configuration.
+type EventSourcedStateChecker interface {
+	// HasNoEventSourcedState reports whether the event log and all event
+	// projections are empty. Configuration tables are ignored.
+	HasNoEventSourcedState(ctx context.Context) (bool, error)
+
+	// WipeEventSourcedState clears the event log and all event projections,
+	// including historical market data. Configuration is preserved.
+	WipeEventSourcedState(ctx context.Context) error
 }
 
 // EventLogReader allows callers to read the event log.

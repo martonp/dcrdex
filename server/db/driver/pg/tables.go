@@ -14,14 +14,15 @@ import (
 )
 
 const (
-	marketsTableName      = "markets"
-	metaTableName         = "meta"
-	feeKeysTableName      = "fee_keys"
-	accountsTableName     = "accounts"
-	bondsTableName        = "bonds"
-	prepaidBondsTableName = "prepaid_bonds"
-	pointsTableName       = "points"
-	eventLogTableName     = "event_log"
+	marketsTableName         = "markets"
+	marketLifecycleTableName = "market_lifecycle"
+	metaTableName            = "meta"
+	feeKeysTableName         = "fee_keys"
+	accountsTableName        = "accounts"
+	bondsTableName           = "bonds"
+	prepaidBondsTableName    = "prepaid_bonds"
+	pointsTableName          = "points"
+	eventLogTableName        = "event_log"
 
 	indexBondsOnAccountName  = "idx_bonds_on_acct"
 	indexBondsOnLockTimeName = "idx_bonds_on_locktime"
