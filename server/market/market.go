@@ -483,53 +483,393 @@ ordersLoop:
 		// query these order statuses, and look for at-fault match failures
 		// involving them, so just give the user the benefit of the doubt.
 	}
-	log.Infof("Tracking %d orders with %d active matches.", len(settling), len(activeMatches))
+	log.Infof("Tracking %d orders with %d active matches.", len(m.settling), len(activeMatches))
 
 	lastEpochEndRate, err := storage.LastEpochRate(base, quote)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load last epoch end rate: %w", err)
+		return fmt.Errorf("failed to load last epoch end rate: %w", err)
+	}
+	m.lastRate = lastEpochEndRate
+
+	// Not just reads: this acquires coin locks in the shared lockers.
+	if err := restoreStartupBookCoinLocks(m.name, insertedBookOrders, m.coinLockerBase, m.coinLockerQuote); err != nil {
+		return err
 	}
 
-	return &Market{
-		running:          make(chan struct{}), // closed on market start
-		marketInfo:       mktInfo,
-		book:             Book,
-		settling:         settling,
-		matcher:          matcher.New(),
-		persistBook:      true,
-		epochCommitments: make(map[order.Commitment]order.OrderID),
-		epochOrders:      make(map[order.OrderID]order.Order),
-		swapper:          swapper,
-		auth:             cfg.AuthManager,
-		storage:          storage,
-		coinLockerBase:   cfg.CoinLockerBase,
-		coinLockerQuote:  cfg.CoinLockerQuote,
-		baseFeeFetcher:   cfg.FeeFetcherBase,
-		quoteFeeFetcher:  cfg.FeeFetcherQuote,
-		dataCollector:    cfg.DataCollector,
-		lastRate:         lastEpochEndRate,
-		checkParcelLimit: cfg.CheckParcelLimit,
-		minimumRate:      cfg.MinimumRate,
-		mmSnapshotSubs:   make(map[account.AccountID]struct{}),
-	}, nil
+	return m.seedEpochMemory(lifecycleRow)
 }
 
-// SuspendASAP suspends requests the market to gracefully suspend epoch cycling
-// as soon as possible, always allowing an active epoch to close. See also
-// Suspend.
-func (m *Market) SuspendASAP(persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	return m.Suspend(time.Now(), persistBook)
+// seedEpochMemory rebuilds a running market's in-memory epoch state from
+// durable storage.
+func (m *Market) seedEpochMemory(lc *db.MarketLifecycle) error {
+	if lc == nil {
+		return nil
+	}
+	switch lc.State {
+	case db.MarketStateRunning:
+	case db.MarketStateSuspended:
+		return m.verifyNoStoredEpochOrders()
+	default: // never started
+		return nil
+	}
+	epochOrders, err := m.storage.EpochOrders(m.base, m.quote)
+	if err != nil {
+		return fmt.Errorf("load epoch orders for %s: %w", m.name, err)
+	}
+	sortOrdersByID(epochOrders)
+
+	if lc.PendingAction == db.MarketPendingSuspendDrain {
+		// No epoch to seed while draining; lock the leftover orders' coins.
+		return m.lockEpochOrderCoins(epochOrders)
+	}
+
+	if err := m.validateEpochSeed(lc, epochOrders); err != nil {
+		return err
+	}
+	if err := m.lockEpochOrderCoins(epochOrders); err != nil {
+		return err
+	}
+	m.seedEpochQueues(lc.ActiveEpochIdx, lc.StartEpochDur, epochOrders)
+	return nil
 }
 
-// Suspend requests the market to gracefully suspend epoch cycling as soon as
-// the given time, always allowing the epoch including that time to complete. If
-// the time is before the current epoch, the current epoch will be the last.
-func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	// epochMtx guards activeEpochIdx, startEpochIdx, suspendEpochIdx, and
-	// persistBook.
+// verifyNoStoredEpochOrders checks that a suspended market holds no
+// epoch-status orders: the suspend transition requires the final epoch
+// processed, so none can exist.
+func (m *Market) verifyNoStoredEpochOrders() error {
+	ords, err := m.storage.EpochOrders(m.base, m.quote)
+	if err != nil {
+		return fmt.Errorf("load epoch orders for %s: %w", m.name, err)
+	}
+	if len(ords) > 0 {
+		return fmt.Errorf("suspended market %s has %d epoch-status orders; storage is inconsistent",
+			m.name, len(ords))
+	}
+	return nil
+}
+
+// validateEpochSeed rejects storage states the seeding cannot faithfully
+// project: a missing cursor, or an order stamped beyond the next epoch
+// window. A configured duration that disagrees with the row is a warning;
+// it takes effect at the next market_started this node masters.
+func (m *Market) validateEpochSeed(lc *db.MarketLifecycle, epochOrders []order.Order) error {
+	name := m.name
+	active, epochDur := lc.ActiveEpochIdx, lc.StartEpochDur
+	if epochDur != m.configuredParams.epochDur {
+		log.Warnf("Market %s runs with log-pinned epoch duration %d; configured duration %d "+
+			"takes effect at the next market start.", name, epochDur, m.configuredParams.epochDur)
+	}
+	if active <= 0 {
+		return fmt.Errorf("running market %s has no active epoch cursor; "+
+			"this node's DB predates the cursor column — re-initialize it or re-seed from a mesh peer", name)
+	}
+	nextEnd := (active + 2) * epochDur
+	for _, ord := range epochOrders {
+		if ord.Time() >= nextEnd {
+			return fmt.Errorf("market %s epoch order %v stamped %d beyond the next epoch window of cursor %d",
+				name, ord.ID(), ord.Time(), active)
+		}
+	}
+	return nil
+}
+
+// seedEpochQueues projects the current and next epoch queues from the stored
+// epoch orders.
+func (m *Market) seedEpochQueues(active, epochDur int64, epochOrders []order.Order) {
+	currentOrders := ordersInEpoch(epochOrders, active, epochDur)
+	nextOrders := ordersInEpoch(epochOrders, active+1, epochDur)
 	m.epochMtx.Lock()
-	defer m.epochMtx.Unlock()
+	m.currentEpoch = NewEpoch(active, epochDur)
+	m.nextEpoch = NewEpoch(active+1, epochDur)
+	m.activeEpochIdx = active
+	for _, ord := range currentOrders {
+		m.insertEpochOrderLocked(m.currentEpoch, ord)
+	}
+	for _, ord := range nextOrders {
+		m.insertEpochOrderLocked(m.nextEpoch, ord)
+	}
+	m.epochMtx.Unlock()
 
+	m.bookMtx.Lock()
+	if active > m.bookEpochIdx {
+		m.bookEpochIdx = active
+	}
+	m.bookMtx.Unlock()
+	log.Infof("Seeded market %s epoch memory at epoch %d: %d current, %d next, %d awaiting processing.",
+		m.name, active, len(currentOrders), len(nextOrders),
+		len(epochOrders)-len(currentOrders)-len(nextOrders))
+}
+
+func restoreStartupBookCoinLocks(marketName string, bookOrders []*order.LimitOrder, baseLocker, quoteLocker coinlock.CoinLocker) error {
+	candidates := make([]*order.LimitOrder, 0, len(bookOrders))
+	for _, lo := range bookOrders {
+		if lo.Sell {
+			if baseLocker != nil {
+				candidates = append(candidates, lo)
+			}
+			continue
+		}
+		if quoteLocker != nil {
+			candidates = append(candidates, lo)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		idi := candidates[i].ID()
+		idj := candidates[j].ID()
+		return bytes.Compare(idi[:], idj[:]) < 0
+	})
+
+	var lockedBase, lockedQuote []order.OrderID
+	rollback := func() {
+		if baseLocker != nil {
+			baseLocker.UnlockOrdersCoins(lockedBase)
+		}
+		if quoteLocker != nil {
+			quoteLocker.UnlockOrdersCoins(lockedQuote)
+		}
+	}
+
+	for _, lo := range candidates {
+		oid := lo.ID()
+		locker := quoteLocker
+		locked := &lockedQuote
+		if lo.Sell {
+			locker = baseLocker
+			locked = &lockedBase
+		}
+		if failed := locker.LockCoins(map[order.OrderID][]order.CoinID{
+			oid: lo.Coins,
+		}); len(failed) > 0 {
+			rollback()
+			return fmt.Errorf("failed to restore startup book coin locks for market %s order %v", marketName, oid)
+		}
+		*locked = append(*locked, oid)
+	}
+	return nil
+}
+
+// SetMeshService configures the mesh service. It must be set before the comms
+// routes serve traffic.
+func (m *Market) SetMeshService(mesh MeshService) {
+	m.mesh = mesh
+}
+
+func cloneBool(v *bool) *bool {
+	if v == nil {
+		return nil
+	}
+	cpy := *v
+	return &cpy
+}
+
+func cloneRunParams(p *meshevents.MarketRunParams) *meshevents.MarketRunParams {
+	if p == nil {
+		return nil
+	}
+	cpy := *p
+	return &cpy
+}
+
+func (m *Market) wakeLifecycleDriver() {
+	select {
+	case m.lifecycleWake <- struct{}{}:
+	default:
+	}
+}
+
+// wakeClosureWaiter signals the epoch advancer that the closure watermark
+// moved (an epoch close applied, or a lifecycle event re-baselined it).
+func (m *Market) wakeClosureWaiter() {
+	select {
+	case m.closureWake <- struct{}{}:
+	default:
+	}
+}
+
+// projectMarketLifecycleLocked copies durable lifecycle fields into the market.
+// Caller must hold epochMtx.
+func (m *Market) projectMarketLifecycleLocked(lc *db.MarketLifecycle) {
+	m.liveParams.Store(&marketRun{MarketRunParams: lc.RunParams, epochDur: lc.StartEpochDur})
+	m.lifecycleState = lc.State
+	m.startEpochIdx = lc.StartEpochIdx
+	m.suspendEpochIdx = lc.FinalEpochIdx
+	m.pendingLifecycleAction = lc.PendingAction
+	m.pendingLifecycleEpochIdx = lc.PendingEpochIdx
+	m.pendingLifecycleEpochDur = lc.PendingEpochDur
+	m.processedEpochIdx = lc.ProcessedEpochIdx
+	m.persistBookSet = lc.PersistBook != nil
+	if lc.PersistBook != nil {
+		m.persistBook = *lc.PersistBook
+	}
+	if lc.State == db.MarketStateSuspended || lc.PendingAction == db.MarketPendingSuspendDrain {
+		m.activeEpochIdx = 0
+		m.currentEpoch = nil
+		m.nextEpoch = nil
+	}
+	m.wakeClosureWaiter()
+}
+
+// restoreMarketLifecycle applies a durable lifecycle snapshot at construction
+// or other startup paths. It does not open order admission, seed live epochs,
+// or rebind the book; LoadState follows it by building the book and calling
+// seedEpochMemory for running markets.
+func (m *Market) restoreMarketLifecycle(lc *db.MarketLifecycle) {
+	if lc == nil {
+		return
+	}
+	m.epochMtx.Lock()
+	m.projectMarketLifecycleLocked(lc)
+	m.epochMtx.Unlock()
+}
+
+// applyMarketLifecycleRow applies a durable lifecycle row on a live market,
+// seeding epochs and order admission when the market is running.
+func (m *Market) applyMarketLifecycleRow(lc *db.MarketLifecycle) error {
+	if lc == nil {
+		return nil
+	}
+	if err := m.book.SetLotSize(lc.RunParams.LotSize); err != nil {
+		return err
+	}
+	m.epochMtx.Lock()
+	m.projectMarketLifecycleLocked(lc)
+	if lc.State == db.MarketStateRunning && lc.PendingAction == db.MarketPendingNone && m.currentEpoch == nil {
+		m.currentEpoch = NewEpoch(lc.ActiveEpochIdx, lc.StartEpochDur)
+		m.nextEpoch = NewEpoch(lc.ActiveEpochIdx+1, lc.StartEpochDur)
+		m.activeEpochIdx = lc.ActiveEpochIdx
+	}
+	acceptOrders := lc.State == db.MarketStateRunning &&
+		lc.PendingAction != db.MarketPendingSuspendDrain && m.currentEpoch != nil
+	m.epochMtx.Unlock()
+
+	m.running.Store(acceptOrders)
+	m.wakeLifecycleDriver()
+	return nil
+}
+
+func (m *Market) lifecyclePendingSuspendDrain(epochIdx, epochDur int64) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateRunning &&
+		m.pendingLifecycleAction == db.MarketPendingSuspendDrain &&
+		m.pendingLifecycleEpochIdx == epochIdx &&
+		m.pendingLifecycleEpochDur == epochDur
+}
+
+func (m *Market) lifecycleFinalizingSuspend() bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateRunning &&
+		m.pendingLifecycleAction == db.MarketPendingSuspendDrain
+}
+
+func (m *Market) submitMarketSuspend(ctx context.Context) error {
+	m.epochMtx.RLock()
+	finalEpochIdx := m.pendingLifecycleEpochIdx
+	finalEpochDur := m.pendingLifecycleEpochDur
+	m.epochMtx.RUnlock()
+	if finalEpochIdx == 0 || finalEpochDur == 0 {
+		return fmt.Errorf("market %s has no pending final epoch to suspend", m.name)
+	}
+	event := meshevents.NewMarketLifecycleEvent(meshevents.LifecycleActionSuspend, m.name, finalEpochIdx, finalEpochDur)
+	event.Timestamp = time.Now().Truncate(time.Millisecond).UTC().UnixMilli()
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = m.mesh.ApplyEvent(ctx, meshEvent)
+	return err
+}
+
+func (m *Market) lifecyclePendingResume(epochIdx, epochDur int64) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateSuspended &&
+		m.pendingLifecycleAction == db.MarketPendingResume &&
+		m.pendingLifecycleEpochIdx == epochIdx &&
+		m.pendingLifecycleEpochDur == epochDur
+}
+
+func (m *Market) submitMarketResume(ctx context.Context, pendingEpochIdx, pendingEpochDur int64) error {
+	m.resumeSubmitMtx.Lock()
+	defer m.resumeSubmitMtx.Unlock()
+
+	if pendingEpochIdx == 0 || pendingEpochDur == 0 || !m.lifecyclePendingResume(pendingEpochIdx, pendingEpochDur) {
+		return fmt.Errorf("market %s has no matching pending resume epoch %d:%d",
+			m.name, pendingEpochIdx, pendingEpochDur)
+	}
+	// schedule_resume named this epoch in the old duration unit.
+	if pendingEpochDur != m.configuredParams.epochDur {
+		return fmt.Errorf("market %s epoch duration changed from %d to %d; revert the configured duration, "+
+			"resume, and change it at the next market start",
+			m.name, pendingEpochDur, m.configuredParams.epochDur)
+	}
+	runParams := m.configuredParams.MarketRunParams
+	bookedRevokes, err := m.startupBookedRevokes(ctx, runParams.LotSize)
+	if err != nil {
+		return err
+	}
+	sortStartupOrderRevokes(bookedRevokes)
+	event := meshevents.NewMarketLifecycleEvent(meshevents.LifecycleActionResume, m.name, pendingEpochIdx, pendingEpochDur)
+	event.Timestamp = time.Now().Truncate(time.Millisecond).UTC().UnixMilli()
+	event.ResumeRevokes = encodeStartupOrderRevokes(bookedRevokes)
+	event.RunParams = &runParams
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = m.mesh.ApplyEvent(ctx, meshEvent)
+	return err
+}
+
+func (m *Market) applyMarketSuspendPurge(purged []order.OrderID) {
+	if len(purged) == 0 {
+		return
+	}
+	m.bookMtx.Lock()
+	var removed []*order.LimitOrder
+	for _, oid := range purged {
+		lo, ok := m.book.Remove(oid)
+		if !ok {
+			continue
+		}
+		delete(m.settling, oid)
+		removed = append(removed, lo)
+	}
+	m.bookMtx.Unlock()
+	for _, lo := range removed {
+		m.unlockOrderCoins(lo)
+		m.sendRevokeOrderNote(lo.ID(), lo.User())
+	}
+}
+
+func (m *Market) applyMarketResumeCleanup(revokes []*db.StartupOrderRevoke) []*order.LimitOrder {
+	if len(revokes) == 0 {
+		return nil
+	}
+	m.bookMtx.Lock()
+	var removed []order.Order
+	var removedLimits []*order.LimitOrder
+	for _, revoke := range revokes {
+		if revoke == nil || revoke.Order == nil {
+			continue
+		}
+		lo, ok := m.book.Remove(revoke.Order.ID())
+		if ok {
+			delete(m.settling, lo.ID())
+			removedLimits = append(removedLimits, lo)
+		}
+		removed = append(removed, revoke.Order)
+	}
+	m.bookMtx.Unlock()
+	for _, ord := range removed {
+		m.unlockOrderCoins(ord)
+		m.sendRevokeOrderNote(ord.ID(), ord.User())
+	}
+	return removedLimits
+}
+
+func (m *Market) suspendEpoch(asSoonAs time.Time) (finalEpochIdx int64, finalEpochEnd time.Time) {
 	dur := int64(m.EpochDuration())
 
 	epochEnd := func(idx int64) time.Time {
@@ -537,50 +877,105 @@ func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx in
 		return start.Add(time.Duration(dur) * time.Millisecond)
 	}
 
-	// Determine which epoch includes asSoonAs, and compute its end time. If
-	// asSoonAs is in a past epoch, suspend at the end of the active epoch.
-
-	soonestFinalIdx := m.activeEpochIdx
-	if soonestFinalIdx == 0 {
-		// Cannot schedule a suspend if Run isn't running.
+	// Soonest final epoch is the one after the live epoch (matches the
+	// schedule_suspend validator).
+	soonestFinalIdx := m.activeEpochIdx + 1
+	if m.activeEpochIdx == 0 {
 		if m.startEpochIdx == 0 {
 			return -1, time.Time{}
 		}
-		// Not yet started. Soonest suspend idx is the start epoch idx - 1.
 		soonestFinalIdx = m.startEpochIdx - 1
 	}
 
 	if soonestEnd := epochEnd(soonestFinalIdx); asSoonAs.Before(soonestEnd) {
-		// Suspend at the end of the active epoch or the one prior to start.
 		finalEpochIdx = soonestFinalIdx
 		finalEpochEnd = soonestEnd
 	} else {
-		// Suspend at the end of the epoch that includes the target time.
 		ms := asSoonAs.UnixMilli()
 		finalEpochIdx = ms / dur
-		// Allow stopping at boundary, prior to the epoch starting at this time.
 		if ms%dur == 0 {
 			finalEpochIdx--
 		}
 		finalEpochEnd = epochEnd(finalEpochIdx)
 	}
-
-	m.suspendEpochIdx = finalEpochIdx
-	m.persistBook = persistBook
-
 	return
 }
 
-// ResumeEpoch gets the next available resume epoch index for the currently
-// configured epoch duration for the market and the provided earliest allowable
-// start time. The market must be running, otherwise the zero index is returned.
+// ScheduleSuspendEvent builds a schedule_suspend event (last trading epoch
+// at or after asSoonAs) for the caller to apply through mesh. Fails before
+// a live epoch exists.
+func (m *Market) ScheduleSuspendEvent(asSoonAs time.Time, persistBook bool) (*mesh.Event, *SuspendEpoch, error) {
+	m.epochMtx.RLock()
+	liveEpoch := m.currentEpoch != nil || m.activeEpochIdx > 0
+	if !liveEpoch {
+		m.epochMtx.RUnlock()
+		return nil, nil, fmt.Errorf("unable to schedule suspend for market %s before a live epoch is established", m.name)
+	}
+	finalEpochIdx, finalEpochEnd := m.suspendEpoch(asSoonAs)
+	epochDur := int64(m.EpochDuration())
+	m.epochMtx.RUnlock()
+	if finalEpochIdx < 0 {
+		return nil, nil, fmt.Errorf("unable to schedule suspend for market %s", m.name)
+	}
+	event := meshevents.NewMarketLifecycleEvent(meshevents.LifecycleActionScheduleSuspend, m.name, finalEpochIdx, epochDur)
+	event.PersistBook = &persistBook
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meshEvent, &SuspendEpoch{Idx: finalEpochIdx, End: finalEpochEnd}, nil
+}
+
+func (m *Market) validateScheduleSuspendEvent(finalEpochIdx, finalEpochDur int64) error {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	if finalEpochDur != int64(m.EpochDuration()) {
+		return fmt.Errorf("schedule_suspend epoch duration %d mismatches market duration %d",
+			finalEpochDur, m.EpochDuration())
+	}
+	switch m.pendingLifecycleAction {
+	case db.MarketPendingNone, db.MarketPendingSuspend:
+	default:
+		return fmt.Errorf("schedule_suspend rejected in pending lifecycle action %d", m.pendingLifecycleAction)
+	}
+	if m.lifecycleState == db.MarketStateSuspended {
+		return fmt.Errorf("schedule_suspend rejected for suspended market %s", m.name)
+	}
+	if m.currentEpoch != nil {
+		// With an epoch live: final epoch must be strictly after current, and
+		// a pending suspend already at the current epoch cannot be moved.
+		if m.pendingLifecycleAction == db.MarketPendingSuspend && m.pendingLifecycleEpochIdx == m.currentEpoch.Epoch {
+			return fmt.Errorf("schedule_suspend rejected: market %s final epoch %d is already closing",
+				m.name, m.currentEpoch.Epoch)
+		}
+		if finalEpochIdx <= m.currentEpoch.Epoch {
+			return fmt.Errorf("schedule_suspend final epoch %d is not after current epoch %d",
+				finalEpochIdx, m.currentEpoch.Epoch)
+		}
+		return nil
+	}
+	soonestFinalIdx := m.activeEpochIdx
+	if soonestFinalIdx == 0 && m.startEpochIdx > 0 {
+		soonestFinalIdx = m.startEpochIdx - 1
+	}
+	if soonestFinalIdx > 0 && finalEpochIdx < soonestFinalIdx {
+		return fmt.Errorf("schedule_suspend final epoch %d is before current schedulable epoch %d",
+			finalEpochIdx, soonestFinalIdx)
+	}
+	return nil
+}
+
+// ResumeEpoch is the first epoch index at or after asSoonAs in the live
+// duration unit. The scheduled index must stay in that unit; submitMarketResume
+// refuses if configuredParams.epochDur disagrees. Zero if the market is already
+// running.
 func (m *Market) ResumeEpoch(asSoonAs time.Time) (startEpochIdx int64) {
 	// Only allow scheduling a resume if the market is not running.
 	if m.Running() {
 		return
 	}
 
-	dur := int64(m.EpochDuration())
+	dur := m.liveParams.Load().epochDur
 
 	now := time.Now().UnixMilli()
 	nextEpochIdx := 1 + now/dur
@@ -590,27 +985,21 @@ func (m *Market) ResumeEpoch(asSoonAs time.Time) (startEpochIdx int64) {
 	return
 }
 
-// SetStartEpochIdx sets the starting epoch index. This should generally be
-// called before Run, or Start used to specify the index at the same time.
-func (m *Market) SetStartEpochIdx(startEpochIdx int64) {
-	m.epochMtx.Lock()
-	m.startEpochIdx = startEpochIdx
-	m.epochMtx.Unlock()
-}
-
-// Start begins order processing with a starting epoch index. See also
-// SetStartEpochIdx and Run. Stop the Market by cancelling the context.
-func (m *Market) Start(ctx context.Context, startEpochIdx int64) {
-	m.SetStartEpochIdx(startEpochIdx)
-	m.Run(ctx)
-}
-
-// waitForEpochOpen waits until the start of epoch processing.
-func (m *Market) waitForEpochOpen() {
-	m.runMtx.RLock()
-	c := m.running // the field may be rewritten, but only after close
-	m.runMtx.RUnlock()
-	<-c
+// ScheduleResumeEvent builds a schedule_resume event for the caller to
+// apply through mesh. Fails if the market is already running.
+func (m *Market) ScheduleResumeEvent(asSoonAs time.Time) (*mesh.Event, int64, time.Time, error) {
+	startEpochIdx := m.ResumeEpoch(asSoonAs)
+	if startEpochIdx == 0 {
+		return nil, 0, time.Time{}, fmt.Errorf("unable to resume market %s at time %v", m.name, asSoonAs)
+	}
+	epochDur := m.liveParams.Load().epochDur
+	startTime := time.UnixMilli(epochDur * startEpochIdx)
+	event := meshevents.NewMarketLifecycleEvent(meshevents.LifecycleActionScheduleResume, m.name, startEpochIdx, epochDur)
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return nil, 0, time.Time{}, err
+	}
+	return meshEvent, startEpochIdx, startTime, nil
 }
 
 // Status describes the operation state of the Market.
@@ -620,8 +1009,36 @@ type Status struct {
 	ActiveEpoch   int64
 	StartEpoch    int64
 	SuspendEpoch  int64
-	PersistBook   bool
+	PersistBook   *bool
 	Base, Quote   uint32
+	LotSize       uint64
+	RateStep      uint64
+	ParcelSize    uint32
+}
+
+// LifecyclePhase is the market's suspend/resume control phase.
+type LifecyclePhase uint8
+
+const (
+	LifecyclePhaseUnknown    LifecyclePhase = iota
+	LifecyclePhaseRunning                   // live; suspend may be scheduled
+	LifecyclePhaseSuspended                 // parked; resume may be scheduled
+	LifecyclePhaseSuspending                // final epoch closed; suspend event pending
+)
+
+// persistBookForStatusLocked reports whether PersistBook should appear in
+// Status: only once a suspend/resume decision exists. Caller holds epochMtx.
+func (m *Market) persistBookForStatusLocked() *bool {
+	if !m.persistBookSet {
+		return nil
+	}
+	if m.suspendEpochIdx == 0 &&
+		m.pendingLifecycleAction != db.MarketPendingResume &&
+		m.lifecycleState != db.MarketStateSuspended {
+		return nil
+	}
+	persist := m.persistBook
+	return &persist
 }
 
 // Status returns the current operating state of the Market.
@@ -630,13 +1047,36 @@ func (m *Market) Status() *Status {
 	defer m.epochMtx.Unlock()
 	return &Status{
 		Running:       m.Running(),
-		EpochDuration: m.marketInfo.EpochDuration,
+		EpochDuration: m.EpochDuration(),
+		LotSize:       m.LotSize(),
+		RateStep:      m.RateStep(),
+		ParcelSize:    m.ParcelSize(),
 		ActiveEpoch:   m.activeEpochIdx,
 		StartEpoch:    m.startEpochIdx,
 		SuspendEpoch:  m.suspendEpochIdx,
-		PersistBook:   m.persistBook,
-		Base:          m.marketInfo.Base,
-		Quote:         m.marketInfo.Quote,
+		PersistBook:   m.persistBookForStatusLocked(),
+		Base:          m.base,
+		Quote:         m.quote,
+	}
+}
+
+// LifecyclePhase reports this market's suspend/resume control phase.
+func (m *Market) LifecyclePhase() LifecyclePhase {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	liveEpoch := m.currentEpoch != nil || m.activeEpochIdx > 0
+	switch {
+	case m.lifecycleState == db.MarketStateRunning &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingSuspend) &&
+		liveEpoch:
+		return LifecyclePhaseRunning
+	case m.lifecycleState == db.MarketStateRunning && m.pendingLifecycleAction == db.MarketPendingSuspendDrain:
+		return LifecyclePhaseSuspending
+	case m.lifecycleState == db.MarketStateSuspended &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingResume):
+		return LifecyclePhaseSuspended
+	default:
+		return LifecyclePhaseUnknown
 	}
 }
 
@@ -650,213 +1090,423 @@ func (m *Market) Status() *Status {
 // TODO: Instead of using Running in OrderRouter and DEX, these types should
 // track statuses (known suspend times).
 func (m *Market) Running() bool {
-	m.runMtx.RLock()
-	defer m.runMtx.RUnlock()
-	select {
-	case <-m.running:
-		return true
-	default:
-		return false
-	}
+	return m.running.Load()
 }
 
-// EpochDuration returns the Market's epoch duration in milliseconds.
+// EpochDuration is the market's epoch duration in milliseconds.
 func (m *Market) EpochDuration() uint64 {
-	return m.marketInfo.EpochDuration
+	return uint64(m.liveParams.Load().epochDur)
 }
 
-// MarketBuyBuffer returns the Market's market-buy buffer.
+// startParams is what this market_started should carry.
+//
+// If we are only finishing a suspend (already draining, or the last trading
+// epoch already passed), return liveParams. A new lot size here would cancel
+// booked orders for a run that never opens. Otherwise return the file.
+func (m *Market) startParams() marketRun {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	live := *m.liveParams.Load()
+	switch m.pendingLifecycleAction {
+	case db.MarketPendingSuspendDrain:
+		return live
+	case db.MarketPendingSuspend:
+		if currentMarketEpochIdx(live.epochDur) > m.pendingLifecycleEpochIdx {
+			return live
+		}
+	}
+	return m.configuredParams
+}
+
+// MarketBuyBuffer is an origin-only funding heuristic, not a run parameter.
 func (m *Market) MarketBuyBuffer() float64 {
-	return m.marketInfo.MarketBuyBuffer
+	return m.marketBuyBuffer
 }
 
-// LotSize returns the market's lot size in units of the base asset.
+// LotSize is the market's lot size in units of the base asset.
 func (m *Market) LotSize() uint64 {
-	return m.marketInfo.LotSize
+	return m.liveParams.Load().LotSize
 }
 
-// RateStep returns the market's rate step in units of the quote asset.
+// RateStep is the market's rate step in units of the quote asset.
 func (m *Market) RateStep() uint64 {
-	return m.marketInfo.RateStep
+	return m.liveParams.Load().RateStep
+}
+
+func (m *Market) minimumRate() uint64 {
+	return m.liveParams.Load().MinimumRate
+}
+
+func (m *Market) maxUserCancelsPerEpoch() uint32 {
+	return m.liveParams.Load().MaxUserCancelsPerEpoch
 }
 
 // Base is the base asset ID.
 func (m *Market) Base() uint32 {
-	return m.marketInfo.Base
+	return m.base
 }
 
 // Quote is the quote asset ID.
 func (m *Market) Quote() uint32 {
-	return m.marketInfo.Quote
+	return m.quote
 }
 
-// OrderFeed provides a new order book update channel. Channels provided before
-// the market starts and while a market is running are both valid. When the
-// market stops, channels are closed (invalidated), and new channels should be
-// requested if the market starts again.
-func (m *Market) OrderFeed() <-chan *updateSignal {
-	bookUpdates := make(chan *updateSignal, 1)
-	m.orderFeedMtx.Lock()
-	m.orderFeeds = append(m.orderFeeds, bookUpdates)
-	m.orderFeedMtx.Unlock()
-	return bookUpdates
+// SetUnbookNotifier is called for unbooks outside an event applier's own
+// book-router notify: at-fault SwapDone and orders_revoked.
+func (m *Market) SetUnbookNotifier(f func(*order.LimitOrder)) {
+	m.unbookMtx.Lock()
+	m.unbookNotifier = f
+	m.unbookMtx.Unlock()
 }
 
-// FeedDone informs the market that the caller is finished receiving from the
-// given channel, which should have been obtained from OrderFeed. If the channel
-// was a registered order feed channel from OrderFeed, it is closed and removed
-// so that no further signals will be send on the channel.
-func (m *Market) FeedDone(feed <-chan *updateSignal) bool {
-	m.orderFeedMtx.Lock()
-	defer m.orderFeedMtx.Unlock()
-	for i := range m.orderFeeds {
-		if m.orderFeeds[i] == feed {
-			close(m.orderFeeds[i])
-			// Order is not important to delete the channel without allocation.
-			m.orderFeeds[i] = m.orderFeeds[len(m.orderFeeds)-1]
-			m.orderFeeds[len(m.orderFeeds)-1] = nil // chan is a pointer
-			m.orderFeeds = m.orderFeeds[:len(m.orderFeeds)-1]
-			return true
-		}
+// notifyUnbooked delivers an unbooked order to the registered unbook notifier,
+// if any.
+func (m *Market) notifyUnbooked(lo *order.LimitOrder) {
+	m.unbookMtx.RLock()
+	notify := m.unbookNotifier
+	m.unbookMtx.RUnlock()
+	if notify != nil {
+		notify(lo)
 	}
+}
+
+func marketOrderError(err error) *msgjson.Error {
+	code := msgjson.UnknownMarketError
+	switch {
+	case errors.Is(err, ErrInternalServer), errors.Is(err, errEpochOrderStorage):
+		code = msgjson.RPCInternalError
+		log.Errorf("Market order submission failed: %v", err)
+	case errors.Is(err, ErrMarketNotRunning):
+		code = msgjson.MarketNotRunningError
+	case errors.Is(err, ErrQuantityTooHigh):
+		code = msgjson.OrderQuantityTooHigh
+	case errors.Is(err, ErrInvalidRate), errors.Is(err, ErrInvalidCommitment), errors.Is(err, ErrInvalidOrder):
+		code = msgjson.OrderParameterError
+	default:
+		log.Debugf("Market order submission failed: %v", err)
+	}
+	return mesh.ClientError(err, code, "%v", err)
+}
+
+// resendResultWindow must exceed the client's worst-case ladder span (ten
+// attempts of up to fundingTxWait+1min each plus ~1min of backoff, ~21min)
+// so a late resend cannot outlive it and mint a second life.
+const resendResultWindow = 30 * time.Minute
+
+// sameOrderAs reports whether incoming is the same order as stored: stamped
+// with stored's server time, it must serialize to the same order ID. A hit
+// leaves that stamp on incoming; a miss clears it.
+func sameOrderAs(incoming, stored order.Order) bool {
+	incoming.SetTime(time.UnixMilli(stored.Time()))
+	if incoming.ID() == stored.ID() {
+		return true
+	}
+	// Restore the unstamped state on a miss.
+	incoming.SetTime(time.Time{})
 	return false
 }
 
-// sendToFeeds sends an *updateSignal to all order feed channels created with
-// OrderFeed().
-func (m *Market) sendToFeeds(sig *updateSignal) {
-	m.orderFeedMtx.RLock()
-	for _, s := range m.orderFeeds {
-		s <- sig
+// ResendOfKnownOrder answers a client sending the same order again. Call it
+// before other submission checks: those reject the resend because of the
+// original order (locked coins, a live commitment). If the order is still
+// live, return the stored result. If it was archived recently, return a
+// retired error so the client stops tracking it. If the lookup fails, return
+// TryAgainLater; continuing would refuse an order we may already have taken.
+func (m *Market) ResendOfKnownOrder(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) (handled bool, rpcErr *msgjson.Error) {
+	commit := rec.order.Commitment()
+
+	m.epochMtx.RLock()
+	oid, found := m.epochCommitments[commit]
+	epochOrd := m.epochOrders[oid]
+	m.epochMtx.RUnlock()
+	if found && epochOrd != nil {
+		if !sameOrderAs(rec.order, epochOrd) {
+			return false, nil
+		}
+		return true, m.completeStoredOrderResult(ctx, rec, completion)
 	}
-	m.orderFeedMtx.RUnlock()
+
+	// The active-table hit is unique (live commits are), but the archived
+	// window can hold several lives of a legally reused commitment; identity
+	// must be checked against every one.
+	candidates, err := m.storage.OrdersWithCommit(ctx, m.base, m.quote, commit,
+		time.Now().Add(-resendResultWindow))
+	if err != nil {
+		log.Errorf("Resend lookup for commitment %v failed: %v", commit, err)
+		return true, msgjson.NewError(msgjson.TryAgainLaterError,
+			"order resend lookup unavailable; retry the request")
+	}
+	for _, cand := range candidates {
+		if !sameOrderAs(rec.order, cand.Order) {
+			continue
+		}
+		switch cand.Status {
+		case order.OrderStatusEpoch, order.OrderStatusBooked:
+			return true, m.completeStoredOrderResult(ctx, rec, completion)
+		default:
+			// A success answer would have the client track a dead order.
+			return true, msgjson.NewError(msgjson.UnknownOrderError,
+				"order %v with this commitment was already accepted and retired", cand.Order.ID())
+		}
+	}
+	return false, nil
 }
 
-type orderUpdateSignal struct {
-	rec     *orderRecord
-	errChan chan error // should be buffered
+// completeStoredOrderResult delivers the stored result. rec must already be
+// stamped (sameOrderAs). No event is emitted.
+func (m *Market) completeStoredOrderResult(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
+	respMsg, err := m.orderResponse(rec)
+	if err != nil {
+		log.Errorf("failed to create msgjson.Message for resent order %v response: %v", rec.order.ID(), err)
+		return msgjson.NewError(msgjson.RPCInternalError, "%v", ErrMalformedOrderResponse)
+	}
+	result, err := orderResultFromResponse(respMsg)
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to build order result: %v", err)
+	}
+	log.Debugf("Answering resend of accepted order %v with its stored result.", rec.order.ID())
+	if err := completion.Complete(ctx, result); err != nil {
+		// Delivery failure only: the client resends again and this path
+		// answers again.
+		log.Errorf("failed to deliver stored order result for %v: %v", rec.order.ID(), err)
+	}
+	return nil
 }
 
-func newOrderUpdateSignal(ord *orderRecord) *orderUpdateSignal {
-	return &orderUpdateSignal{ord, make(chan error, 1)}
+func (m *Market) stampedOrderAcceptedEvent(rec *orderRecord) (*mesh.Event, *msgjson.OrderResult, *msgjson.Error) {
+	sTime := time.Now().Truncate(time.Millisecond).UTC()
+	rec.order.SetTime(sTime)
+	log.Tracef("Received order %v at %v", rec.order, sTime)
+
+	if err := m.validateOrderAcceptedPreEvent(rec.order); err != nil {
+		return nil, nil, marketOrderError(err)
+	}
+
+	respMsg, err := m.orderResponse(rec)
+	if err != nil {
+		log.Errorf("failed to create msgjson.Message for order %v, msgID %v response: %v",
+			rec.order, rec.msgID, err)
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "%v", ErrMalformedOrderResponse)
+	}
+	result, err := orderResultFromResponse(respMsg)
+	if err != nil {
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build order result: %v", err)
+	}
+	event, err := mesh.NewEvent(meshevents.NewOrderAcceptedEvent(rec.order))
+	if err != nil {
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build accepted order event: %v", err)
+	}
+	return event, result, nil
 }
 
-// SubmitOrder submits a new order for inclusion into the current epoch. This is
-// the synchronous version of SubmitOrderAsync.
-func (m *Market) SubmitOrder(rec *orderRecord) error {
-	return <-m.SubmitOrderAsync(rec)
-}
-
-// processCancelOrderWhileSuspended is called when cancelling an order while
-// the market is suspended and Run is not running. The error sent on errChan
-// is returned to the client.
-//
-// This function:
-// 1. Removes the target order from the book.
-// 2. Unlocks the order coins.
-// 3. Updates the storage with the new cancel order and cancels the existing limit order.
-// 4. Responds to the client that the order was received.
-// 5. Sends the unbooked order to the order feeds.
-// 6. Creates a match object, stores it, and notifies the client of the match.
-func (m *Market) processCancelOrderWhileSuspended(rec *orderRecord, errChan chan<- error) {
+func (m *Market) stampedSuspendedCancelEvent(rec *orderRecord) (*mesh.Event, *msgjson.OrderResult, *msgjson.Error) {
 	co, ok := rec.order.(*order.CancelOrder)
 	if !ok {
-		errChan <- ErrInvalidOrder
-		return
+		return nil, nil, marketOrderError(ErrInvalidOrder)
 	}
-
 	if cancelable, _, err := m.CancelableBy(co.TargetOrderID, co.AccountID); !cancelable {
-		errChan <- err
-		return
+		return nil, nil, marketOrderError(err)
 	}
-
 	m.bookMtx.Lock()
-	delete(m.settling, co.TargetOrderID)
-	lo, ok := m.book.Remove(co.TargetOrderID)
+	target := m.book.Order(co.TargetOrderID)
 	m.bookMtx.Unlock()
-	if !ok {
-		errChan <- ErrTargetNotCancelable
-		return
+	if target == nil {
+		return nil, nil, marketOrderError(ErrTargetNotCancelable)
 	}
-
-	m.unlockOrderCoins(lo)
 
 	sTime := time.Now().Truncate(time.Millisecond).UTC()
 	co.SetTime(sTime)
-
-	// Create the client response here, but don't send it until the order has been
-	// committed to the storage.
 	respMsg, err := m.orderResponse(rec)
 	if err != nil {
-		errChan <- fmt.Errorf("failed to create order response: %w", err)
-		return
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "%v", ErrMalformedOrderResponse)
 	}
-
+	result, err := orderResultFromResponse(respMsg)
+	if err != nil {
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build order result: %v", err)
+	}
 	dur := int64(m.EpochDuration())
-	now := time.Now().UnixMilli()
-	epochIdx := now / dur
-	if err := m.storage.NewArchivedCancel(co, epochIdx, dur); err != nil {
-		errChan <- err
-		return
-	}
-	if err := m.storage.CancelOrder(lo); err != nil {
-		errChan <- err
-		return
-	}
-
-	err = m.auth.Send(rec.order.User(), respMsg)
+	epochIdx := time.Now().UnixMilli() / dur
+	matchServerTime := time.Now().Truncate(time.Millisecond).UTC()
+	event, err := mesh.NewEvent(meshevents.NewSuspendedCancelEvent(m.name, m.base,
+		m.quote, co, target, epochIdx, dur, m.getFeeRate(m.Base(), m.baseFeeFetcher),
+		m.getFeeRate(m.Quote(), m.quoteFeeFetcher), matchServerTime))
 	if err != nil {
-		log.Errorf("Failed to send cancel order response: %v", err)
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build suspended cancel event: %v", err)
 	}
-
-	sig := &updateSignal{
-		action: unbookAction,
-		data: sigDataUnbookedOrder{
-			order:    lo,
-			epochIdx: 0,
-		},
-	}
-	m.sendToFeeds(sig)
-
-	match := order.Match{
-		Taker:    co,
-		Maker:    lo,
-		Quantity: lo.Remaining(),
-		Rate:     lo.Rate,
-		Epoch: order.EpochID{
-			Idx: uint64(epochIdx),
-			Dur: m.EpochDuration(),
-		},
-		FeeRateBase:  m.getFeeRate(m.Base(), m.baseFeeFetcher),
-		FeeRateQuote: m.getFeeRate(m.Quote(), m.quoteFeeFetcher),
-	}
-	// insertMatchErr is sent on errChan at the end of the function. We
-	// want to send the match request to the client even if this insertion
-	// fails.
-	insertMatchErr := m.storage.InsertMatch(&match)
-
-	makerMsg, takerMsg := matchNotifications(&match)
-	m.auth.Sign(makerMsg)
-	m.auth.Sign(takerMsg)
-	msgs := []msgjson.Signable{makerMsg, takerMsg}
-	req, err := msgjson.NewRequest(comms.NextID(), msgjson.MatchRoute, msgs)
-	if err != nil {
-		log.Errorf("Failed to create match request: %v", err)
-	} else {
-		err = m.auth.Request(rec.order.User(), req, func(_ comms.Link, resp *msgjson.Message) {
-			m.processMatchAcksForCancel(rec.order.User(), resp)
-		})
-		if err != nil {
-			log.Errorf("Failed to send match request: %v", err)
-		}
-	}
-
-	errChan <- insertMatchErr
+	return event, result, nil
 }
 
-// matchNotifications creates a pair of msgjson.Match from a match.
-func matchNotifications(match *order.Match) (makerMsg *msgjson.Match, takerMsg *msgjson.Match) {
-	stamp := uint64(time.Now().UnixMilli())
+// validateOrderAcceptedPreEvent performs trade eligibility checks before the
+// authoritative order_accepted event is created. This function should not be
+// called as part of the event applier.
+func (m *Market) validateOrderAcceptedPreEvent(ord order.Order) error {
+	if m.orderAtOrAfterPendingSuspendBoundary(ord) {
+		return ErrMarketNotRunning
+	}
+	if ord.Type() == order.CancelOrderType {
+		return nil
+	}
+	oid := ord.ID()
+	if _, tier := m.auth.AcctStatus(ord.User()); tier < 1 {
+		log.Debugf("Account %v with tier %d not allowed to submit order %v", ord.User(), tier, oid)
+		return ErrSuspendedAccount
+	}
+	return m.validateOrderAcceptedParcelLimit(ord)
+}
+
+func (m *Market) orderAtOrAfterPendingSuspendBoundary(ord order.Order) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.orderAtOrAfterPendingSuspendBoundaryLocked(ord)
+}
+
+func (m *Market) orderAtOrAfterPendingSuspendBoundaryLocked(ord order.Order) bool {
+	switch m.pendingLifecycleAction {
+	case db.MarketPendingSuspend, db.MarketPendingSuspendDrain:
+	default:
+		return false
+	}
+	if m.pendingLifecycleEpochIdx == 0 || m.pendingLifecycleEpochDur == 0 {
+		return false
+	}
+	return ord.Time() >= (m.pendingLifecycleEpochIdx+1)*m.pendingLifecycleEpochDur
+}
+
+func (m *Market) validateOrderAcceptedParcelLimit(ord order.Order) error {
+	if ord.Type() == order.CancelOrderType {
+		return nil
+	}
+	likelyTaker, baseQty := m.analysisHelpers()
+	orderWeight := baseQty(ord)
+	if likelyTaker(ord) {
+		orderWeight *= 2
+	}
+	user := ord.User()
+	calcParcels := func(settlingWeight uint64) float64 {
+		return m.parcels(user, settlingWeight+orderWeight)
+	}
+	ok, err := m.checkParcelLimit(user, time.UnixMilli(ord.Time()).UTC(), calcParcels)
+	if err != nil {
+		// Reputation load failed: propagate, do not treat as over-limit.
+		return fmt.Errorf("parcel limit reputation load for order %v: %w: %w", ord.ID(), ErrInternalServer, err)
+	}
+	if !ok {
+		oid := ord.ID()
+		log.Debugf("Received order %s that pushed user over the parcel limit", oid)
+		return ErrQuantityTooHigh
+	}
+	return nil
+}
+
+// AcceptOrderCommand runs the order on the master: a byte-identical resend
+// is answered from store, a cancel on a suspended market emits
+// suspended_cancel, otherwise order_accepted (restamped if the epoch closed).
+func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
+	if err := m.validateOrder(rec.order); err != nil {
+		log.Debugf("AcceptOrderCommand: Invalid order received from user %v with commitment %v: %v",
+			rec.order.User(), rec.order.Commitment(), err)
+		return marketOrderError(err)
+	}
+
+	if !m.Running() {
+		if rec.order.Type() != order.CancelOrderType {
+			log.Infof("AcceptOrderCommand: Market stopped with an order in submission (commitment %v).",
+				rec.order.Commitment())
+			return msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+		}
+		if handled, rpcErr := m.acceptSuspendedCancel(ctx, rec, completion); handled {
+			return rpcErr
+		}
+		// The market resumed while acquiring resumeSubmitMtx; take the normal
+		// running-market path below.
+	}
+
+	commit := rec.order.Commitment()
+	m.epochMtx.RLock()
+	otherOID, found := m.epochCommitments[commit]
+	m.epochMtx.RUnlock()
+	if found {
+		// The live commitment can belong to this exact payload: an identical
+		// in-flight duplicate whose first life applied after the router's
+		// resend lookup ran. Answer idempotently; refuse only a true mismatch.
+		if handled, rpcErr := m.ResendOfKnownOrder(ctx, rec, completion); handled {
+			return rpcErr
+		}
+		log.Debugf("Received order with commitment %x also used in previous order %v!",
+			commit, otherOID)
+		return marketOrderError(ErrInvalidCommitment)
+	}
+
+	// Make two attempts to apply the order accepted event, to handle the case
+	// where the order is stamped to go into an epoch that was already closed.
+	for attempt := 0; attempt < 2; attempt++ {
+		event, result, rpcErr := m.stampedOrderAcceptedEvent(rec)
+		if rpcErr != nil {
+			return rpcErr
+		}
+		if err := completion.Emit(ctx, event, func() any { return result }); err != nil {
+			if attempt == 0 && errors.Is(err, ErrEpochMissed) {
+				log.Debugf("Restamping order %v after missed epoch during event apply", rec.order.ID())
+				continue
+			}
+			if db.IsErrReusedCommit(err) {
+				// Make sure there wasn't another concurrent identical duplicate.
+				if handled, rpcErr := m.ResendOfKnownOrder(ctx, rec, completion); handled {
+					return rpcErr
+				}
+				return marketOrderError(ErrInvalidCommitment)
+			}
+			return marketOrderError(err)
+		}
+		return nil
+	}
+
+	panic("unreachable order acceptance retry state")
+}
+
+// acceptSuspendedCancel handles a cancel order submitted while the market is
+// not accepting orders. If the market is suspended (with no pending action or
+// a pending resume), the cancel is emitted as a suspended_cancel event. It
+// reports handled=false without emitting when the market resumed while
+// acquiring resumeSubmitMtx, in which case the caller takes the normal
+// running-market path.
+func (m *Market) acceptSuspendedCancel(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) (handled bool, rpcErr *msgjson.Error) {
+	m.resumeSubmitMtx.RLock()
+	defer m.resumeSubmitMtx.RUnlock()
+
+	if m.Running() {
+		return false, nil
+	}
+	m.epochMtx.RLock()
+	suspended := m.lifecycleState == db.MarketStateSuspended &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingResume)
+	m.epochMtx.RUnlock()
+	if !suspended {
+		return true, msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+	}
+	event, result, rpcErr := m.stampedSuspendedCancelEvent(rec)
+	if rpcErr != nil {
+		// Once an identical duplicate applied, CancelableBy no longer sees
+		// the target it unbooked.
+		if handled, resendErr := m.ResendOfKnownOrder(ctx, rec, completion); handled {
+			return true, resendErr
+		}
+		return true, rpcErr
+	}
+	if err := completion.Emit(ctx, event, func() any { return result }); err != nil {
+		// Make sure there wasn't another concurrent identical duplicate.
+		if handled, resendErr := m.ResendOfKnownOrder(ctx, rec, completion); handled {
+			return true, resendErr
+		}
+		return true, marketOrderError(err)
+	}
+	return true, nil
+}
+
+// matchNotifications creates a pair of msgjson.Match from a match, stamped
+// with the given server time.
+func matchNotifications(match order.Match, serverTime time.Time) (makerMsg *msgjson.Match, takerMsg *msgjson.Match) {
+	stamp := uint64(serverTime.UnixMilli())
 	return &msgjson.Match{
 			OrderID:      idToBytes(match.Maker.ID()),
 			MatchID:      idToBytes(match.ID()),
