@@ -254,6 +254,8 @@ const (
 	// delivering the counterparty's per-match swap address after both sides
 	// have acknowledged the match.
 	CounterPartyAddressRoute = "counterparty_address"
+	// MeshEndpointsRoute notifies clients of an updated mesh endpoint list.
+	MeshEndpointsRoute = "mesh_endpoints"
 )
 
 const errNullRespPayload = dex.ErrorKind("null response payload")
@@ -1308,6 +1310,20 @@ type BondAsset struct {
 	Amt     uint64 `json:"amount"` // to be implied by bond version?
 }
 
+// MeshEndpoint identifies a client-facing endpoint for the same logical DEX
+// mesh. Cert is optional and should be used for endpoints with non-public TLS
+// trust roots.
+type MeshEndpoint struct {
+	Host string    `json:"host"`
+	Cert dex.Bytes `json:"cert,omitempty"`
+}
+
+// MeshEndpointsNotification is a full replacement of mesh failover endpoints.
+// Clients ignore an empty list rather than clearing known peers.
+type MeshEndpointsNotification struct {
+	MeshEndpoints []*MeshEndpoint `json:"meshEndpoints"`
+}
+
 // ConfigResult is the successful result for the ConfigRoute.
 type ConfigResult struct {
 	// APIVersion is the server's communications API version, but we may
@@ -1334,6 +1350,8 @@ type ConfigResult struct {
 
 	PenaltyThreshold uint32 `json:"penaltyThreshold"`
 	MaxScore         uint32 `json:"maxScore"`
+
+	MeshEndpoints []*MeshEndpoint `json:"meshEndpoints,omitempty"`
 }
 
 // Spot is a snapshot of a market at the end of a match cycle. A slice of Spot
