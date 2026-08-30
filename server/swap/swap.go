@@ -1094,111 +1094,124 @@ func (s *Swapper) matchSlice() []*matchTracker {
 // This method simply sets swapConfirmed in the last actor's swapStatus.
 func (s *Swapper) processBlock(ctx context.Context, block *blockNotification) {
 	for _, match := range s.matchSlice() {
-		// If it's neither of the match assets, nothing to do.
-		if match.makerStatus.swapAsset != block.assetID &&
-			match.takerStatus.swapAsset != block.assetID {
+		s.confirmMatchForBlock(ctx, match, block)
+	}
+}
+
+// confirmMatchForBlock updates swapConfirmed for one match if this block's
+// asset is the side waiting on confirmations.
+func (s *Swapper) confirmMatchForBlock(ctx context.Context, match *matchTracker, block *blockNotification) {
+	if match.makerStatus.swapAsset != block.assetID &&
+		match.takerStatus.swapAsset != block.assetID {
+		return
+	}
+
+	// Lock the matchTracker so the following checks and updates are atomic
+	// with respect to Status.
+	match.mtx.RLock()
+	defer match.mtx.RUnlock()
+
+	switch match.Status {
+	case order.MakerSwapCast:
+		if match.makerStatus.swapAsset != block.assetID {
 			return
 		}
-
-		// Lock the matchTracker so the following checks and updates are atomic
-		// with respect to Status.
-		match.mtx.RLock()
-		defer match.mtx.RUnlock()
-
-		switch match.Status {
-		case order.MakerSwapCast:
-			if match.makerStatus.swapAsset != block.assetID {
-				break
-			}
-			// If the maker has broadcast their transaction, the taker's
-			// broadcast timeout starts once the maker's swap has SwapConf
-			// confs.
-			if s.tryConfirmSwap(ctx, match.makerStatus, block.time) {
-				s.unlockOrderCoins(match.Maker)
-			}
-		case order.TakerSwapCast:
-			if match.takerStatus.swapAsset != block.assetID {
-				break
-			}
-			// If the taker has broadcast their transaction, the maker's
-			// broadcast timeout (for redemption) starts once the taker's swap
-			// has SwapConf confs.
-			if s.tryConfirmSwap(ctx, match.takerStatus, block.time) {
-				s.unlockOrderCoins(match.Taker)
-			}
+		// If the maker has broadcast their transaction, the taker's
+		// broadcast timeout starts once the maker's swap has SwapConf
+		// confs.
+		s.tryConfirmSwap(ctx, match.makerStatus, block.time)
+	case order.TakerSwapCast:
+		if match.takerStatus.swapAsset != block.assetID {
+			return
 		}
+		// If the taker has broadcast their transaction, the maker's
+		// broadcast timeout (for redemption) starts once the taker's swap
+		// has SwapConf confs.
+		s.tryConfirmSwap(ctx, match.takerStatus, block.time)
 	}
 }
 
 // failMatch revokes the match and marks the swap as done for accounting
 // purposes. If userFault is false, there will be no penalty, such as if the
 // failure is because a swap tx lock time expired before required confirmations
-// were reached.
-func (s *Swapper) failMatch(match *matchTracker, userFault bool, takerAddrFault bool) {
-	// From the match status, determine maker/taker fault and the corresponding
-	// auth.NoActionStep.
-	var makerFault bool
-	var outcome db.Outcome
-	var refTime time.Time // a reference time found in the DB for reproducibly sorting outcomes
-	switch match.Status {
-	case order.NewlyMatched:
-		if takerAddrFault {
-			// The taker failed to provide their per-match swap address
-			// in time, preventing the maker from swapping.
-			outcome = db.OutcomeNoAddrAsTaker
-			refTime = match.Epoch.End()
-			makerFault = false
-		} else {
-			outcome = db.OutcomeNoSwapAsMaker
-			refTime = match.Epoch.End()
-			makerFault = true
+// were reached. status is the decision-time match status.
+func (s *Swapper) failMatch(match *matchTracker, status order.MatchStatus, userFault bool, takerAddrFault bool) {
+	if err := s.submitMatchFailed(context.Background(), match, status, userFault, takerAddrFault); err != nil {
+		if errors.Is(err, errMatchFailedRaceLost) {
+			log.Debugf("match_failed proposal for match %v lost the commit-order race: %v", match.ID(), err)
+			return
 		}
-	case order.MakerSwapCast:
-		outcome = db.OutcomeNoSwapAsTaker
-		refTime = match.makerStatus.swapTime // swapConfirmed time is not in the DB
-	case order.TakerSwapCast:
-		outcome = db.OutcomeNoRedeemAsMaker
-		refTime = match.takerStatus.swapTime // swapConfirmed time is not in the DB
-		makerFault = true
-	case order.MakerRedeemed:
-		outcome = db.OutcomeNoRedeemAsTaker
-		refTime = match.makerStatus.redeemTime
-	default:
-		log.Errorf("Invalid failMatch status %v for match %v", match.Status, match.ID())
-		return
+		log.Warnf("failed to apply match_failed event for match %v: %v", match.ID(), err)
 	}
+}
 
-	orderAtFault, otherOrder := match.Taker, order.Order(match.Maker) // an order.Order
-	if makerFault {
-		orderAtFault, otherOrder = match.Maker, match.Taker
+func (s *Swapper) submitMatchFailed(ctx context.Context, match *matchTracker, status order.MatchStatus, userFault bool, takerAddrFault bool) error {
+	if s.mesh == nil {
+		return fmt.Errorf("swapper mesh service is not configured")
 	}
-	log.Debugf("failMatch: swap %v failing at %v (%v), user fault = %v",
-		match.ID(), match.Status, outcome, userFault)
-
-	// Record the end of this match's processing.
-	s.storage.SetMatchInactive(db.MatchID(match.Match), !userFault)
-
-	// Cancellation rate accounting
-	s.swapDone(orderAtFault, match.Match, userFault) // will also unbook/revoke order if needed
-
-	// Accounting for the maker has already taken place if they have redeemed.
-	if match.Status != order.MakerRedeemed {
-		s.swapDone(otherOrder, match.Match, false)
+	if !s.matchTracked(match) {
+		return errMatchFailedRaceLost
 	}
-
-	// Register the failure to act violation, adjusting the user's score.
-	if userFault && (match.Maker.User() != match.Taker.User()) {
-		s.authMgr.Inaction(orderAtFault.User(), outcome, db.MatchID(match.Match),
-			match.Quantity, refTime, orderAtFault.ID())
+	event, err := s.newMatchFailedEvent(match, status, userFault, takerAddrFault)
+	if err != nil {
+		return err
 	}
+	if _, err := s.mesh.ApplyEvent(ctx, event); err != nil {
+		return err
+	}
+	return nil
+}
 
-	// Send the revoke_match messages, and solicit acks.
-	s.revoke(match)
+func swapContractKey(coinID, contract []byte) string {
+	return fmt.Sprintf("%x:%x", coinID, contract)
+}
+
+func secretHashKey(secretHash []byte) string {
+	return fmt.Sprintf("%x", secretHash)
+}
+
+// checkSwapContractDedup rejects contracts or maker secret hashes already tied
+// to another active match before the swap contract event is emitted/applied.
+func (s *Swapper) checkSwapContractDedup(matchID order.MatchID, coinID, contract, secretHash []byte, maker bool) error {
+	s.activeCoinsMtx.Lock()
+	defer s.activeCoinsMtx.Unlock()
+	dedupKey := swapContractKey(coinID, contract)
+	if existingMatch, exists := s.activeCoinIDs[dedupKey]; exists && existingMatch != matchID {
+		return errSwapContractInUse
+	}
+	if maker && len(secretHash) > 0 {
+		secretHashHex := secretHashKey(secretHash)
+		if existingMatch, exists := s.activeSecretHashes[secretHashHex]; exists && existingMatch != matchID {
+			return errSecretHashInUse
+		}
+	}
+	return nil
+}
+
+// registerSwapContractDedup records the accepted contract keys so reuse by
+// another active match is rejected while same-match ownership is not a conflict.
+func (s *Swapper) registerSwapContractDedup(matchID order.MatchID, coinID, contract, secretHash []byte, maker bool) {
+	s.activeCoinsMtx.Lock()
+	defer s.activeCoinsMtx.Unlock()
+	dedupKey := swapContractKey(coinID, contract)
+	if _, already := s.activeCoinIDs[dedupKey]; !already {
+		s.matchCoinIDs[matchID] = append(s.matchCoinIDs[matchID], dedupKey)
+	}
+	s.activeCoinIDs[dedupKey] = matchID
+	if maker && len(secretHash) > 0 {
+		secretHashHex := secretHashKey(secretHash)
+		if _, already := s.activeSecretHashes[secretHashHex]; !already {
+			s.matchSecretHashes[matchID] = append(s.matchSecretHashes[matchID], secretHashHex)
+		}
+		s.activeSecretHashes[secretHashHex] = matchID
+	}
 }
 
 type fail struct {
 	match *matchTracker
-	fault bool
+	// status is the detector's decision-time match status, captured under match.mtx.
+	status order.MatchStatus
+	fault  bool
 	// takerAddrFault overrides the default fault attribution for
 	// NewlyMatched timeouts. When true, the taker is blamed instead of
 	// the maker because the taker failed to provide their per-match
@@ -1219,6 +1232,12 @@ type fail struct {
 // maker, since the maker cannot broadcast their swap without the taker's
 // address.
 func (s *Swapper) checkInactionEventBased() {
+	// Do not revoke for inaction while later master workers (the markets) are
+	// still starting: clients may be unable to act, or even connect, until the
+	// node is fully up. MarketsReady re-floors the deadlines when the wait ends.
+	if !s.marketsReady.Load() {
+		return
+	}
 	// If the DB is failing, do not penalize or attempt to start revocations.
 	if err := s.storage.LastErr(); err != nil {
 		log.Errorf("DB in failing state.")
@@ -1236,14 +1255,13 @@ func (s *Swapper) checkInactionEventBased() {
 	checkMatch := func(match *matchTracker) {
 		// Lock entire matchTracker so the following is atomic with respect to
 		// Status.
-		match.mtx.RLock()
-		defer match.mtx.RUnlock()
+		match.mtx.Lock()
+		defer match.mtx.Unlock()
 
 		log.Tracef("checkInactionEventBased: match %v (%v)", match.ID(), match.Status)
 
-		deleteMatch := func(fault bool) {
-			s.deleteMatch(match)
-			failures = append(failures, fail{match: match, fault: fault})
+		failMatch := func(fault bool) {
+			failures = append(failures, fail{match: match, status: match.Status, fault: fault})
 		}
 
 		switch match.Status {
@@ -1256,10 +1274,9 @@ func (s *Swapper) checkInactionEventBased() {
 					// address in time, preventing the maker from
 					// swapping. Fault the taker, not the maker.
 					log.Infof("Revoking match %v at NewlyMatched: taker did not provide per-match address in time", match.ID())
-					s.deleteMatch(match)
-					failures = append(failures, fail{match: match, fault: true, takerAddrFault: true})
+					failures = append(failures, fail{match: match, status: match.Status, fault: true, takerAddrFault: true})
 				} else {
-					deleteMatch(true)
+					failMatch(true)
 				}
 			}
 		case order.MakerSwapCast:
@@ -1269,13 +1286,13 @@ func (s *Swapper) checkInactionEventBased() {
 			if expectedTakerLockTime.Before(now) {
 				log.Infof("Revoking match %v at %v because the expected taker swap locktime would be in the past (%v).",
 					match.ID(), match.Status, expectedTakerLockTime)
-				deleteMatch(false)
+				failMatch(false)
 			} else if match.expiredBy(now) {
 				// The taker's contract should expire first, but also check the
 				// lock time of the maker's known swap.
 				log.Warnf("Revoking match %v at %v because maker's published contract has expired.",
 					match.ID(), match.Status) // WRN because taker's should expire first
-				deleteMatch(false)
+				failMatch(false)
 			}
 		case order.TakerSwapCast:
 			// If either published contract's lock time is already passed,
@@ -1283,37 +1300,30 @@ func (s *Swapper) checkInactionEventBased() {
 			if match.expiredBy(now) {
 				log.Infof("Revoking match %v at %v because at least one published contract has expired.",
 					match.ID(), match.Status)
-				deleteMatch(false)
+				failMatch(false)
 			}
 		case order.MakerRedeemed:
 			// If the maker has redeemed, the taker can redeem immediately, so
 			// check the timeout against the time the Swapper received the
 			// maker's `redeem` request (and sent the taker's 'redemption').
 			if tooOld(match.makerStatus.redeemSeenTime()) { // rlocks swapStatus.mtx
-				deleteMatch(true)
-			}
-		case order.MatchComplete:
-			// If we got an ack from the redemption request sent to maker
-			// (detailing the taker's redeem), or it has been a while since
-			// taker redeemed, delete the match. Former should have deleted it.
-			if len(match.Sigs.MakerRedeem) > 0 || tooOld(match.takerStatus.redeemSeenTime()) {
-				log.Debugf("Deleting completed match %v", match.ID())
-				s.deleteMatch(match) // no fail or revoke, just remove from map
+				failMatch(true)
 			}
 		}
+		// MatchComplete: deleted in swap_redemption_recorded applier, not here.
 	}
 
-	// Check and delete atomically
+	// Collect failures while match state is stable.
 	s.matchMtx.Lock()
 	for _, match := range s.matches {
 		checkMatch(match)
 	}
 	s.matchMtx.Unlock()
 
-	// Record failed matches in the DB and auth mgr, unlock coins, and send
-	// revoke_match messages.
+	// Emit the authoritative failure events after releasing matchMtx. The
+	// applier performs final deletion and side effects.
 	for _, fail := range failures {
-		s.failMatch(fail.match, fail.fault, fail.takerAddrFault)
+		s.failMatch(fail.match, fail.status, fail.fault, fail.takerAddrFault)
 	}
 }
 
@@ -1325,6 +1335,11 @@ func (s *Swapper) checkInactionEventBased() {
 // that have not received a maker redeem after the taker's swap reaches the
 // required confirmation count.
 func (s *Swapper) checkInactionBlockBased(assetID uint32) {
+	// See checkInactionEventBased: no inaction revocations until the markets
+	// have reported ready.
+	if !s.marketsReady.Load() {
+		return
+	}
 	// If the DB is failing, do not penalize or attempt to start revocations.
 	if err := s.storage.LastErr(); err != nil {
 		log.Errorf("DB in failing state.")
@@ -1346,41 +1361,40 @@ func (s *Swapper) checkInactionBlockBased(assetID uint32) {
 
 		// Lock entire matchTracker so the following is atomic with respect to
 		// Status.
-		match.mtx.RLock()
-		defer match.mtx.RUnlock()
+		match.mtx.Lock()
+		defer match.mtx.Unlock()
 
 		log.Tracef("checkInactionBlockBased: asset %d, match %v (%v)",
 			assetID, match.ID(), match.Status)
 
-		deleteMatch := func() {
+		failMatch := func() {
 			// Fail the match, and assign fault if lock times are not passed.
-			s.deleteMatch(match)
-			failures = append(failures, fail{match: match, fault: !match.expiredBy(now)})
+			failures = append(failures, fail{match: match, status: match.Status, fault: !match.expiredBy(now)})
 		}
 
 		switch match.Status {
 		case order.MakerSwapCast:
 			if tooOld(match.makerStatus.swapConfTime()) { // rlocks swapStatus.mtx
-				deleteMatch()
+				failMatch()
 			}
 		case order.TakerSwapCast:
 			if tooOld(match.takerStatus.swapConfTime()) {
-				deleteMatch()
+				failMatch()
 			}
 		}
 	}
 
-	// Check and delete atomically.
+	// Collect failures while match state is stable.
 	s.matchMtx.Lock()
 	for _, match := range s.matches {
 		checkMatch(match)
 	}
 	s.matchMtx.Unlock()
 
-	// Record failed matches in the DB and auth mgr, unlock coins, and send
-	// revoke_match messages.
+	// Emit the authoritative failure events after releasing matchMtx. The
+	// applier performs final deletion and side effects.
 	for _, fail := range failures {
-		s.failMatch(fail.match, fail.fault, fail.takerAddrFault)
+		s.failMatch(fail.match, fail.status, fail.fault, fail.takerAddrFault)
 	}
 }
 
@@ -2330,7 +2344,7 @@ func (s *Swapper) revoke(match *matchTracker) {
 				route, ord.User(), mid, err)
 			return
 		}
-		if err = s.authMgr.Send(ord.User(), ntfn); err != nil {
+		if err = s.authMgr.SendIfLocal(ord.User(), ntfn); err != nil {
 			log.Debugf("Failed to send '%s' notification to user %v, match %v: %v",
 				route, ord.User(), mid, err)
 		}
