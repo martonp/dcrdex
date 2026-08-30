@@ -431,3 +431,99 @@ func (u *OrdersRevokedUpdate) EventTxData() ([]byte, error) {
 		AddData(int64Bytes(u.RevokeTime.UnixMilli())).
 		AddData(orders), nil
 }
+
+// midTxData starts a version-0 tx-data encoding with the MatchID/Base/Quote
+// triple shared by every per-match event encoder.
+func midTxData(mid MarketMatchID) encode.BuildyBytes {
+	return encode.BuildyBytes{0}.
+		AddData(mid.MatchID[:]).
+		AddData(encode.Uint32Bytes(mid.Base)).
+		AddData(encode.Uint32Bytes(mid.Quote))
+}
+
+// ackTxData is the shared tx-data encoding of the audit_ack_recorded and
+// redemption_ack_recorded events.
+func ackTxData(mid MarketMatchID, maker bool, sig []byte) []byte {
+	return midTxData(mid).
+		AddData(boolBytes(maker)).
+		AddData(sig)
+}
+
+func matchAckTxData(ack *MatchAck) []byte {
+	if ack == nil {
+		return nil
+	}
+	return midTxData(ack.MID).
+		AddData(boolBytes(ack.Maker)).
+		AddData(boolBytes(ack.Cancel)).
+		AddData(ack.Sig).
+		AddData([]byte(ack.Address))
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for a match_acks_recorded event.
+func (u *MatchAcksRecordedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil match acks recorded update")
+	}
+	b := encode.BuildyBytes{0}
+	for _, ack := range u.Acks {
+		b = b.AddData(matchAckTxData(ack))
+	}
+	return b, nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for a swap_contract_recorded event.
+func (c *SwapContract) EventTxData() ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("nil swap contract")
+	}
+	return midTxData(c.MID).
+		AddData(boolBytes(c.Maker)).
+		AddData(c.Contract).
+		AddData(c.CoinID).
+		AddData(int64Bytes(c.Timestamp)), nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for an audit_ack_recorded event.
+func (a *AuditAck) EventTxData() ([]byte, error) {
+	if a == nil {
+		return nil, fmt.Errorf("nil audit ack")
+	}
+	return ackTxData(a.MID, a.Maker, a.Sig), nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for a swap_redemption_recorded event.
+func (r *SwapRedemption) EventTxData() ([]byte, error) {
+	if r == nil {
+		return nil, fmt.Errorf("nil swap redemption")
+	}
+	return midTxData(r.MID).
+		AddData(boolBytes(r.Maker)).
+		AddData(r.CoinID).
+		AddData(r.Secret).
+		AddData(int64Bytes(r.Timestamp)), nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for a redemption_ack_recorded event.
+func (a *RedemptionAck) EventTxData() ([]byte, error) {
+	if a == nil {
+		return nil, fmt.Errorf("nil redemption ack")
+	}
+	return ackTxData(a.MID, a.Maker, a.Sig), nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for a match_failed event.
+func (u *MatchFailedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil match failed update")
+	}
+	return midTxData(u.MID).
+		AddData(int64Bytes(u.FailTimeMS)).
+		AddData([]byte{byte(u.Reason)}), nil
+}

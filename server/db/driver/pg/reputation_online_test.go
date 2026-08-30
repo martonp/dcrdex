@@ -237,7 +237,7 @@ func TestApplyRepEventTx(t *testing.T) {
 	calls := captureRepListener(t)
 	userA, userB := randomAccountID(), randomAccountID()
 	userBPreimage, userBOrder := randomReputationOrderID(), randomReputationOrderID()
-	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, OrderLimit: 1}
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, MatchLimit: 1, OrderLimit: 1}
 
 	// A failed callback must not record the batch or notify listeners.
 	applyErr := errors.New("apply failed")
@@ -263,6 +263,9 @@ func TestApplyRepEventTx(t *testing.T) {
 				{user: userA, oid: randomReputationOrderID()},
 				{user: userB, oid: userBOrder},
 			}
+			batch.matches = []*reputationMatchOutcome{{
+				user: userB, mid: db.MarketMatchID{MatchID: randomReputationMatchID()}, outcome: db.OutcomeNoSwapAsTaker,
+			}}
 			return nil
 		})
 	if err != nil {

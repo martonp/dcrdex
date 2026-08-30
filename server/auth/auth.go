@@ -1847,6 +1847,7 @@ func coinIDString(assetID uint32, coinID []byte) string {
 func (auth *AuthManager) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
 	return &db.ReputationOutcomePolicy{
 		PreimageLimit:       scoringOrderLimit,
+		MatchLimit:          ScoringMatchLimit,
 		OrderLimit:          cancelThreshWindow,
 		FreeCancelThreshold: freeCancelThreshold,
 	}
