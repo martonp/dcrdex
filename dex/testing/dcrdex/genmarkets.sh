@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 TEST_ROOT=~/dextest
-FILEPATH=${TEST_ROOT}/dcrdex/markets.json
+FILEPATH=${DCRDEX_MARKETS_PATH:-${TEST_ROOT}/dcrdex/markets.json}
 
 EPOCH_DURATION=${EPOCH:-15000}
-if [ "${EPOCH_DURATION}" -lt 1000 ]; then
-    echo "epoch duration cannot be < 1000 ms"
+if [ "${EPOCH_DURATION}" -lt 5000 ]; then
+    echo "epoch duration cannot be < 5000 ms"
     exit 1
 fi
 
