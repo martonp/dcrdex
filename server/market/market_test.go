@@ -510,6 +510,10 @@ func (ta *TArchivist) BookOrder(lo *order.LimitOrder) error {
 	return nil
 }
 
+func (ta *TArchivist) SwapDataFullByID(order.MatchID) (*db.SwapDataFull, error) {
+	return nil, nil
+}
+
 // SwapArchiver for Swapper
 func (ta *TArchivist) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
 func (ta *TArchivist) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {
@@ -522,6 +526,24 @@ func (ta *TArchivist) MatchStatuses(aid account.AccountID, base, quote uint32, m
 	return nil, nil
 }
 
+func (ta *TArchivist) ApplyMatchAcksRecordedEvent(context.Context, *db.EventLogMeta, *db.MatchAcksRecordedUpdate) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplySwapContractRecordedEvent(context.Context, *db.EventLogMeta, *db.SwapContract) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplyAuditAckRecordedEvent(context.Context, *db.EventLogMeta, *db.AuditAck) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplySwapRedemptionRecordedEvent(context.Context, *db.EventLogMeta, *db.ReputationOutcomePolicy, *db.SwapRedemption) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplyRedemptionAckRecordedEvent(context.Context, *db.EventLogMeta, *db.RedemptionAck) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplyMatchFailedEvent(context.Context, *db.EventLogMeta, *db.ReputationOutcomePolicy, *db.MatchFailedUpdate) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
 func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}
@@ -636,7 +658,10 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		preimagesByOrdID: make(map[string]order.Preimage),
 	}
 
-	var swapDone func(ord order.Order, match *order.Match, fail bool)
+	var (
+		mkt      *Market
+		swapDone func(ord order.Order, match *order.Match, faulted bool)
+	)
 	swapperCfg := &swap.Config{
 		Assets: map[uint32]*swap.SwapperAsset{
 			assetDCR.ID:   {BackedAsset: assetDCR, Locker: swapLockerBase},
@@ -650,12 +675,15 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		TxWaitExpiration: 5 * time.Second,
 		LockTimeTaker:    dex.LockTimeTaker(dex.Testnet),
 		LockTimeMaker:    dex.LockTimeMaker(dex.Testnet),
-		SwapDone: func(ord order.Order, match *order.Match, fail bool) {
-			swapDone(ord, match, fail)
+		SwapDone: func(ord order.Order, match *order.Match, faulted bool) {
+			swapDone(ord, match, faulted)
 		},
 	}
 	swapper, err := swap.NewSwapper(swapperCfg)
 	if err != nil {
+		panic(err.Error())
+	}
+	if err := swapper.RestoreActiveSwaps(false); err != nil {
 		panic(err.Error())
 	}
 
@@ -666,7 +694,7 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		return nil, nil, nil, func() {}, fmt.Errorf("dex.NewMarketInfo() failure: %w", err)
 	}
 
-	mkt, err := NewMarket(&Config{
+	mkt, err = NewMarket(&Config{
 		MarketInfo:      mktInfo,
 		Storage:         storage,
 		Swapper:         swapper,
@@ -690,12 +718,30 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	}
 	mkt.SetMeshService(newTMesh(mkt, authMgr))
 
-	swapDone = func(ord order.Order, match *order.Match, fail bool) {
-		mkt.SwapDone(ord, match, fail)
+	swapDone = func(ord order.Order, match *order.Match, faulted bool) {
+		mkt.SwapDone(ord, match, faulted)
 	}
 
-	ssw := dex.NewStartStopWaiter(swapper)
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		Commands:       swapper.Commands(),
+		Events:         swapper.Events(),
+		EventLogReader: storage,
+		OnHalt:         func(error) {},
+		MasterWorkers: []mesh.MasterWorker{{
+			Name: "Swapper",
+			Run:  swapper.Run,
+		}},
+		Logger: dex.Disabled,
+	})
+	if err != nil {
+		return nil, nil, nil, func() {}, fmt.Errorf("mesh.NewService: %w", err)
+	}
+	swapper.SetMeshService(meshSvc)
+	ssw := dex.NewStartStopWaiter(meshSvc)
 	ssw.Start(testCtx)
+	if err := meshSvc.WaitUntilReadyForComms(testCtx); err != nil {
+		return nil, nil, nil, func() {}, err
+	}
 	cleanup := func() {
 		ssw.Stop()
 		ssw.WaitForShutdown()
