@@ -1831,6 +1831,30 @@ func TestFatalStorageErr(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("swapper worker did not stop after fatal storage error")
 	}
+
+	// An event committed while the worker was stopping must still update memory.
+	set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+	match := set.matchInfos[0].match
+	rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+	rig.swapper.matchMtx.RLock()
+	tracked := rig.swapper.matches[match.ID()]
+	makerTracked := rig.swapper.userMatches[match.Maker.User()][match.ID()]
+	takerTracked := rig.swapper.userMatches[match.Taker.User()][match.ID()]
+	rig.swapper.matchMtx.RUnlock()
+	if tracked == nil || makerTracked != tracked || takerTracked != tracked {
+		t.Fatal("committed match was not tracked after worker stopped")
+	}
+	for _, ord := range []order.Order{match.Maker, match.Taker} {
+		assetID := ord.Quote()
+		if ord.Trade().Sell {
+			assetID = ord.Base()
+		}
+		for _, coin := range ord.Trade().Coins {
+			if !rig.swapper.coins[assetID].Locker.CoinLocked(coin) {
+				t.Fatalf("funding coin %x was not locked after worker stopped", coin)
+			}
+		}
+	}
 }
 
 func testSwap(t *testing.T, rig *testRig) {

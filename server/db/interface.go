@@ -157,8 +157,6 @@ type OrderArchiver interface {
 	// StorePreimage stores the preimage associated with an existing order.
 	StorePreimage(ord order.Order, pi order.Preimage) error
 
-	CancelOrder(*order.LimitOrder) error
-
 	// RevokeOrder puts an order into the revoked state, and generates a cancel
 	// order to record the action. Orders should be revoked by the DEX according
 	// to policy on failed orders.
