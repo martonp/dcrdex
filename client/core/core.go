@@ -7455,6 +7455,32 @@ func (dc *dexConnection) updateReputation(
 	newReputation *account.Reputation,
 ) {
 	dc.acct.rep = *newReputation
+
+	// A server reputation snapshot may already exclude bonds with lock times
+	// before BondExpiryThreshold while those bonds remain in acct.bonds. Reconcile
+	// them while installing the snapshot so bondStateOfDEX cannot later treat them
+	// as newly expired and subtract their strength a second time.
+
+	lockTimeThresh := newReputation.BondExpiryThreshold
+	if lockTimeThresh <= 0 { // Servers predating BondExpiryThreshold.
+		cfg := dc.config()
+		if cfg == nil {
+			return
+		}
+		lockTimeThresh = time.Now().Unix() + int64(cfg.BondExpiry)
+	}
+
+	liveBonds := make([]*db.Bond, 0, len(dc.acct.bonds))
+	for _, bond := range dc.acct.bonds {
+		if int64(bond.LockTime) >= lockTimeThresh {
+			liveBonds = append(liveBonds, bond)
+			continue
+		}
+		dc.acct.expiredBonds = append(dc.acct.expiredBonds, bond)
+		dc.acct.bondExpiryNote = true
+	}
+
+	dc.acct.bonds = liveBonds
 }
 
 // findBondKeyIdx will attempt to find the address index whose public key hashes
