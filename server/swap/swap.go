@@ -1,6 +1,9 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+// Package swap monitors atomic swaps. Client init and redeem requests are
+// mesh commands on the master. Chain observations and match outcomes are
+// events every node applies. Run is the master's swap loop.
 package swap
 
 import (
@@ -25,6 +28,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 var (
@@ -37,6 +42,9 @@ var (
 	// bursts when blocks are generated closely together (e.g. in Ethereum
 	// occasionally several blocks are generated in a single second).
 	minBlockPeriod = time.Second * 10
+
+	errSwapContractInUse = errors.New("swap contract already in use by another match")
+	errSecretHashInUse   = errors.New("secret hash already in use by another match")
 )
 
 func unixMsNow() time.Time {
@@ -54,24 +62,24 @@ func makerTaker(isMaker bool) string {
 // communications.
 type AuthManager interface {
 	Route(string, func(account.AccountID, *msgjson.Message) *msgjson.Error)
-	Auth(user account.AccountID, msg, sig []byte) error
+	VerifyUserSig(user account.AccountID, msg, sig []byte) error
 	Sign(...msgjson.Signable)
 	Send(account.AccountID, *msgjson.Message) error
+	SendIfLocal(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(user account.AccountID, req *msgjson.Message, handlerFunc func(comms.Link, *msgjson.Message),
 		expireTimeout time.Duration, expireFunc func()) error
-	SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time)
-	Inaction(user account.AccountID, misstep db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID)
+	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
 }
 
-// Storage updates match data in what is presumably a database.
+// Storage is the swapper's DB and event-log reader. Match writes go
+// through event appliers, not this interface's callers.
 type Storage interface {
 	db.SwapArchiver
+	db.EventLogReader
 	LastErr() error
 	Fatal() <-chan struct{}
 	Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error)
-	CancelOrder(*order.LimitOrder) error
-	InsertMatch(match *order.Match) error
 }
 
 // swapStatus is information related to the completion or incompletion of each
@@ -95,6 +103,10 @@ type swapStatus struct {
 	// transaction.
 	redeemTime time.Time
 	redemption asset.Coin
+	// secret is the maker's revealed redeem secret, retained (via
+	// swap_redemption_recorded) so the taker's 'redemption' request can be
+	// re-issued after promotion or reconnect.
+	secret []byte
 }
 
 // String satisfies the Stringer interface for pretty printing. The swapStatus
@@ -141,7 +153,7 @@ func (ss *swapStatus) redeemSeenTime() time.Time {
 // matchTracker embeds an order.Match and adds some data necessary for tracking
 // the match negotiation.
 type matchTracker struct {
-	mtx sync.RWMutex // Match.Sigs and Match.Status
+	mtx sync.RWMutex // Match.Sigs, Match.Status, and per-match addresses
 	*order.Match
 	time        time.Time // the match request time, not epoch close
 	matchTime   time.Time // epoch close time
@@ -159,6 +171,12 @@ type matchTracker struct {
 	makerSwapAddr         string
 	takerSwapAddr         string
 	counterPartyAddrsSent bool
+	// last send of each kind. Send sites stamp them; zero means this node
+	// never sent one.
+	lastMakerMatch, lastTakerMatch time.Time
+	lastMakerAudit, lastTakerAudit time.Time
+	lastMakerCPA, lastTakerCPA     time.Time
+	lastRedeem                     time.Time
 }
 
 // expiredBy returns true if the lock time of either party's *known* swap is
@@ -224,12 +242,12 @@ type stepInformation struct {
 // SwapperAsset is a BackedAsset with an optional CoinLocker.
 type SwapperAsset struct {
 	*asset.BackedAsset
-	Locker coinlock.CoinLocker // should be *coinlock.AssetCoinLocker
+	Locker coinlock.CoinLocker // nil unless OutputTracker
 }
 
-// Swapper handles order matches by handling authentication and inter-party
-// communications between clients, or 'users'. The Swapper authenticates users
-// (vua AuthManager) and validates transactions as they are reported.
+// Swapper tracks in-progress atomic swaps. Init and redeem are mesh
+// commands on the master. Audited contracts, acks, redemptions, and
+// failures are events every node applies. Run is the master's swap loop.
 type Swapper struct {
 	// coins is a map to all the Asset information, including the asset backends,
 	// used by this Swapper.
@@ -238,8 +256,10 @@ type Swapper struct {
 	storage Storage
 	// authMgr is an AuthManager for client messaging and authentication.
 	authMgr AuthManager
-	// swapDone is callback for reporting a swap outcome.
-	swapDone func(oid order.Order, match *order.Match, fail bool)
+	mesh    MeshService
+	// swapDone applies market-side swap-done projection after the DB event
+	// transaction commits. The bool is true when the order side is faulted.
+	swapDone func(order.Order, *order.Match, bool)
 
 	// The matches maps and the contained matches are protected by the matchMtx.
 	matchMtx    sync.RWMutex
@@ -282,10 +302,17 @@ type Swapper struct {
 	// latencyQ is a queue for coin waiters to deal with network latency.
 	latencyQ *wait.TaperingTickerQueue
 
+	// master is true while Run is active on the acting master.
+	master atomic.Bool
+
+	// marketsReady gates the inaction checks. Run clears it; MarketsReady
+	// sets it once every master worker started after the Swapper is ready.
+	marketsReady atomic.Bool
+
 	// handlerMtx should be read-locked for the duration of the comms route
-	// handlers (handleInit and handleRedeem) and Negotiate. This blocks
-	// shutdown until any coin waiters are registered with latencyQ. It should
-	// be write-locked before setting the stop flag.
+	// handlers (handleInit and handleRedeem). This blocks shutdown until any
+	// coin waiters are registered with latencyQ. It should be write-locked
+	// before setting the stop flag.
 	handlerMtx sync.RWMutex
 	// stop is used to prevent new handlers from starting coin waiters. It is
 	// set to true during shutdown of Run.
@@ -312,15 +339,9 @@ type Config struct {
 	LockTimeTaker time.Duration
 	// LockTimeMaker is the locktime Swapper will use for auditing maker swaps.
 	LockTimeMaker time.Duration
-	// NoResume indicates that the swapper should not resume active swaps.
-	NoResume bool
-	// AllowPartialRestore indicates if it is acceptable to load only some of
-	// the active swaps if the Swapper's asset configuration lacks assets
-	// required to load them all.
-	AllowPartialRestore bool
-	// SwapDone registers a match with the DEX manager (or other consumer) for a
-	// given order as being finished.
-	SwapDone func(oid order.Order, match *order.Match, fail bool)
+	// SwapDone applies market-side swap-done projection after the DB event
+	// transaction commits. The bool is true when the order side is faulted.
+	SwapDone func(order.Order, *order.Match, bool)
 }
 
 // NewSwapper is a constructor for a Swapper.
@@ -329,6 +350,9 @@ func NewSwapper(cfg *Config) (*Swapper, error) {
 		if asset.MaxFeeRate == 0 {
 			return nil, fmt.Errorf("max fee rate of 0 is invalid for asset %q", asset.Symbol)
 		}
+	}
+	if cfg.SwapDone == nil {
+		return nil, fmt.Errorf("swap-done applier is not configured")
 	}
 
 	acctMatches := make(map[uint32]map[string]map[order.MatchID]*matchTracker)
@@ -357,19 +381,10 @@ func NewSwapper(cfg *Config) (*Swapper, error) {
 		lockTimeTaker:      cfg.LockTimeTaker,
 		lockTimeMaker:      cfg.LockTimeMaker,
 	}
-
 	// Ensure txWaitExpiration is not greater than broadcast timeout setting.
 	if swapper.txWaitExpiration > swapper.bTimeout {
 		swapper.txWaitExpiration = swapper.bTimeout
 	}
-
-	if !cfg.NoResume {
-		err := swapper.restoreActiveSwaps(cfg.AllowPartialRestore)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// The swapper is only concerned with two types of client-originating
 	// method requests.
 	authMgr.Route(msgjson.InitRoute, swapper.handleInit)
@@ -420,6 +435,17 @@ func (s *Swapper) addMatch(mt *matchTracker) {
 	}
 }
 
+// orderBacksActiveMatch reports whether any active match references the
+// user's order. The matchMtx must be locked.
+func (s *Swapper) orderBacksActiveMatch(user account.AccountID, oid order.OrderID) bool {
+	for _, mt := range s.userMatches[user] {
+		if mt.Maker.ID() == oid || mt.Taker.ID() == oid {
+			return true
+		}
+	}
+	return false
+}
+
 // deleteMatch unregisters a match. The matchMtx must be locked.
 func (s *Swapper) deleteMatch(mt *matchTracker) {
 	mid := mt.ID()
@@ -437,12 +463,6 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 	delete(s.matchSecretHashes, mid)
 	s.activeCoinsMtx.Unlock()
 
-	// Unlock the maker and taker order coins. May be redundant if processBlock
-	// confirmed both swaps, but premature/quick counterparty actions that
-	// advance match status first prevent that.
-	s.unlockOrderCoins(mt.Maker)
-	s.unlockOrderCoins(mt.Taker)
-
 	// Remove the match from both maker's and taker's match maps.
 	maker, taker := mt.Maker.User(), mt.Taker.User()
 	for _, user := range []account.AccountID{maker, taker} {
@@ -459,6 +479,14 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 		if maker == taker {
 			break
 		}
+	}
+
+	// Unlock only on the last match so live locks match a restore seed.
+	if !s.orderBacksActiveMatch(maker, mt.Maker.ID()) {
+		s.unlockOrderCoins(mt.Maker)
+	}
+	if !s.orderBacksActiveMatch(taker, mt.Taker.ID()) {
+		s.unlockOrderCoins(mt.Taker)
 	}
 
 	deleteAcctMatch := func(matches map[string]map[order.MatchID]*matchTracker, acctAddr string, mt *matchTracker) {
@@ -482,6 +510,13 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 		deleteAcctMatch(acctMatches, mt.Maker.QuoteAccount(), mt)
 		deleteAcctMatch(acctMatches, mt.Taker.Trade().QuoteAccount(), mt)
 	}
+}
+
+// matchTracked reports whether match is the live tracker for its ID.
+func (s *Swapper) matchTracked(match *matchTracker) bool {
+	s.matchMtx.RLock()
+	defer s.matchMtx.RUnlock()
+	return s.matches[match.ID()] == match
 }
 
 // UnsettledQuantity sums up the settling quantity per market for a user. Part
@@ -597,6 +632,15 @@ func (s *Swapper) ChainsSynced(base, quote uint32) (bool, error) {
 	return quoteSynced, nil
 }
 
+// RestoreActiveSwaps loads the active-swap projection from the database.
+// allowPartial indicates whether it is acceptable to load only some of
+// the active swaps if the Swapper's asset configuration lacks assets
+// required to load them all. Any other load failure fails the restore.
+// It must run at most once.
+func (s *Swapper) RestoreActiveSwaps(allowPartial bool) error {
+	return s.restoreActiveSwaps(allowPartial)
+}
+
 func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 	// Load active swap data from DB.
 	swapData, err := s.storage.ActiveSwaps()
@@ -636,6 +680,7 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		ContractScript  []byte // {a,b}Contract
 		RedeemTime      int64  // {a,b}RedeemTime
 		RedeemCoinIn    []byte // {a,b}aRedeemCoinID
+		RedeemSecret    []byte // aRedeemSecret (maker only)
 		// SwapConfirmTime is not stored in the DB, so use time.Now() if the
 		// contract has reached SwapConf.
 	}
@@ -672,6 +717,7 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			}
 			ss.redemption = redeem
 			ss.redeemTime = time.UnixMilli(ssd.RedeemTime)
+			ss.secret = ssd.RedeemSecret
 		}
 
 		return nil
@@ -679,6 +725,11 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 
 	s.matches = make(map[order.MatchID]*matchTracker, len(swapData))
 	s.userMatches = make(map[account.AccountID]map[order.MatchID]*matchTracker)
+
+	// An order can back several matches; lock it once.
+	seenOrders := make(map[order.OrderID]bool)
+	var lockOrders []order.Order
+
 	for _, sd := range swapData {
 		if missingAssets[sd.Base] {
 			log.Warnf("Dropping match %v with no backend available for base asset %d", sd.ID, sd.Base)
@@ -692,28 +743,31 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		// This is a different Order instance from whatever Market or other
 		// subsystems might have. As such, the mutable fields or accessors of
 		// mutable data should not be used.
+		// NOTE: An executed order lives in the archived orders table while its
+		// match settles, so both orders MUST be available even for matches with
+		// no swap data yet (e.g. NewlyMatched). A snapshot-seeded node relies on
+		// the snapshot carrying archived orders referenced by active matches
+		// (see server/db/driver/pg.(*Archiver).snapshotTables). A load failure
+		// fails the restore: a silently dropped tracker would make every
+		// replicated event referencing the match fail on this node forever,
+		// wedging mesh catch-up.
 		taker, _, err := s.storage.Order(sd.MatchData.Taker, sd.Base, sd.Quote)
 		if err != nil {
-			log.Errorf("Failed to load taker order: %v", err)
-			continue
+			return fmt.Errorf("failed to load taker order %v for active match %v: %w", sd.MatchData.Taker, sd.MatchData.ID, err)
 		}
 		if taker.ID() != sd.MatchData.Taker {
-			log.Errorf("Failed to load order %v, computed ID %v instead", sd.MatchData.Taker, taker.ID())
-			continue
+			return fmt.Errorf("loaded taker order %v for active match %v, but computed ID %v", sd.MatchData.Taker, sd.MatchData.ID, taker.ID())
 		}
 		maker, _, err := s.storage.Order(sd.MatchData.Maker, sd.Base, sd.Quote)
 		if err != nil {
-			log.Errorf("Failed to load taker order: %v", err)
-			continue
+			return fmt.Errorf("failed to load maker order %v for active match %v: %w", sd.MatchData.Maker, sd.MatchData.ID, err)
 		}
 		if maker.ID() != sd.MatchData.Maker {
-			log.Errorf("Failed to load order %v, computed ID %v instead", sd.MatchData.Maker, maker.ID())
-			continue
+			return fmt.Errorf("loaded maker order %v for active match %v, but computed ID %v", sd.MatchData.Maker, sd.MatchData.ID, maker.ID())
 		}
 		makerLO, ok := maker.(*order.LimitOrder)
 		if !ok {
-			log.Errorf("Maker order was not a limit order: %T", maker)
-			continue
+			return fmt.Errorf("maker order %v for active match %v is not a limit order: %T", sd.MatchData.Maker, sd.MatchData.ID, maker)
 		}
 
 		match := &order.Match{
@@ -725,19 +779,18 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			FeeRateQuote: sd.QuoteRate,
 			Epoch:        sd.Epoch,
 			Status:       sd.Status,
-			Sigs: order.Signatures{ // not really needed
+			Sigs: order.Signatures{ // consumed by pendingRequests in startup repairs
 				MakerMatch:  sd.SwapData.SigMatchAckMaker,
 				TakerMatch:  sd.SwapData.SigMatchAckTaker,
-				MakerAudit:  sd.SwapData.ContractAAckSig,
-				TakerAudit:  sd.SwapData.ContractBAckSig,
+				MakerAudit:  sd.SwapData.ContractBAckSig, // maker's ack of contract B (aSigAckOfBContract)
+				TakerAudit:  sd.SwapData.ContractAAckSig, // taker's ack of contract A (bSigAckOfAContract)
 				TakerRedeem: sd.SwapData.RedeemAAckSig,
 			},
 		}
 
 		mid := sd.MatchData.ID
 		if mid != match.ID() { // serialization is order IDs, qty, and rate
-			log.Errorf("Failed to load Match %v, computed ID %v instead", mid, match.ID())
-			continue
+			return fmt.Errorf("loaded match %v, but computed ID %v", mid, match.ID())
 		}
 
 		// Check and skip matches for missing assets.
@@ -774,6 +827,7 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			ContractScript:  sd.SwapData.ContractA,
 			RedeemTime:      sd.SwapData.RedeemATime,
 			RedeemCoinIn:    sd.SwapData.RedeemACoinID,
+			RedeemSecret:    sd.SwapData.RedeemASecret,
 		}
 		takerStatus := &swapStatusData{
 			SwapAsset:       makerRedeemAsset,
@@ -786,16 +840,21 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		}
 
 		if err := translateSwapStatus(mt.makerStatus, makerStatus, takerStatus.ContractCoinOut); err != nil {
-			log.Errorf("Loading match %v failed: %v", mid, err)
-			continue
+			return fmt.Errorf("failed to load maker swap status for match %v: %w", mid, err)
 		}
 		if err := translateSwapStatus(mt.takerStatus, takerStatus, makerStatus.ContractCoinOut); err != nil {
-			log.Errorf("Loading match %v failed: %v", mid, err)
-			continue
+			return fmt.Errorf("failed to load taker swap status for match %v: %w", mid, err)
 		}
 
 		log.Infof("Resuming swap %v in status %v", mid, mt.Status)
 		s.addMatch(mt)
+
+		for _, ord := range []order.Order{makerLO, taker} {
+			if !seenOrders[ord.ID()] {
+				seenOrders[ord.ID()] = true
+				lockOrders = append(lockOrders, ord)
+			}
+		}
 
 		// Register swap contracts in the dedup maps using composite
 		// keys of CoinID and contract data.
@@ -821,31 +880,25 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		}
 	}
 
-	// Revoke pre-upgrade matches that lack per-match swap addresses
-	// introduced in PerMatchAddrVersion. Matches at NewlyMatched or
-	// MakerSwapCast cannot proceed without addresses, so revoke them
-	// without fault. Matches at TakerSwapCast or later already have both
-	// contracts on-chain and don't need the addresses to finish.
-	//
-	// NOTE: For EVM assets, surviving TakerSwapCast+ matches may still
-	// have v0 contract data. The server's ETH backend only binds one
-	// contract version, so verifying their redeem coins will fail unless
-	// the operator uses evm-protocol-overrides.json to keep v0 active
-	// until those swaps complete. See server/asset/eth/eth.go.
-	var toRevoke []*matchTracker
-	for _, mt := range s.matches {
-		if mt.makerSwapAddr != "" || mt.takerSwapAddr != "" {
-			continue
+	// Both orders of each active match, booked or not, same as TrackMatches.
+	// A conflict is a corrupt projection.
+	assetOrders := make(map[uint32][]order.Order)
+	for _, ord := range lockOrders {
+		assetID := ord.Quote()
+		if ord.Trade().Sell {
+			assetID = ord.Base()
 		}
-		if mt.Status != order.NewlyMatched && mt.Status != order.MakerSwapCast {
-			continue
-		}
-		toRevoke = append(toRevoke, mt)
+		assetOrders[assetID] = append(assetOrders[assetID], ord)
 	}
-	for _, mt := range toRevoke {
-		log.Infof("Revoking pre-upgrade match %v (status %v): no per-match swap addresses", mt.ID(), mt.Status)
-		s.deleteMatch(mt)
-		s.failMatch(mt, false, false) // no fault
+	for assetID, orders := range assetOrders {
+		swapperAsset := s.coins[assetID]
+		if swapperAsset == nil || swapperAsset.Locker == nil {
+			continue // account-based assets have no coin locker
+		}
+		if failed := swapperAsset.Locker.LockOrdersCoins(orders); len(failed) > 0 {
+			return fmt.Errorf("failed to seed swap coin locks for %d orders of asset %d (first %v)",
+				len(failed), assetID, failed[0].ID())
+		}
 	}
 
 	// Live coin waiters are abandoned on Swapper shutdown. When a client
@@ -854,9 +907,319 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 	return nil
 }
 
-// Run is the main Swapper loop. It's primary purpose is to update transaction
-// confirmations when new blocks are mined, and to trigger inaction checks.
-func (s *Swapper) Run(ctx context.Context) {
+// runStartupRepairs re-issues client match/audit/redemption requests that the
+// previous master may not have delivered. Match state is mesh-replicated;
+// those client requests are not. Floors the inaction deadlines first (see
+// floorInactionDeadlines). Master-only, before inaction checks; never from an
+// event applier. Cancel matches are not swap-tracked, so they are not
+// repaired here.
+func (s *Swapper) runStartupRepairs(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.floorInactionDeadlines(time.Now().UTC())
+
+	for _, mt := range s.matchSlice() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.resendPendingRequestsNow(mt, nil)
+	}
+	return nil
+}
+
+// floorInactionDeadlines raises every inaction deadline base — match.time,
+// maker redeemTime, and both sides' swap confirmation times — to now if
+// earlier, so the clients get a full bTimeout after promotion or a delayed
+// market startup.
+func (s *Swapper) floorInactionDeadlines(now time.Time) {
+	floorTime := func(t *time.Time) {
+		if !t.IsZero() && t.Before(now) {
+			*t = now
+		}
+	}
+	for _, mt := range s.matchSlice() {
+		mt.mtx.Lock()
+		if mt.time.Before(now) {
+			mt.time = now
+		}
+		mt.mtx.Unlock()
+
+		ms := mt.makerStatus
+		ms.mtx.Lock()
+		floorTime(&ms.redeemTime)
+		floorTime(&ms.swapConfirmed)
+		ms.mtx.Unlock()
+
+		ts := mt.takerStatus
+		ts.mtx.Lock()
+		floorTime(&ts.swapConfirmed)
+		ts.mtx.Unlock()
+	}
+}
+
+// MarketsReady re-floors the inaction deadlines and enables the inaction
+// checks. The master-worker wiring calls it once every market has reported
+// ready: the Swapper starts first, and a market held back by chain sync also
+// holds back client comms, so until then clients may have no way to act on
+// their swaps.
+func (s *Swapper) MarketsReady() {
+	s.floorInactionDeadlines(time.Now().UTC())
+	s.marketsReady.Store(true)
+}
+
+// pendingClientRequests is which client requests for a match still lack an ack.
+type pendingClientRequests struct {
+	makerMatchAck  bool // 'match' request to the maker
+	takerMatchAck  bool // 'match' request to the taker
+	makerAuditAck  bool // 'audit' of the taker's contract, to the maker
+	takerAuditAck  bool // 'audit' of the maker's contract, to the taker
+	takerRedeemAck bool // 'redemption' of the maker's redeem, to the taker
+}
+
+// pendingRequests reports missing client acks. An empty per-match swap address
+// means that side has not acked the match.
+func pendingRequests(match *matchTracker) (p pendingClientRequests) {
+	makerContractKnown, _ := match.makerStatus.contractState()
+	takerContractKnown, _ := match.takerStatus.contractState()
+
+	match.mtx.RLock()
+	defer match.mtx.RUnlock()
+	switch match.Status {
+	case order.NewlyMatched, order.MakerSwapCast:
+		p.makerMatchAck = match.makerSwapAddr == ""
+		p.takerMatchAck = match.takerSwapAddr == ""
+	}
+	switch match.Status {
+	case order.MakerSwapCast, order.TakerSwapCast, order.MakerRedeemed:
+		p.makerAuditAck = takerContractKnown && len(match.Sigs.MakerAudit) == 0
+		p.takerAuditAck = makerContractKnown && len(match.Sigs.TakerAudit) == 0
+	}
+	p.takerRedeemAck = match.Status == order.MakerRedeemed && len(match.Sigs.TakerRedeem) == 0
+	return
+}
+
+// resendStaleRequests re-issues pending requests and counterparty addresses
+// that are old enough to repair before the inaction deadline without
+// touching a healthy in-flight request. Event times cannot race the
+// original send: they are recorded in the same critical sections as the
+// pending state.
+func (s *Swapper) resendStaleRequests() {
+	now := time.Now()
+	for _, mt := range s.matchSlice() {
+		s.resendPendingRequests(mt, nil, now)
+		s.resendStaleCounterPartyAddress(mt, now)
+	}
+}
+
+func sentRecently(last, now time.Time, window time.Duration) bool {
+	return !last.IsZero() && now.Sub(last) < window
+}
+
+func (s *Swapper) stale(event, last, now time.Time) bool {
+	return now.Sub(event) >= s.bTimeout/2 && !sentRecently(last, now, s.bTimeout/2)
+}
+
+// resendPendingRequestsNow re-issues missing client requests without the
+// tick's age and last-send gates.
+func (s *Swapper) resendPendingRequestsNow(match *matchTracker, user *account.AccountID) {
+	s.resendPendingRequests(match, user, time.Time{})
+}
+
+// resendPendingRequests re-issues missing client requests for match.
+// A nil user includes both sides. A zero now sends immediately.
+func (s *Swapper) resendPendingRequests(match *matchTracker, user *account.AccountID, now time.Time) {
+	p := pendingRequests(match)
+	include := func(u account.AccountID) bool { return user == nil || *user == u }
+
+	var matchTime, makerSwapTime, takerSwapTime, redeemTime time.Time
+	var lastMakerMatch, lastTakerMatch, lastMakerAudit, lastTakerAudit, lastRedeem time.Time
+	if !now.IsZero() {
+		ms, ts := match.makerStatus, match.takerStatus
+		ms.mtx.RLock()
+		makerSwapTime, redeemTime = ms.swapTime, ms.redeemTime
+		ms.mtx.RUnlock()
+		ts.mtx.RLock()
+		takerSwapTime = ts.swapTime
+		ts.mtx.RUnlock()
+		match.mtx.RLock()
+		matchTime = match.time
+		lastMakerMatch, lastTakerMatch = match.lastMakerMatch, match.lastTakerMatch
+		lastMakerAudit, lastTakerAudit = match.lastMakerAudit, match.lastTakerAudit
+		lastRedeem = match.lastRedeem
+		match.mtx.RUnlock()
+	}
+
+	due := func(pending bool, event, last time.Time) bool {
+		if !pending {
+			return false
+		}
+		if now.IsZero() {
+			return true
+		}
+		return s.stale(event, last, now)
+	}
+
+	maker, taker := match.Maker.User(), match.Taker.User()
+	if due(p.makerMatchAck, matchTime, lastMakerMatch) && include(maker) {
+		s.resendMatchRequest(match, true)
+	}
+	if due(p.takerMatchAck, matchTime, lastTakerMatch) && include(taker) {
+		s.resendMatchRequest(match, false)
+	}
+	// Each side audits the counterparty's contract, so the age anchor is the
+	// counterparty's swap time.
+	if due(p.makerAuditAck, takerSwapTime, lastMakerAudit) && include(maker) {
+		s.resendAuditRequest(match, true)
+	}
+	if due(p.takerAuditAck, makerSwapTime, lastTakerAudit) && include(taker) {
+		s.resendAuditRequest(match, false)
+	}
+	if due(p.takerRedeemAck, redeemTime, lastRedeem) && include(taker) {
+		s.resendRedemptionRequest(match)
+	}
+}
+
+// resendStaleCounterPartyAddress re-sends the address to the side that still
+// has to cast. Send, not SendIfLocal: the user may be on the slave.
+// match.time is the second-ack time, so it anchors the CPA age gate.
+func (s *Swapper) resendStaleCounterPartyAddress(match *matchTracker, now time.Time) {
+	match.mtx.RLock()
+	bothReady := match.makerSwapAddr != "" && match.takerSwapAddr != ""
+	status := match.Status
+	maker, taker := match.Maker.User(), match.Taker.User()
+	// Gate on the to-act side's own stamp: the counterparty's reconnect
+	// re-sends must not defer this side's repair.
+	last := match.lastMakerCPA
+	if status == order.MakerSwapCast {
+		last = match.lastTakerCPA
+	}
+	needCPA := bothReady && (status == order.NewlyMatched || status == order.MakerSwapCast)
+	cpaDue := needCPA && s.stale(match.time, last, now)
+	match.mtx.RUnlock()
+	if !cpaDue {
+		return
+	}
+	switch status {
+	case order.NewlyMatched:
+		s.sendCounterPartyAddress(match, maker, false)
+	case order.MakerSwapCast:
+		s.sendCounterPartyAddress(match, taker, false)
+	}
+}
+
+// resendMatchRequest rebuilds and re-issues a 'match' ack request to one side.
+func (s *Swapper) resendMatchRequest(match *matchTracker, toMaker bool) {
+	match.mtx.Lock()
+	if toMaker {
+		match.lastMakerMatch = time.Now()
+	} else {
+		match.lastTakerMatch = time.Now()
+	}
+	match.mtx.Unlock()
+
+	makerMsg, takerMsg := matchNotifications(match)
+	params, user := msgjson.Signable(takerMsg), match.Taker.User()
+	if toMaker {
+		params, user = makerMsg, match.Maker.User()
+	}
+	s.authMgr.Sign(params)
+	req, err := msgjson.NewRequest(comms.NextID(), msgjson.MatchRoute, []msgjson.Signable{params})
+	if err != nil {
+		log.Errorf("error creating match re-request: %v", err)
+		return
+	}
+	acker := &messageAcker{
+		user:    user,
+		match:   match,
+		params:  params,
+		isMaker: toMaker,
+		// isAudit: false,
+	}
+	log.Debugf("re-issuing 'match' ack request to user %v (%s) for match %v",
+		user, makerTaker(toMaker), match.ID())
+	err = s.authMgr.Request(user, req, func(_ comms.Link, resp *msgjson.Message) {
+		s.processMatchAcks(user, resp, []*messageAcker{acker})
+	})
+	if err != nil {
+		log.Infof("Failed to re-send %v request to %v for match %v: %v. "+
+			"The match will be returned in the connect response.",
+			req.Route, user, match.ID(), err)
+	}
+}
+
+// resendAuditRequest rebuilds and re-issues an 'audit' request from swap status.
+func (s *Swapper) resendAuditRequest(match *matchTracker, toMaker bool) {
+	// Audited contract is the recipient's counterparty.
+	status, recipientOrder := match.makerStatus, match.Taker
+	if toMaker {
+		status, recipientOrder = match.takerStatus, match.Maker
+	}
+	status.mtx.RLock()
+	swap := status.swap
+	swapTime := status.swapTime
+	status.mtx.RUnlock()
+	if swap == nil {
+		return // pendingRequests only flags audit when the contract is known
+	}
+	matchID := match.ID()
+	auditParams := &msgjson.Audit{
+		OrderID:  idToBytes(recipientOrder.ID()),
+		MatchID:  matchID[:],
+		Time:     uint64(swapTime.UnixMilli()),
+		CoinID:   swap.ID(),
+		Contract: swap.ContractData,
+		TxData:   swap.TxData,
+	}
+	s.sendAuditRequest(match, recipientOrder.User(), toMaker, auditParams)
+}
+
+// resendRedemptionRequest rebuilds and re-issues the taker's 'redemption' request.
+func (s *Swapper) resendRedemptionRequest(match *matchTracker) {
+	ms := match.makerStatus
+	ms.mtx.RLock()
+	redemption := ms.redemption
+	secret := ms.secret
+	redeemTime := ms.redeemTime
+	ms.mtx.RUnlock()
+	if redemption == nil {
+		return // pending only at MakerRedeemed after the redeem is recorded
+	}
+	matchID := match.ID()
+	rParams := &msgjson.Redemption{
+		Redeem: msgjson.Redeem{
+			OrderID: idToBytes(match.Taker.ID()),
+			MatchID: matchID[:],
+			CoinID:  redemption.ID(),
+			Secret:  append(dex.Bytes(nil), secret...),
+		},
+		Time: uint64(redeemTime.UnixMilli()),
+	}
+	// Fresh full response window; the original was relative to redeemTime.
+	s.sendRedemptionRequest(match, match.Taker.User(), false, rParams, s.bTimeout)
+}
+
+// Run is the swapper master worker. Call SetMeshService first.
+// reportReady is called once (error on startup failure, nil when live).
+func (s *Swapper) Run(ctx context.Context, reportReady func(error)) {
+	if reportReady == nil {
+		reportReady = func(error) {}
+	}
+	if s.mesh == nil {
+		reportReady(fmt.Errorf("swapper startup requires SetMeshService before Run"))
+		return
+	}
+
+	s.master.Store(true)
+	defer s.master.Store(false)
+	s.marketsReady.Store(false)
+
+	if err := s.runStartupRepairs(ctx); err != nil {
+		reportReady(fmt.Errorf("swapper startup repair failed: %w", err))
+		return
+	}
+
 	// Permit internal cancel on anomaly such as storage failure.
 	ctxMaster, cancel := context.WithCancel(ctx)
 
@@ -1012,14 +1375,16 @@ func (s *Swapper) Run(ctx context.Context) {
 				s.checkInactionBlockBased(assetID)
 
 			case <-bcastEventTrigger:
-				// Inaction checks that are not relative to blocks.
 				s.checkInactionEventBased()
+				s.resendStaleRequests()
 
 			case <-mainLoop:
 				return
 			}
 		}
 	}()
+
+	reportReady(nil)
 
 	// Wait for caller cancel or anomalous return from main loop.
 	<-ctxMaster.Done()
