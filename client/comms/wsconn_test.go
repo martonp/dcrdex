@@ -7,10 +7,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +31,432 @@ var tLogger = dex.StdOutLogger("conn_TEST", dex.LevelTrace)
 func makeRequest(id uint64, route string, msg any) *msgjson.Message {
 	req, _ := msgjson.NewRequest(id, route, msg)
 	return req
+}
+
+func testEndpoint(uri string) *WsEndpoint {
+	return &WsEndpoint{URL: uri}
+}
+
+func newTestWsConn(t *testing.T, cfg *WsCfg) *wsConn {
+	t.Helper()
+	ws, err := NewWsConn(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ws.(*wsConn)
+}
+
+func newTestFailoverWsConn(t *testing.T, cfg *WsCfg, endpoints ...*WsEndpoint) *wsConn {
+	t.Helper()
+	ws, err := NewFailoverWsConn(cfg, endpoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ws.(*wsConn)
+}
+
+func TestWsConnInterfaceShape(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		typ    reflect.Type
+		method string
+		want   bool
+	}{
+		{"WsConn has UpdateURL", reflect.TypeOf((*WsConn)(nil)).Elem(), "UpdateURL", true},
+		{"WsConn omits SetFailoverEndpoints", reflect.TypeOf((*WsConn)(nil)).Elem(), "SetFailoverEndpoints", false},
+		{"FailoverWsConn has SetFailoverEndpoints", reflect.TypeOf((*FailoverWsConn)(nil)).Elem(), "SetFailoverEndpoints", true},
+		{"FailoverWsConn omits UpdateURL", reflect.TypeOf((*FailoverWsConn)(nil)).Elem(), "UpdateURL", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, found := tc.typ.MethodByName(tc.method)
+			if found != tc.want {
+				t.Fatalf("method %q found = %v, want %v", tc.method, found, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewWsConnEndpointValidation(t *testing.T) {
+	if _, err := NewWsConn(&WsCfg{}); err == nil {
+		t.Fatalf("expected empty URL error")
+	}
+	for _, uri := range []string{
+		"http://%zz",
+		"https://example.com/ws",
+		"wss:///ws",
+		"",
+	} {
+		if _, err := NewWsConn(&WsCfg{URL: uri}); err == nil {
+			t.Fatalf("expected invalid endpoint error for %q", uri)
+		}
+	}
+
+	validEndpoint := []*WsEndpoint{testEndpoint("wss://one.example/ws")}
+
+	if _, err := NewFailoverWsConn(&WsCfg{}, nil); err == nil {
+		t.Fatalf("expected empty endpoint list error")
+	}
+	if _, err := NewFailoverWsConn(&WsCfg{}, []*WsEndpoint{nil}); err == nil {
+		t.Fatalf("expected nil endpoint error")
+	}
+	if _, err := NewFailoverWsConn(&WsCfg{}, []*WsEndpoint{
+		testEndpoint("wss://dup.example/ws"),
+		testEndpoint("wss://dup.example/ws"),
+	}); err == nil {
+		t.Fatalf("expected duplicate endpoint URL error")
+	}
+
+	for _, tc := range []struct {
+		name string
+		cfg  *WsCfg
+	}{
+		{"URL", &WsCfg{URL: "wss://cfg.example/ws"}},
+		{"Cert", &WsCfg{Cert: []byte{1}}},
+		{"NetDialContext", &WsCfg{NetDialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, nil
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewFailoverWsConn(tc.cfg, validEndpoint); err == nil {
+				t.Fatalf("expected %s validation error", tc.name)
+			}
+		})
+	}
+}
+
+func TestNewFailoverWsConnCommonConfig(t *testing.T) {
+	reconnectSynced := false
+	connectEventCalled := false
+	rawHandled := false
+	headers := http.Header{"X-Test": []string{"one"}}
+	cfg := &WsCfg{
+		PingWait:         time.Second,
+		ReconnectSync:    func() { reconnectSynced = true },
+		ConnectEventFunc: func(ConnectionStatus) { connectEventCalled = true },
+		Logger:           tLogger,
+		RawHandler:       func([]byte) { rawHandled = true },
+		ConnectHeaders:   headers,
+		EchoPingData:     true,
+	}
+
+	conn := newTestFailoverWsConn(t, cfg, testEndpoint("wss://one.example/ws"))
+	if conn.cfg == cfg {
+		t.Fatalf("failover constructor retained caller cfg")
+	}
+	if conn.cfg.PingWait != cfg.PingWait ||
+		conn.cfg.ConnectHeaders.Get("X-Test") != "one" || !conn.cfg.EchoPingData {
+		t.Fatalf("common config fields not copied")
+	}
+	if conn.cfg.URL != "" || len(conn.cfg.Cert) != 0 || conn.cfg.NetDialContext != nil {
+		t.Fatalf("endpoint-specific cfg fields copied into failover config")
+	}
+	conn.cfg.ReconnectSync()
+	conn.cfg.ConnectEventFunc(Connected)
+	conn.cfg.RawHandler(nil)
+	if !reconnectSynced || !connectEventCalled || !rawHandled {
+		t.Fatalf("common callback fields not copied")
+	}
+}
+
+func TestWsConnSetFailoverEndpoints(t *testing.T) {
+	conn := newTestFailoverWsConn(t, &WsCfg{}, testEndpoint("wss://one.example/ws"))
+
+	if err := conn.SetFailoverEndpoints([]*WsEndpoint{
+		testEndpoint("wss://one.example/ws"),
+		testEndpoint("wss://two.example/ws"),
+	}); err != nil {
+		t.Fatalf("SetFailoverEndpoints error: %v", err)
+	}
+	if conn.url() != "wss://one.example/ws" {
+		t.Fatalf("active endpoint = %q, want one", conn.url())
+	}
+	if ep := conn.endpoints.nextEndpoint(); ep.url != "wss://two.example/ws" {
+		t.Fatalf("first rotated endpoint = %q, want two", ep.url)
+	}
+	if ep := conn.endpoints.nextEndpoint(); ep.url != "wss://one.example/ws" {
+		t.Fatalf("second rotated endpoint = %q, want one", ep.url)
+	}
+
+	for _, endpoints := range [][]*WsEndpoint{
+		{{URL: "https://bad.example/ws"}, {URL: "wss:///missing-host"}},
+		{testEndpoint("wss://dup.example/ws"), testEndpoint("wss://dup.example/ws")},
+		{{URL: "https://bad.example/ws"}, testEndpoint("wss://three.example/ws")},
+	} {
+		if err := conn.SetFailoverEndpoints(endpoints); err == nil {
+			t.Fatalf("expected invalid endpoint replacement error")
+		}
+		if conn.url() != "wss://one.example/ws" {
+			t.Fatalf("invalid replacement changed active endpoint to %q", conn.url())
+		}
+	}
+
+	if err := conn.SetFailoverEndpoints([]*WsEndpoint{
+		testEndpoint("wss://three.example/ws"),
+		testEndpoint("wss://one.example/ws"),
+		testEndpoint("wss://four.example/ws"),
+	}); err != nil {
+		t.Fatalf("valid SetFailoverEndpoints error: %v", err)
+	}
+	if conn.url() != "wss://one.example/ws" {
+		t.Fatalf("active endpoint = %q, want one", conn.url())
+	}
+	if ep := conn.endpoints.nextEndpoint(); ep.url != "wss://four.example/ws" {
+		t.Fatalf("first rotated endpoint = %q, want four", ep.url)
+	}
+	if ep := conn.endpoints.nextEndpoint(); ep.url != "wss://three.example/ws" {
+		t.Fatalf("second rotated endpoint = %q, want three", ep.url)
+	}
+}
+
+func TestWsConnUpdateURL(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+
+	conn.UpdateURL("wss://two.example/ws")
+	if conn.url() != "wss://two.example/ws" {
+		t.Fatalf("updated endpoint URL = %q, want two", conn.url())
+	}
+
+	conn.UpdateURL("http://%zz")
+	if conn.url() != "wss://two.example/ws" {
+		t.Fatalf("invalid UpdateURL changed active endpoint to %q", conn.url())
+	}
+	conn.UpdateURL("https://bad.example/ws")
+	if conn.url() != "wss://two.example/ws" {
+		t.Fatalf("invalid scheme UpdateURL changed active endpoint to %q", conn.url())
+	}
+	conn.UpdateURL("wss:///missing-host")
+	if conn.url() != "wss://two.example/ws" {
+		t.Fatalf("empty host UpdateURL changed active endpoint to %q", conn.url())
+	}
+}
+
+func TestWsConnIgnoresStaleGeneration(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+	atomic.StoreUint64(&conn.connID, 2)
+	conn.setConnectionStatus(Connected)
+
+	conn.handleReadError(1, io.EOF)
+	if conn.IsDown() {
+		t.Fatalf("stale read failure marked current connection down")
+	}
+	select {
+	case <-conn.reconnectCh:
+		t.Fatalf("stale read failure scheduled reconnect")
+	default:
+	}
+}
+
+func TestWsConnReadErrorAbortsPendingRequests(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+	atomic.StoreUint64(&conn.connID, 1)
+	conn.setConnectionStatus(Connected)
+
+	expired := make(chan struct{}, 1)
+	conn.logReq(1, func(*msgjson.Message) {}, time.Hour, func() {
+		expired <- struct{}{}
+	})
+
+	conn.handleReadError(1, io.EOF)
+	if !conn.IsDown() {
+		t.Fatalf("read error did not mark connection down")
+	}
+	select {
+	case <-expired:
+	default:
+		t.Fatalf("read error did not abort the pending request")
+	}
+	if conn.respHandler(1) != nil {
+		t.Fatalf("aborted request still registered")
+	}
+	select {
+	case <-conn.reconnectCh:
+	default:
+		t.Fatalf("read error did not schedule reconnect")
+	}
+
+	// A stale generation's read error must NOT abort requests logged by a
+	// newer generation.
+	atomic.StoreUint64(&conn.connID, 5)
+	conn.setConnectionStatus(Connected)
+	conn.logReq(2, func(*msgjson.Message) {}, time.Hour, func() {
+		expired <- struct{}{}
+	})
+	conn.handleReadError(3, io.EOF) // stale connID
+	select {
+	case <-expired:
+		t.Fatalf("stale read error aborted a newer generation's request")
+	default:
+	}
+	if conn.respHandler(2) == nil {
+		t.Fatalf("stale read error removed a newer generation's request")
+	}
+}
+
+func TestWsConnRequestSendFailureOnlyUnregistersFailedRequest(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+	conn.setConnectionStatus(Connected)
+
+	conn.logReq(1, func(*msgjson.Message) {}, time.Hour, func() {})
+
+	err := conn.RequestRawWithTimeout(2, []byte(`{"type":1}`), func(*msgjson.Message) {
+		t.Fatalf("failed request response handler should not run")
+	}, time.Hour, func() {
+		t.Fatalf("failed request expire should not run")
+	})
+	if err == nil {
+		t.Fatalf("expected write error with no websocket")
+	}
+	if conn.respHandler(1) == nil {
+		t.Fatalf("send failure removed existing response handler")
+	}
+	if conn.respHandler(2) != nil {
+		t.Fatalf("failed request response handler still registered")
+	}
+	if conn.IsDown() {
+		t.Fatalf("send failure marked connection down")
+	}
+}
+
+func TestWsConnFailover(t *testing.T) {
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	upgrader := websocket.Upgrader{}
+
+	type wsServer struct {
+		*httptest.Server
+		mtx      sync.Mutex
+		conns    []*websocket.Conn
+		accepted chan struct{}
+	}
+	// killConns force-closes the server's live websocket connections without
+	// stopping the server, simulating a node failure with fast recovery.
+	killConns := func(s *wsServer) {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+		for _, c := range s.conns {
+			c.Close()
+		}
+		s.conns = nil
+	}
+	newServer := func() *wsServer {
+		s := &wsServer{accepted: make(chan struct{}, 1)}
+		s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			c, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade error: %v", err)
+				return
+			}
+			s.mtx.Lock()
+			s.conns = append(s.conns, c)
+			s.mtx.Unlock()
+			s.accepted <- struct{}{}
+			// Ping periodically so the client's read deadline stays fresh, and
+			// consume inbound messages until the connection dies.
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
+				for range ticker.C {
+					if c.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil {
+						return
+					}
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				for {
+					if _, _, err := c.ReadMessage(); err != nil {
+						return
+					}
+				}
+			}()
+		}))
+		return s
+	}
+	wsURL := func(s *wsServer) string { return "ws" + strings.TrimPrefix(s.URL, "http") }
+
+	serverA, serverB := newServer(), newServer()
+	defer serverA.Close()
+	defer serverB.Close()
+
+	statusCh := make(chan ConnectionStatus, 16)
+	conn := newTestFailoverWsConn(t, &WsCfg{
+		PingWait:         time.Second,
+		ConnectEventFunc: func(status ConnectionStatus) { statusCh <- status },
+		Logger:           tLogger,
+	}, testEndpoint(wsURL(serverA)), testEndpoint(wsURL(serverB)))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	connWG, err := conn.Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+	defer func() {
+		cancel()
+		connWG.Wait()
+	}()
+
+	waitStatus := func(tag string, want ConnectionStatus) {
+		t.Helper()
+		timeout := time.After(10 * time.Second)
+		for {
+			select {
+			case status := <-statusCh:
+				if status == want {
+					return
+				}
+			case <-timeout:
+				t.Fatalf("%s: no %v connection event", tag, want)
+			}
+		}
+	}
+	waitAccepted := func(tag string, s *wsServer) {
+		t.Helper()
+		select {
+		case <-s.accepted:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: server did not record connection", tag)
+		}
+	}
+
+	waitStatus("initial connect", Connected)
+	waitAccepted("initial connect", serverA)
+	if active := conn.ActiveEndpoint(); active != wsURL(serverA) {
+		t.Fatalf("initial active endpoint = %q, want server A %q", active, wsURL(serverA))
+	}
+
+	// An in-flight request should be aborted promptly when the connection
+	// fails, not left to wait out its expiry timer.
+	expired := make(chan struct{}, 1)
+	req := makeRequest(conn.NextID(), "test", nil)
+	if err := conn.RequestWithTimeout(req, func(*msgjson.Message) {
+		t.Errorf("no response expected for the abandoned request")
+	}, time.Hour, func() { expired <- struct{}{} }); err != nil {
+		t.Fatalf("RequestWithTimeout error: %v", err)
+	}
+
+	// Kill server A's connections. The client should fail over to server B.
+	killConns(serverA)
+	waitStatus("failover", Connected)
+	waitAccepted("failover", serverB)
+	if active := conn.ActiveEndpoint(); active != wsURL(serverB) {
+		t.Fatalf("post-failover active endpoint = %q, want server B %q", active, wsURL(serverB))
+	}
+	select {
+	case <-expired:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("in-flight request not aborted on failover")
+	}
+
+	// Kill server B's connections. The client should rotate back to server A.
+	killConns(serverB)
+	waitStatus("failback", Connected)
+	waitAccepted("failback", serverA)
+	if active := conn.ActiveEndpoint(); active != wsURL(serverA) {
+		t.Fatalf("post-failback active endpoint = %q, want server A %q", active, wsURL(serverA))
+	}
 }
 
 // genCertPair generates a key/cert pair to the paths provided.
@@ -242,9 +672,9 @@ func TestWsConn(t *testing.T) {
 	setupWsConn := func(cert []byte) (*wsConn, error) {
 		cfg := &WsCfg{
 			URL:      "wss://" + host + "/ws",
-			PingWait: pingWait,
 			Cert:     cert,
 			Logger:   tLogger,
+			PingWait: pingWait,
 		}
 		conn, err := NewWsConn(cfg)
 		if err != nil {
