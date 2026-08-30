@@ -88,6 +88,49 @@ const (
 	// SelectAllMarkets retrieves the active market information.
 	SelectAllMarkets = `SELECT name, base, quote, lot_size FROM %s;`
 
+	SelectMarketLifecycle = `SELECT market, state, start_epoch_idx, start_epoch_dur,
+		final_epoch_idx, final_epoch_dur, pending_action, pending_epoch_idx,
+		pending_epoch_dur, persist_book, active_epoch_idx, processed_epoch_idx,
+		lot_size, rate_step, parcel_size, max_user_cancels, minimum_rate
+		FROM %s WHERE market = $1;`
+
+	SelectMarketLifecycleForUpdate = `SELECT market, state, start_epoch_idx, start_epoch_dur,
+		final_epoch_idx, final_epoch_dur, pending_action, pending_epoch_idx,
+		pending_epoch_dur, persist_book, active_epoch_idx, processed_epoch_idx,
+		lot_size, rate_step, parcel_size, max_user_cancels, minimum_rate
+		FROM %s WHERE market = $1 FOR UPDATE;`
+
+	UpsertMarketLifecycle = `INSERT INTO %s (market, state, start_epoch_idx, start_epoch_dur,
+		final_epoch_idx, final_epoch_dur, pending_action, pending_epoch_idx,
+		pending_epoch_dur, persist_book, active_epoch_idx, processed_epoch_idx,
+		lot_size, rate_step, parcel_size, max_user_cancels, minimum_rate)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		ON CONFLICT (market) DO UPDATE SET
+			state = EXCLUDED.state,
+			start_epoch_idx = EXCLUDED.start_epoch_idx,
+			start_epoch_dur = EXCLUDED.start_epoch_dur,
+			final_epoch_idx = EXCLUDED.final_epoch_idx,
+			final_epoch_dur = EXCLUDED.final_epoch_dur,
+			pending_action = EXCLUDED.pending_action,
+			pending_epoch_idx = EXCLUDED.pending_epoch_idx,
+			pending_epoch_dur = EXCLUDED.pending_epoch_dur,
+			persist_book = EXCLUDED.persist_book,
+			active_epoch_idx = EXCLUDED.active_epoch_idx,
+			processed_epoch_idx = EXCLUDED.processed_epoch_idx,
+			lot_size = EXCLUDED.lot_size,
+			rate_step = EXCLUDED.rate_step,
+			parcel_size = EXCLUDED.parcel_size,
+			max_user_cancels = EXCLUDED.max_user_cancels,
+			minimum_rate = EXCLUDED.minimum_rate;`
+
+	UpdateMarketLifecycle = `UPDATE %s SET state = $2, start_epoch_idx = $3,
+		start_epoch_dur = $4, final_epoch_idx = $5, final_epoch_dur = $6,
+		pending_action = $7, pending_epoch_idx = $8, pending_epoch_dur = $9,
+		persist_book = $10, active_epoch_idx = $11, processed_epoch_idx = $12,
+		lot_size = $13, rate_step = $14, parcel_size = $15,
+		max_user_cancels = $16, minimum_rate = $17
+		WHERE market = $1;`
+
 	// InsertMarket inserts a new market in to the markets tables
 	InsertMarket = `INSERT INTO %s (name, base, quote, lot_size)
 		VALUES ($1, $2, $3, $4);`

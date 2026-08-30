@@ -56,12 +56,13 @@ type Config struct {
 
 // Some frequently used long-form table names.
 type archiverTables struct {
-	feeKeys      string
-	accounts     string
-	bonds        string
-	prepaidBonds string
-	points       string
-	eventLog     string
+	marketLifecycle string
+	feeKeys         string
+	accounts        string
+	bonds           string
+	prepaidBonds    string
+	points          string
+	eventLog        string
 }
 
 // Archiver must implement server/db.DEXArchivist.
@@ -161,12 +162,13 @@ func NewArchiverForRead(ctx context.Context, cfg *Config) (*Archiver, error) {
 		queryTimeout: queryTimeout,
 		markets:      mktMap,
 		tables: archiverTables{
-			feeKeys:      fullTableName(cfg.DBName, publicSchema, feeKeysTableName),
-			accounts:     fullTableName(cfg.DBName, publicSchema, accountsTableName),
-			bonds:        fullTableName(cfg.DBName, publicSchema, bondsTableName),
-			prepaidBonds: fullTableName(cfg.DBName, publicSchema, prepaidBondsTableName),
-			points:       fullTableName(cfg.DBName, publicSchema, pointsTableName),
-			eventLog:     fullTableName(cfg.DBName, publicSchema, eventLogTableName),
+			marketLifecycle: fullTableName(cfg.DBName, publicSchema, marketLifecycleTableName),
+			feeKeys:         fullTableName(cfg.DBName, publicSchema, feeKeysTableName),
+			accounts:        fullTableName(cfg.DBName, publicSchema, accountsTableName),
+			bonds:           fullTableName(cfg.DBName, publicSchema, bondsTableName),
+			prepaidBonds:    fullTableName(cfg.DBName, publicSchema, prepaidBondsTableName),
+			points:          fullTableName(cfg.DBName, publicSchema, pointsTableName),
+			eventLog:        fullTableName(cfg.DBName, publicSchema, eventLogTableName),
 		},
 		fatal: make(chan struct{}),
 	}, nil
