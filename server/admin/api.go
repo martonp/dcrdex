@@ -19,6 +19,7 @@ import (
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
+	"decred.org/dcrdex/server/auth"
 	dexsrv "decred.org/dcrdex/server/dex"
 	"decred.org/dcrdex/server/market"
 	"github.com/go-chi/chi/v5"
@@ -316,13 +317,21 @@ func (s *Server) apiMarketMatches(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiResume(w http.ResponseWriter, r *http.Request) {
 	// Ensure the market exists and is not running.
 	mkt := strings.ToLower(chi.URLParam(r, marketNameKey))
-	found, running := s.core.MarketRunning(mkt)
+	found, lifecycle := s.core.MarketLifecyclePhase(mkt)
 	if !found {
 		http.Error(w, fmt.Sprintf("unknown market %q", mkt), http.StatusBadRequest)
 		return
 	}
-	if running {
+	switch lifecycle {
+	case market.LifecyclePhaseSuspending:
+		http.Error(w, fmt.Sprintf("market %q finalizing suspension", mkt), http.StatusBadRequest)
+		return
+	case market.LifecyclePhaseRunning:
 		http.Error(w, fmt.Sprintf("market %q running", mkt), http.StatusBadRequest)
+		return
+	case market.LifecyclePhaseSuspended:
+	default:
+		http.Error(w, fmt.Sprintf("market %q not resumable", mkt), http.StatusBadRequest)
 		return
 	}
 
@@ -364,13 +373,21 @@ func (s *Server) apiResume(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiSuspend(w http.ResponseWriter, r *http.Request) {
 	// Ensure the market exists and is running.
 	mkt := strings.ToLower(chi.URLParam(r, marketNameKey))
-	found, running := s.core.MarketRunning(mkt)
+	found, lifecycle := s.core.MarketLifecyclePhase(mkt)
 	if !found {
 		http.Error(w, fmt.Sprintf("unknown market %q", mkt), http.StatusBadRequest)
 		return
 	}
-	if !running {
+	switch lifecycle {
+	case market.LifecyclePhaseSuspending:
+		http.Error(w, fmt.Sprintf("market %q finalizing suspension", mkt), http.StatusBadRequest)
+		return
+	case market.LifecyclePhaseRunning:
+	case market.LifecyclePhaseSuspended:
 		http.Error(w, fmt.Sprintf("market %q not running", mkt), http.StatusBadRequest)
+		return
+	default:
+		http.Error(w, fmt.Sprintf("market %q not schedulable", mkt), http.StatusBadRequest)
 		return
 	}
 
@@ -406,7 +423,8 @@ func (s *Server) apiSuspend(w http.ResponseWriter, r *http.Request) {
 
 	suspEpoch, err := s.core.SuspendMarket(mkt, suspTime, persistBook)
 	if suspEpoch == nil || err != nil {
-		// Should not happen.
+		// This includes a schedule that lost a race with an epoch boundary
+		// and was rejected at commit time; retrying the command resolves it.
 		msg := fmt.Sprintf("Failed to suspend market: %v", err)
 		log.Errorf(msg)
 		http.Error(w, msg, http.StatusInternalServerError)
@@ -651,7 +669,14 @@ func (s *Server) apiNotify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), errCode)
 		return
 	}
-	s.core.Notify(acctID, msg)
+	if err := s.core.Notify(acctID, msg); err != nil {
+		if errors.Is(err, auth.ErrUserNotConnected) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
