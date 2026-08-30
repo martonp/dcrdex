@@ -111,8 +111,6 @@ type CoreConfig struct {
 
 	ExtensionModeFile string `long:"extension-mode-file" description:"path to a file that specifies options for running core as an extension."`
 
-	Mesh bool `long:"mesh" description:"Enable Tatanka Mesh for peer-to-peer trading. This is experimental and not recommended for production use."`
-
 	MaxActiveMatches int `long:"max-active-matches" description:"Maximum number of active swap matches per DEX connection before deferring new orders. Default 48."`
 }
 
@@ -227,7 +225,6 @@ func (cfg *Config) Core(log dex.Logger) *core.Config {
 		NoAutoDBBackup:     cfg.NoAutoDBBackup,
 		ExtensionModeFile:  cfg.ExtensionModeFile,
 		TheOneHost:         cfg.TheOneHost,
-		Mesh:               cfg.Mesh,
 		MaxActiveMatches:   cfg.MaxActiveMatches,
 	}
 }
