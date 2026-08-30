@@ -40,8 +40,8 @@ import (
 	"decred.org/dcrdex/dex/calc"
 	"decred.org/dcrdex/dex/config"
 	dexeth "decred.org/dcrdex/dex/networks/eth"
-	"decred.org/dcrdex/dex/version"
 	dexpolygon "decred.org/dcrdex/dex/networks/polygon"
+	"decred.org/dcrdex/dex/version"
 	dexsrv "decred.org/dcrdex/server/dex"
 	toxiproxy "github.com/Shopify/toxiproxy/v2/client"
 )

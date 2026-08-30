@@ -42,6 +42,34 @@ markets.json file referencing dcr and btc node config files created by the
 respective node harnesses; and start a dcrdex instance listening at
 `127.0.0.1:17273` or any address you specify in cli args.
 
+## Mesh Harness
+
+For a two-node mesh setup, use:
+
+```sh
+./mesh-harness.sh
+```
+
+This creates a second harness root at `~/dextest/dcrdex-mesh` with:
+
+- `alpha/` and `beta/` appdata directories
+- separate PostgreSQL databases: `dcrdex_simnet_alpha` and `dcrdex_simnet_beta`
+- separate RPC/admin ports for each node
+- explicit mesh wiring between the two nodes with `meshlisten`, `meshpeer`, and
+  `meshpeercert` (self-signed `rpc.cert`)
+- each node's local client failover advertisement with `clientaddr`
+
+The mesh harness control scripts are created in `~/dextest/dcrdex-mesh`, e.g.:
+
+- `run-alpha`
+- `run-beta`
+- `dexadm-alpha`
+- `dexadm-beta`
+- `quit`
+
+The mesh harness currently does not set up node relay source-node windows, so
+`NODERELAY=1 ./mesh-harness.sh` is not supported yet.
+
 The rpc cert for the dcrdex instance will be created in `~/dextest/dcrdex/rpc.cert`
 with the following content:
 

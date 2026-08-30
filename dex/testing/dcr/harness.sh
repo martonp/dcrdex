@@ -321,9 +321,19 @@ echo "Creating simnet vspd"
 ALPHA_WALLET_PUBKEY=$("${NODES_ROOT}/harness-ctl/alpha" "getmasterpubkey")
 "${HARNESS_DIR}/create-vspd.sh" "$SESSION:8" "${VSPD_PORT}" "${ALPHA_WALLET_PUBKEY}"
 
-sleep 3
-
-VSP_PUBKEY=$(curl -sS "http://127.0.0.1:19591/api/v3/vspinfo" | jq -r '.pubkey')
+echo "Waiting for simnet vspd to be ready"
+VSP_INFO_URL="http://127.0.0.1:${VSPD_PORT}/api/v3/vspinfo"
+for _ in $(seq 1 60); do
+    if curl -sS -o /dev/null "${VSP_INFO_URL}" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
+done
+if ! curl -sS -o /dev/null "${VSP_INFO_URL}" >/dev/null 2>&1; then
+    echo "vspd did not become ready at ${VSP_INFO_URL}" >&2
+    exit 1
+fi
+VSP_PUBKEY="_"
 
 echo "Creating simnet beta wallet"
 USE_SPV="1"
@@ -416,4 +426,6 @@ tmux select-window -t $SESSION:0
 # Reenable history and attach to the control session.
 tmux send-keys -t $SESSION:0 "set -o history" C-m
 tmux select-window -t $SESSION:0
-tmux attach-session -t $SESSION
+if [ -z "${NOATTACH:-}" ]; then
+  tmux attach-session -t $SESSION
+fi
