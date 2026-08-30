@@ -171,12 +171,12 @@ func TestUpdateCert(t *testing.T) {
 	rig.db.acct.LegacyFeeCoin = encode.RandomBytes(32)
 
 	tests := []struct {
-		name                 string
-		host                 string
-		acctErr              bool
-		updateAccountInfoErr bool
-		queueConfig          bool
-		expectError          bool
+		name             string
+		host             string
+		acctErr          bool
+		updateAccountErr bool
+		queueConfig      bool
+		expectError      bool
 	}{
 		{
 			name:        "ok",
@@ -197,20 +197,20 @@ func TestUpdateCert(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:                 "db update account err",
-			host:                 rig.db.acct.Host,
-			queueConfig:          true,
-			updateAccountInfoErr: true,
-			expectError:          true,
+			name:             "db update account err",
+			host:             rig.db.acct.Host,
+			queueConfig:      true,
+			updateAccountErr: true,
+			expectError:      true,
 		},
 	}
 
 	for _, test := range tests {
-		rig.db.verifyUpdateAccountInfo = false
-		if test.updateAccountInfoErr {
-			rig.db.updateAccountInfoErr = errors.New("")
+		rig.db.verifyUpdateAccount = false
+		if test.updateAccountErr {
+			rig.db.updateAccountErr = errors.New("")
 		} else {
-			rig.db.updateAccountInfoErr = nil
+			rig.db.updateAccountErr = nil
 		}
 		if test.acctErr {
 			rig.db.acctErr = errors.New("")
@@ -231,7 +231,7 @@ func TestUpdateCert(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: unexpected error: %v", test.name, err)
 		}
-		if !rig.db.verifyUpdateAccountInfo {
+		if !rig.db.verifyUpdateAccount {
 			t.Fatalf("%s: expected update account to be called but it was not", test.name)
 		}
 		if !bytes.Equal(randomCert, rig.db.acct.Cert) {
