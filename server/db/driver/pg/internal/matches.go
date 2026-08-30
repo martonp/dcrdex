@@ -105,13 +105,17 @@ const (
 		epochIdx, epochDur, quantity, rate, baseRate, quoteRate, status
 	FROM %s WHERE matchid = $1;`
 
-	RetrieveUserMatches = `SELECT matchid, active, takerSell,
-		takerOrder, takerAccount, takerAddress,
-		makerOrder, makerAccount, makerAddress,
-		epochIdx, epochDur, quantity, rate, baseRate, quoteRate, status,
-		makerSwapAddr, takerSwapAddr
-	FROM %s
-	WHERE takerAccount = $1 OR makerAccount = $1;`
+	CreateMatchesActiveMakerOrderIndex = `CREATE INDEX IF NOT EXISTS %s ON %s (makerOrder) WHERE active;`
+
+	CreateMatchesActiveTakerOrderIndex = `CREATE INDEX IF NOT EXISTS %s ON %s (takerOrder) WHERE active;`
+
+	UnsettledOrderMatchExists = `SELECT EXISTS (
+		SELECT 1 FROM %s
+		WHERE active AND matchid != $1 AND makerOrder = $2 AND status < $3
+	) OR EXISTS (
+		SELECT 1 FROM %s
+		WHERE active AND matchid != $1 AND takerOrder = $2
+	);`
 
 	RetrieveActiveUserMatches = `SELECT matchid, takerSell,
 		takerOrder, takerAccount, takerAddress,
@@ -217,8 +221,10 @@ const (
 	SetMakerMatchAckSig = `UPDATE %s SET sigMatchAckMaker = $2 WHERE matchid = $1;`
 	SetTakerMatchAckSig = `UPDATE %s SET sigMatchAckTaker = $2 WHERE matchid = $1;`
 
-	SetMakerSwapAddr = `UPDATE %s SET makerSwapAddr = $2 WHERE matchid = $1;`
-	SetTakerSwapAddr = `UPDATE %s SET takerSwapAddr = $2 WHERE matchid = $1;`
+	// First non-empty address wins; UPDATE still touches the row so
+	// updateMatchStmt's exactly-1-row check holds on re-ack.
+	SetMakerSwapAddr = `UPDATE %s SET makerSwapAddr = COALESCE(NULLIF(makerSwapAddr, ''), $2) WHERE matchid = $1;`
+	SetTakerSwapAddr = `UPDATE %s SET takerSwapAddr = COALESCE(NULLIF(takerSwapAddr, ''), $2) WHERE matchid = $1;`
 
 	SetInitiatorSwapData = `UPDATE %s SET status = $2,
 		aContractCoinID = $3, aContract = $4, aContractTime = $5

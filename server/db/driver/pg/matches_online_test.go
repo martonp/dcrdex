@@ -4,6 +4,7 @@ package pg
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -14,9 +15,51 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/meshevents"
 )
 
-func TestInsertMatch(t *testing.T) {
+// insertMatchForTest stores or updates a match row via the shared upsertMatch
+// helper, the same path the epoch_processed event applier takes.
+func insertMatchForTest(match *order.Match) error {
+	matchesTableName, err := archie.matchTableName(match)
+	if err != nil {
+		return err
+	}
+	N, err := upsertMatch(archie.db, matchesTableName, match)
+	if err != nil {
+		return err
+	}
+	if N != 1 {
+		return fmt.Errorf("upsertMatch: updated %d rows, expected 1", N)
+	}
+	return nil
+}
+
+// saveContractForTest records a swap contract via the unexported
+// swap_contract_recorded applier helper.
+func saveContractForTest(mid db.MarketMatchID, maker bool, contract, coinID []byte, timestamp int64) error {
+	return archie.applySwapContractRecordedEvent(archie.db, &db.SwapContract{
+		MID:       mid,
+		Maker:     maker,
+		Contract:  contract,
+		CoinID:    coinID,
+		Timestamp: timestamp,
+	})
+}
+
+// saveRedeemForTest records a redemption via the shared recordRedeemData
+// helper used by the swap_redemption_recorded event applier.
+func saveRedeemForTest(mid db.MarketMatchID, maker bool, coinID, secret []byte, timestamp int64) error {
+	return archie.recordRedeemData(archie.db, &db.SwapRedemption{
+		MID:       mid,
+		Maker:     maker,
+		CoinID:    coinID,
+		Secret:    secret,
+		Timestamp: timestamp,
+	})
+}
+
+func Test_upsertMatch(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
 	}
@@ -73,9 +116,9 @@ func TestInsertMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := archie.InsertMatch(tt.match)
+			err := insertMatchForTest(tt.match)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("InsertMatch() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("insertMatchForTest() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
 			if tt.wantErr {
@@ -163,9 +206,9 @@ func TestSetSwapData(t *testing.T) {
 		return nil
 	}
 
-	err := archie.InsertMatch(matchA)
+	err := insertMatchForTest(matchA)
 	if err != nil {
-		t.Errorf("InsertMatch() failed: %v", err)
+		t.Errorf("insertMatchForTest() failed: %v", err)
 	}
 
 	if err = checkMatch(order.NewlyMatched, true); err != nil {
@@ -180,7 +223,12 @@ func TestSetSwapData(t *testing.T) {
 
 	// Match Ack Sig A (maker's match ack sig)
 	sigMakerMatch := randomBytes(73)
-	err = archie.SaveMatchAckSigA(mid, sigMakerMatch)
+	err = archie.saveMatchAck(archie.db, &db.MatchAck{
+		MID:     mid,
+		Maker:   true,
+		Sig:     sigMakerMatch,
+		Address: "maker-swap-addr",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +246,12 @@ func TestSetSwapData(t *testing.T) {
 
 	// Match Ack Sig B (taker's match ack sig)
 	sigTakerMatch := randomBytes(73)
-	err = archie.SaveMatchAckSigB(mid, sigTakerMatch)
+	err = archie.saveMatchAck(archie.db, &db.MatchAck{
+		MID:     mid,
+		Maker:   false,
+		Sig:     sigTakerMatch,
+		Address: "taker-swap-addr",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +271,7 @@ func TestSetSwapData(t *testing.T) {
 	contractA := randomBytes(128)
 	coinIDA := randomBytes(36)
 	contractATime := int64(1234)
-	err = archie.SaveContractA(mid, contractA, coinIDA, contractATime)
+	err = saveContractForTest(mid, true, contractA, coinIDA, contractATime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +298,11 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party B's signature for acknowledgement of contract A
 	auditSigB := randomBytes(73)
-	if err = archie.SaveAuditAckSigB(mid, auditSigB); err != nil {
+	if err = archie.applyAuditAckRecordedEvent(archie.db, &db.AuditAck{
+		MID:   mid,
+		Maker: false,
+		Sig:   auditSigB,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,7 +322,7 @@ func TestSetSwapData(t *testing.T) {
 	contractB := randomBytes(128)
 	coinIDB := randomBytes(36)
 	contractBTime := int64(1235)
-	err = archie.SaveContractB(mid, contractB, coinIDB, contractBTime)
+	err = saveContractForTest(mid, false, contractB, coinIDB, contractBTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +349,11 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party A's signature for acknowledgement of contract B
 	auditSigA := randomBytes(73)
-	if err = archie.SaveAuditAckSigA(mid, auditSigA); err != nil {
+	if err = archie.applyAuditAckRecordedEvent(archie.db, &db.AuditAck{
+		MID:   mid,
+		Maker: true,
+		Sig:   auditSigA,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -312,7 +373,7 @@ func TestSetSwapData(t *testing.T) {
 	redeemCoinIDA := randomBytes(36)
 	secret := randomBytes(72)
 	redeemATime := int64(1234)
-	err = archie.SaveRedeemA(mid, redeemCoinIDA, secret, redeemATime)
+	err = saveRedeemForTest(mid, true, redeemCoinIDA, secret, redeemATime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +399,11 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party B's signature for acknowledgement of A's redemption
 	redeemAckSigB := randomBytes(73)
-	if err = archie.SaveRedeemAckSigB(mid, redeemAckSigB); err != nil {
+	if err = archie.applyRedemptionAckRecordedEvent(archie.db, &db.RedemptionAck{
+		MID:   mid,
+		Maker: false,
+		Sig:   redeemAckSigB,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -357,7 +422,7 @@ func TestSetSwapData(t *testing.T) {
 	// Redeem B
 	redeemCoinIDB := randomBytes(36)
 	redeemBTime := int64(1234)
-	err = archie.SaveRedeemB(mid, redeemCoinIDB, redeemBTime)
+	err = saveRedeemForTest(mid, false, redeemCoinIDB, nil, redeemBTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,6 +449,1030 @@ func TestSetSwapData(t *testing.T) {
 	}
 }
 
+func TestApplyMatchAcksRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	sharedUser := randomAccountID()
+	makerAckPair := generateMatch(t, order.NewlyMatched, true, sharedUser, randomAccountID())
+	takerAckPair := generateMatch(t, order.NewlyMatched, true, randomAccountID(), sharedUser, 132412342)
+	makerAckMID := testMarketMatchID(makerAckPair.match)
+	takerAckMID := testMarketMatchID(takerAckPair.match)
+	update := &db.MatchAcksRecordedUpdate{Acks: []*db.MatchAck{
+		{MID: makerAckMID, Maker: true, Sig: []byte("maker-match-sig"), Address: "maker-swap-addr"},
+		{MID: takerAckMID, Maker: false, Sig: []byte("taker-match-sig"), Address: "taker-swap-addr"},
+	}}
+
+	// A single user's match ack response may include multiple matches. This event
+	// writes one maker-side ack and one taker-side ack for different matches in
+	// one DB transaction before appending the event-log entry.
+	event := []byte("match-acks-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindMatchAcksRecorded, event, update)
+	log, err := archie.ApplyMatchAcksRecordedEvent(ctx, &db.EventLogMeta{Event: event}, update)
+	if err != nil {
+		t.Fatalf("ApplyMatchAcksRecordedEvent error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindMatchAcksRecorded, event, tip, update)
+	assertEventLogFrontier(t, 1, tip)
+
+	_, makerSwapData, err := archie.SwapData(makerAckMID)
+	if err != nil {
+		t.Fatalf("SwapData maker ack error: %v", err)
+	}
+	if !bytes.Equal(makerSwapData.SigMatchAckMaker, []byte("maker-match-sig")) ||
+		makerSwapData.MakerSwapAddr != "maker-swap-addr" ||
+		len(makerSwapData.SigMatchAckTaker) != 0 || makerSwapData.TakerSwapAddr != "" {
+		t.Fatalf("maker match swap data = %+v, want only maker ack and address", makerSwapData)
+	}
+	_, takerSwapData, err := archie.SwapData(takerAckMID)
+	if err != nil {
+		t.Fatalf("SwapData taker ack error: %v", err)
+	}
+	if !bytes.Equal(takerSwapData.SigMatchAckTaker, []byte("taker-match-sig")) ||
+		takerSwapData.TakerSwapAddr != "taker-swap-addr" ||
+		len(takerSwapData.SigMatchAckMaker) != 0 || takerSwapData.MakerSwapAddr != "" {
+		t.Fatalf("taker match swap data = %+v, want only taker ack and address", takerSwapData)
+	}
+
+	rollbackUpdate := &db.MatchAcksRecordedUpdate{Acks: []*db.MatchAck{{
+		MID:     makerAckMID,
+		Maker:   true,
+		Sig:     []byte("rolled-back-maker-sig"),
+		Address: "rolled-back-addr",
+	}}}
+	_, err = archie.ApplyMatchAcksRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("match-acks-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, rollbackUpdate)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyMatchAcksRecordedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	_, makerSwapData, err = archie.SwapData(makerAckMID)
+	if err != nil {
+		t.Fatalf("SwapData after rollback error: %v", err)
+	}
+	if !bytes.Equal(makerSwapData.SigMatchAckMaker, []byte("maker-match-sig")) || makerSwapData.MakerSwapAddr != "maker-swap-addr" {
+		t.Fatalf("rollback changed maker ack data: %+v", makerSwapData)
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	// A re-ack event with a different address must refresh the ack sig but
+	// keep the first recorded address, and the no-op address update must
+	// still count as the one updated row.
+	reackUpdate := &db.MatchAcksRecordedUpdate{Acks: []*db.MatchAck{{
+		MID:     makerAckMID,
+		Maker:   true,
+		Sig:     []byte("maker-match-resig"),
+		Address: "divergent-maker-addr",
+	}}}
+	reackEvent := []byte("match-acks-reack-event")
+	tip2 := testEventApplyTip(t, tip, 2, meshevents.EventKindMatchAcksRecorded, reackEvent, reackUpdate)
+	log2, err := archie.ApplyMatchAcksRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           reackEvent,
+		ExpectedTipHash: tip2,
+	}, reackUpdate)
+	if err != nil {
+		t.Fatalf("ApplyMatchAcksRecordedEvent re-ack error: %v", err)
+	}
+	requireEventApplyLog(t, log2, 2, meshevents.EventKindMatchAcksRecorded, reackEvent, tip2, reackUpdate)
+	_, makerSwapData, err = archie.SwapData(makerAckMID)
+	if err != nil {
+		t.Fatalf("SwapData after re-ack error: %v", err)
+	}
+	if !bytes.Equal(makerSwapData.SigMatchAckMaker, []byte("maker-match-resig")) {
+		t.Fatalf("re-ack did not refresh sig: %+v", makerSwapData)
+	}
+	if makerSwapData.MakerSwapAddr != "maker-swap-addr" {
+		t.Fatalf("re-ack displaced first-wins address: got %q, want maker-swap-addr",
+			makerSwapData.MakerSwapAddr)
+	}
+	assertEventLogFrontier(t, 2, tip2)
+}
+
+func TestApplySwapContractRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	pair := generateMatch(t, order.NewlyMatched, true, randomAccountID(), randomAccountID())
+	mid := testMarketMatchID(pair.match)
+	makerContract := &db.SwapContract{
+		MID:       mid,
+		Maker:     true,
+		Contract:  []byte("maker-contract"),
+		CoinID:    []byte("maker-coin"),
+		Timestamp: 1670000000000,
+	}
+
+	// The maker contract advances the persisted match status and stores the
+	// maker's contract script, coin ID, and timestamp beside the event log.
+	event := []byte("swap-contract-maker-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindSwapContractRecorded, event, makerContract)
+	log, err := archie.ApplySwapContractRecordedEvent(ctx, &db.EventLogMeta{Event: event}, makerContract)
+	if err != nil {
+		t.Fatalf("ApplySwapContractRecordedEvent maker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindSwapContractRecorded, event, tip, makerContract)
+	status, swapData, err := archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData maker error: %v", err)
+	}
+	if status != order.MakerSwapCast || !bytes.Equal(swapData.ContractA, makerContract.Contract) ||
+		!bytes.Equal(swapData.ContractACoinID, makerContract.CoinID) || swapData.ContractATime != makerContract.Timestamp {
+		t.Fatalf("maker swap data status=%v data=%+v", status, swapData)
+	}
+
+	takerContract := &db.SwapContract{
+		MID:       mid,
+		Contract:  []byte("taker-contract"),
+		CoinID:    []byte("taker-coin"),
+		Timestamp: 1670000001111,
+	}
+	_, err = archie.ApplySwapContractRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("swap-contract-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, takerContract)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplySwapContractRecordedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	status, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData after rollback error: %v", err)
+	}
+	if status != order.MakerSwapCast || len(swapData.ContractB) != 0 {
+		t.Fatalf("rollback changed taker contract status=%v data=%+v", status, swapData)
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	takerEvent := []byte("swap-contract-taker-event")
+	takerTip := testEventApplyTip(t, tip, 2, meshevents.EventKindSwapContractRecorded, takerEvent, takerContract)
+	log, err = archie.ApplySwapContractRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           takerEvent,
+		ExpectedTipHash: takerTip,
+	}, takerContract)
+	if err != nil {
+		t.Fatalf("ApplySwapContractRecordedEvent taker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 2, meshevents.EventKindSwapContractRecorded, takerEvent, takerTip, takerContract)
+	status, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData taker error: %v", err)
+	}
+	if status != order.TakerSwapCast || !bytes.Equal(swapData.ContractB, takerContract.Contract) ||
+		!bytes.Equal(swapData.ContractBCoinID, takerContract.CoinID) || swapData.ContractBTime != takerContract.Timestamp {
+		t.Fatalf("taker swap data status=%v data=%+v", status, swapData)
+	}
+}
+
+func TestApplyAuditAckRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	pair := generateMatch(t, order.TakerSwapCast, true, randomAccountID(), randomAccountID())
+	mid := testMarketMatchID(pair.match)
+	takerAck := &db.AuditAck{MID: mid, Sig: []byte("taker-audit-ack")}
+
+	// The taker audit ack signs the maker's contract and is stored with the
+	// event-log entry.
+	event := []byte("audit-ack-taker-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindAuditAckRecorded, event, takerAck)
+	log, err := archie.ApplyAuditAckRecordedEvent(ctx, &db.EventLogMeta{Event: event}, takerAck)
+	if err != nil {
+		t.Fatalf("ApplyAuditAckRecordedEvent taker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindAuditAckRecorded, event, tip, takerAck)
+	_, swapData, err := archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData taker ack error: %v", err)
+	}
+	if !bytes.Equal(swapData.ContractAAckSig, takerAck.Sig) {
+		t.Fatalf("ContractAAckSig = %x, want %x", swapData.ContractAAckSig, takerAck.Sig)
+	}
+
+	makerAck := &db.AuditAck{MID: mid, Maker: true, Sig: []byte("maker-audit-ack")}
+	_, err = archie.ApplyAuditAckRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("audit-ack-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, makerAck)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyAuditAckRecordedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	_, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData after rollback error: %v", err)
+	}
+	if len(swapData.ContractBAckSig) != 0 {
+		t.Fatalf("rollback stored maker audit ack: %x", swapData.ContractBAckSig)
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	makerEvent := []byte("audit-ack-maker-event")
+	makerTip := testEventApplyTip(t, tip, 2, meshevents.EventKindAuditAckRecorded, makerEvent, makerAck)
+	log, err = archie.ApplyAuditAckRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           makerEvent,
+		ExpectedTipHash: makerTip,
+	}, makerAck)
+	if err != nil {
+		t.Fatalf("ApplyAuditAckRecordedEvent maker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 2, meshevents.EventKindAuditAckRecorded, makerEvent, makerTip, makerAck)
+	_, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData maker ack error: %v", err)
+	}
+	if !bytes.Equal(swapData.ContractBAckSig, makerAck.Sig) {
+		t.Fatalf("ContractBAckSig = %x, want %x", swapData.ContractBAckSig, makerAck.Sig)
+	}
+}
+
+func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
+	ctx := context.Background()
+	policy := &db.ReputationOutcomePolicy{MatchLimit: 10, OrderLimit: 10}
+
+	newRedemption := func(pair *matchPair, maker bool, stamp int64) *db.SwapRedemption {
+		coinID := []byte("taker-redeem-coin")
+		secret := []byte(nil)
+		if maker {
+			coinID = []byte("maker-redeem-coin")
+			secret = []byte("secret")
+		}
+		return &db.SwapRedemption{
+			MID:       testMarketMatchID(pair.match),
+			Maker:     maker,
+			CoinID:    coinID,
+			Secret:    secret,
+			Timestamp: stamp,
+		}
+	}
+
+	apply := func(t *testing.T, redemption *db.SwapRedemption, event []byte) *db.EventLogEntry {
+		t.Helper()
+		log, err := archie.ApplySwapRedemptionRecordedEvent(ctx, &db.EventLogMeta{Event: event}, policy, redemption)
+		if err != nil {
+			t.Fatalf("ApplySwapRedemptionRecordedEvent error: %v", err)
+		}
+		baseTxData, err := redemption.EventTxData()
+		if err != nil {
+			t.Fatalf("EventTxData error: %v", err)
+		}
+		tip := testEventApplyTipForTxData(t, nil, 1, meshevents.EventKindSwapRedemptionRecorded, event, baseTxData)
+		requireEventApplyLogTxData(t, log, 1, meshevents.EventKindSwapRedemptionRecorded, event, tip, baseTxData)
+		return log
+	}
+
+	requireCompleted := func(t *testing.T, user account.AccountID, oid order.OrderID, wantTime int64) {
+		t.Helper()
+		completed, compTimes, err := archie.CompletedUserOrders(user, 10)
+		if err != nil {
+			t.Fatalf("CompletedUserOrders error: %v", err)
+		}
+		if len(completed) != 1 || completed[0] != oid || compTimes[0] != wantTime {
+			t.Fatalf("completed orders = %v/%v, want %v at %d", completed, compTimes, oid, wantTime)
+		}
+	}
+
+	requireNoCompleted := func(t *testing.T, user account.AccountID) {
+		t.Helper()
+		completed, _, err := archie.CompletedUserOrders(user, 10)
+		if err != nil {
+			t.Fatalf("CompletedUserOrders error: %v", err)
+		}
+		if len(completed) != 0 {
+			t.Fatalf("completed orders = %v, want none", completed)
+		}
+	}
+
+	requireReputation := func(t *testing.T, user account.AccountID, wantMatches, wantOrders int) {
+		t.Helper()
+		_, matches, orders, err := archie.GetUserReputationData(ctx, user, 10, 10, 10)
+		if err != nil {
+			t.Fatalf("GetUserReputationData error: %v", err)
+		}
+		if len(matches) != wantMatches || len(orders) != wantOrders {
+			t.Fatalf("reputation matches=%+v orders=%+v, want %d/%d", matches, orders, wantMatches, wantOrders)
+		}
+		if wantMatches == 1 && matches[0].MatchOutcome != db.OutcomeSwapSuccess {
+			t.Fatalf("match outcome = %v, want swap success", matches[0].MatchOutcome)
+		}
+		if wantOrders == 1 && orders[0].Canceled {
+			t.Fatalf("order outcome = %+v, want completed", orders[0])
+		}
+	}
+
+	addMakerMatch := func(t *testing.T, makerOrder *order.LimitOrder, taker account.AccountID, status order.MatchStatus) {
+		t.Helper()
+		loSell := newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
+		loSell.P.AccountID = taker
+		epochID := order.EpochID{uint64(132412999), 1000}
+		if err := storeOrderForTest(archie, loSell, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted); err != nil {
+			t.Fatalf("failed to store related taker order: %v", err)
+		}
+		match := newMatch(makerOrder, loSell, loSell.Quantity, epochID)
+		match.Status = status
+		if err := insertMatchForTest(match); err != nil {
+			t.Fatalf("insertMatchForTest related match failed: %v", err)
+		}
+		mid := testMarketMatchID(match)
+		if status >= order.MakerSwapCast {
+			if err := saveContractForTest(mid, true, encode.RandomBytes(50), encode.RandomBytes(36), 0); err != nil {
+				t.Fatalf("saveContractForTest (maker) related match error: %v", err)
+			}
+		}
+		if status >= order.TakerSwapCast {
+			if err := saveContractForTest(mid, false, encode.RandomBytes(50), encode.RandomBytes(36), 0); err != nil {
+				t.Fatalf("saveContractForTest (taker) related match error: %v", err)
+			}
+		}
+		if status >= order.MakerRedeemed {
+			if err := saveRedeemForTest(mid, true, encode.RandomBytes(36), encode.RandomBytes(32), 0); err != nil {
+				t.Fatalf("saveRedeemForTest (maker) related match error: %v", err)
+			}
+		}
+	}
+
+	addTakerMatch := func(t *testing.T, maker account.AccountID, takerOrder *order.LimitOrder, status order.MatchStatus) {
+		t.Helper()
+		loBuy := newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
+		loBuy.P.AccountID = maker
+		epochID := order.EpochID{uint64(132413999), 1000}
+		if err := storeOrderForTest(archie, loBuy, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted); err != nil {
+			t.Fatalf("failed to store related maker order: %v", err)
+		}
+		match := newMatch(loBuy, takerOrder, takerOrder.Quantity, epochID)
+		match.Status = status
+		if err := insertMatchForTest(match); err != nil {
+			t.Fatalf("insertMatchForTest related taker match failed: %v", err)
+		}
+		mid := testMarketMatchID(match)
+		if status >= order.MakerSwapCast {
+			if err := saveContractForTest(mid, true, encode.RandomBytes(50), encode.RandomBytes(36), 0); err != nil {
+				t.Fatalf("saveContractForTest (maker) related taker match error: %v", err)
+			}
+		}
+		if status >= order.TakerSwapCast {
+			if err := saveContractForTest(mid, false, encode.RandomBytes(50), encode.RandomBytes(36), 0); err != nil {
+				t.Fatalf("saveContractForTest (taker) related taker match error: %v", err)
+			}
+		}
+		if status >= order.MakerRedeemed {
+			if err := saveRedeemForTest(mid, true, encode.RandomBytes(36), encode.RandomBytes(32), 0); err != nil {
+				t.Fatalf("saveRedeemForTest (maker) related taker match error: %v", err)
+			}
+		}
+	}
+
+	t.Run("nil redemption validates before event log", func(t *testing.T) {
+		if err := cleanTables(archie.db); err != nil {
+			t.Fatalf("cleanTables: %v", err)
+		}
+		_, err := archie.ApplySwapRedemptionRecordedEvent(ctx, &db.EventLogMeta{Event: []byte("nil-redemption")}, policy, nil)
+		if err == nil {
+			t.Fatalf("nil redemption apply succeeded")
+		}
+		assertEventLogFrontier(t, 0, nil)
+	})
+
+	t.Run("rollback restores redemption completion and reputation", func(t *testing.T) {
+		if err := cleanTables(archie.db); err != nil {
+			t.Fatalf("cleanTables: %v", err)
+		}
+		maker := randomAccountID()
+		pair := generateMatch(t, order.TakerSwapCast, true, maker, randomAccountID())
+		redemption := newRedemption(pair, true, 1670000002222)
+		_, err := archie.ApplySwapRedemptionRecordedEvent(ctx, &db.EventLogMeta{
+			Seq:             1,
+			Event:           []byte("swap-redemption-bad-tip"),
+			ExpectedTipHash: wrongEventTip(),
+		}, policy, redemption)
+		var divergence *db.EventLogDivergenceError
+		if !errors.As(err, &divergence) {
+			t.Fatalf("ApplySwapRedemptionRecordedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+		}
+		status, swapData, err := archie.SwapData(redemption.MID)
+		if err != nil {
+			t.Fatalf("SwapData after rollback error: %v", err)
+		}
+		if status != order.TakerSwapCast || len(swapData.RedeemACoinID) != 0 {
+			t.Fatalf("rollback changed redemption status=%v data=%+v", status, swapData)
+		}
+		requireNoCompleted(t, maker)
+		requireReputation(t, maker, 0, 0)
+		assertEventLogFrontier(t, 0, nil)
+	})
+
+	t.Run("status mismatch validates before writes", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			maker      bool
+			status     order.MatchStatus
+			wantStatus order.MatchStatus
+		}{
+			{
+				name:       "maker redemption requires taker swap",
+				maker:      true,
+				status:     order.MakerSwapCast,
+				wantStatus: order.MakerSwapCast,
+			},
+			{
+				name:       "taker redemption requires maker redemption",
+				status:     order.TakerSwapCast,
+				wantStatus: order.TakerSwapCast,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				if err := cleanTables(archie.db); err != nil {
+					t.Fatalf("cleanTables: %v", err)
+				}
+				pair := generateMatch(t, tt.status, true, randomAccountID(), randomAccountID())
+				redemption := newRedemption(pair, tt.maker, 1670000003333)
+				_, err := archie.ApplySwapRedemptionRecordedEvent(ctx, &db.EventLogMeta{
+					Event: []byte(tt.name),
+				}, policy, redemption)
+				if err == nil {
+					t.Fatalf("ApplySwapRedemptionRecordedEvent succeeded for status %v", tt.status)
+				}
+
+				status, swapData, err := archie.SwapData(redemption.MID)
+				if err != nil {
+					t.Fatalf("SwapData after status mismatch error: %v", err)
+				}
+				if status != tt.wantStatus {
+					t.Fatalf("status = %v, want %v", status, tt.wantStatus)
+				}
+				if len(swapData.RedeemACoinID) != 0 || len(swapData.RedeemBCoinID) != 0 {
+					t.Fatalf("status mismatch wrote redemption data: %+v", swapData)
+				}
+				assertEventLogFrontier(t, 0, nil)
+			})
+		}
+	})
+
+	tests := []struct {
+		name        string
+		maker       bool
+		status      order.MatchStatus
+		makerStatus order.OrderStatus
+		takerStatus order.OrderStatus
+		sameUser    bool
+		addMaker    order.MatchStatus
+		addTaker    order.MatchStatus
+		wantBlock   bool
+	}{
+		{
+			name:        "maker redemption completes maker order",
+			maker:       true,
+			status:      order.TakerSwapCast,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+		},
+		{
+			name:        "taker redemption completes taker order",
+			status:      order.MakerRedeemed,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+		},
+		{
+			name:        "booked maker order does not complete",
+			maker:       true,
+			status:      order.TakerSwapCast,
+			makerStatus: order.OrderStatusBooked,
+			takerStatus: order.OrderStatusExecuted,
+			wantBlock:   true,
+		},
+		{
+			name:        "unsettled maker match blocks completion",
+			maker:       true,
+			status:      order.TakerSwapCast,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+			addMaker:    order.TakerSwapCast,
+			wantBlock:   true,
+		},
+		{
+			name:        "unsettled taker match blocks completion",
+			status:      order.MakerRedeemed,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+			addTaker:    order.TakerSwapCast,
+			wantBlock:   true,
+		},
+		{
+			name:        "already maker redeemed match does not block maker completion",
+			maker:       true,
+			status:      order.TakerSwapCast,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+			addMaker:    order.MakerRedeemed,
+		},
+		{
+			name:        "self match suppresses match reputation only",
+			maker:       true,
+			status:      order.TakerSwapCast,
+			makerStatus: order.OrderStatusExecuted,
+			takerStatus: order.OrderStatusExecuted,
+			sameUser:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			maker, taker := randomAccountID(), randomAccountID()
+			if tt.sameUser {
+				taker = maker
+			}
+			pair := generateMatchWithOrderStatuses(t, tt.status, true, maker, taker, tt.makerStatus, tt.takerStatus)
+			if tt.addMaker != 0 {
+				addMakerMatch(t, pair.match.Maker, randomAccountID(), tt.addMaker)
+			}
+			if tt.addTaker != 0 {
+				takerOrder, ok := pair.match.Taker.(*order.LimitOrder)
+				if !ok {
+					t.Fatalf("test match taker = %T, want *order.LimitOrder", pair.match.Taker)
+				}
+				addTakerMatch(t, randomAccountID(), takerOrder, tt.addTaker)
+			}
+			redemption := newRedemption(pair, tt.maker, 1670000003333)
+			apply(t, redemption, []byte(tt.name))
+
+			status, swapData, err := archie.SwapData(redemption.MID)
+			if err != nil {
+				t.Fatalf("SwapData error: %v", err)
+			}
+			wantStatus := order.MatchComplete
+			if tt.maker {
+				wantStatus = order.MakerRedeemed
+				if !bytes.Equal(swapData.RedeemACoinID, redemption.CoinID) ||
+					!bytes.Equal(swapData.RedeemASecret, redemption.Secret) ||
+					swapData.RedeemATime != redemption.Timestamp {
+					t.Fatalf("maker redeem data status=%v data=%+v", status, swapData)
+				}
+			} else if !bytes.Equal(swapData.RedeemBCoinID, redemption.CoinID) ||
+				swapData.RedeemBTime != redemption.Timestamp {
+				t.Fatalf("taker redeem data status=%v data=%+v", status, swapData)
+			}
+			if status != wantStatus {
+				t.Fatalf("redemption status = %v, want %v", status, wantStatus)
+			}
+
+			user, oid := taker, pair.match.Taker.ID()
+			if tt.maker {
+				user, oid = maker, pair.match.Maker.ID()
+			}
+			if tt.wantBlock {
+				requireNoCompleted(t, user)
+				requireReputation(t, user, 1, 0)
+				return
+			}
+			requireCompleted(t, user, oid, redemption.Timestamp)
+			wantMatches := 1
+			if tt.sameUser {
+				wantMatches = 0
+			}
+			requireReputation(t, user, wantMatches, 1)
+		})
+	}
+}
+
+func TestApplyRedemptionAckRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	pair := generateMatch(t, order.MakerRedeemed, true, randomAccountID(), randomAccountID())
+	mid := testMarketMatchID(pair.match)
+	takerAck := &db.RedemptionAck{MID: mid, Sig: []byte("taker-redemption-ack")}
+
+	// The taker redemption ack is durable DB state because it acknowledges the
+	// maker's redemption and may later complete the DB-side match lifecycle.
+	event := []byte("redemption-ack-taker-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindRedemptionAckRecorded, event, takerAck)
+	log, err := archie.ApplyRedemptionAckRecordedEvent(ctx, &db.EventLogMeta{Event: event}, takerAck)
+	if err != nil {
+		t.Fatalf("ApplyRedemptionAckRecordedEvent taker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindRedemptionAckRecorded, event, tip, takerAck)
+	_, swapData, err := archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData taker ack error: %v", err)
+	}
+	if !bytes.Equal(swapData.RedeemAAckSig, takerAck.Sig) {
+		t.Fatalf("RedeemAAckSig = %x, want %x", swapData.RedeemAAckSig, takerAck.Sig)
+	}
+
+	rollbackAck := &db.RedemptionAck{MID: mid, Sig: []byte("rolled-back-redemption-ack")}
+	_, err = archie.ApplyRedemptionAckRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("redemption-ack-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, rollbackAck)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyRedemptionAckRecordedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	_, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData after rollback error: %v", err)
+	}
+	if !bytes.Equal(swapData.RedeemAAckSig, takerAck.Sig) {
+		t.Fatalf("rollback changed taker redemption ack to %x", swapData.RedeemAAckSig)
+	}
+	assertEventLogFrontier(t, 1, tip)
+
+	makerAck := &db.RedemptionAck{MID: mid, Maker: true, Sig: []byte("maker-redemption-ack")}
+	makerEvent := []byte("redemption-ack-maker-event")
+	makerTip := testEventApplyTip(t, tip, 2, meshevents.EventKindRedemptionAckRecorded, makerEvent, makerAck)
+	log, err = archie.ApplyRedemptionAckRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           makerEvent,
+		ExpectedTipHash: makerTip,
+	}, makerAck)
+	if err != nil {
+		t.Fatalf("ApplyRedemptionAckRecordedEvent maker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 2, meshevents.EventKindRedemptionAckRecorded, makerEvent, makerTip, makerAck)
+}
+
+type matchFailedUsers struct {
+	maker account.AccountID
+	taker account.AccountID
+}
+
+type matchFailedFixture struct {
+	ctx      context.Context
+	policy   *db.ReputationOutcomePolicy
+	failTime time.Time
+}
+
+func newMatchFailedFixture() *matchFailedFixture {
+	return &matchFailedFixture{
+		ctx:      context.Background(),
+		policy:   &db.ReputationOutcomePolicy{MatchLimit: 10, OrderLimit: 10},
+		failTime: time.UnixMilli(1670000000000).UTC(),
+	}
+}
+
+func (f *matchFailedFixture) newMatchFailedUpdate(t *testing.T, status order.MatchStatus, reason db.MatchFailureReason, users matchFailedUsers, makerStatus, takerStatus order.OrderStatus) (*matchPair, *db.MatchFailedUpdate) {
+	t.Helper()
+	pair := generateMatchWithOrderStatuses(t, status, true, users.maker, users.taker, makerStatus, takerStatus)
+	update := &db.MatchFailedUpdate{
+		MID:        testMarketMatchID(pair.match),
+		FailTimeMS: f.failTime.UnixMilli(),
+		Reason:     reason,
+	}
+	return pair, update
+}
+
+func (f *matchFailedFixture) apply(t *testing.T, update *db.MatchFailedUpdate, event []byte, meta *db.EventLogMeta) (*db.EventLogEntry, error) {
+	t.Helper()
+	if meta == nil {
+		meta = &db.EventLogMeta{Event: event}
+	} else if meta.Event == nil {
+		meta.Event = event
+	}
+	return archie.ApplyMatchFailedEvent(f.ctx, meta, f.policy, update)
+}
+
+func (f *matchFailedFixture) requireMatchActive(t *testing.T, match *order.Match, want bool) {
+	t.Helper()
+	matchData, err := archie.MatchByID(match.ID(), match.Maker.Base(), match.Maker.Quote())
+	if err != nil {
+		t.Fatalf("MatchByID error: %v", err)
+	}
+	if matchData.Active != want {
+		t.Fatalf("match active = %v, want %v", matchData.Active, want)
+	}
+}
+
+func (f *matchFailedFixture) requireMatchOutcome(t *testing.T, user account.AccountID, want db.Outcome) {
+	t.Helper()
+	_, matches, _, err := archie.GetUserReputationData(f.ctx, user, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData match outcomes error: %v", err)
+	}
+	if len(matches) != 1 || matches[0].MatchOutcome != want {
+		t.Fatalf("match outcomes = %+v, want one %v", matches, want)
+	}
+}
+
+func (f *matchFailedFixture) requireNoMatchOutcomes(t *testing.T, users ...account.AccountID) {
+	t.Helper()
+	seen := make(map[account.AccountID]struct{}, len(users))
+	for _, user := range users {
+		if _, found := seen[user]; found {
+			continue
+		}
+		seen[user] = struct{}{}
+		_, matches, _, err := archie.GetUserReputationData(f.ctx, user, 10, 10, 10)
+		if err != nil {
+			t.Fatalf("GetUserReputationData match outcomes error: %v", err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("user %v match outcomes = %+v, want none", user, matches)
+		}
+	}
+}
+
+func (f *matchFailedFixture) requireOrderOutcome(t *testing.T, user account.AccountID, oid order.OrderID, canceled bool) {
+	t.Helper()
+	_, _, orders, err := archie.GetUserReputationData(f.ctx, user, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData order outcomes error: %v", err)
+	}
+	if len(orders) != 1 || orders[0].OrderID != oid || orders[0].Canceled != canceled {
+		t.Fatalf("order outcomes = %+v, want one order %v canceled=%v", orders, oid, canceled)
+	}
+}
+
+func (f *matchFailedFixture) requireNoOrderOutcomes(t *testing.T, user account.AccountID) {
+	t.Helper()
+	_, _, orders, err := archie.GetUserReputationData(f.ctx, user, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData order outcomes error: %v", err)
+	}
+	if len(orders) != 0 {
+		t.Fatalf("order outcomes = %+v, want none", orders)
+	}
+}
+
+func (f *matchFailedFixture) requireCompletedOrder(t *testing.T, user account.AccountID, oid order.OrderID, wantTime time.Time) {
+	t.Helper()
+	completed, compTimes, err := archie.CompletedUserOrders(user, 10)
+	if err != nil {
+		t.Fatalf("CompletedUserOrders error: %v", err)
+	}
+	if len(completed) != 1 || completed[0] != oid || compTimes[0] != wantTime.UnixMilli() {
+		t.Fatalf("completed orders = %v/%v, want %v at %d", completed, compTimes, oid, wantTime.UnixMilli())
+	}
+}
+
+func (f *matchFailedFixture) requireNoCompletedOrders(t *testing.T, user account.AccountID) {
+	t.Helper()
+	completed, _, err := archie.CompletedUserOrders(user, 10)
+	if err != nil {
+		t.Fatalf("CompletedUserOrders error: %v", err)
+	}
+	if len(completed) != 0 {
+		t.Fatalf("completed orders = %+v, want none", completed)
+	}
+}
+
+func (f *matchFailedFixture) requireOrderStatus(t *testing.T, oid order.OrderID, base, quote uint32, want order.OrderStatus) {
+	t.Helper()
+	_, status, err := archie.Order(oid, base, quote)
+	if err != nil {
+		t.Fatalf("Order error: %v", err)
+	}
+	if status != want {
+		t.Fatalf("order %v status = %v, want %v", oid, status, want)
+	}
+}
+
+func TestApplyMatchFailedEventDurableEffects(t *testing.T) {
+	f := newMatchFailedFixture()
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "maker fault revokes booked maker and completes taker",
+			run: func(t *testing.T) {
+				users := matchFailedUsers{maker: randomAccountID(), taker: randomAccountID()}
+				pair, update := f.newMatchFailedUpdate(t, order.NewlyMatched, db.MatchFailureMakerNoSwap, users,
+					order.OrderStatusBooked, order.OrderStatusExecuted)
+				event := []byte("match-failed-event")
+
+				logEntry, err := f.apply(t, update, event, nil)
+				if err != nil {
+					t.Fatalf("ApplyMatchFailedEvent error: %v", err)
+				}
+				baseTxData, err := update.EventTxData()
+				if err != nil {
+					t.Fatalf("EventTxData error: %v", err)
+				}
+				tip := testEventApplyTipForTxData(t, nil, 1, meshevents.EventKindMatchFailed, event, baseTxData)
+				requireEventApplyLogTxData(t, logEntry, 1, meshevents.EventKindMatchFailed, event, tip, baseTxData)
+
+				f.requireMatchActive(t, pair.match, false)
+
+				expectedCancelID := makePseudoCancel(pair.match.Maker.ID(), users.maker,
+					pair.match.Maker.Base(), pair.match.Maker.Quote(), f.failTime).ID()
+				f.requireMatchOutcome(t, users.maker, db.OutcomeNoSwapAsMaker)
+				f.requireOrderOutcome(t, users.maker, expectedCancelID, false)
+				f.requireOrderStatus(t, pair.match.Maker.ID(), pair.match.Maker.Base(), pair.match.Maker.Quote(), order.OrderStatusRevoked)
+
+				f.requireCompletedOrder(t, users.taker, pair.match.Taker.ID(), f.failTime)
+				f.requireOrderOutcome(t, users.taker, pair.match.Taker.ID(), false)
+			},
+		},
+		{
+			name: "event log divergence rolls back match order and reputation writes",
+			run: func(t *testing.T) {
+				users := matchFailedUsers{maker: randomAccountID(), taker: randomAccountID()}
+				pair, update := f.newMatchFailedUpdate(t, order.NewlyMatched, db.MatchFailureMakerNoSwap, users,
+					order.OrderStatusBooked, order.OrderStatusExecuted)
+
+				_, err := f.apply(t, update, []byte("match-failed-bad-tip"), &db.EventLogMeta{
+					Seq:             1,
+					ExpectedTipHash: wrongEventTip(),
+				})
+				var divergence *db.EventLogDivergenceError
+				if !errors.As(err, &divergence) {
+					t.Fatalf("ApplyMatchFailedEvent error = %T %[1]v, want EventLogDivergenceError", err)
+				}
+				assertEventLogFrontier(t, 0, nil)
+
+				f.requireMatchActive(t, pair.match, true)
+				f.requireOrderStatus(t, pair.match.Maker.ID(), pair.match.Maker.Base(), pair.match.Maker.Quote(), order.OrderStatusBooked)
+				f.requireNoMatchOutcomes(t, users.maker, users.taker)
+				f.requireNoOrderOutcomes(t, users.maker)
+				f.requireNoOrderOutcomes(t, users.taker)
+				f.requireNoCompletedOrders(t, users.taker)
+			},
+		},
+		{
+			name: "shared maker order completes only after last active match fails",
+			run: func(t *testing.T) {
+				makerAcct := randomAccountID()
+				maker := newLimitOrder(false, 4500000, 2, order.StandingTiF, 0)
+				maker.P.AccountID = makerAcct
+				taker1 := newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
+				taker2 := newLimitOrder(true, 4480000, 1, order.ImmediateTiF, 20)
+				for _, ord := range []order.Order{maker, taker1, taker2} {
+					if err := storeOrderForTest(archie, ord, 132412341, 1000, order.OrderStatusExecuted); err != nil {
+						t.Fatalf("StoreOrder error: %v", err)
+					}
+				}
+
+				match1 := newMatch(maker, taker1, taker1.Quantity, order.EpochID{Idx: 132412341, Dur: 1000})
+				match1.Status = order.MakerSwapCast
+				if err := insertMatchForTest(match1); err != nil {
+					t.Fatalf("insertMatchForTest match1 error: %v", err)
+				}
+				match2 := newMatch(maker, taker2, taker2.Quantity, order.EpochID{Idx: 132412342, Dur: 1000})
+				match2.Status = order.MakerSwapCast
+				if err := insertMatchForTest(match2); err != nil {
+					t.Fatalf("insertMatchForTest match2 error: %v", err)
+				}
+
+				applyFailure := func(t *testing.T, match *order.Match, at time.Time) {
+					t.Helper()
+					mid := testMarketMatchID(match)
+					_, err := f.apply(t, &db.MatchFailedUpdate{
+						MID:        mid,
+						FailTimeMS: at.UnixMilli(),
+						Reason:     db.MatchFailureTakerNoSwap,
+					}, mid.MatchID[:], nil)
+					if err != nil {
+						t.Fatalf("ApplyMatchFailedEvent error: %v", err)
+					}
+				}
+
+				applyFailure(t, match1, f.failTime)
+				f.requireNoCompletedOrders(t, makerAcct)
+				f.requireNoCompletedOrders(t, taker1.User())
+
+				secondFailTime := f.failTime.Add(time.Second)
+				applyFailure(t, match2, secondFailTime)
+				f.requireCompletedOrder(t, makerAcct, maker.ID(), secondFailTime)
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			tt.run(t)
+		})
+	}
+}
+
+func TestApplyMatchFailedEventReasonMapping(t *testing.T) {
+	f := newMatchFailedFixture()
+
+	tests := []struct {
+		name        string
+		status      order.MatchStatus
+		reason      db.MatchFailureReason
+		sameUser    bool
+		wantUser    func(matchFailedUsers) account.AccountID
+		wantOutcome db.Outcome
+		wantErr     bool
+	}{
+		{
+			name:        "newly matched maker fault",
+			status:      order.NewlyMatched,
+			reason:      db.MatchFailureMakerNoSwap,
+			wantUser:    func(users matchFailedUsers) account.AccountID { return users.maker },
+			wantOutcome: db.OutcomeNoSwapAsMaker,
+		},
+		{
+			name:        "newly matched taker address fault",
+			status:      order.NewlyMatched,
+			reason:      db.MatchFailureTakerNoAddress,
+			wantUser:    func(users matchFailedUsers) account.AccountID { return users.taker },
+			wantOutcome: db.OutcomeNoAddrAsTaker,
+		},
+		{
+			name:        "maker swap cast taker fault",
+			status:      order.MakerSwapCast,
+			reason:      db.MatchFailureTakerNoSwap,
+			wantUser:    func(users matchFailedUsers) account.AccountID { return users.taker },
+			wantOutcome: db.OutcomeNoSwapAsTaker,
+		},
+		{
+			name:        "taker swap cast maker fault",
+			status:      order.TakerSwapCast,
+			reason:      db.MatchFailureMakerNoRedeem,
+			wantUser:    func(users matchFailedUsers) account.AccountID { return users.maker },
+			wantOutcome: db.OutcomeNoRedeemAsMaker,
+		},
+		{
+			name:        "maker redeemed taker fault",
+			status:      order.MakerRedeemed,
+			reason:      db.MatchFailureTakerNoRedeem,
+			wantUser:    func(users matchFailedUsers) account.AccountID { return users.taker },
+			wantOutcome: db.OutcomeNoRedeemAsTaker,
+		},
+		{
+			name:   "no user fault records no match reputation",
+			status: order.MakerSwapCast,
+			reason: db.MatchFailureNoFaultMakerSwapCast,
+		},
+		{
+			name:     "same account suppresses match reputation",
+			status:   order.MakerSwapCast,
+			reason:   db.MatchFailureTakerNoSwap,
+			sameUser: true,
+		},
+		{
+			name:    "invalid reason enum rolls back",
+			status:  order.NewlyMatched,
+			reason:  db.MatchFailureReasonInvalid,
+			wantErr: true,
+		},
+		{
+			name:    "reason status mismatch rolls back",
+			status:  order.MakerSwapCast,
+			reason:  db.MatchFailureTakerNoAddress,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			users := matchFailedUsers{maker: randomAccountID(), taker: randomAccountID()}
+			if tt.sameUser {
+				users.taker = users.maker
+			}
+			pair, update := f.newMatchFailedUpdate(t, tt.status, tt.reason, users,
+				order.OrderStatusExecuted, order.OrderStatusExecuted)
+
+			_, err := f.apply(t, update, []byte(tt.name), nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ApplyMatchFailedEvent succeeded, want error")
+				}
+				f.requireMatchActive(t, pair.match, true)
+				return
+			}
+			if err != nil {
+				t.Fatalf("ApplyMatchFailedEvent error: %v", err)
+			}
+
+			if tt.wantUser == nil {
+				f.requireNoMatchOutcomes(t, users.maker, users.taker)
+				return
+			}
+			f.requireMatchOutcome(t, tt.wantUser(users), tt.wantOutcome)
+		})
+	}
+}
+
 func TestMatchByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
@@ -398,9 +1487,9 @@ func TestMatchByID(t *testing.T) {
 	// Store it.
 	epochID := order.EpochID{132412341, 1000}
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	err := insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	tests := []struct {
@@ -442,61 +1531,45 @@ func TestMatchByID(t *testing.T) {
 	}
 }
 
-func TestUserMatches(t *testing.T) {
+func TestSwapDataFullByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
 	}
 
-	// Make a perfect 1 lot match.
-	limitBuyStanding := newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
-	limitSellImmediate := newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
-
-	base, quote := limitBuyStanding.Base(), limitBuyStanding.Quote()
-
-	// Store it.
-	epochID := order.EpochID{132412341, 1000}
-	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	got, err := archie.SwapDataFullByID(order.MatchID{})
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("missing match: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("missing match returned %+v", got)
 	}
 
-	tests := []struct {
-		name        string
-		acctID      account.AccountID
-		numExpected int
-		wantedErr   error
-	}{
-		{
-			"ok maker",
-			limitBuyStanding.User(),
-			1,
-			nil,
-		},
-		{
-			"ok taker",
-			limitSellImmediate.User(),
-			1,
-			nil,
-		},
-		{
-			"nope",
-			randomAccountID(),
-			0,
-			nil,
-		},
-	}
+	user1 := randomAccountID()
+	user2 := randomAccountID()
+	mp := generateMatch(t, order.MakerSwapCast, true, user1, user2)
+	mid := mp.match.ID()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			matchData, err := archie.UserMatches(tt.acctID, base, quote)
-			if err != tt.wantedErr {
-				t.Fatal(err)
-			}
-			if len(matchData) != tt.numExpected {
-				t.Errorf("Retrieved %d matches for user %v, expected %d.", len(matchData), tt.acctID, tt.numExpected)
-			}
-		})
+	got, err = archie.SwapDataFullByID(mid)
+	if err != nil {
+		t.Fatalf("SwapDataFullByID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("SwapDataFullByID returned nil")
+	}
+	base, quote := mp.match.Maker.Base(), mp.match.Maker.Quote()
+	md, err := archie.MatchByID(mid, base, quote)
+	if err != nil {
+		t.Fatalf("MatchByID: %v", err)
+	}
+	_, sd, err := archie.SwapData(db.MarketMatchID{MatchID: mid, Base: base, Quote: quote})
+	if err != nil {
+		t.Fatalf("SwapData: %v", err)
+	}
+	if got.ID != md.ID || got.Base != base || got.Quote != quote {
+		t.Fatalf("got ID %v market %d-%d, want %v %d-%d", got.ID, got.Base, got.Quote, md.ID, base, quote)
+	}
+	if !bytes.Equal(got.ContractACoinID, sd.ContractACoinID) || !bytes.Equal(got.ContractA, sd.ContractA) {
+		t.Fatalf("SwapData contract mismatch: %+v vs %+v", got.SwapData, sd)
 	}
 }
 
@@ -514,9 +1587,9 @@ func TestMarketMatches(t *testing.T) {
 	// Store it.
 	epochID := order.EpochID{132412341, 1000}
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	err := insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 	// Make another perfect 1 lot match.
 	limitBuyStanding = newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
@@ -524,11 +1597,11 @@ func TestMarketMatches(t *testing.T) {
 
 	// Store it.
 	match = newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	archie.SetMatchInactive(db.MarketMatchID{
+	archie.setMatchInactive(archie.db, db.MarketMatchID{
 		MatchID: match.ID(),
 		Base:    base,
 		Quote:   quote,
@@ -542,21 +1615,21 @@ func TestMarketMatches(t *testing.T) {
 	}
 	midWithCoins := mktMatchID.MatchID
 	MakerSwap, MakerContract := encode.RandomBytes(36), encode.RandomBytes(50)
-	err = archie.SaveContractA(mktMatchID, MakerContract, MakerSwap, 0)
+	err = saveContractForTest(mktMatchID, true, MakerContract, MakerSwap, 0)
 	if err != nil {
-		t.Fatalf("SaveContractA error: %v", err)
+		t.Fatalf("saveContractForTest (maker) error: %v", err)
 	}
 
 	TakerSwap, TakerContract := encode.RandomBytes(36), encode.RandomBytes(50)
-	err = archie.SaveContractB(mktMatchID, TakerContract, TakerSwap, 0)
+	err = saveContractForTest(mktMatchID, false, TakerContract, TakerSwap, 0)
 	if err != nil {
-		t.Fatalf("SaveContractB error: %v", err)
+		t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 	}
 
 	MakerRedeem, Secret := encode.RandomBytes(36), encode.RandomBytes(32)
-	err = archie.SaveRedeemA(mktMatchID, MakerRedeem, Secret, 0)
+	err = saveRedeemForTest(mktMatchID, true, MakerRedeem, Secret, 0)
 	if err != nil {
-		t.Fatalf("SaveContractB error: %v", err)
+		t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 	}
 	// TakerRedeem not stored.
 
@@ -566,9 +1639,9 @@ func TestMarketMatches(t *testing.T) {
 
 	// Store it.
 	match = newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	// Only active.
@@ -633,6 +1706,11 @@ type matchPair struct {
 }
 
 func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, makerBuyer, takerSeller account.AccountID, epochIdx ...uint64) *matchPair {
+	return generateMatchWithOrderStatuses(t, matchStatus, active, makerBuyer, takerSeller,
+		order.OrderStatusExecuted, order.OrderStatusExecuted, epochIdx...)
+}
+
+func generateMatchWithOrderStatuses(t *testing.T, matchStatus order.MatchStatus, active bool, makerBuyer, takerSeller account.AccountID, makerStatus, takerStatus order.OrderStatus, epochIdx ...uint64) *matchPair {
 	t.Helper()
 	loBuy := newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
 	loBuy.P.AccountID = makerBuyer
@@ -645,20 +1723,20 @@ func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, mak
 	}
 	epochID := order.EpochID{epIdx, 1000}
 
-	err := archie.StoreOrder(loBuy, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted)
+	err := storeOrderForTest(archie, loBuy, int64(epochID.Idx), int64(epochID.Dur), makerStatus)
 	if err != nil {
 		t.Fatalf("failed to store order: %v", err)
 	}
-	err = archie.StoreOrder(loSell, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, loSell, int64(epochID.Idx), int64(epochID.Dur), takerStatus)
 	if err != nil {
 		t.Fatalf("failed to store order: %v", err)
 	}
 
 	match := newMatch(loBuy, loSell, loSell.Quantity, epochID)
 	match.Status = matchStatus
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 	matchID := match.ID()
 	mktMatchID := db.MarketMatchID{
@@ -672,36 +1750,36 @@ func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, mak
 		Active: active,
 	}
 	if !active {
-		archie.SetMatchInactive(mktMatchID, false)
+		archie.setMatchInactive(archie.db, mktMatchID, false)
 	}
 	for iStatus := order.NewlyMatched; iStatus <= matchStatus; iStatus++ {
 		switch iStatus {
 		case order.MakerSwapCast:
 			status.MakerContract = encode.RandomBytes(50)
 			status.MakerSwap = encode.RandomBytes(36)
-			err := archie.SaveContractA(mktMatchID, status.MakerContract, status.MakerSwap, 0)
+			err := saveContractForTest(mktMatchID, true, status.MakerContract, status.MakerSwap, 0)
 			if err != nil {
-				t.Fatalf("SaveContractA error: %v", err)
+				t.Fatalf("saveContractForTest (maker) error: %v", err)
 			}
 		case order.TakerSwapCast:
 			status.TakerContract = encode.RandomBytes(50)
 			status.TakerSwap = encode.RandomBytes(36)
-			err := archie.SaveContractB(mktMatchID, status.TakerContract, status.TakerSwap, 0)
+			err := saveContractForTest(mktMatchID, false, status.TakerContract, status.TakerSwap, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 			}
 		case order.MakerRedeemed:
 			status.MakerRedeem = encode.RandomBytes(36)
 			status.Secret = encode.RandomBytes(32)
-			err := archie.SaveRedeemA(mktMatchID, status.MakerRedeem, status.Secret, 0)
+			err := saveRedeemForTest(mktMatchID, true, status.MakerRedeem, status.Secret, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 			}
 		case order.MatchComplete:
 			status.TakerRedeem = encode.RandomBytes(36)
-			err := archie.SaveRedeemB(mktMatchID, status.TakerRedeem, 0)
+			err := saveRedeemForTest(mktMatchID, false, status.TakerRedeem, nil, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 			}
 		}
 	}
@@ -740,11 +1818,11 @@ func TestCompletedAndAtFaultMatchStats(t *testing.T) {
 	limitSell.AccountID = taker2
 	matchLTC := newMatch(limitBuy, limitSell, limitSell.Quantity, order.EpochID{nextIdx(), 1000})
 	matchLTC.Status = order.MatchComplete
-	err := archie.InsertMatch(matchLTC)
+	err := insertMatchForTest(matchLTC)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	archie.SetMatchInactive(db.MarketMatchID{
+	archie.setMatchInactive(archie.db, db.MarketMatchID{
 		MatchID: matchLTC.ID(),
 		Base:    limitBuy.Base(),
 		Quote:   limitBuy.Quote(),
@@ -880,9 +1958,9 @@ func TestUserMatchFails(t *testing.T) {
 	m4.match.Taker.Prefix().BaseAsset = AssetBTC
 	m4.match.Taker.Prefix().QuoteAsset = AssetLTC
 	for _, m := range matches {
-		err := archie.InsertMatch(m.match)
+		err := insertMatchForTest(m.match)
 		if err != nil {
-			t.Fatalf("InsertMatch() failed: %v", err)
+			t.Fatalf("insertMatchForTest() failed: %v", err)
 		}
 	}
 	fails, err := archie.UserMatchFails(user, 100)
@@ -915,13 +1993,13 @@ func TestAllActiveUserMatches(t *testing.T) {
 	// maker buy (quote swap asset), taker sell (base swap asset)
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
 	match.Status = order.TakerSwapCast // failed here
-	err := archie.InsertMatch(match)   // active by default
+	err := insertMatchForTest(match)   // active by default
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	err = archie.SetMatchInactive(db.MatchID(match), false) // set inactive, not forgiven
+	err = archie.setMatchInactive(archie.db, db.MatchID(match), false) // set inactive, not forgiven
 	if err != nil {
-		t.Fatalf("SetMatchInactive() failed: %v", err)
+		t.Fatalf("setMatchInactive() failed: %v", err)
 	}
 
 	// Make a perfect 1 lot match, same parties.
@@ -934,9 +2012,9 @@ func TestAllActiveUserMatches(t *testing.T) {
 	epochID2 := order.EpochID{132412342, 1000}
 	// maker buy (quote swap asset), taker sell (base swap asset)
 	match2 := newMatch(limitBuyStanding2, limitSellImmediate2, limitSellImmediate2.Quantity, epochID2)
-	err = archie.InsertMatch(match2)
+	err = insertMatchForTest(match2)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	// Make a perfect 1 lot BTC-LTC match.
@@ -952,9 +2030,9 @@ func TestAllActiveUserMatches(t *testing.T) {
 	// Store it.
 	epochID3 := order.EpochID{132412342, 1000}
 	match3 := newMatch(limitBuyStanding3, limitSellImmediate3, limitSellImmediate3.Quantity, epochID3)
-	err = archie.InsertMatch(match3)
+	err = insertMatchForTest(match3)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	tests := []struct {
@@ -1254,7 +2332,7 @@ func TestEpochReport(t *testing.T) {
 	}
 
 	var epochIdx, epochDur int64 = 13245678, 6000
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx,
@@ -1295,7 +2373,7 @@ func TestEpochReport(t *testing.T) {
 	}
 
 	// Trying for the same epoch should violate a primary key constraint.
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:  42,
 		MktQuote: 0,
 		Idx:      epochIdx,
@@ -1305,7 +2383,7 @@ func TestEpochReport(t *testing.T) {
 		t.Fatalf("no error for duplicate epoch")
 	}
 
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx + 1,
@@ -1343,7 +2421,7 @@ func TestEpochReport(t *testing.T) {
 		t.Fatalf("wrong second-to-last epoch last rate. expected 15, got %d", lastRate)
 	}
 
-	archie.InsertEpoch(&db.EpochResults{
+	archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx + 2,
