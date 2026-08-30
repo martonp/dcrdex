@@ -1544,6 +1544,12 @@ orders:
 	return
 }
 
+// BookedUsers returns the accounts owning booked orders on this market, with
+// their booked order counts.
+func (m *Market) BookedUsers() map[account.AccountID]int {
+	return m.book.Users()
+}
+
 // AccountPending sums the orders quantities that pay to or from the specified
 // account address.
 func (m *Market) AccountPending(acctAddr string, assetID uint32) (qty, lots uint64, redeems int) {

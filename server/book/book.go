@@ -215,6 +215,17 @@ func (b *Book) UserOrders(user account.AccountID) (buys, sells []*order.LimitOrd
 	return b.buys.UserOrders(user), b.sells.UserOrders(user)
 }
 
+// Users returns the accounts owning orders in the book, with their booked
+// order counts.
+func (b *Book) Users() map[account.AccountID]int {
+	b.mtx.RLock()
+	defer b.mtx.RUnlock()
+	users := make(map[account.AccountID]int)
+	b.buys.collectUsers(users)
+	b.sells.collectUsers(users)
+	return users
+}
+
 // UnfilledUserBuys retrieves all buy orders belonging to a given user that are
 // completely unfilled.
 func (b *Book) UnfilledUserBuys(user account.AccountID) []*order.LimitOrder {
