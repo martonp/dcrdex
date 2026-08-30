@@ -59,6 +59,8 @@ Or supply the dcrdex executable with the pubkey using:
 *~/.dcrdex/* is the default **app data directory** location used by the
 DEX server, but can be customized with the `--appdata` command-line argument.
 
+To run two replicas of the same DEX, see [Two-Node Mesh](Two-Node-Mesh).
+
 ## Run your asset daemons
 
 Only the **full node** software listed in the [client configuration](https://github.com/decred/dcrdex/wiki/Client-Installation-and-Configuration#optional-external-software)
