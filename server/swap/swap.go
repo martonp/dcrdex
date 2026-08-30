@@ -3247,9 +3247,3 @@ func (s *Swapper) RequestMatchAcks(matchSets []*order.MatchSet) {
 func idToBytes(id [order.OrderIDSize]byte) []byte {
 	return id[:]
 }
-
-// TrackMatches is a temporary stub until swap processing is converted to mesh.
-func (s *Swapper) TrackMatches(matchSets []*order.MatchSet) {}
-
-// RequestMatchAcks is a temporary stub until swap processing is converted to mesh.
-func (s *Swapper) RequestMatchAcks(matchSets []*order.MatchSet) {}
