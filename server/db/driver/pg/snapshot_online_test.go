@@ -40,7 +40,7 @@ func mustStoreOrder(t *testing.T, ord order.Order, status order.OrderStatus) {
 	t.Helper()
 	epochDuration := int64(EpochDuration)
 	epochIndex := ord.Time() / epochDuration
-	if err := archie.StoreOrder(ord, epochIndex, epochDuration, status); err != nil {
+	if err := storeOrderForTest(archie, ord, epochIndex, epochDuration, status); err != nil {
 		t.Fatalf("StoreOrder(%v): %v", ord.ID(), err)
 	}
 }

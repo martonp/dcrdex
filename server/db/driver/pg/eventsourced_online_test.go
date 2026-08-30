@@ -30,7 +30,7 @@ func TestWipeEventSourcedState(t *testing.T) {
 		t.Fatalf("insert point: %v", err)
 	}
 	archivedOrder := newLimitOrder(true, 4_900_000, 1, order.StandingTiF, 10)
-	if err := archie.StoreOrder(archivedOrder, 12345, int64(EpochDuration), order.OrderStatusExecuted); err != nil {
+	if err := storeOrderForTest(archie, archivedOrder, 12345, int64(EpochDuration), order.OrderStatusExecuted); err != nil {
 		t.Fatalf("StoreOrder: %v", err)
 	}
 	if _, err := archie.applyEventTx(ctx, &db.EventLogMeta{Event: []byte("e1")}, "wipe_test",
@@ -115,7 +115,7 @@ func TestHasNoEventSourcedState(t *testing.T) {
 
 	// Seed a market table.
 	bookedOrder := newLimitOrder(false, 4_500_000, 1, order.StandingTiF, 0)
-	if err := archie.StoreOrder(bookedOrder, 12345, int64(EpochDuration), order.OrderStatusBooked); err != nil {
+	if err := storeOrderForTest(archie, bookedOrder, 12345, int64(EpochDuration), order.OrderStatusBooked); err != nil {
 		t.Fatalf("StoreOrder: %v", err)
 	}
 	assertEmpty(false, "with a booked order")

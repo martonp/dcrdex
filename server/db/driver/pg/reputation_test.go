@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 )
@@ -49,4 +50,49 @@ func TestSetReputationInputsListenerOnce(t *testing.T) {
 		}
 	}()
 	archiver.SetReputationInputsListener(func(...account.AccountID) {})
+}
+
+func repTestOrderID(b byte) (oid order.OrderID) {
+	oid[0] = b
+	return
+}
+
+func TestOutcomeBatchUsers(t *testing.T) {
+	if users := outcomeBatchUsers(nil); len(users) != 0 {
+		t.Fatalf("nil batch users = %v, want none", users)
+	}
+	if users := outcomeBatchUsers(new(reputationOutcomeBatch)); len(users) != 0 {
+		t.Fatalf("empty batch users = %v, want none", users)
+	}
+
+	userA, userB := randomAccountID(), randomAccountID()
+	// userA in every class, userB once — each reported once.
+	batch := &reputationOutcomeBatch{
+		preimages: []*reputationPreimageOutcome{
+			{user: userA, oid: repTestOrderID(1), miss: true},
+			{user: userA, oid: repTestOrderID(2)},
+		},
+		matches: []*reputationMatchOutcome{
+			{user: userA, mid: db.MarketMatchID{}, outcome: db.OutcomeSwapSuccess},
+			{user: userB, mid: db.MarketMatchID{}, outcome: db.OutcomeNoSwapAsTaker},
+		},
+		orders: []*reputationOrderOutcome{
+			{user: userA, oid: repTestOrderID(3), penalizedCancel: true},
+		},
+	}
+	users := outcomeBatchUsers(batch)
+	if len(users) != 2 {
+		t.Fatalf("batch users = %v, want exactly {%v, %v}", users, userA, userB)
+	}
+	seen := map[account.AccountID]bool{userA: false, userB: false}
+	for _, user := range users {
+		counted, want := seen[user]
+		if !want {
+			t.Fatalf("unexpected batch user %v", user)
+		}
+		if counted {
+			t.Fatalf("duplicate batch user %v", user)
+		}
+		seen[user] = true
+	}
 }

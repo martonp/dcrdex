@@ -1819,6 +1819,17 @@ func coinIDString(assetID uint32, coinID []byte) string {
 	return s
 }
 
+// ReputationOutcomePolicy returns the reputation policy used when storage
+// derives outcome updates from event facts.
+func (auth *AuthManager) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
+	return &db.ReputationOutcomePolicy{
+		PreimageLimit:       scoringOrderLimit,
+		MatchLimit:          ScoringMatchLimit,
+		OrderLimit:          cancelThreshWindow,
+		FreeCancelThreshold: freeCancelThreshold,
+	}
+}
+
 // VerifyUserSig validates the signature/message pair with the user's public
 // key, using the live session when the user is connected and falling back to
 // stored account data otherwise.

@@ -4,6 +4,7 @@ package pg
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"testing"
@@ -223,5 +224,191 @@ func requireMatchForgiven(t *testing.T, ctx context.Context, mid db.MarketMatchI
 	}
 	if forgiven != want {
 		t.Fatalf("match forgiven = %v, want %v", forgiven, want)
+	}
+}
+
+func TestApplyRepEventTxListener(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	ctx := context.Background()
+	calls := captureRepListener(t)
+	userA, userB := randomAccountID(), randomAccountID()
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 5, MatchLimit: 5, OrderLimit: 5}
+
+	// Rolled-back apply: no notify even if the batch was staged.
+	applyErr := errors.New("apply failed")
+	_, err := archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-fail")},
+		"test_reputation", []byte("rep-listener-fail-tx"), policy,
+		func(tx *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.orders = append(batch.orders, &reputationOrderOutcome{user: userA, oid: randomReputationOrderID()})
+			return applyErr
+		})
+	if !errors.Is(err, applyErr) {
+		t.Fatalf("applyRepEventTx error = %v, want %v", err, applyErr)
+	}
+	requireRepListenerCall(t, *calls, 0)
+
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-commit")},
+		"test_reputation", []byte("rep-listener-commit-tx"), policy,
+		func(tx *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.preimages = append(batch.preimages, &reputationPreimageOutcome{user: userA, oid: randomReputationOrderID(), miss: true})
+			batch.orders = append(batch.orders, &reputationOrderOutcome{user: userA, oid: randomReputationOrderID()})
+			batch.matches = append(batch.matches, &reputationMatchOutcome{
+				user: userB, mid: db.MarketMatchID{MatchID: randomReputationMatchID()}, outcome: db.OutcomeNoSwapAsTaker,
+			})
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("applyRepEventTx error: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 1, userA, userB)
+
+	pimgs, matches, ords, err := archie.GetUserReputationData(ctx, userA, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData error: %v", err)
+	}
+	if len(pimgs) != 1 || len(ords) != 1 || len(matches) != 0 {
+		t.Fatalf("userA outcomes pimgs=%d ords=%d matches=%d, want 1/1/0", len(pimgs), len(ords), len(matches))
+	}
+
+	// Empty batch: committed, no notify.
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-empty")},
+		"test_reputation", []byte("rep-listener-empty-tx"), policy,
+		func(tx *sql.Tx, batch *reputationOutcomeBatch) error { return nil })
+	if err != nil {
+		t.Fatalf("applyRepEventTx empty error: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 1, userA, userB)
+}
+
+func TestValidateReputationOutcomeUpdates(t *testing.T) {
+	var user account.AccountID
+	copy(user[:], encode.RandomBytes(len(user)))
+	oid := randomReputationOrderID()
+	mid := randomReputationMatchID()
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, MatchLimit: 1, OrderLimit: 1}
+
+	tests := []struct {
+		name    string
+		policy  *db.ReputationOutcomePolicy
+		updates *reputationOutcomeBatch
+		wantErr bool
+	}{
+		{
+			name:    "nil updates",
+			updates: nil,
+			wantErr: true,
+		},
+		{
+			name:    "empty updates are no-op",
+			updates: &reputationOutcomeBatch{},
+		},
+		{
+			name:   "nil preimage update",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				preimages: []*reputationPreimageOutcome{nil},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero preimage user",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				preimages: []*reputationPreimageOutcome{{oid: oid}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero preimage order id",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				preimages: []*reputationPreimageOutcome{{user: user}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "nil match update",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				matches: []*reputationMatchOutcome{nil},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero match user",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				matches: []*reputationMatchOutcome{{mid: db.MarketMatchID{MatchID: mid}, outcome: db.OutcomeSwapSuccess}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero match id",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				matches: []*reputationMatchOutcome{{user: user, outcome: db.OutcomeSwapSuccess}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "invalid match outcome",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				matches: []*reputationMatchOutcome{{user: user, mid: db.MarketMatchID{MatchID: mid}, outcome: db.OutcomeOrderCanceled}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "nil order update",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				orders: []*reputationOrderOutcome{nil},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero order user",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				orders: []*reputationOrderOutcome{{oid: oid}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "zero order id",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				orders: []*reputationOrderOutcome{{user: user}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "missing limit for affected class",
+			policy: &db.ReputationOutcomePolicy{MatchLimit: 1, OrderLimit: 1},
+			updates: &reputationOutcomeBatch{
+				preimages: []*reputationPreimageOutcome{{user: user, oid: oid}},
+			},
+			wantErr: true,
+		},
+		{
+			name:   "valid updates",
+			policy: policy,
+			updates: &reputationOutcomeBatch{
+				preimages: []*reputationPreimageOutcome{{user: user, oid: oid}},
+				matches:   []*reputationMatchOutcome{{user: user, mid: db.MarketMatchID{MatchID: mid}, outcome: db.OutcomeSwapSuccess}},
+				orders:    []*reputationOrderOutcome{{user: user, oid: oid}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateReputationOutcomeUpdates(tt.policy, tt.updates)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateReputationOutcomeUpdates error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
 	}
 }

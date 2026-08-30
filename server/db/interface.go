@@ -844,3 +844,10 @@ type BondPostedResult struct {
 	Matches   []*MatchResult
 	Orders    []*OrderOutcome
 }
+
+type ReputationOutcomePolicy struct {
+	PreimageLimit       int
+	MatchLimit          int
+	OrderLimit          int
+	FreeCancelThreshold int32
+}
