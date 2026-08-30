@@ -372,6 +372,10 @@ type dexAcctBondState struct {
 	mustPost int64 // includes toComp
 	toComp   int64
 	inBonds  uint64
+	// liveBondExpired is true when a confirmed bond expired this call, or a
+	// prior snapshot already dropped BondedTier and rotateBonds has not
+	// notified yet.
+	liveBondExpired bool
 }
 
 // bondStateOfDEX collects all the information needed to determine what
@@ -383,13 +387,14 @@ func (c *Core) bondStateOfDEX(dc *dexConnection, bondCfg *dexBondCfg) *dexAcctBo
 	state := new(dexAcctBondState)
 	weakBonds := make([]*db.Bond, 0, len(dc.acct.bonds))
 
-	filterExpiredBonds := func(bonds []*db.Bond) (liveBonds []*db.Bond) {
+	filterExpiredBonds := func(bonds []*db.Bond) (liveBonds, expired []*db.Bond) {
 		for _, bond := range bonds {
-			if int64(bond.LockTime) <= bondCfg.lockTimeThresh {
+			if int64(bond.LockTime) < bondCfg.lockTimeThresh {
 				// Often auth, reconnect, or a bondexpired notification will
 				// do this first, but we must also here for refunds when the
 				// DEX host is down or gone.
 				dc.acct.expiredBonds = append(dc.acct.expiredBonds, bond)
+				expired = append(expired, bond)
 				c.log.Infof("Newly expired bond found: %v (%s)", coinIDString(bond.AssetID, bond.CoinID), unbip(bond.AssetID))
 			} else {
 				if int64(bond.LockTime) <= bondCfg.replaceThresh {
@@ -400,15 +405,25 @@ func (c *Core) bondStateOfDEX(dc *dexConnection, bondCfg *dexBondCfg) *dexAcctBo
 				liveBonds = append(liveBonds, bond)
 			}
 		}
-		return liveBonds
+		return
 	}
 
 	state.Rep, state.TargetTier, state.EffectiveTier = dc.acct.rep, dc.acct.targetTier, dc.acct.rep.EffectiveTier()
 	state.BondAssetID, state.MaxBondedAmt, state.PenaltyComps = dc.acct.bondAsset, dc.acct.maxBondedAmt, dc.acct.penaltyComps
 	state.inBonds, _ = dc.bondTotalInternal(state.BondAssetID)
 	// Screen the unexpired bonds slices.
-	dc.acct.bonds = filterExpiredBonds(dc.acct.bonds)
-	dc.acct.pendingBonds = filterExpiredBonds(dc.acct.pendingBonds) // possibly expired before confirmed
+	var newlyExpiredLive []*db.Bond
+	dc.acct.bonds, newlyExpiredLive = filterExpiredBonds(dc.acct.bonds)
+	dc.acct.pendingBonds, _ = filterExpiredBonds(dc.acct.pendingBonds) // possibly expired before confirmed
+	if expiredLive := sumBondStrengths(newlyExpiredLive, bondCfg.bondAssets); expiredLive > 0 {
+		dc.acct.rep.BondedTier -= expiredLive
+		if dc.acct.rep.BondedTier < 0 {
+			dc.acct.rep.BondedTier = 0
+		}
+		dc.acct.bondExpiryNote = true
+		state.Rep, state.EffectiveTier = dc.acct.rep, dc.acct.rep.EffectiveTier()
+	}
+	state.liveBondExpired = dc.acct.bondExpiryNote
 	state.PendingStrength = sumBondStrengths(dc.acct.pendingBonds, bondCfg.bondAssets)
 	state.WeakStrength = sumBondStrengths(weakBonds, bondCfg.bondAssets)
 	state.LiveStrength = sumBondStrengths(dc.acct.bonds, bondCfg.bondAssets) // for max bonded check
@@ -723,6 +738,17 @@ func (c *Core) rotateBonds(ctx context.Context) {
 			continue
 		}
 		acctBondState := c.bondStateOfDEX(dc, bondCfg)
+		if acctBondState.liveBondExpired {
+			dc.acct.authMtx.Lock()
+			dc.acct.bondExpiryNote = false
+			dc.acct.authMtx.Unlock()
+			c.notify(newReputationNote(dc.acct.host, acctBondState.Rep))
+			if int64(acctBondState.TargetTier) > acctBondState.EffectiveTier {
+				subject, details := c.formatDetails(TopicBondExpired, acctBondState.EffectiveTier, acctBondState.TargetTier)
+				c.notify(newBondPostNoteWithTier(TopicBondExpired, subject, details, db.WarningLevel,
+					dc.acct.host, acctBondState.Rep.BondedTier, &acctBondState.ExchangeAuth))
+			}
+		}
 
 		refundedAssets, expiredStrength, err := c.refundExpiredBonds(ctx, dc.acct, bondCfg, acctBondState, now)
 		if err != nil {
@@ -855,6 +881,11 @@ func (c *Core) postAndConfirmBond(dc *dexConnection, bond *asset.Bond) {
 	// the bond (in DB and dc.acct.{bond,pendingBonds}).
 	pbr, err := c.postBond(dc, bond) // can be long while server searches
 	if err != nil {
+		var msgErr *msgjson.Error
+		if errors.As(err, &msgErr) && msgErr.Code == msgjson.BondAlreadyConfirmingError {
+			c.log.Debugf("postbond for %s already confirming server-side", coinIDStr)
+			return
+		}
 		subject, details := c.formatDetails(TopicBondPostError, err, err)
 		c.notify(newBondPostNote(TopicBondPostError, subject, details, db.ErrorLevel, dc.acct.host))
 		return
@@ -993,6 +1024,10 @@ func (c *Core) RedeemPrepaidBond(appPW []byte, code []byte, host string, certI a
 				dc.connMaster.Disconnect()
 			}
 		}()
+
+		if err := c.checkDupeDEXPubKey(dc, host); err != nil {
+			return 0, err
+		}
 	}
 
 	if !acctExists { // new dex connection or pre-existing view-only connection
@@ -1468,6 +1503,10 @@ func (c *Core) PostBond(form *PostBondForm) (*PostBondResult, error) {
 				dc.connMaster.Disconnect()
 			}
 		}()
+
+		if err := c.checkDupeDEXPubKey(dc, host); err != nil {
+			return nil, err
+		}
 	}
 
 	if !acctExists { // new dex connection or pre-existing view-only connection
@@ -1794,10 +1833,12 @@ func (c *Core) bondExpired(dc *dexConnection, assetID uint32, coinID []byte, not
 			break
 		}
 	}
+	alreadyExpired := false
 	if !found { // rotateBonds may have gotten to it first
 		for _, bond := range dc.acct.expiredBonds {
 			if bond.AssetID == assetID && bytes.Equal(bond.CoinID, coinID) {
 				found = true
+				alreadyExpired = true
 				break
 			}
 		}
@@ -1808,6 +1849,7 @@ func (c *Core) bondExpired(dc *dexConnection, assetID uint32, coinID []byte, not
 	} else {
 		dc.acct.rep.BondedTier = note.Tier + int64(dc.acct.rep.Penalties)
 	}
+	dc.acct.bondExpiryNote = false
 	targetTier := dc.acct.targetTier
 	effectiveTier := dc.acct.rep.EffectiveTier()
 	bondedTier := dc.acct.rep.BondedTier
@@ -1819,7 +1861,7 @@ func (c *Core) bondExpired(dc *dexConnection, assetID uint32, coinID []byte, not
 			bondIDStr, unbip(assetID))
 	}
 
-	if int64(targetTier) > effectiveTier {
+	if int64(targetTier) > effectiveTier && !alreadyExpired {
 		subject, details := c.formatDetails(TopicBondExpired, effectiveTier, targetTier)
 		c.notify(newBondPostNoteWithTier(TopicBondExpired, subject,
 			details, db.WarningLevel, dc.acct.host, bondedTier, c.exchangeAuth(dc)))
