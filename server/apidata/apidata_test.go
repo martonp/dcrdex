@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/candles"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/server/comms"
@@ -74,17 +75,15 @@ func TestAddMarketSource(t *testing.T) {
 	if err == nil {
 		t.Fatalf("no error for unknown asset")
 	}
-	// DB error
+	// DB error surfaces at LoadCaches, not AddMarketSource.
 	rig.db.loadEpochErr = dummyErr
-	err = rig.api.AddMarketSource(&TMarketSource{42, 0})
-	if err == nil {
+	if err := rig.api.LoadCaches(); err == nil {
 		t.Fatalf("no error for DB error")
 	}
 	rig.db.loadEpochErr = nil
 	// success again
-	err = rig.api.AddMarketSource(&TMarketSource{42, 0})
-	if err != nil {
-		t.Fatalf("AddMarketSource error after: %v", err)
+	if err := rig.api.LoadCaches(); err != nil {
+		t.Fatalf("LoadCaches error after: %v", err)
 	}
 }
 
@@ -94,6 +93,9 @@ func TestReportEpoch(t *testing.T) {
 	err := rig.api.AddMarketSource(mktSrc)
 	if err != nil {
 		t.Fatalf("AddMarketSource error: %v", err)
+	}
+	if err := rig.api.LoadCaches(); err != nil {
+		t.Fatalf("LoadCaches error: %v", err)
 	}
 	epoch := uint64(time.Now().UnixMilli()) / mktSrc.EpochDuration()
 	epochsPerDay := uint64(time.Hour*24/time.Millisecond) / mktSrc.EpochDuration()
@@ -193,5 +195,37 @@ func TestOrderBook(t *testing.T) {
 	}
 	if reBook != book {
 		t.Fatalf("where did this book come from?")
+	}
+}
+
+// TestLoadCaches asserts the zero-reads-before-load contract: AddMarketSource
+// touches no event-sourced tables, and LoadCaches performs the deferred
+// reads.
+func TestLoadCaches(t *testing.T) {
+	rig := newTestRig()
+	rig.db.loadEpochErr = fmt.Errorf("read before loaders")
+
+	mkt := &TMarketSource{base: 42, quote: 0}
+	if err := rig.api.AddMarketSource(mkt); err != nil {
+		t.Fatalf("deferred AddMarketSource read the DB: %v", err)
+	}
+
+	if err := rig.api.LoadCaches(); err == nil {
+		t.Fatal("LoadCaches did not perform the deferred reads")
+	}
+
+	rig.db.loadEpochErr = nil
+	if err := rig.api.LoadCaches(); err != nil {
+		t.Fatalf("LoadCaches: %v", err)
+	}
+	mktName, err := dex.MarketName(42, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.api.cacheMtx.RLock()
+	_, found := rig.api.marketCaches[mktName]
+	rig.api.cacheMtx.RUnlock()
+	if !found {
+		t.Fatal("caches not primed after LoadCaches")
 	}
 }
