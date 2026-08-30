@@ -1203,7 +1203,6 @@ func (c *Core) UpdateBondOptions(form *BondOptionsForm) error {
 	tierChanged = targetTier != targetTier0
 	if tierChanged {
 		dc.acct.targetTier = targetTier
-		dbAcct.TargetTier = targetTier
 	}
 
 	var penaltyComps = penaltyComps0
@@ -1211,7 +1210,6 @@ func (c *Core) UpdateBondOptions(form *BondOptionsForm) error {
 		penaltyComps = *form.PenaltyComps
 	}
 	dc.acct.penaltyComps = penaltyComps
-	dbAcct.PenaltyComps = penaltyComps
 
 	var bondAssetAmt uint64 // because to disable we must proceed even with no config
 	bondAsset := bondAssets[bondAssetID]
@@ -1307,20 +1305,26 @@ func (c *Core) UpdateBondOptions(form *BondOptionsForm) error {
 		bonder.SetBondReserves(nominalReserves + feeReserves)
 
 		dc.acct.bondAsset = bondAssetID
-		dbAcct.BondAsset = bondAssetID
 	}
 
 	if assetChanged || tierChanged || form.MaxBondedAmt != nil || maxBonded < dc.acct.maxBondedAmt {
 		dc.acct.maxBondedAmt = maxBonded
-		dbAcct.MaxBondedAmt = maxBonded
 	}
 
 	c.triggerBondRotation()
 
 	c.log.Debugf("Bond options for %v: target tier %d, bond asset %d, maxBonded %v",
-		dbAcct.Host, dc.acct.targetTier, dc.acct.bondAsset, dbAcct.MaxBondedAmt)
+		dbAcct.Host, dc.acct.targetTier, dc.acct.bondAsset, dc.acct.maxBondedAmt)
 
-	if err = c.db.UpdateAccountInfo(dbAcct); err == nil {
+	// Only bond fields — leave mesh endpoints and other writers alone.
+	err = c.db.UpdateAccount(dbAcct.Host, func(ai *db.AccountInfo) bool {
+		ai.TargetTier = dc.acct.targetTier
+		ai.PenaltyComps = dc.acct.penaltyComps
+		ai.BondAsset = dc.acct.bondAsset
+		ai.MaxBondedAmt = dc.acct.maxBondedAmt
+		return true
+	})
+	if err == nil {
 		success = true
 	} // else we might have already done ReserveBondFunds...
 	return err
