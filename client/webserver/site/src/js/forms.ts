@@ -847,7 +847,7 @@ export class ConfirmRegistrationForm {
     const res = await postJSON(url, form)
     loaded()
     if (!app().checkResponse(res)) {
-      page.regErr.textContent = res.msg
+      page.regErr.textContent = friendlyDupeDEXError(res.msg) ?? res.msg
       Doc.show(page.regErr)
       return
     }
@@ -1682,7 +1682,7 @@ export class DEXAddressForm {
       if (String(res.msg).includes('certificate required')) {
         Doc.show(page.needCert)
       } else {
-        page.err.textContent = res.msg
+        page.err.textContent = friendlyDupeDEXError(res.msg) ?? res.msg
         Doc.show(page.err)
       }
       return
@@ -1732,7 +1732,7 @@ export class DiscoverAccountForm {
     const res = await postJSON('/api/discoveracct', req)
     loaded()
     if (!app().checkResponse(res)) {
-      page.err.textContent = res.msg
+      page.err.textContent = friendlyDupeDEXError(res.msg) ?? res.msg
       Doc.show(page.err)
       return
     }
@@ -2260,6 +2260,22 @@ export async function slideSwap (form1: HTMLElement, form2: HTMLElement) {
     form2.style.right = `${-shift + progress * shift}px`
   }, 'easeOutHard')
   form2.style.right = '0'
+}
+
+/*
+ * friendlyDupeDEXError returns a friendlier message when the error from
+ * adding or registering a DEX indicates that the address is another endpoint
+ * of a server that is already configured on this client, or null for any
+ * other error. Callers should fall back to the raw error message on null.
+ */
+export function friendlyDupeDEXError (msg: any): string | null {
+  const s = String(msg ?? '')
+  if (!s.includes('is the same dex as')) return null
+  const match = /is the same dex as ([^\s()]+)/.exec(s)
+  if (!match) return null
+  const host = match[1].replace(/[.,;]+$/, '')
+  if (!host) return null
+  return intl.prep(intl.ID_DUPLICATE_SERVER_ENDPOINT_MSG, { host })
 }
 
 export function showSuccess (page: Record<string, PageElement>, msg: string) {
