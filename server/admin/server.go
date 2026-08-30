@@ -27,6 +27,7 @@ import (
 	"decred.org/dcrdex/server/db"
 	dexsrv "decred.org/dcrdex/server/dex"
 	"decred.org/dcrdex/server/market"
+	"decred.org/dcrdex/server/mesh"
 	"github.com/decred/slog"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -78,6 +79,7 @@ type SvrCore interface {
 	EnableDataAPI(yes bool)
 	CreatePrepaidBonds(n int, strength uint32, durSecs int64) ([][]byte, error)
 	ForgiveUser(user account.AccountID) error
+	MeshStatus() mesh.Status
 }
 
 // Server is a multi-client https server.
@@ -150,6 +152,7 @@ func NewServer(cfg *SrvConfig) (*Server, error) {
 		r.Use(middleware.AllowContentType("text/plain"))
 		r.Get("/ping", apiPing)
 		r.Get("/config", s.apiConfig)
+		r.Get("/mesh", s.apiMesh)
 		r.Get("/enabledataapi/{"+yesKey+"}", s.apiEnableDataAPI)
 		r.Route("/account/{"+accountIDKey+"}", func(rm chi.Router) {
 			rm.Get("/", s.apiAccountInfo)
