@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/lib/pq"
 )
 
@@ -24,25 +26,6 @@ func (a *Archiver) matchTableName(match *order.Match) (string, error) {
 		return "", err
 	}
 	return fullMatchesTableName(a.dbName, marketSchema), nil
-}
-
-// ForgiveMatchFail marks the specified match as forgiven. Since this is an
-// administrative function, the burden is on the operator to ensure the match
-// can actually be forgiven (inactive, not already forgiven, and not in
-// MatchComplete status).
-func (a *Archiver) ForgiveMatchFail(mid order.MatchID) (bool, error) {
-	for schema := range a.markets {
-		stmt := fmt.Sprintf(internal.ForgiveMatchFail, fullMatchesTableName(a.dbName, schema))
-		N, err := sqlExec(a.db, stmt, mid)
-		if err != nil { // not just no rows updated
-			return false, err
-		}
-		if N == 1 {
-			return true, nil
-		} // N > 1 cannot happen since matchid is the primary key
-		// N==0 could also mean it was not eligible to forgive, but just keep going
-	}
-	return false, nil
 }
 
 // ActiveSwaps loads the full details for all active swaps across all markets.
@@ -272,33 +255,15 @@ func atFaultMatches(ctx context.Context, dbe *sql.DB, tableName string, aid acco
 	return
 }
 
-// UserMatches retrieves all matches involving a user on the given market.
-// TODO: consider a time limited version of this to retrieve recent matches.
-func (a *Archiver) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
-	marketSchema, err := a.marketSchema(base, quote)
-	if err != nil {
-		return nil, err
-	}
-
-	matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
-
-	ctx, cancel := context.WithTimeout(a.ctx, a.queryTimeout)
-	defer cancel()
-
-	return userMatches(ctx, a.db, matchesTableName, aid, true)
-}
-
-func userMatches(ctx context.Context, dbe *sql.DB, tableName string, aid account.AccountID, includeInactive bool) ([]*db.MatchData, error) {
-	query := internal.RetrieveActiveUserMatches
-	if includeInactive {
-		query = internal.RetrieveUserMatches
-	}
-	stmt := fmt.Sprintf(query, tableName)
+// activeUserMatches retrieves all active matches involving a user on the given
+// market.
+func activeUserMatches(ctx context.Context, dbe *sql.DB, tableName string, aid account.AccountID) ([]*db.MatchData, error) {
+	stmt := fmt.Sprintf(internal.RetrieveActiveUserMatches, tableName)
 	rows, err := dbe.QueryContext(ctx, stmt, aid)
 	if err != nil {
 		return nil, err
 	}
-	return rowsToMatchData(rows, includeInactive)
+	return rowsToMatchData(rows, false)
 }
 
 func rowsToMatchData(rows *sql.Rows, includeInactive bool) ([]*db.MatchData, error) {
@@ -470,7 +435,7 @@ func (a *Archiver) AllActiveUserMatches(aid account.AccountID) ([]*db.MatchData,
 	var matches []*db.MatchData
 	for schema := range a.markets {
 		matchesTableName := fullMatchesTableName(a.dbName, schema)
-		mdM, err := userMatches(ctx, a.db, matchesTableName, aid, false)
+		mdM, err := activeUserMatches(ctx, a.db, matchesTableName, aid)
 		if err != nil {
 			return nil, err
 		}
@@ -527,23 +492,6 @@ func upsertMatch(dbe sqlExecutor, tableName string, match *order.Match) (int64, 
 		match.FeeRateBase, match.FeeRateQuote, int8(match.Status))
 }
 
-// InsertMatch updates an existing match.
-func (a *Archiver) InsertMatch(match *order.Match) error {
-	matchesTableName, err := a.matchTableName(match)
-	if err != nil {
-		return err
-	}
-	N, err := upsertMatch(a.db, matchesTableName, match)
-	if err != nil {
-		a.fatalBackendErr(err)
-		return err
-	}
-	if N != 1 {
-		return fmt.Errorf("upsertMatch: updated %d rows, expected 1", N)
-	}
-	return nil
-}
-
 // MatchByID retrieves the match for the given MatchID.
 func (a *Archiver) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
 	marketSchema, err := a.marketSchema(base, quote)
@@ -559,7 +507,7 @@ func (a *Archiver) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchDa
 	return matchData, err
 }
 
-func matchByID(dbe *sql.DB, tableName string, mid order.MatchID) (*db.MatchData, error) {
+func matchByID(dbe sqlQueryer, tableName string, mid order.MatchID) (*db.MatchData, error) {
 	var m db.MatchData
 	var status uint8
 	var baseRate, quoteRate sql.NullInt64
@@ -637,6 +585,24 @@ func matchStatusesByID(ctx context.Context, dbe *sql.DB, aid account.AccountID, 
 // The methods for saving this data are defined below in the order in which the
 // data is expected from the parties.
 
+func (a *Archiver) SwapDataFullByID(mid order.MatchID) (*db.SwapDataFull, error) {
+	for _, mkt := range a.markets {
+		md, err := a.MatchByID(mid, mkt.Base, mkt.Quote)
+		if err != nil {
+			if db.IsErrMatchUnknown(err) {
+				continue
+			}
+			return nil, err
+		}
+		_, sd, err := a.SwapData(db.MarketMatchID{MatchID: mid, Base: mkt.Base, Quote: mkt.Quote})
+		if err != nil {
+			return nil, err
+		}
+		return &db.SwapDataFull{Base: mkt.Base, Quote: mkt.Quote, MatchData: md, SwapData: sd}, nil
+	}
+	return nil, nil
+}
+
 // SwapData retrieves the match status and all the SwapData for a match.
 func (a *Archiver) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
 	marketSchema, err := a.marketSchema(mid.Base, mid.Quote)
@@ -676,7 +642,7 @@ func (a *Archiver) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapDa
 // updateMatchStmt executes a SQL statement with the provided arguments,
 // choosing the market's matches table from the MarketMatchID. Exactly 1 table
 // row must be updated, otherwise an error is returned.
-func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...any) error {
+func (a *Archiver) updateMatchStmtWithExecutor(dbe sqlExecutor, mid db.MarketMatchID, stmt string, args ...any) error {
 	marketSchema, err := a.marketSchema(mid.Base, mid.Quote)
 	if err != nil {
 		return err
@@ -684,7 +650,7 @@ func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...an
 
 	matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
 	stmt = fmt.Sprintf(stmt, matchesTableName)
-	N, err := sqlExec(a.db, stmt, args...)
+	N, err := sqlExec(dbe, stmt, args...)
 	if err != nil { // not just no rows updated
 		a.fatalBackendErr(err)
 		return err
@@ -697,99 +663,392 @@ func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...an
 
 // Match acknowledgement message signatures.
 
-// SaveMatchAckSigA records the match data acknowledgement signature from swap
-// party A (the initiator), which is the maker in the DEX.
-func (a *Archiver) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetMakerMatchAckSig,
-		mid.MatchID, sig)
+func (a *Archiver) saveMatchAck(dbe sqlExecutor, ack *db.MatchAck) error {
+	if ack == nil {
+		return fmt.Errorf("nil match ack")
+	}
+	sigStmt := internal.SetTakerMatchAckSig
+	addrStmt := internal.SetTakerSwapAddr
+	if ack.Maker {
+		sigStmt = internal.SetMakerMatchAckSig
+		addrStmt = internal.SetMakerSwapAddr
+	}
+	if err := a.updateMatchStmtWithExecutor(dbe, ack.MID, sigStmt, ack.MID.MatchID, ack.Sig); err != nil {
+		return fmt.Errorf("saving match ack signature (match id=%v, maker=%v): %w",
+			ack.MID.MatchID, ack.Maker, err)
+	}
+	if ack.Cancel {
+		return nil
+	}
+	if err := a.updateMatchStmtWithExecutor(dbe, ack.MID, addrStmt, ack.MID.MatchID, ack.Address); err != nil {
+		return fmt.Errorf("saving match ack address (match id=%v, maker=%v): %w",
+			ack.MID.MatchID, ack.Maker, err)
+	}
+	return nil
 }
 
-// SaveMatchAckSigB records the match data acknowledgement signature from swap
-// party B (the participant), which is the taker in the DEX.
-func (a *Archiver) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetTakerMatchAckSig,
-		mid.MatchID, sig)
-}
+// ApplyMatchAcksRecordedEvent records match acknowledgement signatures and swap
+// addresses in one transaction.
+func (a *Archiver) ApplyMatchAcksRecordedEvent(ctx context.Context, meta *db.EventLogMeta, update *db.MatchAcksRecordedUpdate) (result *db.EventLogEntry, err error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil match acks recorded update")
+	}
+	if len(update.Acks) == 0 {
+		return nil, fmt.Errorf("match_acks_recorded event has no acks")
+	}
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
 
-// SaveMatchAckAddrA records the per-match swap address from the maker's match
-// acknowledgement.
-func (a *Archiver) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error {
-	return a.updateMatchStmt(mid, internal.SetMakerSwapAddr,
-		mid.MatchID, addr)
-}
-
-// SaveMatchAckAddrB records the per-match swap address from the taker's match
-// acknowledgement.
-func (a *Archiver) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error {
-	return a.updateMatchStmt(mid, internal.SetTakerSwapAddr,
-		mid.MatchID, addr)
+	return a.applyEventTx(ctx, meta, meshevents.EventKindMatchAcksRecorded, txData, func(tx *sql.Tx) error {
+		for _, ack := range update.Acks {
+			if err := a.saveMatchAck(tx, ack); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // Swap contracts, and counterparty audit acknowledgement signatures.
 
-// SaveContractA records party A's swap contract script and the coinID (e.g.
-// transaction output) containing the contract on chain X. Note that this
-// contract contains the secret hash.
-func (a *Archiver) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorSwapData,
-		mid.MatchID, uint8(order.MakerSwapCast), coinID, contract, timestamp)
+func (a *Archiver) applySwapContractRecordedEvent(dbe sqlExecutor, contract *db.SwapContract) error {
+	if contract == nil {
+		return fmt.Errorf("nil swap contract")
+	}
+	stmt := internal.SetParticipantSwapData
+	status := order.TakerSwapCast
+	if contract.Maker {
+		stmt = internal.SetInitiatorSwapData
+		status = order.MakerSwapCast
+	}
+	return a.updateMatchStmtWithExecutor(dbe, contract.MID, stmt, contract.MID.MatchID,
+		uint8(status), contract.CoinID, contract.Contract, contract.Timestamp)
 }
 
-// SaveAuditAckSigB records party B's signature acknowledging their audit of A's
-// swap contract.
-func (a *Archiver) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantContractAuditSig,
-		mid.MatchID, sig)
+// ApplySwapContractRecordedEvent records a swap contract in one transaction.
+func (a *Archiver) ApplySwapContractRecordedEvent(ctx context.Context, meta *db.EventLogMeta, contract *db.SwapContract) (result *db.EventLogEntry, err error) {
+	if contract == nil {
+		return nil, fmt.Errorf("nil swap contract")
+	}
+	txData, err := contract.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindSwapContractRecorded, txData, func(tx *sql.Tx) error {
+		return a.applySwapContractRecordedEvent(tx, contract)
+	})
 }
 
-// SaveContractB records party B's swap contract script and the coinID (e.g.
-// transaction output) containing the contract on chain Y.
-func (a *Archiver) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantSwapData,
-		mid.MatchID, uint8(order.TakerSwapCast), coinID, contract, timestamp)
+func (a *Archiver) applyAuditAckRecordedEvent(dbe sqlExecutor, ack *db.AuditAck) error {
+	if ack == nil {
+		return fmt.Errorf("nil audit ack")
+	}
+	stmt := internal.SetParticipantContractAuditSig
+	if ack.Maker {
+		stmt = internal.SetInitiatorContractAuditSig
+	}
+	return a.updateMatchStmtWithExecutor(dbe, ack.MID, stmt, ack.MID.MatchID, ack.Sig)
 }
 
-// SaveAuditAckSigA records party A's signature acknowledging their audit of B's
-// swap contract.
-func (a *Archiver) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorContractAuditSig,
-		mid.MatchID, sig)
+// ApplyAuditAckRecordedEvent records a contract audit acknowledgement in one
+// transaction.
+func (a *Archiver) ApplyAuditAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, ack *db.AuditAck) (result *db.EventLogEntry, err error) {
+	if ack == nil {
+		return nil, fmt.Errorf("nil audit ack")
+	}
+	txData, err := ack.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindAuditAckRecorded, txData, func(tx *sql.Tx) error {
+		return a.applyAuditAckRecordedEvent(tx, ack)
+	})
 }
 
 // Redemption transactions, and counterparty acknowledgement signatures.
 
-// SaveRedeemA records party A's redemption coinID (e.g. transaction output),
-// which spends party B's swap contract on chain Y, and the secret revealed by
-// the signature script of the input spending the contract. Note that this
-// transaction will contain the secret, which party B extracts.
-func (a *Archiver) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorRedeemData,
-		mid.MatchID, uint8(order.MakerRedeemed), coinID, secret, timestamp)
+func (a *Archiver) recordRedeemData(dbe sqlExecutor, redemption *db.SwapRedemption) error {
+	if redemption == nil {
+		return fmt.Errorf("nil swap redemption")
+	}
+	stmt := internal.SetParticipantRedeemData
+	status := order.MatchComplete
+	args := []any{redemption.MID.MatchID, uint8(status), redemption.CoinID, redemption.Timestamp}
+	if redemption.Maker {
+		stmt = internal.SetInitiatorRedeemData
+		status = order.MakerRedeemed
+		args = []any{redemption.MID.MatchID, uint8(status), redemption.CoinID, redemption.Secret, redemption.Timestamp}
+	}
+	return a.updateMatchStmtWithExecutor(dbe, redemption.MID, stmt, args...)
 }
 
-// SaveRedeemAckSigB records party B's signature acknowledging party A's
-// redemption, which spent their swap contract on chain Y and revealed the
-// secret. Since this may be the final step in match negotiation, the match is
-// also flagged as inactive (not the same as archival or even status of
-// MatchComplete, which is set by SaveRedeemB) if the initiators's redeem ack
-// signature is already set.
-func (a *Archiver) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantRedeemAckSig,
-		mid.MatchID, sig)
+func validateSwapRedemption(redemption *db.SwapRedemption) error {
+	if redemption == nil {
+		return fmt.Errorf("nil swap redemption")
+	}
+	if redemption.MID.MatchID == (order.MatchID{}) {
+		return fmt.Errorf("empty swap redemption match ID")
+	}
+	if redemption.MID.Base == 0 && redemption.MID.Quote == 0 {
+		return fmt.Errorf("empty swap redemption market for match %v", redemption.MID.MatchID)
+	}
+	if redemption.Timestamp <= 0 {
+		return fmt.Errorf("empty swap redemption time for match %v", redemption.MID.MatchID)
+	}
+	return nil
 }
 
-// SaveRedeemB records party B's redemption coinID (e.g. transaction output),
-// which spends party A's swap contract on chain X.
-func (a *Archiver) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantRedeemData,
-		mid.MatchID, uint8(order.MatchComplete), coinID, timestamp)
+func swapRedemptionRequiredStatus(maker bool) order.MatchStatus {
+	if maker {
+		return order.TakerSwapCast
+	}
+	return order.MakerRedeemed
 }
 
-// SetMatchInactive flags the match as done/inactive. This is not necessary if
-// SaveRedeemAckSigB is run for the match since it will flag the match as done.
-func (a *Archiver) SetMatchInactive(mid db.MarketMatchID, forgive bool) error {
+func orderHasOtherUnsettledMatch(dbe sqlQueryer, matchesTable string, matchID order.MatchID, oid order.OrderID) (bool, error) {
+	stmt := fmt.Sprintf(internal.UnsettledOrderMatchExists, matchesTable, matchesTable)
+	var exists bool
+	err := dbe.QueryRow(stmt, matchID, oid, uint8(order.MakerRedeemed)).Scan(&exists)
+	return exists, err
+}
+
+func (a *Archiver) applyOrderCompletionIfSettled(
+	dbe sqlQueryExecutor,
+	matchesTable string,
+	repUpdates *reputationOutcomeBatch,
+	mid db.MarketMatchID,
+	oid order.OrderID,
+	user account.AccountID,
+	completeTimeMS int64,
+) error {
+	status, _, _, err := a.orderStatusByIDWithExecutor(dbe, oid, mid.Base, mid.Quote)
+	if err != nil {
+		return err
+	}
+	if status != orderStatusExecuted {
+		return nil
+	}
+	hasUnsettled, err := orderHasOtherUnsettledMatch(dbe, matchesTable, mid.MatchID, oid)
+	if err != nil {
+		return err
+	}
+	if hasUnsettled {
+		return nil
+	}
+	if err := a.setOrderCompleteTimeByID(dbe, oid, mid.Base, mid.Quote, completeTimeMS); err != nil {
+		return err
+	}
+	repUpdates.orders = append(repUpdates.orders, &reputationOrderOutcome{
+		user: user,
+		oid:  oid,
+	})
+	return nil
+}
+
+// ApplySwapRedemptionRecordedEvent records a swap redemption and all DB side
+// effects owned by the event in one transaction.
+func (a *Archiver) ApplySwapRedemptionRecordedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, redemption *db.SwapRedemption) (*db.EventLogEntry, error) {
+	if err := validateSwapRedemption(redemption); err != nil {
+		return nil, err
+	}
+	baseTxData, err := redemption.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyRepEventTx(ctx, meta, meshevents.EventKindSwapRedemptionRecorded, baseTxData, policy, func(tx *sql.Tx, repUpdates *reputationOutcomeBatch) error {
+		marketSchema, err := a.marketSchema(redemption.MID.Base, redemption.MID.Quote)
+		if err != nil {
+			return err
+		}
+		matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
+
+		matchData, err := matchByID(tx, matchesTableName, redemption.MID.MatchID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = db.ArchiveError{Code: db.ErrUnknownMatch}
+		}
+		if err != nil {
+			return err
+		}
+		requiredStatus := swapRedemptionRequiredStatus(redemption.Maker)
+		if matchData.Status != requiredStatus {
+			return fmt.Errorf("swap redemption recorded event requires status %v, found %v for match %v",
+				requiredStatus, matchData.Status, redemption.MID.MatchID)
+		}
+		if err := a.recordRedeemData(tx, redemption); err != nil {
+			return err
+		}
+
+		actor, counterparty := matchData.TakerAcct, matchData.MakerAcct
+		actorOrder := matchData.Taker
+		if redemption.Maker {
+			actor, counterparty = matchData.MakerAcct, matchData.TakerAcct
+			actorOrder = matchData.Maker
+		}
+		if actor != counterparty {
+			repUpdates.matches = append(repUpdates.matches, &reputationMatchOutcome{
+				user:    actor,
+				mid:     redemption.MID,
+				outcome: db.OutcomeSwapSuccess,
+			})
+		}
+		return a.applyOrderCompletionIfSettled(tx, matchesTableName, repUpdates,
+			redemption.MID, actorOrder, actor, redemption.Timestamp)
+	})
+}
+
+func (a *Archiver) applyRedemptionAckRecordedEvent(dbe sqlExecutor, ack *db.RedemptionAck) error {
+	if ack == nil {
+		return fmt.Errorf("nil redemption ack")
+	}
+	if ack.Maker {
+		return nil
+	}
+	return a.updateMatchStmtWithExecutor(dbe, ack.MID, internal.SetParticipantRedeemAckSig,
+		ack.MID.MatchID, ack.Sig)
+}
+
+// ApplyRedemptionAckRecordedEvent records a redemption acknowledgement in one
+// transaction.
+func (a *Archiver) ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, ack *db.RedemptionAck) (result *db.EventLogEntry, err error) {
+	if ack == nil {
+		return nil, fmt.Errorf("nil redemption ack")
+	}
+	txData, err := ack.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindRedemptionAckRecorded, txData, func(tx *sql.Tx) error {
+		return a.applyRedemptionAckRecordedEvent(tx, ack)
+	})
+}
+
+// setMatchInactive flags the match as done/inactive.
+func (a *Archiver) setMatchInactive(dbe sqlExecutor, mid db.MarketMatchID, forgive bool) error {
 	if forgive {
-		return a.updateMatchStmt(mid, internal.SetSwapDoneForgiven, mid.MatchID)
-	} // else leave the forgiven column NULL
-	return a.updateMatchStmt(mid, internal.SetSwapDone, mid.MatchID)
+		return a.updateMatchStmtWithExecutor(dbe, mid, internal.SetSwapDoneForgiven, mid.MatchID)
+	}
+	return a.updateMatchStmtWithExecutor(dbe, mid, internal.SetSwapDone, mid.MatchID)
+}
+
+func validateMatchFailedUpdate(update *db.MatchFailedUpdate) error {
+	if update == nil {
+		return fmt.Errorf("nil match failed update")
+	}
+	if update.MID.MatchID == (order.MatchID{}) {
+		return fmt.Errorf("empty match_failed match ID")
+	}
+	if update.MID.Base == 0 && update.MID.Quote == 0 {
+		return fmt.Errorf("empty match_failed market for match %v", update.MID.MatchID)
+	}
+	if update.FailTimeMS <= 0 {
+		return fmt.Errorf("empty match_failed time for match %v", update.MID.MatchID)
+	}
+	if _, ok := db.MatchFailureReasonDetails(update.Reason); !ok {
+		return fmt.Errorf("invalid match failure reason %d", update.Reason)
+	}
+	return nil
+}
+
+func (a *Archiver) applyMatchFailedOrderSide(
+	dbe sqlQueryExecutor,
+	matchesTable string,
+	repUpdates *reputationOutcomeBatch,
+	mid db.MarketMatchID,
+	oid order.OrderID,
+	user account.AccountID,
+	faulted bool,
+	failTimeMS int64,
+) error {
+	status, ordType, _, err := a.orderStatusByIDWithExecutor(dbe, oid, mid.Base, mid.Quote)
+	if err != nil {
+		return err
+	}
+
+	if faulted {
+		if status != orderStatusBooked {
+			return nil
+		}
+		if ordType != order.LimitOrderType {
+			return fmt.Errorf("cannot revoke match_failed order %v in status %v with type %v", oid, status, ordType)
+		}
+		cancelID, err := a.revokeOrderByID(dbe, oid, user, mid.Base, mid.Quote, false, time.UnixMilli(failTimeMS).UTC())
+		if err != nil {
+			return err
+		}
+		repUpdates.orders = append(repUpdates.orders, &reputationOrderOutcome{
+			user: user,
+			oid:  cancelID,
+		})
+		return nil
+	}
+
+	if status != orderStatusExecuted {
+		return nil
+	}
+	return a.applyOrderCompletionIfSettled(dbe, matchesTable, repUpdates, mid, oid, user, failTimeMS)
+}
+
+// ApplyMatchFailedEvent applies the match_failed event's persistent state
+// transition in one transaction.
+func (a *Archiver) ApplyMatchFailedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, update *db.MatchFailedUpdate) (*db.EventLogEntry, error) {
+	if err := validateMatchFailedUpdate(update); err != nil {
+		return nil, err
+	}
+	baseTxData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	logEntry, err := a.applyRepEventTx(ctx, meta, meshevents.EventKindMatchFailed, baseTxData, policy, func(tx *sql.Tx, repUpdates *reputationOutcomeBatch) error {
+		marketSchema, err := a.marketSchema(update.MID.Base, update.MID.Quote)
+		if err != nil {
+			return err
+		}
+		matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
+		matchData, err := matchByID(tx, matchesTableName, update.MID.MatchID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				err = db.ArchiveError{Code: db.ErrUnknownMatch}
+			}
+			return err
+		}
+		details, _ := db.MatchFailureReasonDetails(update.Reason)
+		if matchData.Status != details.Status {
+			return fmt.Errorf("match_failed reason %d requires status %v, found %v for match %v",
+				update.Reason, details.Status, matchData.Status, update.MID.MatchID)
+		}
+
+		if err := a.setMatchInactive(tx, update.MID, !details.UserFault()); err != nil {
+			return err
+		}
+
+		if details.UserFault() && matchData.MakerAcct != matchData.TakerAcct {
+			user := matchData.TakerAcct
+			if details.MakerFault() {
+				user = matchData.MakerAcct
+			}
+			repUpdates.matches = append(repUpdates.matches, &reputationMatchOutcome{
+				user:    user,
+				mid:     update.MID,
+				outcome: details.Outcome,
+			})
+		}
+
+		if details.ProcessMaker() {
+			if err := a.applyMatchFailedOrderSide(tx, matchesTableName, repUpdates, update.MID,
+				matchData.Maker, matchData.MakerAcct, details.MakerFault(), update.FailTimeMS); err != nil {
+				return err
+			}
+		}
+
+		return a.applyMatchFailedOrderSide(tx, matchesTableName, repUpdates, update.MID,
+			matchData.Taker, matchData.TakerAcct, details.TakerFault(), update.FailTimeMS)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return logEntry, nil
 }

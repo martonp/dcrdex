@@ -250,12 +250,12 @@ func TestSnapshotMatchOrders(t *testing.T) {
 				Dur: EpochDuration,
 			}
 			match := newMatch(maker, taker, taker.Quantity, epoch)
-			if err := archie.InsertMatch(match); err != nil {
+			if err := insertMatchForTest(match); err != nil {
 				t.Fatalf("InsertMatch: %v", err)
 			}
 			if !tt.active {
-				if err := archie.SetMatchInactive(db.MatchID(match), false); err != nil {
-					t.Fatalf("SetMatchInactive: %v", err)
+				if err := archie.setMatchInactive(archie.db, db.MatchID(match), false); err != nil {
+					t.Fatalf("setMatchInactive: %v", err)
 				}
 			}
 
