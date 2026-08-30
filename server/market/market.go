@@ -1,16 +1,19 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+// Package market runs the DEX markets. Client orders enter as mesh commands
+// (AcceptOrderCommand on the master). Durable changes are events every node
+// applies. Run is the master's epoch loop; it does not take client orders.
 package market
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +31,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 // Error is just a basic error.
@@ -56,9 +61,12 @@ const (
 	ErrInternalServer         = Error("internal server error")
 )
 
+var errEpochOrderStorage = errors.New("epoch order storage failure")
+
 // Swapper coordinates atomic swaps for one or more matchsets.
 type Swapper interface {
-	Negotiate(matchSets []*order.MatchSet)
+	TrackMatches(matchSets []*order.MatchSet) error
+	RequestMatchAcks(matchSets []*order.MatchSet)
 	CheckUnspent(ctx context.Context, asset uint32, coinID []byte) error
 	ChainsSynced(base, quote uint32) (bool, error)
 }
@@ -83,6 +91,9 @@ type Balancer interface {
 	// trade the outgoing number of lots (totaling qty) and incoming number of
 	// redeems.
 	CheckBalance(acctAddr string, assetID, redeemAssetID uint32, qty, lots uint64, redeems int) bool
+	// CheckReserved reports whether the account can still fund its existing
+	// DEX commitments for this asset. No new order is being placed.
+	CheckReserved(acctAddr string, assetID uint32) bool
 }
 
 // Config is the Market configuration.
@@ -97,61 +108,73 @@ type Config struct {
 	CoinLockerQuote  coinlock.CoinLocker
 	DataCollector    DataCollector
 	Balancer         Balancer
-	CheckParcelLimit func(user account.AccountID, calcParcels MarketParcelCalculator) bool
+	CheckParcelLimit func(user account.AccountID, asOf time.Time, calcParcels MarketParcelCalculator) (bool, error)
 	MinimumRate      uint64
 }
 
-// Market is the market manager. It should not be overly involved with details
-// of accounts and authentication. Via the account package it should request
-// account status with new orders, verification of order signatures. The Market
-// should also perform various account package callbacks such as order status
-// updates so that the account package code can keep various data up-to-date,
-// including order status, history, cancellation statistics, etc.
-//
-// The Market performs the following:
-//  1. Receive and validate new order data (amounts vs. lot size, check fees,
-//     utxos, sufficient market buy buffer, etc.).
-//  2. Put incoming orders into the current epoch queue.
-//  3. Maintain an order book, which must also implement matcher.Booker.
-//  4. Initiate order matching with matcher.Match(book, currentQueue)
-//  5. During and/or after matching:
-//     * update the book (remove orders, add new standing orders, etc.)
-//     * retire/archive the epoch queue
-//     * publish the matches (and order book changes?)
-//     * initiate swaps for each match (possibly groups of related matches)
-//  6. Cycle the epochs.
-//  7. Record all events with the archivist.
+// marketRun is MarketRunParams plus epoch duration. Duration is not in
+// MarketRunParams: a resume may replace the params but must keep the
+// duration the resume epoch was scheduled in.
+type marketRun struct {
+	meshevents.MarketRunParams
+	epochDur int64
+}
+
+// Market is one trading pair. Client orders enter as mesh commands
+// (AcceptOrderCommand on the master). Durable book, epoch, and lifecycle
+// changes are events every node applies. Run is the master's epoch loop.
 type Market struct {
-	marketInfo *dex.MarketInfo
+	name            string
+	base, quote     uint32
+	marketBuyBuffer float64
+	// configuredParams is this process's markets.json / flags. Use it when
+	// composing a start or resume, or to see if the operator changed
+	// duration. Do not use it to match or serve clients.
+	configuredParams marketRun
+	// liveParams is what the market is actually running with. Until the
+	// first start it is a copy of configuredParams.
+	liveParams atomic.Pointer[marketRun]
 
 	tasks sync.WaitGroup // for lazy asynchronous tasks e.g. revoke ntfns
 
-	// Communications.
-	orderRouter chan *orderUpdateSignal // incoming orders, via SubmitOrderAsync
+	unbookMtx      sync.RWMutex // guards unbookNotifier
+	unbookNotifier func(*order.LimitOrder)
 
-	orderFeedMtx sync.RWMutex         // guards orderFeeds and running
-	orderFeeds   []chan *updateSignal // all outgoing notification consumers
-
-	runMtx  sync.RWMutex
-	running chan struct{} // closed when running (accepting new orders)
-	up      uint32        // Run is called, either waiting for first epoch or running
+	running atomic.Bool // true when accepting new orders
+	up      uint32      // Run is called, either waiting for first epoch or running
 
 	bookMtx      sync.Mutex // guards book and bookEpochIdx
 	book         *book.Book
+	acctTracking book.AccountTracking
 	bookEpochIdx int64 // next epoch from the point of view of the book
 	settling     map[order.OrderID]uint64
 
-	epochMtx         sync.RWMutex
-	startEpochIdx    int64
-	activeEpochIdx   int64
-	suspendEpochIdx  int64
-	persistBook      bool
-	epochCommitments map[order.Commitment]order.OrderID
-	epochOrders      map[order.OrderID]order.Order
+	epochMtx                 sync.RWMutex
+	startEpochIdx            int64
+	activeEpochIdx           int64
+	processedEpochIdx        int64
+	suspendEpochIdx          int64
+	pendingLifecycleAction   db.MarketPendingAction
+	pendingLifecycleEpochIdx int64
+	pendingLifecycleEpochDur int64
+	persistBook              bool
+	persistBookSet           bool
+	lifecycleState           db.MarketState
+	lifecycleWake            chan struct{}
+	closureWake              chan struct{}
+	epochCommitments         map[order.Commitment]order.OrderID
+	epochOrders              map[order.OrderID]order.Order
+	currentEpoch             *EpochQueue
+	nextEpoch                *EpochQueue
 
-	matcher *matcher.Matcher
-	swapper Swapper
-	auth    AuthManager
+	// resumeSubmitMtx serializes resume submit (revoke snapshot + apply)
+	// against suspended-cancel admission. It does not guard Market fields.
+	resumeSubmitMtx sync.RWMutex
+
+	matcher  *matcher.Matcher
+	swapper  Swapper
+	auth     AuthManager
+	balancer Balancer
 
 	feeScalesMtx sync.RWMutex
 	feeScales    struct {
@@ -172,12 +195,12 @@ type Market struct {
 	dataCollector DataCollector
 	lastRate      uint64
 
-	checkParcelLimit func(user account.AccountID, calcParcels MarketParcelCalculator) bool
-
-	minimumRate uint64
+	checkParcelLimit func(user account.AccountID, asOf time.Time, calcParcels MarketParcelCalculator) (bool, error)
 
 	mmSnapshotMtx  sync.RWMutex
 	mmSnapshotSubs map[account.AccountID]struct{}
+
+	mesh MeshService
 }
 
 // Storage is the DB interface required by Market.
@@ -186,10 +209,8 @@ type Storage interface {
 	LastErr() error
 	Fatal() <-chan struct{}
 	Close() error
-	InsertEpoch(ed *db.EpochResults) error
 	LastEpochRate(base, quote uint32) (uint64, error)
 	MarketMatches(base, quote uint32) ([]*db.MatchDataWithCoins, error)
-	InsertMatch(match *order.Match) error
 }
 
 // NewMarket creates a new Market for the provided base and quote assets, with
@@ -201,281 +222,101 @@ func NewMarket(cfg *Config) (*Market, error) {
 		return nil, err
 	}
 
-	// Load existing book orders from the DB.
-	base, quote := mktInfo.Base, mktInfo.Quote
-
-	bookOrders, err := storage.BookOrders(base, quote)
-	if err != nil {
-		return nil, err
-	}
-	log.Infof("Loaded %d stored book orders.", len(bookOrders))
-
 	baseIsAcctBased := cfg.CoinLockerBase == nil
 	quoteIsAcctBased := cfg.CoinLockerQuote == nil
-
-	// Put the book orders in a map so orders that no longer have funding coins
-	// can be removed easily.
-	bookOrdersByID := make(map[order.OrderID]*order.LimitOrder, len(bookOrders))
-	for _, lo := range bookOrders {
-		// Limit order amount requirements are simple unlike market buys.
-		if lo.Quantity%mktInfo.LotSize != 0 || lo.FillAmt%mktInfo.LotSize != 0 {
-			// To change market configuration, the operator should suspended the
-			// market with persist=false, but that may not have happened, or
-			// maybe a revoke failed.
-			log.Errorf("Not rebooking order %v with amount (%v/%v) incompatible with current lot size (%v)",
-				lo.ID(), lo.FillAmt, lo.Quantity, mktInfo.LotSize)
-			// Revoke the order, but do not count this against the user.
-			if _, _, err = storage.RevokeOrderUncounted(lo); err != nil {
-				log.Errorf("Failed to revoke order %v: %v", lo, err)
-				// But still not added back on the book.
-			}
-			continue
-		}
-		bookOrdersByID[lo.ID()] = lo
-	}
-
-	// "execute" any epoch orders in DB that may be left over from unclean
-	// shutdown. Whatever epoch they were in will not be seen again.
-	epochOrders, err := storage.EpochOrders(base, quote)
-	if err != nil {
-		return nil, err
-	}
-	for _, ord := range epochOrders {
-		oid := ord.ID()
-		log.Infof("Dropping old epoch order %v", oid)
-		if co, ok := ord.(*order.CancelOrder); ok {
-			if err := storage.FailCancelOrder(co); err != nil {
-				log.Errorf("Failed to set orphaned epoch cancel order %v as executed: %v", oid, err)
-			}
-			continue
-		}
-		if err := storage.ExecuteOrder(ord); err != nil {
-			log.Errorf("Failed to set orphaned epoch trade order %v as executed: %v", oid, err)
-		}
-	}
-
-	// Set up tracking. Which of these are actually used depend on whether the
-	// assets are account- or utxo-based.
-	// utxo-based
-	var baseCoins, quoteCoins map[order.OrderID][]order.CoinID
-	var missingCoinFails map[order.OrderID]struct{}
-	// account-based
-	var quoteAcctStats, baseAcctStats accountCounter
-	var failedBaseAccts, failedQuoteAccts map[string]bool
-	var failedAcctOrders map[order.OrderID]struct{}
 	var acctTracking book.AccountTracking
 
 	if baseIsAcctBased {
 		acctTracking |= book.AccountTrackingBase
-		baseAcctStats = make(accountCounter)
-		failedBaseAccts = make(map[string]bool)
-		failedAcctOrders = make(map[order.OrderID]struct{})
-	} else {
-		baseCoins = make(map[order.OrderID][]order.CoinID)
-		missingCoinFails = make(map[order.OrderID]struct{})
 	}
-
 	if quoteIsAcctBased {
 		acctTracking |= book.AccountTrackingQuote
-		quoteAcctStats = make(accountCounter)
-		failedQuoteAccts = make(map[string]bool)
-		if failedAcctOrders == nil {
-			failedAcctOrders = make(map[order.OrderID]struct{})
-		}
-	} else {
-		quoteCoins = make(map[order.OrderID][]order.CoinID)
-		if missingCoinFails == nil {
-			missingCoinFails = make(map[order.OrderID]struct{})
-		}
 	}
 
-ordersLoop:
-	for id, lo := range bookOrdersByID {
-		if lo.FillAmt > 0 {
-			// Order already matched with another trade, so it is expected that
-			// the funding coins are spent in a swap.
-			//
-			// In general, our position is that the server is not ultimately
-			// responsible for verifying that all orders have locked coins since
-			// the client will be penalized if they cannot complete the swap.
-			// The least the server can do is ensure funding coins for NEW
-			// orders are unspent and owned by the user.
-
-			// On to the next order. Do not lock coins that are spent or should
-			// be spent in a swap contract.
-			continue
-		}
-
-		// Verify all funding coins for this order.
-		assetID := quote
-		if lo.Sell {
-			assetID = base
-		}
-		for i := range lo.Coins {
-			err = swapper.CheckUnspent(context.Background(), assetID, lo.Coins[i]) // no timeout
-			if err == nil {
-				continue
-			}
-
-			if errors.Is(err, asset.CoinNotFoundError) {
-				// spent, exclude this order
-				log.Warnf("Coin %s not unspent for unfilled order %v. "+
-					"Revoking the order.", fmtCoinID(assetID, lo.Coins[i]), lo)
-			} else {
-				// other failure (coinID decode, RPC, etc.)
-				return nil, fmt.Errorf("unexpected error checking coinID %v for order %v: %w",
-					lo.Coins[i], lo, err)
-				// NOTE: This does not revoke orders from storage since this is
-				// likely to be a configuration or node issue.
-			}
-
-			delete(bookOrdersByID, id)
-			// Revoke the order, but do not count this against the user.
-			if _, _, err = storage.RevokeOrderUncounted(lo); err != nil {
-				log.Errorf("Failed to revoke order %v: %v", lo, err)
-			}
-			// No penalization here presently since the market was down, but if
-			// a suspend message with persist=true was sent, the users should
-			// have kept their coins locked. (TODO)
-			continue ordersLoop
-		}
-
-		if baseIsAcctBased {
-			var addr string
-			var qty, lots uint64
-			var redeems int
-			if lo.Sell {
-				// address is zeroth coin
-				if len(lo.Coins) != 1 {
-					log.Errorf("rejecting account-based-base-asset order %s that has no coins ¯\\_(ツ)_/¯", lo.ID())
-					continue ordersLoop
-				}
-				addr = string(lo.Coins[0])
-				qty = lo.Quantity
-				lots = qty / mktInfo.LotSize
-			} else {
-				addr = lo.Address
-				redeems = int((lo.Quantity - lo.FillAmt) / mktInfo.LotSize)
-			}
-			baseAcctStats.add(addr, qty, lots, redeems)
-		} else if lo.Sell {
-			baseCoins[id] = lo.Coins
-		}
-
-		if quoteIsAcctBased {
-			var addr string
-			var qty, lots uint64
-			var redeems int
-			if lo.Sell { // sell base => redeem acct-based quote
-				addr = lo.Address
-				redeems = int((lo.Quantity - lo.FillAmt) / mktInfo.LotSize)
-			} else { // buy base => offer acct-based quote
-				// address is zeroth coin
-				if len(lo.Coins) != 1 {
-					log.Errorf("rejecting account-based-base-asset order %s that has no coins ¯\\_(ツ)_/¯", lo.ID())
-					continue ordersLoop
-				}
-				addr = string(lo.Coins[0])
-				lots = lo.Quantity / mktInfo.LotSize
-				qty = calc.BaseToQuote(lo.Rate, lo.Quantity)
-			}
-			quoteAcctStats.add(addr, qty, lots, redeems)
-		} else if !lo.Sell {
-			quoteCoins[id] = lo.Coins
-		}
+	cfgRun := marketRun{
+		MarketRunParams: meshevents.MarketRunParams{
+			LotSize:                mktInfo.LotSize,
+			RateStep:               mktInfo.RateStep,
+			ParcelSize:             mktInfo.ParcelSize,
+			MaxUserCancelsPerEpoch: mktInfo.MaxUserCancelsPerEpoch,
+			MinimumRate:            cfg.MinimumRate,
+		},
+		epochDur: int64(mktInfo.EpochDuration),
 	}
-
-	if baseIsAcctBased {
-		log.Debugf("Checking %d base asset (%d) balances.", len(baseAcctStats), base)
-		for acctAddr, stats := range baseAcctStats {
-			if !cfg.Balancer.CheckBalance(acctAddr, mktInfo.Base, mktInfo.Quote, stats.qty, stats.lots, stats.redeems) {
-				log.Info("%s base asset account failed the startup balance check on the %s market", acctAddr, mktInfo.Name)
-				failedBaseAccts[acctAddr] = true
-			}
-		}
-	} else {
-		log.Debugf("Locking %d base asset (%d) coins.", len(baseCoins), base)
-		if log.Level() <= dex.LevelTrace {
-			for oid, coins := range baseCoins {
-				log.Tracef(" - order %v: %v", oid, coins)
-			}
-		}
-		for oid := range cfg.CoinLockerBase.LockCoins(baseCoins) {
-			missingCoinFails[oid] = struct{}{}
-		}
+	m := &Market{
+		name:             mktInfo.Name,
+		base:             mktInfo.Base,
+		quote:            mktInfo.Quote,
+		marketBuyBuffer:  mktInfo.MarketBuyBuffer,
+		configuredParams: cfgRun,
+		acctTracking:     acctTracking,
+		book:             book.New(mktInfo.LotSize, acctTracking),
+		settling:         make(map[order.OrderID]uint64),
+		matcher:          matcher.New(),
+		persistBook:      true,
+		persistBookSet:   true,
+		lifecycleWake:    make(chan struct{}, 1),
+		closureWake:      make(chan struct{}, 1),
+		epochCommitments: make(map[order.Commitment]order.OrderID),
+		epochOrders:      make(map[order.OrderID]order.Order),
+		swapper:          swapper,
+		auth:             cfg.AuthManager,
+		balancer:         cfg.Balancer,
+		storage:          storage,
+		coinLockerBase:   cfg.CoinLockerBase,
+		coinLockerQuote:  cfg.CoinLockerQuote,
+		baseFeeFetcher:   cfg.FeeFetcherBase,
+		quoteFeeFetcher:  cfg.FeeFetcherQuote,
+		dataCollector:    cfg.DataCollector,
+		checkParcelLimit: cfg.CheckParcelLimit,
+		mmSnapshotSubs:   make(map[account.AccountID]struct{}),
 	}
+	live := cfgRun
+	m.liveParams.Store(&live)
 
-	if quoteIsAcctBased {
-		log.Debugf("Checking %d quote asset (%d) balances.", len(quoteAcctStats), quote)
-		for acctAddr, stats := range quoteAcctStats { // quoteAcctStats is nil for utxo-based quote assets
-			if !cfg.Balancer.CheckBalance(acctAddr, mktInfo.Quote, mktInfo.Base, stats.qty, stats.lots, stats.redeems) {
-				log.Errorf("%s quote asset account failed the startup balance check on the %s market", acctAddr, mktInfo.Name)
-				failedQuoteAccts[acctAddr] = true
-			}
-		}
-	} else {
-		log.Debugf("Locking %d quote asset (%d) coins.", len(quoteCoins), quote)
-		if log.Level() <= dex.LevelTrace {
-			for oid, coins := range quoteCoins {
-				log.Tracef(" - order %v: %v", oid, coins)
-			}
-		}
-		for oid := range cfg.CoinLockerQuote.LockCoins(quoteCoins) {
-			missingCoinFails[oid] = struct{}{}
-		}
-	}
+	return m, nil
+}
 
-	for oid := range missingCoinFails {
-		log.Warnf("Revoking book order %v with already locked coins.", oid)
-		bad := bookOrdersByID[oid]
-		delete(bookOrdersByID, oid)
-		// Revoke the order, but do not count this against the user.
-		if _, _, err = storage.RevokeOrderUncounted(bad); err != nil {
-			log.Errorf("Failed to revoke order %v: %v", bad, err)
-			// But still not added back on the book.
-		}
-	}
+// LoadState rebuilds in-memory book, epoch queues, lifecycle, and coin locks
+// from the database.
+func (m *Market) LoadState() error {
+	storage := m.storage
+	base, quote := m.base, m.quote
 
-	Book := book.New(mktInfo.LotSize, acctTracking)
-	for _, lo := range bookOrdersByID {
-		// Catch account-based asset low-balance rejections here.
-		if baseIsAcctBased && failedBaseAccts[lo.BaseAccount()] {
-			failedAcctOrders[lo.ID()] = struct{}{}
-			log.Warnf("Skipping insert of order %s into %s book because base asset "+
-				"account failed the balance check", lo.ID(), mktInfo.Name)
-			continue
-		}
-		if quoteIsAcctBased && failedQuoteAccts[lo.QuoteAccount()] {
-			failedAcctOrders[lo.ID()] = struct{}{}
-			log.Warnf("Skipping insert of order %s into %s book because quote asset "+
-				"account failed the balance check", lo.ID(), mktInfo.Name)
-			continue
-		}
-		if ok := Book.Insert(lo); !ok {
-			// This can only happen if one of the loaded orders has an
-			// incompatible lot size for the current market config, which was
-			// already checked above.
-			log.Errorf("Failed to insert order %v into %v book.", mktInfo.Name, lo)
-		}
+	// Restore the lifecycle row first so the book is built at the pinned lot size.
+	lifecycleRow, err := storage.MarketLifecycle(m.name)
+	if err != nil {
+		return fmt.Errorf("load market lifecycle for %s: %w", m.name, err)
 	}
+	m.restoreMarketLifecycle(lifecycleRow) // nil: never started; liveParams stay at config
 
-	// Revoke the low-balance rejections in the database.
-	for oid := range failedAcctOrders {
-		// Already logged in the Book.Insert loop.
-		if _, _, err = storage.RevokeOrderUncounted(bookOrdersByID[oid]); err != nil {
-			log.Errorf("Failed to revoke order with insufficient account balance %v: %v", bookOrdersByID[oid], err)
-		}
+	// Load existing book orders from the DB.
+	bookOrders, err := storage.BookOrders(base, quote)
+	if err != nil {
+		return err
 	}
+	log.Infof("Loaded %d stored book orders.", len(bookOrders))
+
+	m.bookMtx.Lock()
+	m.book = book.New(m.LotSize(), m.acctTracking)
+	insertedBookOrders := make([]*order.LimitOrder, 0, len(bookOrders))
+	for _, lo := range bookOrders {
+		if ok := m.book.Insert(lo); !ok {
+			m.bookMtx.Unlock()
+			return fmt.Errorf("failed to insert stored booked order %v into %v book", lo.ID(), m.name)
+		}
+		insertedBookOrders = append(insertedBookOrders, lo)
+	}
+	m.bookMtx.Unlock()
 
 	// Populate the order settling amount map from the active matches in DB.
 	activeMatches, err := storage.MarketMatches(base, quote)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load active matches for market %v: %w", mktInfo.Name, err)
+		return fmt.Errorf("failed to load active matches for market %v: %w", m.name, err)
 	}
-	settling := make(map[order.OrderID]uint64)
 	for _, match := range activeMatches {
-		settling[match.Taker] += match.Quantity
-		settling[match.Maker] += match.Quantity
+		m.settling[match.Taker] += match.Quantity
+		m.settling[match.Maker] += match.Quantity
 		// Note: we actually don't want to bother with matches for orders that
 		// were canceled or had at-fault match failures, since including them
 		// give that user another shot to get a successfully "completed" order
