@@ -193,6 +193,9 @@ type Reputation struct {
 	// BondedTier is the tier indicated by the user's active bonds. BondedTier
 	// does not account for penalties.
 	BondedTier int64 `json:"bondedTier"`
+	// BondExpiryThreshold is the lock-time threshold used to calculate
+	// BondedTier. Bonds with an earlier lock time were excluded.
+	BondExpiryThreshold int64 `json:"bondExpiryThreshold,omitempty"`
 	// Penalties are the number of tiers that are currently revoked due to low
 	// user score.
 	Penalties uint16 `json:"penalties"`
