@@ -182,10 +182,13 @@ func (c *Cache) Last() *Candle {
 	return &c.Candles[c.cursor]
 }
 
-// CompletedCandlesSince returns any candles that fall into an epoch after the
-// epoch of the provided timestamp, and before the current epoch.
+// CompletedCandlesSince returns candles in bins after the provided timestamp
+// and before the newest bin in the cache.
 func (c *Cache) CompletedCandlesSince(lastStoredEndStamp uint64) (cs []*Candle) {
-	currentIdx := uint64(time.Now().UnixMilli()) / c.BinSize
+	if len(c.Candles) == 0 {
+		return nil
+	}
+	currentIdx := c.Last().EndStamp / c.BinSize
 	lastStoredIdx := lastStoredEndStamp / c.BinSize
 
 	sz := len(c.Candles)
