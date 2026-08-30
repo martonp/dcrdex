@@ -58,6 +58,13 @@ func apiPing(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, pongStr)
 }
 
+// apiMesh is the handler for the '/mesh' API request. It reports the mesh
+// service's operator status: mode, peer connection, stream progress, and
+// halt reason.
+func (s *Server) apiMesh(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.core.MeshStatus())
+}
+
 // apiConfig is the handler for the '/config' API request.
 func (s *Server) apiConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.core.ConfigMsg())
