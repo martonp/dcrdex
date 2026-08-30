@@ -108,6 +108,15 @@ func (pq *OrderPQ) copy(newCap uint32) *OrderPQ {
 	return newPQ
 }
 
+// collectUsers adds each account's order count to users.
+func (pq *OrderPQ) collectUsers(users map[account.AccountID]int) {
+	pq.mtx.RLock()
+	for user, orders := range pq.userOrders {
+		users[user] += len(orders)
+	}
+	pq.mtx.RUnlock()
+}
+
 // UserOrders retrieves all orders for a given user.
 func (pq *OrderPQ) UserOrders(user account.AccountID) []*order.LimitOrder {
 	pq.mtx.RLock()
