@@ -207,6 +207,10 @@ func NewArchiver(ctx context.Context, cfg *Config) (*Archiver, error) {
 			len(unbookedSells), len(unbookedBuys), staleMarket)
 	}
 
+	if err := archiver.verifyTableClassification(ctx); err != nil {
+		return nil, err
+	}
+
 	return archiver, nil
 }
 
