@@ -412,3 +412,93 @@ func TestValidateReputationOutcomeUpdates(t *testing.T) {
 		})
 	}
 }
+
+func TestReputation(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var user account.AccountID
+	copy(user[:], encode.RandomBytes(len(user)))
+	keepPreimage := randomReputationOrderID()
+	keepMatch := randomReputationMatchID()
+	keepOrder := randomReputationOrderID()
+
+	tx, err := archie.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx error: %v", err)
+	}
+
+	// The helper inserts all requested outcome rows, then prunes each affected
+	// class down to the supplied retention limit before the transaction commits.
+	err = archie.insertReputationOutcomeRows(tx,
+		&db.ReputationOutcomePolicy{PreimageLimit: 1, MatchLimit: 1, OrderLimit: 1},
+		&reputationOutcomeBatch{
+			preimages: []*reputationPreimageOutcome{
+				{user: user, oid: randomReputationOrderID(), miss: true},
+				{user: user, oid: keepPreimage},
+			},
+			matches: []*reputationMatchOutcome{
+				{user: user, mid: db.MarketMatchID{MatchID: randomReputationMatchID()}, outcome: db.OutcomeNoRedeemAsMaker},
+				{user: user, mid: db.MarketMatchID{MatchID: keepMatch}, outcome: db.OutcomeSwapSuccess},
+			},
+			orders: []*reputationOrderOutcome{
+				{user: user, oid: randomReputationOrderID(), penalizedCancel: true},
+				{user: user, oid: keepOrder},
+			},
+		})
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insertReputationOutcomeRows error: %v", err)
+	}
+	if err := commitEventTx(ctx, tx); err != nil {
+		t.Fatalf("commitEventTx error: %v", err)
+	}
+
+	pimgs, matches, ords, err := archie.GetUserReputationData(ctx, user, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData error: %v", err)
+	}
+	if len(pimgs) != 1 || pimgs[0].OrderID != keepPreimage || pimgs[0].Miss {
+		t.Fatalf("preimage outcomes = %+v, want retained success %v", pimgs, keepPreimage)
+	}
+	if len(matches) != 1 || matches[0].MatchID != keepMatch || matches[0].MatchOutcome != db.OutcomeSwapSuccess {
+		t.Fatalf("match outcomes = %+v, want retained success %v", matches, keepMatch)
+	}
+	if len(ords) != 1 || ords[0].OrderID != keepOrder || ords[0].Canceled {
+		t.Fatalf("order outcomes = %+v, want retained completion %v", ords, keepOrder)
+	}
+
+	var rollbackUser account.AccountID
+	copy(rollbackUser[:], encode.RandomBytes(len(rollbackUser)))
+	tx, err = archie.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx rollback error: %v", err)
+	}
+	err = archie.insertReputationOutcomeRows(tx,
+		&db.ReputationOutcomePolicy{PreimageLimit: 1},
+		&reputationOutcomeBatch{
+			preimages: []*reputationPreimageOutcome{{
+				user: rollbackUser,
+				oid:  randomReputationOrderID(),
+				miss: true,
+			}},
+		})
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insertReputationOutcomeRows rollback seed error: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback error: %v", err)
+	}
+	pimgs, matches, ords, err = archie.GetUserReputationData(ctx, rollbackUser, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData rollback user error: %v", err)
+	}
+	if len(pimgs)+len(matches)+len(ords) != 0 {
+		t.Fatalf("rollback user reputation data pimgs=%+v matches=%+v ords=%+v, want none", pimgs, matches, ords)
+	}
+}

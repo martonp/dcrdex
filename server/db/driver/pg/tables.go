@@ -17,7 +17,6 @@ const (
 	marketsTableName         = "markets"
 	marketLifecycleTableName = "market_lifecycle"
 	metaTableName            = "meta"
-	feeKeysTableName         = "fee_keys"
 	accountsTableName        = "accounts"
 	bondsTableName           = "bonds"
 	prepaidBondsTableName    = "prepaid_bonds"
@@ -59,7 +58,6 @@ var createDEXTableStatements = []tableStmt{
 }
 
 var createAccountTableStatements = []tableStmt{
-	{feeKeysTableName, internal.CreateFeeKeysTable},
 	{accountsTableName, internal.CreateAccountsTable},
 	{bondsTableName, internal.CreateBondsTable},
 	{prepaidBondsTableName, internal.CreatePrepaidBondsTable},
