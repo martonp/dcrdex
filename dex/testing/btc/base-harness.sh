@@ -453,4 +453,6 @@ chmod +x "${HARNESS_DIR}/omega"
 fi
 
 tmux select-window -t $SESSION:2
-tmux attach-session -t $SESSION
+if [ -z "${NOATTACH:-}" ]; then
+  tmux attach-session -t $SESSION
+fi
