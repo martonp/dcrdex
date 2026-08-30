@@ -49,23 +49,16 @@ type OrderStatus struct {
 	Status order.OrderStatus
 }
 
-// PreimageResult is the outcome of preimage collection for an order in an epoch
-// that closed at a certain time.
-type PreimageResult struct {
-	Miss bool
-	Time int64
-	ID   order.OrderID
+// StartupOrderRevoke identifies an order revoked during market startup. The
+// reason is the wire-level meshevents.StartupOrderRevokeReason carried by the
+// market_started and market_lifecycle events.
+type StartupOrderRevoke struct {
+	Order  order.Order
+	Reason meshevents.StartupOrderRevokeReason
 }
 
-// KeyIndexer are the functions required to track an extended public key and
-// derived children by index.
-type KeyIndexer interface {
-	KeyIndex(xpub string) (uint32, error)
-	SetKeyIndex(idx uint32, xpub string) error
-}
-
-// DEXArchivist will be composed of several different interfaces. Starting with
-// OrderArchiver.
+// DEXArchivist is composed of lifecycle methods plus storage capability
+// interfaces.
 type DEXArchivist interface {
 	// LastErr should returns any fatal or unexpected error encountered by the
 	// archivist backend. This may be used to check if the database had an
@@ -79,9 +72,6 @@ type DEXArchivist interface {
 	// Close should gracefully shutdown the backend, returning when complete.
 	Close() error
 
-	// InsertEpoch stores the results of a newly-processed epoch.
-	InsertEpoch(ed *EpochResults) error
-
 	// LastEpochRate gets the EndRate of the last EpochResults inserted for the
 	// market. If the database is empty, no error and a rate of zero are
 	// returned.
@@ -94,7 +84,6 @@ type DEXArchivist interface {
 
 	OrderArchiver
 	AccountArchiver
-	KeyIndexer
 	MatchArchiver
 	SwapArchiver
 	ReputationArchiver
@@ -110,21 +99,18 @@ type OrderArchiver interface {
 	// specified by the given base and quote assets.
 	Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error)
 
+	// OrdersWithCommit searches a market's trade and cancel orders for the
+	// given commitment. Active orders are searched unconditionally; archived
+	// orders only when accepted at or after archivedCutoff. Commitment reuse
+	// is legal across archived lives, so several rows can match. An empty
+	// result with a nil error means no matching row.
+	OrdersWithCommit(ctx context.Context, base, quote uint32, commit order.Commitment, archivedCutoff time.Time) ([]CommitOrder, error)
+
 	// BookOrders returns all book orders for a market.
 	BookOrders(base, quote uint32) ([]*order.LimitOrder, error)
 
 	// EpochOrders returns all epoch orders for a market.
 	EpochOrders(base, quote uint32) ([]order.Order, error)
-
-	// FlushBook revokes all booked orders for a market.
-	FlushBook(base, quote uint32) (sellsRemoved, buysRemoved []order.OrderID, err error)
-
-	// ActiveOrderCoins retrieves a CoinID slice for each active order.
-	ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error)
-
-	// UserOrders retrieves all orders for the given account in the market
-	// specified by a base and quote asset.
-	UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error)
 
 	// UserOrderStatuses retrieves the statuses and filled amounts of the orders
 	// with the provided order IDs for the given account in the market specified
@@ -139,87 +125,47 @@ type OrderArchiver interface {
 	// active orders for a user across all markets.
 	ActiveUserOrderStatuses(aid account.AccountID) ([]*OrderStatus, error)
 
-	// CompletedUserOrders retrieves the N most recently completed orders for a
-	// user across all markets.
-	CompletedUserOrders(aid account.AccountID, N int) (oids []order.OrderID, compTimes []int64, err error)
-
-	// PreimageStats retrieves the N most recent results of preimage requests
-	// for the user across all markets.
-	PreimageStats(user account.AccountID, lastN int) ([]*PreimageResult, error)
-
-	// ExecutedCancelsForUser retrieves up to N executed cancel orders for a
-	// given user. These may be user-initiated cancels, or cancels created by
-	// the server (revokes). Executed cancel orders from all markets are
-	// returned.
-	ExecutedCancelsForUser(aid account.AccountID, N int) ([]*CancelRecord, error)
-
-	// OrderWithCommit searches all markets' trade and cancel orders, both
-	// active and archived, for an order with the given Commitment.
-	OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error)
-
 	// OrderStatus gets the status, ID, and filled amount of the given order.
 	OrderStatus(order.Order) (order.OrderStatus, order.OrderType, int64, error)
 
-	// NewEpochOrder stores a new order with epoch status. Such orders are
-	// pending execution or insertion on a book (standing limit orders with a
-	// remaining unfilled amount). For trade orders, the epoch gap should be
-	// db.EpochGapNA, while for cancel orders it is the number of epochs since
-	// the targeted order was placed, as described in the docs for CancelRecord.
-	NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error
+	// ApplyOrderAcceptedEvent is called from the mesh event applier on every
+	// node. It projects an already-decided order_accepted onto this node's
+	// DB and event log.
+	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 
-	// StorePreimage stores the preimage associated with an existing order.
-	StorePreimage(ord order.Order, pi order.Preimage) error
+	// ApplyMarketStartedEvent is called from the mesh event applier on every
+	// node. It projects an already-decided market_started onto this node's
+	// DB and event log.
+	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*EventLogEntry, error)
 
-	// BookOrder books the given order. If the order was already stored (i.e.
-	// NewEpochOrder), it's status and filled amount are updated, otherwise it
-	// is inserted. See also UpdateOrderFilled.
-	BookOrder(*order.LimitOrder) error
+	// MarketLifecycle retrieves the durable lifecycle projection for a market.
+	MarketLifecycle(market string) (*MarketLifecycle, error)
 
-	// ExecuteOrder puts the order into the executed state, and sets the filled
-	// amount for market and limit orders. For unmatched cancel orders, use
-	// FailCancelOrder instead.
-	ExecuteOrder(ord order.Order) error
+	// ApplyMarketLifecycleEvent is called from the mesh event applier on every
+	// node. It projects an already-decided market_lifecycle onto this node's
+	// DB and event log.
+	ApplyMarketLifecycleEvent(ctx context.Context, meta *EventLogMeta, update *MarketLifecycleUpdate) (*MarketLifecycleApplyResult, error)
 
-	// CancelOrder puts a limit order into the canceled state. Market orders
-	// must use ExecuteOrder since they may not be canceled. Similarly, cancel
-	// orders must use ExecuteOrder or FailCancelOrder. Orders that are
-	// terminated by the DEX rather than via a cancel order are considered
-	// "revoked", and RevokeOrder should be used to set this status.
-	CancelOrder(*order.LimitOrder) error
+	// ApplyAdvanceEpochEvent is called from the mesh event applier on every
+	// node. It projects an already-decided advance_epoch onto this node's DB
+	// and event log.
+	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, update *AdvanceEpochUpdate) (*EventLogEntry, error)
 
-	// RevokeOrder puts an order into the revoked state, and generates a cancel
-	// order to record the action. Orders should be revoked by the DEX according
-	// to policy on failed orders. For canceling an order that was matched with
-	// a cancel order, use CancelOrder.
-	RevokeOrder(order.Order) (cancelID order.OrderID, t time.Time, err error)
+	// ApplyEpochProcessedEvent is called from the mesh event applier on every
+	// node. It projects an already-decided epoch_processed (preimage outcomes
+	// and match results) onto this node's DB and event log.
+	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 
-	// RevokeOrderUncounted is like RevokeOrder except that the generated cancel
-	// order will not be counted against the user. i.e. ExecutedCancelsForUser
-	// should not return the cancel orders created this way.
-	RevokeOrderUncounted(order.Order) (cancelID order.OrderID, t time.Time, err error)
+	// ApplySuspendedCancelEvent is called from the mesh event applier on every
+	// node. It projects an already-decided suspended_cancel onto this node's
+	// DB and event log.
+	ApplySuspendedCancelEvent(ctx context.Context, meta *EventLogMeta, update *SuspendedCancelUpdate) (*SuspendedCancelApplyResult, error)
 
-	// NewArchivedCancel stores a cancel order directly in the executed state. This
-	// is used for orders that are canceled when the market is suspended, and therefore
-	// do not need to be matched.
-	NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error
-
-	// FailCancelOrder puts an unmatched cancel order into the executed state.
-	// For matched cancel orders, use ExecuteOrder.
-	FailCancelOrder(*order.CancelOrder) error
-
-	// UpdateOrderFilled updates the filled amount of the given order. This
-	// function applies only to limit orders, not cancel or market orders. The
-	// filled amount of a market order should be updated by ExecuteOrder.
-	UpdateOrderFilled(*order.LimitOrder) error
-
-	// UpdateOrderStatus updates the status and filled amount of the given
-	// order.
-	UpdateOrderStatus(order.Order, order.OrderStatus) error
-
-	// SetOrderCompleteTime sets the successful completion time for an existing
-	// order. This will follow the final step in swap negotiation, for an order
-	// that is not on the book.
-	SetOrderCompleteTime(ord order.Order, compTimeMs int64) error
+	// ApplyOrdersRevokedEvent is called from the mesh event applier on every
+	// node. It revokes booked standing limits with a generated cancel and a
+	// neutral order outcome. Server revocations never count toward the
+	// owner's cancellation rate. Non-booked targets error.
+	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
 }
 
 // Account holds data returned by Accounts.
@@ -381,6 +327,263 @@ type BondPostedUpdate struct {
 type BondPostedResult struct {
 	BondAdded bool
 	Log       *EventLogEntry
+}
+
+type OrderAcceptedUpdate struct {
+	Order    order.Order
+	EpochIdx int64
+	EpochDur int64
+	EpochGap int32
+}
+
+type MarketState int16
+
+const (
+	MarketStateRunning MarketState = iota + 1
+	MarketStateSuspended
+)
+
+type MarketPendingAction int16
+
+const (
+	MarketPendingNone MarketPendingAction = iota
+	MarketPendingSuspend
+	MarketPendingSuspendDrain
+	MarketPendingResume
+)
+
+type MarketLifecycleAction int16
+
+const (
+	MarketLifecycleActionInvalid MarketLifecycleAction = iota
+	MarketLifecycleActionScheduleSuspend
+	MarketLifecycleActionSuspend
+	MarketLifecycleActionScheduleResume
+	MarketLifecycleActionResume
+)
+
+// MarketLifecycle is the durable suspend/resume/epoch-cursor row projected
+// by market_started, market_lifecycle, and advance_epoch events.
+type MarketLifecycle struct {
+	Market          string
+	State           MarketState
+	StartEpochIdx   int64
+	StartEpochDur   int64
+	FinalEpochIdx   int64
+	FinalEpochDur   int64
+	PendingAction   MarketPendingAction
+	PendingEpochIdx int64
+	PendingEpochDur int64
+	PersistBook     *bool
+	// ActiveEpochIdx is the current trading epoch for a running market,
+	// and zero for when suspended or draining.
+	ActiveEpochIdx int64
+	// ProcessedEpochIdx is the latest epoch whose epoch_processed event has
+	// applied. Closed epochs above it still await their close: up to
+	// ActiveEpochIdx-1 while running, up to PendingEpochIdx while draining.
+	ProcessedEpochIdx int64
+	// RunParams are the log-pinned market parameters for the current run.
+	RunParams meshevents.MarketRunParams
+}
+
+// SuspendTime is the wall-clock end of the pending final trading epoch. It is
+// only meaningful while PendingAction is MarketPendingSuspend or
+// MarketPendingSuspendDrain.
+func (lc *MarketLifecycle) SuspendTime() time.Time {
+	return time.UnixMilli((lc.PendingEpochIdx + 1) * lc.PendingEpochDur).UTC()
+}
+
+// ResumeTime is the wall-clock start of the pending resume epoch. It is only
+// meaningful while PendingAction is MarketPendingResume.
+func (lc *MarketLifecycle) ResumeTime() time.Time {
+	return time.UnixMilli(lc.PendingEpochIdx * lc.PendingEpochDur).UTC()
+}
+
+// MarketLifecycleUpdate is a decoded market_lifecycle event.
+type MarketLifecycleUpdate struct {
+	Action MarketLifecycleAction
+	Market string
+	Base   uint32
+	Quote  uint32
+	// EpochIdx is the last trading epoch for suspend actions and the resume
+	// epoch for resume actions.
+	EpochIdx      int64
+	EpochDur      int64
+	PersistBook   *bool
+	Timestamp     time.Time
+	ResumeRevokes []*StartupOrderRevoke
+	// RunParams re-pins the market run parameters; carried by resume only.
+	RunParams *meshevents.MarketRunParams
+}
+
+// OpenEpochIdx is the first epoch a resume opens: the scheduled resume epoch,
+// or the epoch at the master's decision time when the schedule already passed.
+func (u *MarketLifecycleUpdate) OpenEpochIdx() int64 {
+	if idx := u.Timestamp.UnixMilli() / u.EpochDur; idx > u.EpochIdx {
+		return idx
+	}
+	return u.EpochIdx
+}
+
+// MarketLifecycleApplyResult is the stored outcome of a market_lifecycle event.
+type MarketLifecycleApplyResult struct {
+	Log           *EventLogEntry
+	Lifecycle     *MarketLifecycle
+	PurgeOrders   []order.OrderID
+	ResumeRevokes []*StartupOrderRevoke
+}
+
+// MarketStartedUpdate is a decoded market_started event.
+type MarketStartedUpdate struct {
+	Market          string
+	Base            uint32
+	Quote           uint32
+	CurrentEpochIdx int64
+	EpochDur        int64
+	RunParams       meshevents.MarketRunParams
+	RevocationTime  time.Time
+	BookedRevokes   []*StartupOrderRevoke
+	// EpochRevokes must exactly match the active epoch orders, or apply rejects.
+	EpochRevokes []*StartupOrderRevoke
+}
+
+// AdvanceEpochUpdate is the persistent state transition of an advance_epoch
+// event. ClosedOrderIDs are the orders leaving the closed epoch.
+type AdvanceEpochUpdate struct {
+	Market         string
+	ClosedEpochIdx int64
+	OpenedEpochIdx int64
+	EpochDur       int64
+	ClosedOrderIDs []order.OrderID
+}
+
+// OrdersRevokedUpdate is the persistent state transition of an orders_revoked
+// event. All orders must be booked standing limit orders. The revocation
+// reason is the wire-level meshevents.OrderRevokeReason carried by the event.
+type OrdersRevokedUpdate struct {
+	Reason     meshevents.OrderRevokeReason
+	RevokeTime time.Time
+	Orders     []*order.LimitOrder
+}
+
+type ReputationOutcomePolicy struct {
+	PreimageLimit       int
+	MatchLimit          int
+	OrderLimit          int
+	FreeCancelThreshold int32
+}
+
+type PreimageMissUpdate struct {
+	Order      order.Order
+	RevokeTime time.Time
+}
+
+type PreimageRevealUpdate struct {
+	Order    order.Order
+	Preimage order.Preimage
+}
+
+type EpochProcessedUpdate struct {
+	Epoch           *EpochResults
+	Misses          []*PreimageMissUpdate
+	Reveals         []*PreimageRevealUpdate
+	TradesBooked    []*order.LimitOrder
+	TradesPartial   []*order.LimitOrder
+	TradesCompleted []order.Order
+	TradesCanceled  []*order.LimitOrder
+	TradesFailed    []order.Order
+	CancelsFailed   []*order.CancelOrder
+	CancelsExecuted []*order.CancelOrder
+	Matches         []*order.Match
+}
+
+type SuspendedCancelUpdate struct {
+	Market          string
+	Base            uint32
+	Quote           uint32
+	Cancel          *order.CancelOrder
+	TargetOrderID   order.OrderID
+	TargetAccount   account.AccountID
+	TargetSell      bool
+	EpochIdx        int64
+	EpochDur        int64
+	FeeRateBase     uint64
+	FeeRateQuote    uint64
+	MatchServerTime time.Time
+	Match           *order.Match
+}
+
+type SuspendedCancelApplyResult struct {
+	Log         *EventLogEntry
+	Cancel      *order.CancelOrder
+	TargetOrder *order.LimitOrder
+	Match       *order.Match
+}
+
+// MatchAck is a client acknowledgement of match data to persist for a match.
+type MatchAck struct {
+	MID     MarketMatchID
+	Maker   bool
+	Cancel  bool
+	Sig     []byte
+	Address string
+}
+
+type MatchAcksRecordedUpdate struct {
+	Acks []*MatchAck
+}
+
+// AuditAck is a client acknowledgement of a counterparty's swap contract.
+type AuditAck struct {
+	MID   MarketMatchID
+	Maker bool
+	Sig   []byte
+}
+
+// RedemptionAck is a client acknowledgement of a counterparty's redemption.
+type RedemptionAck struct {
+	MID   MarketMatchID
+	Maker bool
+	Sig   []byte
+}
+
+// SwapContract is an on-chain swap contract to persist for a match.
+type SwapContract struct {
+	MID       MarketMatchID
+	Maker     bool
+	Contract  []byte
+	CoinID    []byte
+	Timestamp int64
+}
+
+// SwapRedemption is a redemption record to persist for a match.
+type SwapRedemption struct {
+	MID       MarketMatchID
+	Maker     bool
+	CoinID    []byte
+	Secret    []byte
+	Timestamp int64
+}
+
+type MatchFailureReason uint8
+
+const (
+	MatchFailureReasonInvalid MatchFailureReason = iota
+	MatchFailureNoFaultNewlyMatched
+	MatchFailureNoFaultMakerSwapCast
+	MatchFailureNoFaultTakerSwapCast
+	MatchFailureNoFaultMakerRedeemed
+	MatchFailureMakerNoSwap
+	MatchFailureTakerNoAddress
+	MatchFailureTakerNoSwap
+	MatchFailureMakerNoRedeem
+	MatchFailureTakerNoRedeem
+)
+
+type MatchFailedUpdate struct {
+	MID        MarketMatchID
+	FailTimeMS int64
+	Reason     MatchFailureReason
 }
 
 type ReputationForgivenResult struct {
@@ -557,12 +760,8 @@ type MatchFail struct {
 // MatchArchiver is the interface required for storage and retrieval of all
 // match data.
 type MatchArchiver interface {
-	InsertMatch(match *order.Match) error
-	MatchByID(mid order.MatchID, base, quote uint32) (*MatchData, error)
-	UserMatches(aid account.AccountID, base, quote uint32) ([]*MatchData, error)
 	CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*MatchOutcome, error)
 	UserMatchFails(aid account.AccountID, lastN int) ([]*MatchFail, error)
-	ForgiveMatchFail(mid order.MatchID) (bool, error)
 	AllActiveUserMatches(aid account.AccountID) ([]*MatchData, error)
 	MarketMatches(base, quote uint32) ([]*MatchDataWithCoins, error)
 	MarketMatchesStreaming(base, quote uint32, includeInactive bool, N int64, f func(*MatchDataWithCoins) error) (int, error)
@@ -585,77 +784,46 @@ type MatchArchiver interface {
 //     coinIDs), one on each party's blockchain.
 //   - 2 redemption transaction outputs (coinIDs).
 //
-// The methods for saving this data are defined below in the order in which the
-// data is expected from the parties.
+// The event appliers that save this data are defined below in the order in
+// which the data is expected from the parties.
 type SwapArchiver interface {
 	// ActiveSwaps loads the full details for all active swaps across all markets.
 	ActiveSwaps() ([]*SwapDataFull, error)
 
-	// SwapData retrieves the swap/match status and the current SwapData.
-	SwapData(mid MarketMatchID) (order.MatchStatus, *SwapData, error)
+	// SwapDataFullByID loads a match's row and swap data by match ID,
+	// searching all markets, active or inactive. A nil result with a nil
+	// error means no matching row.
+	SwapDataFullByID(mid order.MatchID) (*SwapDataFull, error)
 
-	// Match acknowledgement message signatures.
+	// ApplyMatchAcksRecordedEvent is called from the mesh event applier on
+	// every node. It projects already-decided match acks onto this node's DB
+	// and event log.
+	ApplyMatchAcksRecordedEvent(ctx context.Context, meta *EventLogMeta, update *MatchAcksRecordedUpdate) (*EventLogEntry, error)
 
-	// SaveMatchAckSigA records the match data acknowledgement signature from
-	// swap party A (the initiator), which is the maker in the DEX.
-	SaveMatchAckSigA(mid MarketMatchID, sig []byte) error
+	// ApplySwapContractRecordedEvent is called from the mesh event applier on
+	// every node. It projects an already-decided swap contract onto this
+	// node's DB and event log.
+	ApplySwapContractRecordedEvent(ctx context.Context, meta *EventLogMeta, contract *SwapContract) (*EventLogEntry, error)
 
-	// SaveMatchAckSigB records the match data acknowledgement signature from
-	// swap party B (the participant), which is the taker in the DEX.
-	SaveMatchAckSigB(mid MarketMatchID, sig []byte) error
+	// ApplyAuditAckRecordedEvent is called from the mesh event applier on
+	// every node. It projects an already-decided contract audit ack onto
+	// this node's DB and event log.
+	ApplyAuditAckRecordedEvent(ctx context.Context, meta *EventLogMeta, ack *AuditAck) (*EventLogEntry, error)
 
-	// SaveMatchAckAddrA records the per-match swap address from the maker's
-	// match acknowledgement.
-	SaveMatchAckAddrA(mid MarketMatchID, addr string) error
+	// ApplySwapRedemptionRecordedEvent is called from the mesh event applier
+	// on every node. It projects an already-decided redemption onto this
+	// node's DB and event log.
+	ApplySwapRedemptionRecordedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, redemption *SwapRedemption) (*EventLogEntry, error)
 
-	// SaveMatchAckAddrB records the per-match swap address from the taker's
-	// match acknowledgement.
-	SaveMatchAckAddrB(mid MarketMatchID, addr string) error
+	// ApplyRedemptionAckRecordedEvent is called from the mesh event applier
+	// on every node. Maker redemption acks have no persistent state beyond
+	// the event-log row.
+	ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *EventLogMeta, ack *RedemptionAck) (*EventLogEntry, error)
 
-	// Swap contracts, and counterparty audit acknowledgement signatures.
-
-	// SaveContractA records party A's swap contract script and the coinID (e.g.
-	// transaction output) containing the contract on chain X. Note that this
-	// contract contains the secret hash.
-	SaveContractA(mid MarketMatchID, contract []byte, coinID []byte, timestamp int64) error
-
-	// SaveAuditAckSigB records party B's signature acknowledging their audit of
-	// A's swap contract.
-	SaveAuditAckSigB(mid MarketMatchID, sig []byte) error
-
-	// SaveContractB records party B's swap contract script and the coinID (e.g.
-	// transaction output) containing the contract on chain Y.
-	SaveContractB(mid MarketMatchID, contract []byte, coinID []byte, timestamp int64) error
-
-	// SaveAuditAckSigA records party A's signature acknowledging their audit of
-	// B's swap contract.
-	SaveAuditAckSigA(mid MarketMatchID, sig []byte) error
-
-	// Redemption transactions, and counterparty acknowledgement signatures.
-
-	// SaveRedeemA records party A's redemption coinID (e.g. transaction
-	// output), which spends party B's swap contract on chain Y. Note that this
-	// transaction will contain the secret, which party B extracts.
-	SaveRedeemA(mid MarketMatchID, coinID, secret []byte, timestamp int64) error
-
-	// SaveRedeemAckSigB records party B's signature acknowledging party A's
-	// redemption, which spent their swap contract on chain Y and revealed the
-	// secret.
-	SaveRedeemAckSigB(mid MarketMatchID, sig []byte) error
-
-	// SaveRedeemB records party B's redemption coinID (e.g. transaction
-	// output), which spends party A's swap contract on chain X. This should
-	// also flag the match as inactive.
-	SaveRedeemB(mid MarketMatchID, coinID []byte, timestamp int64) error
-
-	// SetMatchInactive sets the swap as done/inactive. This can be because of a
-	// failed or successfully completed swap, but in practice this will be used
-	// for failed swaps since SaveRedeemB flags the swap as done/inactive. If
-	// the match is being marked as inactive prior to MatchComplete (the match
-	// was revoked) but the user is not at fault, the forgive bool may be set to
-	// true so the outcome will not count against the user who would have the
-	// next action in the swap.
-	SetMatchInactive(mid MarketMatchID, forgive bool) error
+	// ApplyMatchFailedEvent is called from the mesh event applier on every
+	// node. It projects an already-decided match_failed onto this node's DB
+	// and event log.
+	ApplyMatchFailedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *MatchFailedUpdate) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified
