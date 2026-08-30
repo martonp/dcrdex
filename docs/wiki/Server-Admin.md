@@ -1,5 +1,7 @@
 # Server Settings
 
+For a two-node replica, see [Two-Node Mesh](Two-Node-Mesh).
+
 ## Exchange Settings
 
 ### Admin HTTP JSON API

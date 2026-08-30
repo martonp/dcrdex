@@ -67,6 +67,7 @@
     - [DCRDEX Specification](https://github.com/decred/dcrdex/blob/master/spec/README.mediawiki)
     - [Client control API](Client-control-API)
     - [Integrating New Assets](Integrating-New-Assets)
+    - [Two-Node Mesh](Two-Node-Mesh)
     - [Simnet Testing](Simnet-Testing)
     - [Testnet Testing](Testnet-Testing)
     - [Test App Server](Test-App-Server)
