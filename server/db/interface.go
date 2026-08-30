@@ -5,6 +5,7 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"time"
@@ -96,6 +97,7 @@ type DEXArchivist interface {
 	MatchArchiver
 	SwapArchiver
 	ReputationArchiver
+	EventLogReader
 }
 
 // OrderArchiver is the interface required for storage and retrieval of all
@@ -365,6 +367,22 @@ type SwapDataFull struct {
 type MarketMatchID struct {
 	order.MatchID
 	Base, Quote uint32 // market
+}
+
+const EventLogTipHashSize = sha256.Size
+
+// EventLogMeta specifies how to record a database update in the event log.
+type EventLogMeta struct {
+	// Seq is the event's sequence number. If zero, storage assigns the next
+	// sequence. Otherwise, it must match the next sequence.
+	Seq uint64
+
+	// Event is the encoded event payload.
+	Event []byte
+
+	// ExpectedTipHash is the expected log tip hash after this event.
+	// A nil value skips hash verification.
+	ExpectedTipHash []byte
 }
 
 // EventLogEntry is a row in the event log.

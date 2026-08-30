@@ -60,6 +60,7 @@ type archiverTables struct {
 	bonds        string
 	prepaidBonds string
 	points       string
+	eventLog     string
 }
 
 // Archiver must implement server/db.DEXArchivist.
@@ -165,6 +166,7 @@ func NewArchiverForRead(ctx context.Context, cfg *Config) (*Archiver, error) {
 			bonds:        fullTableName(cfg.DBName, publicSchema, bondsTableName),
 			prepaidBonds: fullTableName(cfg.DBName, publicSchema, prepaidBondsTableName),
 			points:       fullTableName(cfg.DBName, publicSchema, pointsTableName),
+			eventLog:     fullTableName(cfg.DBName, publicSchema, eventLogTableName),
 		},
 		fatal: make(chan struct{}),
 	}, nil
