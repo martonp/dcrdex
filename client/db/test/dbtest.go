@@ -33,11 +33,19 @@ func randomPubKey() *secp256k1.PublicKey {
 
 // RandomAccountInfo creates an AccountInfo with random values.
 func RandomAccountInfo() *db.AccountInfo {
+	meshEndpoints := make([]*db.MeshEndpoint, rand.IntN(3))
+	for i := range meshEndpoints {
+		meshEndpoints[i] = &db.MeshEndpoint{
+			Host: ordertest.RandomAddress(),
+			Cert: randBytes(100),
+		}
+	}
 	return &db.AccountInfo{
 		Host: ordertest.RandomAddress(),
 		// LegacyEncKey: randBytes(32),
 		EncKeyV2:         randBytes(32),
 		DEXPubKey:        randomPubKey(),
+		MeshEndpoints:    meshEndpoints,
 		TargetTier:       uint64(rand.IntN(34)),
 		MaxBondedAmt:     uint64(rand.IntN(40e8)),
 		BondAsset:        uint32(rand.IntN(66)),

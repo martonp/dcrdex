@@ -152,10 +152,11 @@ type pendingFeeState struct {
 
 // dexConnection is the websocket connection and the DEX configuration.
 type dexConnection struct {
-	comms.WsConn
+	comms.FailoverWsConn
 	connMaster *dex.ConnectionMaster
 	log        dex.Logger
 	acct       *dexAccount
+	ctx        context.Context
 	notify     func(Notification)
 	ticker     *dexTicker
 	// apiVer is an atomic. An uninitiated connection should be set to -1.
@@ -205,6 +206,12 @@ type dexConnection struct {
 	anomaliesCount uint32 // atomic
 	lastConnectMtx sync.RWMutex
 	lastConnect    time.Time
+
+	endpointsMtx      sync.RWMutex // endpointHosts, endpointHostByURL, lastConnectedHost
+	endpointHosts     []string     // registered host first, then mesh peers
+	endpointHostByURL map[string]string
+	// lastConnectedHost is used to detect failover between successful connects.
+	lastConnectedHost string
 
 	// mmSnapshotSubs tracks markets with active MM snapshot subscriptions,
 	// keyed by market name (e.g. "dcr_btc"), for re-subscription on
@@ -272,6 +279,32 @@ func (dc *dexConnection) running(mkt string) bool {
 // status returns the status of the connection to the dex.
 func (dc *dexConnection) status() comms.ConnectionStatus {
 	return comms.ConnectionStatus(atomic.LoadUint32(&dc.connectionStatus))
+}
+
+func (dc *dexConnection) setEndpointHosts(hosts []string, hostByURL map[string]string) {
+	dc.endpointsMtx.Lock()
+	dc.endpointHosts = hosts
+	dc.endpointHostByURL = hostByURL
+	dc.endpointsMtx.Unlock()
+}
+
+func (dc *dexConnection) endpointHostList() []string {
+	dc.endpointsMtx.RLock()
+	defer dc.endpointsMtx.RUnlock()
+	return append([]string(nil), dc.endpointHosts...)
+}
+
+func (dc *dexConnection) activeEndpointHost() string {
+	activeURL := dc.ActiveEndpoint()
+	if activeURL == "" {
+		return ""
+	}
+	dc.endpointsMtx.RLock()
+	defer dc.endpointsMtx.RUnlock()
+	if host, found := dc.endpointHostByURL[activeURL]; found {
+		return host
+	}
+	return activeURL
 }
 
 func (dc *dexConnection) config() *msgjson.ConfigResult {
@@ -534,6 +567,8 @@ func (c *Core) exchangeInfo(dc *dexConnection) *Exchange {
 		return &Exchange{
 			Host:             dc.acct.host,
 			AcctID:           acctID,
+			ServerEndpoints:  dc.endpointHostList(),
+			ActiveEndpoint:   dc.activeEndpointHost(),
 			DEXPubKey:        dexPubKeyB,
 			ConnectionStatus: dc.status(),
 			Disabled:         dc.acct.isDisabled(),
@@ -566,6 +601,8 @@ func (c *Core) exchangeInfo(dc *dexConnection) *Exchange {
 	return &Exchange{
 		Host:             dc.acct.host,
 		AcctID:           acctID,
+		ServerEndpoints:  dc.endpointHostList(),
+		ActiveEndpoint:   dc.activeEndpointHost(),
 		DEXPubKey:        dexPubKeyB,
 		Markets:          dc.marketMap(),
 		Assets:           assets,
@@ -1654,7 +1691,7 @@ type Core struct {
 
 	seedGenerationTime uint64
 
-	wsConstructor func(*comms.WsCfg) (comms.WsConn, error)
+	wsConstructor func(*comms.WsCfg, []*comms.WsEndpoint) (comms.FailoverWsConn, error)
 	newCrypter    func([]byte) encrypt.Crypter
 	reCrypter     func([]byte, []byte) (encrypt.Crypter, error)
 	latencyQ      *wait.TickerQueue
@@ -1824,7 +1861,7 @@ func New(cfg *Config) (*Core, error) {
 		balPending:    make(map[uint32]*asset.Balance),
 		balActive:     make(map[uint32]bool),
 		// Allowing to change the constructor makes testing a lot easier.
-		wsConstructor: comms.NewWsConn,
+		wsConstructor: comms.NewFailoverWsConn,
 		newCrypter:    encrypt.NewCrypter,
 		reCrypter:     encrypt.Deserialize,
 		latencyQ:      wait.NewTickerQueue(recheckInterval),
@@ -4270,12 +4307,8 @@ func (c *Core) AddDEX(appPW []byte, dexAddr string, certI any) error {
 		}
 	}()
 
-	// Don't allow adding another dex with the same pubKey. There can only be
-	// one dex connection per pubKey. UpdateDEXHost must be called to connect to
-	// the same dex using a different host name.
-	exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey)
-	if exists {
-		return newError(dupeDEXErr, "already connected to DEX at %s but with different host name %s", dexAddr, host)
+	if err := c.checkDupeDEXPubKey(dc, dexAddr); err != nil {
+		return err
 	}
 
 	err = c.db.CreateAccount(&db.AccountInfo{
@@ -4286,6 +4319,7 @@ func (c *Core) AddDEX(appPW []byte, dexAddr string, certI any) error {
 	if err != nil {
 		return fmt.Errorf("error saving account info for view-only DEX: %w", err)
 	}
+	c.persistConfiguredMeshEndpoints(dc)
 
 	success = true
 	c.connMtx.Lock()
@@ -4319,10 +4353,20 @@ func (c *Core) dbCreateOrUpdateAccount(dc *dexConnection, ai *db.AccountInfo) er
 	defer dc.acct.keyMtx.Unlock()
 
 	if !dc.acct.viewOnly {
-		return c.db.CreateAccount(ai)
+		if err := c.db.CreateAccount(ai); err != nil {
+			return err
+		}
+		c.persistConfiguredMeshEndpoints(dc)
+		return nil
 	}
 
-	err := c.db.UpdateAccountInfo(ai)
+	err := c.db.UpdateAccount(ai.Host, func(stored *db.AccountInfo) bool {
+		// Callers do not set mesh endpoints; keep whatever is stored.
+		mesh := stored.MeshEndpoints
+		*stored = *ai
+		stored.MeshEndpoints = mesh
+		return true
+	})
 	if err == nil {
 		dc.acct.viewOnly = false
 	}
@@ -4428,6 +4472,20 @@ func (c *Core) dexWithPubKeyExists(pubKey *secp256k1.PublicKey) (bool, string) {
 	return false, ""
 }
 
+// checkDupeDEXPubKey returns a dupeDEXErr when another known DEX connection
+// shares the new connection's DEX pubkey, meaning addr is a different host of
+// an already-known DEX — e.g. another node of the same server mesh. There can
+// only be one connection per DEX identity; UpdateDEXHost switches host names.
+func (c *Core) checkDupeDEXPubKey(dc *dexConnection, addr string) error {
+	if dc.acct.dexPubKey == nil {
+		return nil // older server, nothing to compare
+	}
+	if exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey); exists {
+		return newError(dupeDEXErr, "the dex at %s is the same dex as %s (another endpoint of the same server); use Update Host to switch host names", addr, host)
+	}
+	return nil
+}
+
 // upgradeConnection promotes a temporary dex connection and starts listening
 // to the messages it receives.
 func (c *Core) upgradeConnection(dc *dexConnection) {
@@ -4504,14 +4562,9 @@ func (c *Core) DiscoverAccount(dexAddr string, appPW []byte, certI any) (*Exchan
 		return c.exchangeInfo(dc), false, nil
 	}
 
-	// Don't allow registering for another dex with the same pubKey. There can only
-	// be one dex connection per pubKey. UpdateDEXHost must be called to connect to
-	// the same dex using a different host name.
 	if !existingConn {
-		exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey)
-		if exists {
-			return nil, false,
-				fmt.Errorf("the dex at %v is the same dex as %v. Use Update Host to switch host names", host, dexAddr)
+		if err := c.checkDupeDEXPubKey(dc, dexAddr); err != nil {
+			return nil, false, err
 		}
 	}
 
@@ -5477,7 +5530,7 @@ func (c *Core) initializeDEXConnection(dc *dexConnection, crypter encrypt.Crypte
 		c.log.Warnf("Connection to %v not available for authorization. "+
 			"It will automatically authorize when it connects.", dc.acct.host)
 		subject, details := c.formatDetails(TopicDEXDisconnected, dc.acct.host)
-		c.notify(newConnEventNote(TopicDEXDisconnected, subject, dc.acct.host, comms.Disconnected, details, db.ErrorLevel))
+		c.notify(newConnEventNote(TopicDEXDisconnected, subject, dc.acct.host, "", comms.Disconnected, details, db.ErrorLevel))
 		return
 	}
 
@@ -8812,6 +8865,161 @@ func isOnionHost(addr string) bool {
 	return strings.HasSuffix(host, ".onion")
 }
 
+func (c *Core) wsEndpoint(host string, cert []byte) (*comms.WsEndpoint, error) {
+	wsURL, err := url.Parse("wss://" + host + "/ws")
+	if err != nil {
+		return nil, newError(addressParseErr, "error parsing ws address from host %s: %w", host, err)
+	}
+
+	endpoint := &comms.WsEndpoint{
+		URL:  wsURL.String(),
+		Cert: cert,
+	}
+
+	onionHost := isOnionHost(wsURL.Host)
+	if onionHost || c.cfg.TorProxy != "" {
+		proxyAddr := c.cfg.TorProxy
+		if onionHost {
+			if c.cfg.Onion == "" {
+				return nil, errors.New("tor must be configured for .onion addresses")
+			}
+			proxyAddr = c.cfg.Onion
+
+			wsURL.Scheme = "ws"
+			endpoint.URL = wsURL.String()
+		}
+		proxy := &socks.Proxy{
+			Addr:         proxyAddr,
+			TorIsolation: c.cfg.TorIsolation, // need socks.NewPool with isolation???
+		}
+		endpoint.NetDialContext = proxy.DialContext
+	}
+
+	return endpoint, nil
+}
+
+// configureMeshEndpoints applies advertised mesh endpoints and persists them.
+// An empty list is ignored so missing or buggy ads do not wipe known peers.
+// On error it logs and leaves the previous failover set in place.
+func (c *Core) configureMeshEndpoints(dc *dexConnection, advertised []*msgjson.MeshEndpoint) {
+	if len(advertised) == 0 {
+		return
+	}
+	persist, err := c.applyMeshEndpoints(dc, advertised)
+	if err != nil {
+		dc.log.Errorf("Unable to update mesh endpoints for %s: %v", dc.acct.host, err)
+		return
+	}
+	c.persistMeshEndpoints(dc, persist)
+}
+
+// persistConfiguredMeshEndpoints writes already-applied ads now that the
+// account row exists.
+func (c *Core) persistConfiguredMeshEndpoints(dc *dexConnection) {
+	dc.cfgMtx.RLock()
+	var ads []*msgjson.MeshEndpoint
+	if dc.cfg != nil {
+		ads = dc.cfg.MeshEndpoints
+	}
+	dc.cfgMtx.RUnlock()
+	c.configureMeshEndpoints(dc, ads)
+}
+
+// applyMeshEndpoints sets failover to the registered host plus advertised
+// peers. It returns the peers (not the registered host) for persistence.
+func (c *Core) applyMeshEndpoints(dc *dexConnection, advertised []*msgjson.MeshEndpoint) ([]*db.MeshEndpoint, error) {
+	// Normalize to an ordered candidate list, deduplicated by host, with the
+	// registered host always first.
+	registered, err := addrHost(dc.acct.host)
+	if err != nil {
+		return nil, err
+	}
+	candidates := []*db.MeshEndpoint{{Host: registered, Cert: dc.acct.cert}}
+	seen := map[string]struct{}{registered: {}}
+	for _, endpoint := range advertised {
+		if endpoint == nil {
+			return nil, errors.New("nil mesh endpoint")
+		}
+		host, err := addrHost(endpoint.Host)
+		if err != nil {
+			return nil, fmt.Errorf("malformed mesh endpoint %q: %w", endpoint.Host, err)
+		}
+		if _, found := seen[host]; found {
+			continue
+		}
+		seen[host] = struct{}{}
+		candidates = append(candidates, &db.MeshEndpoint{Host: host, Cert: endpoint.Cert})
+	}
+
+	endpoints := make([]*comms.WsEndpoint, 0, len(candidates))
+	hosts := make([]string, 0, len(candidates))
+	hostByURL := make(map[string]string, len(candidates))
+	for _, cand := range candidates {
+		endpoint, err := c.wsEndpoint(cand.Host, cand.Cert)
+		if err != nil {
+			return nil, fmt.Errorf("mesh endpoint %q: %w", cand.Host, err)
+		}
+		endpoints = append(endpoints, endpoint)
+		hosts = append(hosts, cand.Host)
+		hostByURL[endpoint.URL] = cand.Host
+	}
+
+	if err := dc.FailoverWsConn.SetFailoverEndpoints(endpoints); err != nil {
+		return nil, err
+	}
+	dc.setEndpointHosts(hosts, hostByURL)
+	return candidates[1:], nil
+}
+
+// handleMeshEndpointsMsg applies a mesh_endpoints notification (full replace).
+// An empty list is ignored; a healthy mesh always advertises at least itself.
+func handleMeshEndpointsMsg(c *Core, dc *dexConnection, msg *msgjson.Message) error {
+	var note msgjson.MeshEndpointsNotification
+	if err := msg.Unmarshal(&note); err != nil {
+		return fmt.Errorf("mesh endpoints note unmarshal error: %w", err)
+	}
+	if len(note.MeshEndpoints) == 0 {
+		dc.log.Warnf("Ignoring empty mesh_endpoints notification from %s", dc.acct.host)
+		return nil
+	}
+	dc.cfgMtx.Lock()
+	if dc.cfg != nil {
+		dc.cfg.MeshEndpoints = note.MeshEndpoints
+	}
+	dc.cfgMtx.Unlock()
+	c.configureMeshEndpoints(dc, note.MeshEndpoints)
+	return nil
+}
+
+// persistMeshEndpoints saves advertised peers on the account if they changed.
+func (c *Core) persistMeshEndpoints(dc *dexConnection, endpoints []*db.MeshEndpoint) {
+	err := c.db.UpdateAccount(dc.acct.host, func(ai *db.AccountInfo) bool {
+		if meshEndpointsEqual(ai.MeshEndpoints, endpoints) {
+			return false
+		}
+		ai.MeshEndpoints = endpoints
+		return true
+	})
+	if errors.Is(err, db.ErrAcctNotFound) {
+		// No account yet (temp / pre-registration).
+		c.log.Debugf("Not persisting mesh endpoints for %s: %v", dc.acct.host, err)
+	} else if err != nil {
+		c.log.Errorf("Error persisting mesh endpoints for %s: %v", dc.acct.host, err)
+	}
+}
+
+func meshEndpointsEqual(a, b []*db.MeshEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Host != b[i].Host || !bytes.Equal(a[i].Cert, b[i].Cert) {
+			return false
+		}
+	}
+	return true
+}
+
 type connectDEXFlag uint8
 
 const (
@@ -8858,9 +9066,9 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 	if err != nil {
 		return nil, newError(addressParseErr, "error parsing address: %v", err)
 	}
-	wsURL, err := url.Parse("wss://" + host + "/ws")
+	wsEndpoint, err := c.wsEndpoint(host, acctInfo.Cert)
 	if err != nil {
-		return nil, newError(addressParseErr, "error parsing ws address from host %s: %w", host, err)
+		return nil, err
 	}
 
 	listen := flag&connectDEXFlagTemporary == 0
@@ -8872,6 +9080,7 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 
 	dc := &dexConnection{
 		log:                c.log,
+		ctx:                c.ctx,
 		acct:               newDEXAccount(acctInfo, viewOnly),
 		notify:             c.notify,
 		ticker:             newDexTicker(defaultTickInterval), // updated when server config obtained
@@ -8892,29 +9101,8 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 	}
 
 	wsCfg := comms.WsCfg{
-		URL:      wsURL.String(),
 		PingWait: 20 * time.Second, // larger than server's pingPeriod (server/comms/server.go)
-		Cert:     acctInfo.Cert,
-		Logger:   c.log.SubLogger(wsURL.String()),
-	}
-
-	isOnionHost := isOnionHost(wsURL.Host)
-	if isOnionHost || c.cfg.TorProxy != "" {
-		proxyAddr := c.cfg.TorProxy
-		if isOnionHost {
-			if c.cfg.Onion == "" {
-				return nil, errors.New("tor must be configured for .onion addresses")
-			}
-			proxyAddr = c.cfg.Onion
-
-			wsURL.Scheme = "ws"
-			wsCfg.URL = wsURL.String()
-		}
-		proxy := &socks.Proxy{
-			Addr:         proxyAddr,
-			TorIsolation: c.cfg.TorIsolation, // need socks.NewPool with isolation???
-		}
-		wsCfg.NetDialContext = proxy.DialContext
+		Logger:   c.log.SubLogger(wsEndpoint.URL),
 	}
 
 	wsCfg.ConnectEventFunc = func(status comms.ConnectionStatus) {
@@ -8924,14 +9112,42 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 		go c.handleReconnect(host)
 	}
 
+	// Seed failover from DB peers (skip bad entries) so a down primary is not fatal.
+	endpoints := []*comms.WsEndpoint{wsEndpoint}
+	hosts := []string{host}
+	hostByURL := map[string]string{wsEndpoint.URL: host}
+	seen := map[string]struct{}{host: {}}
+	for _, meshEndpoint := range acctInfo.MeshEndpoints {
+		peerHost, err := addrHost(meshEndpoint.Host)
+		if err != nil {
+			c.log.Warnf("Skipping malformed persisted mesh endpoint %q for %s: %v",
+				meshEndpoint.Host, host, err)
+			continue
+		}
+		if _, found := seen[peerHost]; found {
+			continue
+		}
+		seen[peerHost] = struct{}{}
+		endpoint, err := c.wsEndpoint(peerHost, meshEndpoint.Cert)
+		if err != nil {
+			c.log.Warnf("Skipping invalid persisted mesh endpoint %q for %s: %v",
+				meshEndpoint.Host, host, err)
+			continue
+		}
+		endpoints = append(endpoints, endpoint)
+		hosts = append(hosts, peerHost)
+		hostByURL[endpoint.URL] = peerHost
+	}
+
 	// Create a websocket "connection" to the server. (Don't actually connect.)
-	conn, err := c.wsConstructor(&wsCfg)
+	conn, err := c.wsConstructor(&wsCfg, endpoints)
 	if err != nil {
 		return nil, err
 	}
 
-	dc.WsConn = conn
+	dc.FailoverWsConn = conn
 	dc.connMaster = dex.NewConnectionMaster(conn)
+	dc.setEndpointHosts(hosts, hostByURL)
 
 	return dc, nil
 }
@@ -9022,6 +9238,7 @@ func (c *Core) startDexConnection(acctInfo *db.AccountInfo, dc *dexConnection) e
 		}
 		return err // no dc.acct.dexPubKey
 	}
+	c.configureMeshEndpoints(dc, cfg.MeshEndpoints)
 	// handleConnectEvent sets dc.connected, even on first connect
 
 	// Given bond config, sort through our db.Bond slice.
@@ -9062,6 +9279,7 @@ func (c *Core) handleReconnect(host string) {
 		c.log.Errorf("handleReconnect: Unable to apply new configuration for DEX at %s: %v", host, err)
 		return
 	}
+	c.configureMeshEndpoints(dc, cfg.MeshEndpoints)
 	c.notify(newServerConfigUpdateNote(host))
 
 	type market struct { // for book re-subscribe
@@ -9220,11 +9438,22 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 	atomic.StoreUint32(&dc.connectionStatus, uint32(status))
 
 	topic := TopicDEXDisconnected
+	var activeHost, switchedFrom string
 	if status == comms.Connected {
 		topic = TopicDEXConnected
 		dc.lastConnectMtx.Lock()
 		dc.lastConnect = time.Now()
 		dc.lastConnectMtx.Unlock()
+
+		activeHost = dc.activeEndpointHost()
+		dc.endpointsMtx.Lock()
+		if activeHost != "" {
+			if dc.lastConnectedHost != "" && dc.lastConnectedHost != activeHost {
+				switchedFrom = dc.lastConnectedHost
+			}
+			dc.lastConnectedHost = activeHost
+		}
+		dc.endpointsMtx.Unlock()
 	} else {
 		dc.lastConnectMtx.RLock()
 		lastConnect := dc.lastConnect
@@ -9235,7 +9464,7 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 			if count%wsMaxAnomalyCount == 0 {
 				// Send notification to check connectivity.
 				subject, details := c.formatDetails(TopicDexConnectivity, dc.acct.host)
-				c.notify(newConnEventNote(TopicDexConnectivity, subject, dc.acct.host, dc.status(), details, db.Poke))
+				c.notify(newConnEventNote(TopicDexConnectivity, subject, dc.acct.host, dc.activeEndpointHost(), dc.status(), details, db.Poke))
 			}
 		} else {
 			atomic.StoreUint32(&dc.anomaliesCount, 0)
@@ -9261,7 +9490,11 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 
 	if dc.broadcastingConnect() {
 		subject, details := c.formatDetails(topic, dc.acct.host)
-		dc.notify(newConnEventNote(topic, subject, dc.acct.host, status, details, db.Poke))
+		dc.notify(newConnEventNote(topic, subject, dc.acct.host, activeHost, status, details, db.Poke))
+		if switchedFrom != "" {
+			subject, details := c.formatDetails(TopicServerEndpointSwitched, dc.acct.host, activeHost)
+			dc.notify(newConnEventNote(TopicServerEndpointSwitched, subject, dc.acct.host, activeHost, status, details, db.Poke))
+		}
 	}
 }
 
@@ -9631,6 +9864,7 @@ var noteHandlers = map[string]routeHandler{
 	msgjson.BondExpiredRoute:         handleBondExpiredMsg,
 	msgjson.MMEpochSnapshotRoute:     handleMMEpochSnapshotMsg,
 	msgjson.CounterPartyAddressRoute: handleCounterPartyAddressMsg,
+	msgjson.MeshEndpointsRoute:       handleMeshEndpointsMsg,
 }
 
 // listen monitors the DEX websocket connection for server requests and
@@ -11086,6 +11320,9 @@ func parseCert(host string, certI any, net dex.Network) ([]byte, error) {
 	case string:
 		if len(c) == 0 {
 			return CertStore[net][host], nil // not found is ok (try without TLS)
+		}
+		if strings.Contains(c, "-----BEGIN CERTIFICATE-----") {
+			return []byte(c), nil
 		}
 		cert, err := os.ReadFile(c)
 		if err != nil {

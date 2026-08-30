@@ -112,7 +112,7 @@ func (c *Core) ToggleAccountStatus(pw []byte, host string, disable, force bool) 
 	}
 
 	subject, details := c.formatDetails(topic, dc.acct.host)
-	dc.notify(newConnEventNote(topic, subject, dc.acct.host, status, details, db.Poke))
+	dc.notify(newConnEventNote(topic, subject, dc.acct.host, dc.activeEndpointHost(), status, details, db.Poke))
 
 	return nil
 }
