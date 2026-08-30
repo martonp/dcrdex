@@ -15,7 +15,7 @@ var reactivateDuration = 24*time.Hour + FiatRateDataExpiry
 
 type Config struct {
 	CryptoCompareAPIKey string `long:"ccdataapikey" description:"This is your free API Key from cryptocompare.com."`
-	EnableBinanceUS     bool   `long:"enablebinanceus" description:"Set to true, if running the tatanka mesh from a US based server."`
+	EnableBinanceUS     bool   `long:"enablebinanceus" description:"Use Binance US instead of Binance for fiat rate requests."`
 	DisabledFiatSources string `long:"disabledfiatsources" description:"A list of disabled sources separated by comma. See fiatrate/sources.go."`
 }
 

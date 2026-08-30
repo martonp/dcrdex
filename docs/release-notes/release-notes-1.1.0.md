@@ -220,14 +220,6 @@ subsequent patch release.
 - Add transaction support, index upgrades, simplified upgrade API (#3328, #3294, #3317)
 - Migrate ETH transaction DB to Lexi (#3213)
 
-### Tatanka Mesh (Next-Gen DEX)
-
-- Add orderbook with map structure and push data (#3194, #3244, #3221)
-- Add order compatibility and matching functions (#3165)
-- Switch to AES for end-to-end encryption (#3204)
-- Add fee rate estimate oracle (#2769)
-- Add simnet harness and connect to mesh in core (#3339)
-
 ### Build and CI
 
 - Go 1.24 and updated GitHub actions (#3347)

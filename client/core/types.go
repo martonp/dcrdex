@@ -20,7 +20,6 @@ import (
 	"decred.org/dcrdex/dex/candles"
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/encrypt"
-	"decred.org/dcrdex/dex/feerates"
 	"decred.org/dcrdex/dex/keygen"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
@@ -38,8 +37,6 @@ const (
 	// scheme to locate them on-chain:
 	//  m / hdKeyPurposeBonds / assetID' / bondIndex
 	hdKeyPurposeBonds uint32 = hdkeychain.HardenedKeyStart + 0x626f6e64 // ASCII "bond"
-	// hdKeyPurposeMesh is the BIP-43 purpose field for mesh keys.
-	hdKeyPurposeMesh uint32 = hdkeychain.HardenedKeyStart + 0x6d657368 // ASCII "mesh"
 	// hdKeyPurposeMulti is the BIP-43 purpose field for multisig keys.
 	hdKeyPurposeMulti uint32 = hdkeychain.HardenedKeyStart + 0x6D756C74 // ASCII "mult"
 )
@@ -205,19 +202,6 @@ type ExtensionModeConfig struct {
 	} `json:"restrictedWallets"`
 }
 
-// MeshMarket is a market on the Mesh.
-type MeshMarket struct {
-	BaseID  uint32 `json:"baseID"`
-	QuoteID uint32 `json:"quoteID"`
-}
-
-// Mesh is the core representation of the Mesh.
-type Mesh struct {
-	Markets       map[string]*MeshMarket        `json:"markets"`
-	AssetVersions map[uint32]uint32             `json:"assetVersions"`
-	FeeRates      map[uint32]*feerates.Estimate `json:"feeRates"`
-}
-
 // User is information about the user's wallets and DEX accounts.
 type User struct {
 	Exchanges          map[string]*Exchange        `json:"exchanges"`
@@ -228,7 +212,6 @@ type User struct {
 	Net                dex.Network                 `json:"net"`
 	ExtensionConfig    *ExtensionModeConfig        `json:"extensionModeConfig,omitempty"`
 	Actions            []*asset.ActionRequiredNote `json:"actions,omitempty"`
-	Mesh               *Mesh                       `json:"mesh,omitempty"`
 }
 
 // SupportedAsset is data about an asset and possibly the wallet associated

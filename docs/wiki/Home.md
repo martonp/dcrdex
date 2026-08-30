@@ -14,11 +14,10 @@ If you're a developer and interested in contributing, jump to the
 
 # What is Bison Wallet?
 
-Bison Wallet is a multi-coin wallet developed in concert with [DCRDEX](#what-is-dcrdex)
-and [Tatanka Mesh](#tatanka-mesh). Bison Wallet leverages state-of-the-art blockchain
-technology to bring more features and more privacy for your favorite assets. DCRDEX is
-built-in and has advanced trading features like market-making and arbitrage with funds
-directly from your wallet.
+Bison Wallet is a multi-coin wallet developed in concert with [DCRDEX](#what-is-dcrdex).
+Bison Wallet leverages state-of-the-art blockchain technology to bring more features
+and more privacy for your favorite assets. DCRDEX is built-in and has advanced trading
+features like market-making and arbitrage with funds directly from your wallet.
 
 Our goal is to find a balance of convenience and privacy that works for you,
 while giving you access to advanced features most wallets ignore. For many
@@ -123,25 +122,6 @@ Check the [Troubleshooting](Troubleshooting-Problems) page for help with common
 issues like wallet recovery and rescanning. You can also get help from the
 community in the #support channel on
 [Decred Matrix](https://docs.decred.org/getting-started/joining-matrix-channels/).
-
-# Tatanka Mesh
-
-Tatanka Mesh (Tatanka, the mesh) is the evolution of DCRDEX. Where DCRDEX relies
-on a central server for maintaining order books and policing trades, Tatanka is
-a decentralized P2P protocol that enables a network of subscribers to
-collectively perform these tasks. Here are the three critical services that
-Tatanka Mesh provides.
-
-- Enhance the ability for users to connect and to share data both publicly and privately
-- Aggregate reputation data and monitor fidelity bonds. Tatanka can limit
-access to users who earn a bad reputation
-- Oracle services for fiat exchange rates and blockchain transaction fee rates
-
-The mesh collects no fees for its services. Trades are performed using trustless
-atomic swaps that exchange funds directly between wallets.
-
-Going P2P empowers our users to trade directly, enhancing security,
-censorship-resistance, privacy, and self-sovereignty.
 
 # Supported Assets
 
