@@ -88,4 +88,19 @@ func TestNewMarketInfoFromSymbols(t *testing.T) {
 	if err == nil {
 		t.Errorf("NewMarketInfoFromSymbols succeeded for non-existent quote asset")
 	}
+
+	// epoch duration below the minimum
+	_, err = NewMarketInfoFromSymbols("dcr", "btc", LotSize, RateStep, MinEpochDuration-1, defaultParcelSize, MarketBuyBuffer)
+	if err == nil {
+		t.Errorf("NewMarketInfoFromSymbols succeeded for a sub-minimum epoch duration")
+	}
+
+	// the minimum epoch duration and the zero-value default are accepted
+	if _, err = NewMarketInfoFromSymbols("dcr", "btc", LotSize, RateStep, MinEpochDuration, defaultParcelSize, MarketBuyBuffer); err != nil {
+		t.Errorf("NewMarketInfoFromSymbols failed for the minimum epoch duration: %v", err)
+	}
+	mktInfo, err = NewMarketInfoFromSymbols("dcr", "btc", LotSize, RateStep, 0, defaultParcelSize, MarketBuyBuffer)
+	if err != nil || mktInfo.EpochDuration != defaultEpochDuration {
+		t.Errorf("NewMarketInfoFromSymbols default epoch duration = %d, err = %v", mktInfo.EpochDuration, err)
+	}
 }

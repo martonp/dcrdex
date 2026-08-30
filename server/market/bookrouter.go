@@ -14,97 +14,12 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/meshevents"
 )
 
-// A updateAction classifies updates into how they affect the book or epoch
-// queue.
-type updateAction uint8
-
-const (
-	// invalidAction is the zero value action and should be considered programmer
-	// error if received.
-	invalidAction updateAction = iota
-	// epochAction means an order is being added to the epoch queue and will
-	// result in a msgjson.EpochOrderNote being sent to subscribers.
-	epochAction
-	// bookAction means an order is being added to the order book, and will result
-	// in a msgjson.BookOrderNote being sent to subscribers.
-	bookAction
-	// unbookAction means an order is being removed from the order book and will
-	// result in a msgjson.UnbookOrderNote being sent to subscribers.
-	unbookAction
-	// updateRemainingAction means a standing limit order has partially filled
-	// and will result in a msgjson.UpdateRemainingNote being sent to
-	// subscribers.
-	updateRemainingAction
-	// newEpochAction is an internal signal to the routers main loop that
-	// indicates when a new epoch has opened.
-	newEpochAction
-	// epochReportAction is sent when all bookAction, unbookAction, and
-	// updateRemainingAction signals are sent for a completed epoch.
-	// This signal performs a couple of important roles. First, it informs the
-	// client that the book updates are done, and the book will be static until
-	// the end of the epoch. Second, it sends the candlestick data, so a
-	// subscriber can maintain a up-to-date candles.Cache without repeatedly
-	// querying the HTTP API for the data.
-	epochReportAction
-	// matchProofAction means the matching has been performed and will result in
-	// a msgjson.MatchProofNote being sent to subscribers.
-	matchProofAction
-	// suspendAction means the market has suspended.
-	suspendAction
-	// resumeAction means the market has resumed.
-	resumeAction
-)
-
-// String provides a string representation of a updateAction. This is primarily
-// for logging and debugging purposes.
-func (bua updateAction) String() string {
-	switch bua {
-	case invalidAction:
-		return "invalid"
-	case epochAction:
-		return "epoch"
-	case bookAction:
-		return "book"
-	case unbookAction:
-		return "unbook"
-	case updateRemainingAction:
-		return "update_remaining"
-	case newEpochAction:
-		return "newEpoch"
-	case matchProofAction:
-		return "matchProof"
-	case suspendAction:
-		return "suspend"
-	default:
-		return ""
-	}
-}
-
-// updateSignal combines an updateAction with data for which the action
-// applies.
-type updateSignal struct {
-	action updateAction
-	data   any // sigData* type
-}
-
-func (us updateSignal) String() string {
-	return us.action.String()
-}
-
-// nolint:structcheck,unused
-type sigDataOrder struct {
-	order    order.Order
-	epochIdx int64
-}
-
-type sigDataBookedOrder sigDataOrder
-type sigDataUnbookedOrder sigDataOrder
-type sigDataEpochOrder sigDataOrder
-type sigDataUpdateRemaining sigDataOrder
-
-type sigDataEpochReport struct {
+// epochReport carries the per-epoch statistics published to book subscribers
+// and price feeders after an epoch_processed event.
+type epochReport struct {
 	epochIdx     int64
 	epochDur     int64
 	stats        *matcher.MatchCycleStats
@@ -114,29 +29,11 @@ type sigDataEpochReport struct {
 	matches      [][2]int64
 }
 
-type sigDataNewEpoch struct {
-	idx int64
-}
-
-type sigDataSuspend struct {
-	finalEpoch  int64
-	persistBook bool
-}
-
-type sigDataResume struct {
-	epochIdx int64
-	// TODO: indicate config change if applicable
-}
-
-type sigDataMatchProof struct {
-	matchProof *order.MatchProof
-}
-
-// BookSource is a source of a market's order book and a feed of updates to the
-// order book and epoch queue.
+// BookSource is a market's order book plus unbook notes from at-fault
+// SwapDone and orders_revoked.
 type BookSource interface {
 	Book() (epoch int64, buys []*order.LimitOrder, sells []*order.LimitOrder)
-	OrderFeed() <-chan *updateSignal
+	SetUnbookNotifier(func(*order.LimitOrder))
 	Base() uint32
 	Quote() uint32
 }
@@ -260,18 +157,29 @@ func (book *msgBook) update(lo *order.LimitOrder) *msgjson.BookOrderNote {
 }
 
 // Remove the order from the order book.
-func (book *msgBook) remove(lo *order.LimitOrder) {
+func (book *msgBook) remove(lo *order.LimitOrder) bool {
 	book.mtx.Lock()
 	defer book.mtx.Unlock()
+	if _, found := book.orders[lo.ID()]; !found {
+		return false
+	}
 	delete(book.orders, lo.ID())
+	return true
 }
 
-// addBulkOrders adds the lists of orders to the order book, and records the
-// currently active epoch. Use this for the initial sync of the orderbook.
+// addBulkOrders initializes the router's cached order book from an authoritative
+// market snapshot and records the currently active epoch. It replaces any
+// existing cached orders so stale entries cannot survive a resync.
 func (book *msgBook) addBulkOrders(epoch int64, orderSets ...[]*order.LimitOrder) {
+	n := 0
+	for _, set := range orderSets {
+		n += len(set)
+	}
+
 	book.mtx.Lock()
 	defer book.mtx.Unlock()
 	book.epochIdx = epoch
+	book.orders = make(map[order.OrderID]*msgjson.BookOrderNote, n)
 	for _, set := range orderSets {
 		for _, lo := range set {
 			book.orders[lo.ID()] = limitOrderToMsgOrder(lo, book.name)
@@ -279,12 +187,15 @@ func (book *msgBook) addBulkOrders(epoch int64, orderSets ...[]*order.LimitOrder
 	}
 }
 
-// BookRouter handles order book subscriptions, syncing the market with a group
-// of subscribers, and maintaining an intermediate copy of the orderbook in
-// message payload format for quick, full-book syncing.
+// BookRouter serves order-book subscriptions. Full-book syncs use a cached
+// payload; book-change notes are sent by the replicated event appliers,
+// not by this type mutating the book itself.
 type BookRouter struct {
 	books     map[string]*msgBook
 	feeSource FeeSource
+
+	// seedOnce makes SeedBooks one-shot.
+	seedOnce sync.Once
 
 	priceFeeders *subscribers
 	spotsMtx     sync.RWMutex
@@ -292,9 +203,8 @@ type BookRouter struct {
 }
 
 // NewBookRouter is a constructor for a BookRouter. Routes are registered with
-// comms and a monitoring goroutine is started for each BookSource specified.
-// The input sources is a mapping of market names to sources for order and epoch
-// queue information.
+// comms. The input sources is a mapping of market names to order book sources;
+// each market's book is started later, by SeedBooks.
 func NewBookRouter(sources map[string]BookSource, feeSource FeeSource, route func(route string, handler comms.MsgHandler)) *BookRouter {
 	router := &BookRouter{
 		books:     make(map[string]*msgBook),
@@ -326,224 +236,73 @@ func NewBookRouter(sources map[string]BookSource, feeSource FeeSource, route fun
 	return router
 }
 
-// Run implements dex.Runner, and is blocking.
+// Run implements dex.Runner, and is blocking. Run keeps the books — seeded by
+// the owner via SeedBooks — running until the Context is canceled. All other
+// subscriber notifications are sent synchronously by the replicated event
+// appliers through the apply*Event methods.
 func (r *BookRouter) Run(ctx context.Context) {
-	var wg sync.WaitGroup
-	for _, b := range r.books {
-		wg.Add(1)
-		go func(b *msgBook) {
-			r.runBook(ctx, b)
-			wg.Done()
-		}(b)
-	}
-	wg.Wait()
-}
+	<-ctx.Done()
 
-// runBook is a monitoring loop for an order book.
-func (r *BookRouter) runBook(ctx context.Context, book *msgBook) {
-	// Get the initial book.
-	feed := book.source.OrderFeed()
-	book.addBulkOrders(book.source.Book())
-	subs := book.subs
-
-	defer func() {
+	for _, book := range r.books {
 		book.mtx.Lock()
 		book.running = false
 		book.orders = make(map[order.OrderID]*msgjson.BookOrderNote)
 		book.mtx.Unlock()
 		log.Infof("Book router terminating for market %q", book.name)
-	}()
+	}
+}
+
+// SeedBooks starts every market's book, at most once. The owner must call it
+// — after the markets' state loaders have populated their books, and before
+// any replicated event applies — for client orderbook feeds to carry
+// pre-restart booked orders.
+func (r *BookRouter) SeedBooks() {
+	r.seedOnce.Do(func() {
+		for _, book := range r.books {
+			r.startBook(book)
+		}
+	})
+}
+
+// startBook wires a market's unbook notifier, seeds the router's book
+// projection from the market's current book, and marks the book running.
+// Unbook notifications that fire while the initial book snapshot loads are
+// buffered so a stale snapshot entry cannot outlive its removal.
+func (r *BookRouter) startBook(book *msgBook) {
+	var pendingMtx sync.Mutex
+	var pending []*order.LimitOrder
+	loading := true
+	book.source.SetUnbookNotifier(func(lo *order.LimitOrder) {
+		pendingMtx.Lock()
+		if loading {
+			pending = append(pending, lo)
+			pendingMtx.Unlock()
+			return
+		}
+		pendingMtx.Unlock()
+		r.applyUnbookOrderEvent(book, lo)
+	})
+
+	book.addBulkOrders(book.source.Book())
+
+	pendingMtx.Lock()
+	loading = false
+	unbooked := pending
+	pending = nil
+	pendingMtx.Unlock()
+	for _, lo := range unbooked {
+		r.applyUnbookOrderEvent(book, lo)
+	}
 
 	book.mtx.Lock()
 	book.running = true
 	book.mtx.Unlock()
+}
 
-out:
-	for {
-		select {
-		case u, ok := <-feed:
-			if !ok {
-				log.Errorf("Book order feed closed for market %q at epoch %d",
-					book.name, book.epoch())
-				break out
-			}
-
-			// Prepare the book/unbook/epoch note.
-			var note any
-			var route string
-			var spot *msgjson.Spot
-			switch sigData := u.data.(type) {
-			case sigDataNewEpoch:
-				// New epoch index should be sent here by the market following
-				// order matching and booking, but before new orders are added
-				// to this new epoch. This is needed for msgjson.OrderBook in
-				// sendBook, which must include the current epoch index.
-				book.setEpoch(sigData.idx)
-				continue // no notification to send
-
-			case sigDataBookedOrder:
-				route = msgjson.BookOrderRoute
-				lo, ok := sigData.order.(*order.LimitOrder)
-				if !ok {
-					panic("non-limit order received with bookAction")
-				}
-				n := book.insert(lo)
-				n.Seq = subs.nextSeq()
-				note = n
-
-			case sigDataUnbookedOrder:
-				route = msgjson.UnbookOrderRoute
-				lo, ok := sigData.order.(*order.LimitOrder)
-				if !ok {
-					panic("non-limit order received with unbookAction")
-				}
-				book.remove(lo)
-				oid := sigData.order.ID()
-				note = &msgjson.UnbookOrderNote{
-					Seq:      subs.nextSeq(),
-					MarketID: book.name,
-					OrderID:  oid[:],
-				}
-
-			case sigDataUpdateRemaining:
-				route = msgjson.UpdateRemainingRoute
-				lo, ok := sigData.order.(*order.LimitOrder)
-				if !ok {
-					panic("non-limit order received with updateRemainingAction")
-				}
-				bookNote := book.update(lo)
-				n := &msgjson.UpdateRemainingNote{
-					OrderNote: bookNote.OrderNote,
-					Remaining: lo.Remaining(),
-				}
-				n.Seq = subs.nextSeq()
-				note = n
-
-			case sigDataEpochReport:
-				route = msgjson.EpochReportRoute
-				startStamp := sigData.epochIdx * sigData.epochDur
-				endStamp := startStamp + sigData.epochDur
-				stats := sigData.stats
-				spot = sigData.spot
-
-				matchesWithTimestamp := make([][3]int64, 0, len(sigData.matches))
-				for _, match := range sigData.matches {
-					matchesWithTimestamp = append(matchesWithTimestamp, [3]int64{
-						match[0],
-						match[1],
-						endStamp})
-				}
-				book.addRecentMatches(matchesWithTimestamp)
-
-				note = &msgjson.EpochReportNote{
-					MarketID:     book.name,
-					Epoch:        uint64(sigData.epochIdx),
-					BaseFeeRate:  sigData.baseFeeRate,
-					QuoteFeeRate: sigData.quoteFeeRate,
-					Candle: msgjson.Candle{
-						StartStamp:  uint64(startStamp),
-						EndStamp:    uint64(endStamp),
-						MatchVolume: stats.MatchVolume,
-						QuoteVolume: stats.QuoteVolume,
-						HighRate:    stats.HighRate,
-						LowRate:     stats.LowRate,
-						StartRate:   stats.StartRate,
-						EndRate:     stats.EndRate,
-					},
-					MatchSummary: sigData.matches,
-				}
-
-			case sigDataEpochOrder:
-				route = msgjson.EpochOrderRoute
-				epochNote := new(msgjson.EpochOrderNote)
-				switch o := sigData.order.(type) {
-				case *order.LimitOrder:
-					epochNote.BookOrderNote = *limitOrderToMsgOrder(o, book.name)
-					epochNote.OrderType = msgjson.LimitOrderNum
-				case *order.MarketOrder:
-					epochNote.BookOrderNote = *marketOrderToMsgOrder(o, book.name)
-					epochNote.OrderType = msgjson.MarketOrderNum
-				case *order.CancelOrder:
-					epochNote.BookOrderNote = *cancelOrderToMsgOrder(o, book.name)
-					epochNote.OrderType = msgjson.CancelOrderNum
-					epochNote.TargetID = o.TargetOrderID[:]
-				}
-
-				epochNote.Seq = subs.nextSeq()
-				epochNote.MarketID = book.name
-				epochNote.Epoch = uint64(sigData.epochIdx)
-				c := sigData.order.Commitment()
-				epochNote.Commit = c[:]
-
-				note = epochNote
-
-			case sigDataMatchProof:
-				route = msgjson.MatchProofRoute
-				mp := sigData.matchProof
-				misses := make([]msgjson.Bytes, 0, len(mp.Misses))
-				for _, o := range mp.Misses {
-					oid := o.ID()
-					misses = append(misses, oid[:])
-				}
-				preimages := make([]msgjson.Bytes, 0, len(mp.Preimages))
-				for i := range mp.Preimages {
-					preimages = append(preimages, mp.Preimages[i][:])
-				}
-				note = &msgjson.MatchProofNote{
-					MarketID:  book.name,
-					Epoch:     mp.Epoch.Idx, // not u.epochIdx
-					Preimages: preimages,
-					Misses:    misses,
-					CSum:      mp.CSum,
-					Seed:      mp.Seed,
-				}
-
-			case sigDataSuspend:
-				// When sent with seq set, it indicates immediate stop, and may
-				// also indicate to purge the book.
-				route = msgjson.SuspensionRoute
-				susp := &msgjson.TradeSuspension{
-					MarketID: book.name,
-					// SuspendTime of 0 means now.
-					FinalEpoch: uint64(sigData.finalEpoch),
-					Persist:    sigData.persistBook,
-				}
-				// Only set Seq if there is a book update.
-				if !sigData.persistBook {
-					susp.Seq = subs.nextSeq() // book purge
-					book.mtx.Lock()
-					book.orders = make(map[order.OrderID]*msgjson.BookOrderNote)
-					book.mtx.Unlock()
-					// The router is "running" although the market is suspended.
-				}
-				note = susp
-
-				log.Infof("Market %q suspended after epoch %d, persist book = %v.",
-					book.name, sigData.finalEpoch, sigData.persistBook)
-
-			case sigDataResume:
-				route = msgjson.ResumptionRoute
-				note = &msgjson.TradeResumption{
-					MarketID: book.name,
-					// ResumeTime of 0 means now.
-					StartEpoch: uint64(sigData.epochIdx),
-				} // no Seq for the resume since it doesn't modify the book
-
-				log.Infof("Market %q resumed at epoch %d", book.name, sigData.epochIdx)
-
-			default:
-				log.Errorf("Unknown orderbook update action %d", u.action)
-				continue
-			}
-
-			r.sendNote(route, subs, note)
-
-			if spot != nil {
-				r.sendNote(msgjson.PriceUpdateRoute, r.priceFeeders, spot)
-			}
-		case <-ctx.Done():
-			break out
-		}
+func (r *BookRouter) applyMarketStartedEvent(book *msgBook, epochIdx int64, removed []*order.LimitOrder) {
+	book.setEpoch(epochIdx)
+	for _, lo := range removed {
+		r.applyUnbookOrderEvent(book, lo)
 	}
 }
 
@@ -756,6 +515,171 @@ func (r *BookRouter) sendNote(route string, subs *subscribers, note any) {
 	}
 }
 
+// applyOrderAcceptedEvent applies an accepted-order event to the local book
+// projection and notifies local subscribers.
+func (r *BookRouter) applyOrderAcceptedEvent(book *msgBook, note *msgjson.EpochOrderNote, epochIdx int64) {
+	r.applyEpochOrderNote(book, note, epochIdx)
+	r.sendNote(msgjson.EpochOrderRoute, book.subs, note)
+}
+
+// applyAdvanceEpochEvent applies a replicated epoch transition to the book
+// router's local projection.
+func (r *BookRouter) applyAdvanceEpochEvent(book *msgBook, epochIdx int64) {
+	book.setEpoch(epochIdx)
+}
+
+func (r *BookRouter) applyMarketSuspendedEvent(book *msgBook, finalEpoch int64, persistBook bool, purged []order.OrderID) {
+	note := &msgjson.TradeSuspension{
+		MarketID:   book.name,
+		FinalEpoch: uint64(finalEpoch),
+		Persist:    persistBook,
+	}
+	if !persistBook {
+		note.Seq = book.subs.nextSeq()
+		book.mtx.Lock()
+		book.orders = make(map[order.OrderID]*msgjson.BookOrderNote)
+		book.mtx.Unlock()
+	}
+	r.sendNote(msgjson.SuspensionRoute, book.subs, note)
+	log.Infof("Market %q suspended after epoch %d, persist book = %v, purged orders = %d.",
+		book.name, finalEpoch, persistBook, len(purged))
+}
+
+func (r *BookRouter) applyMarketResumedEvent(book *msgBook, startEpoch int64, removed []*order.LimitOrder) {
+	for _, lo := range removed {
+		r.applyUnbookOrderEvent(book, lo)
+	}
+	r.sendNote(msgjson.ResumptionRoute, book.subs, &msgjson.TradeResumption{
+		MarketID:   book.name,
+		StartEpoch: uint64(startEpoch),
+	})
+	log.Infof("Market %q resumed at epoch %d", book.name, startEpoch)
+}
+
+// applyBookedOrder applies a newly booked limit order to the local book
+// projection and notifies local subscribers.
+func (r *BookRouter) applyBookedOrder(book *msgBook, lo *order.LimitOrder) {
+	note := book.insert(lo)
+	note.Seq = book.subs.nextSeq()
+	r.sendNote(msgjson.BookOrderRoute, book.subs, note)
+}
+
+// applyEpochProcessedEvent applies the order book projection and notifications
+// produced by an epoch_processed event.
+func (r *BookRouter) applyEpochProcessedEvent(book *msgBook, event *meshevents.EpochProcessedEvent, result *epochProcessedResult) {
+	preimages := make([]order.Preimage, len(result.revealed))
+	for i := range result.revealed {
+		preimages[i] = result.revealed[i].Preimage
+	}
+	r.applyMatchProofEvent(book, &order.MatchProof{
+		Epoch: order.EpochID{
+			Idx: uint64(event.EpochIdx),
+			Dur: uint64(event.EpochDur),
+		},
+		Preimages: preimages,
+		Misses:    result.misses,
+		CSum:      event.CSum,
+		Seed:      result.seed,
+	})
+
+	for _, ord := range result.booked {
+		lo, ok := ord.Order.(*order.LimitOrder)
+		if !ok {
+			log.Errorf("non-limit order %T received in booked orders", ord.Order)
+			continue
+		}
+		r.applyBookedOrder(book, lo)
+	}
+
+	for _, lo := range result.updates.TradesPartial {
+		r.applyUpdateRemainingEvent(book, lo)
+	}
+	for _, lo := range result.unbooked {
+		r.applyUnbookOrderEvent(book, lo)
+	}
+}
+
+func (r *BookRouter) applyMatchProofEvent(book *msgBook, mp *order.MatchProof) {
+	misses := make([]msgjson.Bytes, 0, len(mp.Misses))
+	for _, o := range mp.Misses {
+		oid := o.ID()
+		misses = append(misses, oid[:])
+	}
+	preimages := make([]msgjson.Bytes, 0, len(mp.Preimages))
+	for i := range mp.Preimages {
+		preimages = append(preimages, mp.Preimages[i][:])
+	}
+	r.sendNote(msgjson.MatchProofRoute, book.subs, &msgjson.MatchProofNote{
+		MarketID:  book.name,
+		Epoch:     mp.Epoch.Idx,
+		Preimages: preimages,
+		Misses:    misses,
+		CSum:      mp.CSum,
+		Seed:      mp.Seed,
+	})
+}
+
+func (r *BookRouter) applyUpdateRemainingEvent(book *msgBook, lo *order.LimitOrder) {
+	bookNote := book.update(lo)
+	note := &msgjson.UpdateRemainingNote{
+		OrderNote: bookNote.OrderNote,
+		Remaining: lo.Remaining(),
+	}
+	note.Seq = book.subs.nextSeq()
+	r.sendNote(msgjson.UpdateRemainingRoute, book.subs, note)
+}
+
+// applyUnbookOrderEvent removes an order from the book projection and
+// notifies subscribers, doing nothing if the order was not in the projection.
+func (r *BookRouter) applyUnbookOrderEvent(book *msgBook, lo *order.LimitOrder) {
+	if !book.remove(lo) {
+		return
+	}
+	oid := lo.ID()
+	note := &msgjson.UnbookOrderNote{
+		Seq:      book.subs.nextSeq(),
+		MarketID: book.name,
+		OrderID:  oid[:],
+	}
+	r.sendNote(msgjson.UnbookOrderRoute, book.subs, note)
+}
+
+func (r *BookRouter) applyEpochReportEvent(book *msgBook, report *epochReport) {
+	startStamp := report.epochIdx * report.epochDur
+	endStamp := startStamp + report.epochDur
+	stats := report.stats
+
+	matchesWithTimestamp := make([][3]int64, 0, len(report.matches))
+	for _, match := range report.matches {
+		matchesWithTimestamp = append(matchesWithTimestamp, [3]int64{
+			match[0],
+			match[1],
+			endStamp})
+	}
+	book.addRecentMatches(matchesWithTimestamp)
+
+	r.sendNote(msgjson.EpochReportRoute, book.subs, &msgjson.EpochReportNote{
+		MarketID:     book.name,
+		Epoch:        uint64(report.epochIdx),
+		BaseFeeRate:  report.baseFeeRate,
+		QuoteFeeRate: report.quoteFeeRate,
+		Candle: msgjson.Candle{
+			StartStamp:  uint64(startStamp),
+			EndStamp:    uint64(endStamp),
+			MatchVolume: stats.MatchVolume,
+			QuoteVolume: stats.QuoteVolume,
+			HighRate:    stats.HighRate,
+			LowRate:     stats.LowRate,
+			StartRate:   stats.StartRate,
+			EndRate:     stats.EndRate,
+		},
+		MatchSummary: report.matches,
+	})
+	if report.spot != nil {
+		r.sendNote(msgjson.PriceUpdateRoute, r.priceFeeders, report.spot)
+	}
+}
+
 // cancelOrderToMsgOrder converts an *order.CancelOrder to a
 // *msgjson.BookOrderNote.
 func cancelOrderToMsgOrder(o *order.CancelOrder, mkt string) *msgjson.BookOrderNote {
@@ -771,6 +695,40 @@ func cancelOrderToMsgOrder(o *order.CancelOrder, mkt string) *msgjson.BookOrderN
 			Time: uint64(o.ServerTime.UnixMilli()),
 		},
 	}
+}
+
+func epochOrderNote(ord order.Order, mkt string, epochIdx int64) *msgjson.EpochOrderNote {
+	epochNote := new(msgjson.EpochOrderNote)
+	switch o := ord.(type) {
+	case *order.LimitOrder:
+		epochNote.BookOrderNote = *limitOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.LimitOrderNum
+	case *order.MarketOrder:
+		epochNote.BookOrderNote = *marketOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.MarketOrderNum
+	case *order.CancelOrder:
+		epochNote.BookOrderNote = *cancelOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.CancelOrderNum
+		epochNote.TargetID = o.TargetOrderID[:]
+	default:
+		panic(fmt.Sprintf("unsupported epoch order type %T", ord))
+	}
+	epochNote.MarketID = mkt
+	epochNote.Epoch = uint64(epochIdx)
+	c := ord.Commitment()
+	epochNote.Commit = c[:]
+	return epochNote
+}
+
+func (r *BookRouter) applyEpochOrderNote(book *msgBook, note *msgjson.EpochOrderNote, epochIdx int64) *msgjson.EpochOrderNote {
+	book.mtx.Lock()
+	if epochIdx > book.epochIdx {
+		book.epochIdx = epochIdx
+	}
+	book.mtx.Unlock()
+
+	note.Seq = book.subs.nextSeq()
+	return note
 }
 
 // limitOrderToMsgOrder converts an *order.LimitOrder to a

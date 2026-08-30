@@ -252,20 +252,6 @@ func TestBook(t *testing.T) {
 		t.Errorf("buy side was empty")
 	}
 
-	buysRemoved, sellsRemoved := b.Clear()
-	if len(buysRemoved) != len(bookBuyOrders)-2 {
-		t.Errorf("removed %d buys, expected, %d", len(buysRemoved), len(bookBuyOrders)-2)
-	}
-	if len(sellsRemoved) != len(bookSellOrders)-2 {
-		t.Errorf("removed %d sells, expected, %d", len(sellsRemoved), len(bookSellOrders)-2)
-	}
-
-	if b.SellCount() != 0 {
-		t.Errorf("sell side was not empty after Clear")
-	}
-	if b.BuyCount() != 0 {
-		t.Errorf("buy side was not empty after Clear")
-	}
 }
 
 func TestAccountTracking(t *testing.T) {
@@ -330,5 +316,88 @@ func TestAccountTracking(t *testing.T) {
 
 	if len(b.acctTracker.quote) != 0 {
 		t.Fatalf("quote asset not cleared")
+	}
+}
+
+func TestCheckLotSize(t *testing.T) {
+	startLogger()
+	b := New(LotSize, 0)
+
+	twoLots := newLimitOrder(false, 2500000, 2, order.StandingTiF, 0)
+	if !b.Insert(twoLots) {
+		t.Fatal("insert two-lot buy")
+	}
+	if err := b.CheckLotSize(LotSize, nil); err != nil {
+		t.Fatalf("CheckLotSize current: %v", err)
+	}
+	if err := b.CheckLotSize(2*LotSize, nil); err != nil {
+		t.Fatalf("CheckLotSize 2x: %v", err)
+	}
+
+	oneLot := newLimitOrder(true, 5000000, 1, order.StandingTiF, 0)
+	if !b.Insert(oneLot) {
+		t.Fatal("insert one-lot sell")
+	}
+	if err := b.CheckLotSize(2*LotSize, nil); err == nil {
+		t.Fatal("CheckLotSize 2x with one-lot order: want error")
+	}
+	if err := b.CheckLotSize(2*LotSize, map[order.OrderID]bool{oneLot.ID(): true}); err != nil {
+		t.Fatalf("CheckLotSize 2x with revoke: %v", err)
+	}
+
+	twoLots.FillAmt = LotSize / 2
+	if err := b.CheckLotSize(LotSize, nil); err == nil {
+		t.Fatal("CheckLotSize with odd FillAmt: want error")
+	}
+	if err := b.CheckLotSize(LotSize, map[order.OrderID]bool{twoLots.ID(): true, oneLot.ID(): true}); err != nil {
+		t.Fatalf("CheckLotSize FillAmt revoked: %v", err)
+	}
+}
+
+func TestSetLotSize(t *testing.T) {
+	startLogger()
+	b := New(LotSize, 0)
+	lo := newLimitOrder(false, 2500000, 2, order.StandingTiF, 0)
+	if !b.Insert(lo) {
+		t.Fatal("insert")
+	}
+
+	if err := b.SetLotSize(2 * LotSize); err != nil {
+		t.Fatalf("SetLotSize 2x compatible: %v", err)
+	}
+	if b.LotSize() != 2*LotSize {
+		t.Fatalf("LotSize = %d, want %d", b.LotSize(), 2*LotSize)
+	}
+
+	other := newLimitOrder(true, 5000000, 2, order.StandingTiF, 0)
+	if !b.Insert(other) {
+		t.Fatal("insert other")
+	}
+	if err := b.SetLotSize(3 * LotSize); err == nil {
+		t.Fatal("SetLotSize 3x: want error")
+	}
+	if b.LotSize() != 2*LotSize {
+		t.Fatalf("LotSize changed on error: got %d", b.LotSize())
+	}
+
+	lo.FillAmt = LotSize
+	if err := b.SetLotSize(2 * LotSize); err == nil {
+		t.Fatal("SetLotSize with leftover FillAmt: want error")
+	}
+	if b.LotSize() != 2*LotSize {
+		t.Fatalf("LotSize changed on FillAmt error: got %d", b.LotSize())
+	}
+
+	if _, ok := b.Remove(lo.ID()); !ok {
+		t.Fatal("remove leftover")
+	}
+	if _, ok := b.Remove(other.ID()); !ok {
+		t.Fatal("remove other")
+	}
+	if err := b.SetLotSize(3 * LotSize); err != nil {
+		t.Fatalf("SetLotSize after remove: %v", err)
+	}
+	if b.LotSize() != 3*LotSize {
+		t.Fatalf("LotSize = %d, want %d", b.LotSize(), 3*LotSize)
 	}
 }

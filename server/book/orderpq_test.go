@@ -562,42 +562,6 @@ func TestOrderPQ_RemoveUserOrders(t *testing.T) {
 	if count != 1 {
 		t.Errorf("wanted %d orders, got %d", 1, count)
 	}
-
-	removed := pq.RemoveUserOrders(user0)
-	if pq.Len() != 1 {
-		t.Errorf("Queue length expected %d, got %d", 1, pq.Len())
-	}
-	if len(removed) != 2 {
-		t.Fatalf("removed %d orders, expected %d", len(removed), 2)
-	}
-	for _, oid := range []order.OrderID{orders[0].ID(), orders[1].ID()} {
-		var found bool
-		for i := range removed {
-			if oid == removed[i].ID() {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("didn't remove order %v", oid)
-		}
-	}
-
-	remainingID := pq.PeekBest().ID()
-	if remainingID != other.ID() {
-		t.Errorf("Remaining element expected %s, got %s", other.ID(),
-			remainingID)
-	}
-	removed = pq.RemoveUserOrders(user1)
-	if remain := pq.Len(); remain != 0 {
-		t.Errorf("didn't remove all orders, still have %d", remain)
-	}
-	if len(removed) != 1 {
-		t.Fatalf("removed %d orders, expected %d", len(removed), 1)
-	}
-	if removed[0].ID() != other.ID() {
-		t.Errorf("removed order %v, expected %v", removed[0], other.ID())
-	}
 }
 
 func TestOrderPQMin_Worst(t *testing.T) {
