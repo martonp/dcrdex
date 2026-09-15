@@ -29,6 +29,13 @@ func (auth *AuthManager) Events() map[string]mesh.EventApplier {
 			}
 			return auth.applyBondPostedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), posted)
 		},
+		meshevents.EventKindPrepaidBondsCreated: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			created, err := meshevents.DecodePrepaidBondsCreatedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return auth.storage.ApplyPrepaidBondsCreatedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), created)
+		},
 	}
 }
 

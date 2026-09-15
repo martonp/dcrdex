@@ -64,32 +64,36 @@ type ratioData struct {
 
 // TStorage satisfies the Storage interface
 type TStorage struct {
-	accountReadErr        error
-	acctInfo              *db.Account
-	acctInfoErr           error
-	acct                  *account.Account
-	matches               []*db.MatchData
-	matchStatuses         []*db.MatchStatus
-	userPreimageResults   []*db.PreimageResult
-	userMatchOutcomes     []*db.MatchOutcome
-	reputationPreimages   []*db.PreimageOutcome
-	reputationMatches     []*db.MatchResult
-	reputationOrders      []*db.OrderOutcome
-	reputationErr         error
-	getUserReputationData func(context.Context, account.AccountID, int, int, int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error)
-	orderStatuses         []*db.OrderStatus
-	acctErr               error
-	regAddr               string
-	regAsset              uint32
-	bonds                 []*db.Bond
-	bondPostedResult      *db.BondPostedResult
-	bondPostedErr         error
-	bondPostedLimits      [3]int
-	bondPostedMeta        *db.EventLogMeta
-	bondPostedEvent       *meshevents.BondPostedEvent
-	prepaidBonds          map[string]*meshevents.PrepaidBond
-	repInputsListener     func(users ...account.AccountID)
-	ratio                 ratioData
+	accountReadErr            error
+	acctInfo                  *db.Account
+	acctInfoErr               error
+	acct                      *account.Account
+	matches                   []*db.MatchData
+	matchStatuses             []*db.MatchStatus
+	userPreimageResults       []*db.PreimageResult
+	userMatchOutcomes         []*db.MatchOutcome
+	reputationPreimages       []*db.PreimageOutcome
+	reputationMatches         []*db.MatchResult
+	reputationOrders          []*db.OrderOutcome
+	reputationErr             error
+	getUserReputationData     func(context.Context, account.AccountID, int, int, int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error)
+	orderStatuses             []*db.OrderStatus
+	acctErr                   error
+	regAddr                   string
+	regAsset                  uint32
+	bonds                     []*db.Bond
+	bondPostedResult          *db.BondPostedResult
+	bondPostedErr             error
+	bondPostedLimits          [3]int
+	bondPostedMeta            *db.EventLogMeta
+	bondPostedEvent           *meshevents.BondPostedEvent
+	prepaidBonds              map[string]*meshevents.PrepaidBond
+	prepaidBondsCreatedLog    *db.EventLogEntry
+	prepaidBondsCreatedErr    error
+	prepaidBondsCreatedMeta   *db.EventLogMeta
+	prepaidBondsCreatedUpdate *meshevents.PrepaidBondsCreatedEvent
+	repInputsListener         func(users ...account.AccountID)
+	ratio                     ratioData
 }
 
 func (s *TStorage) SetReputationInputsListener(listener func(users ...account.AccountID)) {
@@ -165,6 +169,11 @@ func (s *TStorage) FetchPrepaidBond(coinID []byte) (uint32, int64, error) {
 		return bond.Strength, bond.LockTime, nil
 	}
 	return 1, time.Now().Add(time.Hour * 48).Unix(), nil
+}
+func (s *TStorage) ApplyPrepaidBondsCreatedEvent(_ context.Context, meta *db.EventLogMeta, event *meshevents.PrepaidBondsCreatedEvent) (*db.EventLogEntry, error) {
+	s.prepaidBondsCreatedMeta = meta
+	s.prepaidBondsCreatedUpdate = event
+	return s.prepaidBondsCreatedLog, s.prepaidBondsCreatedErr
 }
 
 func (s *TStorage) DeletePrepaidBond(coinID []byte) (err error) { return nil }
@@ -2116,6 +2125,74 @@ func decodePostBondResult(t *testing.T, msg *msgjson.Message) *msgjson.PostBondR
 		t.Fatalf("postbond result decode: %v", err)
 	}
 	return &result
+}
+
+func TestCreatePrepaidBonds(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		storageErr error
+	}{
+		{name: "emits event and returns token IDs"},
+		{name: "storage error", storageErr: errors.New("store prepaid bonds failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authMgr, storage := newTestAuthManager(t)
+			storage.prepaidBondsCreatedErr = tt.storageErr
+			if tt.storageErr == nil {
+				storage.prepaidBondsCreatedLog = &db.EventLogEntry{
+					Seq:  1,
+					Kind: meshevents.EventKindPrepaidBondsCreated,
+				}
+			}
+			meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+				EventLogReader: emptyEventLogReader{},
+				OnHalt:         func(error) {},
+				Commands:       authMgr.Commands(),
+				Events:         authMgr.Events(),
+				Logger:         dex.Disabled,
+			})
+			if err != nil {
+				t.Fatalf("NewService error: %v", err)
+			}
+			authMgr.SetMeshService(meshSvc)
+
+			const duration = 48 * time.Hour
+			minLockTime := time.Now().Add(authMgr.bondExpiry + duration).Unix()
+			coinIDs, err := authMgr.CreatePrepaidBonds(2, 3, int64(duration.Seconds()))
+			maxLockTime := time.Now().Add(authMgr.bondExpiry + duration).Unix()
+			event := storage.prepaidBondsCreatedUpdate
+			if event == nil || len(event.Bonds) != 2 {
+				t.Fatalf("storage event = %+v, want two prepaid bonds", event)
+			}
+			if tt.storageErr != nil {
+				var rpcErr *msgjson.Error
+				if !errors.As(err, &rpcErr) || rpcErr.Code != msgjson.RPCInternalError || coinIDs != nil {
+					t.Fatalf("coin IDs = %x, error = %v, want no IDs and an internal error", coinIDs, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreatePrepaidBonds error: %v", err)
+			}
+			if len(coinIDs) != 2 {
+				t.Fatalf("created %d IDs, want 2", len(coinIDs))
+			}
+			for i, bond := range event.Bonds {
+				if len(coinIDs[i]) != prepaidBondIDLength {
+					t.Fatalf("pre-paid bond ID length = %d, want %d", len(coinIDs[i]), prepaidBondIDLength)
+				}
+				if !bytes.Equal(bond.CoinID, coinIDs[i]) {
+					t.Fatalf("event coin ID = %x, returned %x", bond.CoinID, coinIDs[i])
+				}
+				if bond.Strength != 3 {
+					t.Fatalf("event strength = %d, want 3", bond.Strength)
+				}
+				if bond.LockTime < minLockTime || bond.LockTime > maxLockTime {
+					t.Fatalf("event lock time = %d, want between %d and %d", bond.LockTime, minLockTime, maxLockTime)
+				}
+			}
+		})
+	}
 }
 
 func TestExecutePostBond(t *testing.T) {

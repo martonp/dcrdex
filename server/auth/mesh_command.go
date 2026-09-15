@@ -8,12 +8,14 @@ import (
 )
 
 const (
-	commandKindPostBond = "postbond"
+	commandKindPostBond           = "postbond"
+	commandKindCreatePrepaidBonds = "create_prepaid_bonds"
 )
 
 // Commands returns the mesh command handlers.
 func (auth *AuthManager) Commands() map[string]mesh.CommandExecutor {
 	return map[string]mesh.CommandExecutor{
-		commandKindPostBond: auth.executePostBond,
+		commandKindPostBond:           auth.executePostBond,
+		commandKindCreatePrepaidBonds: auth.executeCreatePrepaidBonds,
 	}
 }
