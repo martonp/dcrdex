@@ -66,7 +66,6 @@ type Storage interface {
 
 	CreateAccountWithBond(acct *account.Account, bond *db.Bond) error
 	AddBond(acct account.AccountID, bond *db.Bond) error
-	DeleteBond(assetID uint32, coinID []byte) error
 	FetchPrepaidBond(bondCoinID []byte) (strength uint32, lockTime int64, err error)
 	DeletePrepaidBond(coinID []byte) error
 	StorePrepaidBonds(coinIDs [][]byte, strength uint32, lockTime int64) error
@@ -162,32 +161,6 @@ func (client *clientInfo) addBond(bond *db.Bond) (bondTier int64) {
 	return
 }
 
-// not thread-safe
-func (client *clientInfo) pruneBonds(lockTimeThresh int64) (pruned []*db.Bond, bondTier int64) {
-	if len(client.bonds) == 0 {
-		return
-	}
-
-	var n int
-	for _, bond := range client.bonds {
-		if bond.LockTime >= lockTimeThresh { // not expired
-			if len(pruned) > 0 /* n < i */ { // a prior bond was removed, must move this element up in the slice
-				client.bonds[n] = bond
-			}
-			n++
-			bondTier += int64(bond.Strength)
-			continue
-		}
-		log.Infof("Expiring user %v bond %v (%s)", client.acct.ID,
-			coinIDString(bond.AssetID, bond.CoinID), dex.BipIDSymbol(bond.AssetID))
-		pruned = append(pruned, bond)
-		// n not incremented, next live bond shifts up
-	}
-	client.bonds = client.bonds[:n] // no-op if none expired
-
-	return
-}
-
 func (client *clientInfo) rmHandler(id uint64) bool {
 	client.mtx.Lock()
 	defer client.mtx.Unlock()
@@ -241,15 +214,13 @@ func (client *clientInfo) respHandler(id uint64) *respHandler {
 // bond and reputation requests. It signs outgoing messages and routes
 // communication to authenticated clients.
 type AuthManager struct {
-	wg             sync.WaitGroup
-	ctx            context.Context
-	storage        Storage
-	signer         Signer
-	parseBondTx    BondTxParser
-	checkBond      BondCoinChecker // fidelity bond amount, lockTime, acct, and confs
-	miaUserTimeout time.Duration
-	unbookFun      func(account.AccountID)
-	route          func(route string, handler comms.MsgHandler)
+	wg          sync.WaitGroup
+	ctx         context.Context
+	storage     Storage
+	signer      Signer
+	parseBondTx BondTxParser
+	checkBond   BondCoinChecker // fidelity bond amount, lockTime, acct, and confs
+	route       func(route string, handler comms.MsgHandler)
 
 	bondExpiry time.Duration // a bond is expired when time.Until(lockTime) < bondExpiry
 	bondAssets map[uint32]*msgjson.BondAsset
@@ -267,10 +238,9 @@ type AuthManager struct {
 	bondWaiterMtx sync.Mutex
 	bondWaiterIdx map[string]struct{}
 
-	connMtx   sync.RWMutex
-	users     map[account.AccountID]*clientInfo
-	conns     map[uint64]*clientInfo
-	unbookers map[account.AccountID]*time.Timer
+	connMtx sync.RWMutex
+	users   map[account.AccountID]*clientInfo
+	conns   map[uint64]*clientInfo
 
 	// repNotifyMtx serializes reputation updates sent to clients.
 	repNotifyMtx sync.Mutex
@@ -359,12 +329,6 @@ type Config struct {
 	// TxDataSources are sources of tx data for a coin ID.
 	TxDataSources map[uint32]TxDataSource
 
-	// UserUnbooker is a function for unbooking all of a user's orders.
-	UserUnbooker func(account.AccountID)
-	// MiaUserTimeout is how long after a user disconnects until UserUnbooker is
-	// called for that user.
-	MiaUserTimeout time.Duration
-
 	CancelThreshold float64
 	FreeCancels     bool
 
@@ -397,8 +361,6 @@ func NewAuthManager(cfg *Config) *AuthManager {
 		bondExpiry:       time.Duration(cfg.BondExpiry) * time.Second,
 		parseBondTx:      cfg.BondTxParser, // e.g. dcr's ParseBondTx
 		checkBond:        cfg.BondChecker,  // e.g. dcr's BondCoin
-		miaUserTimeout:   cfg.MiaUserTimeout,
-		unbookFun:        cfg.UserUnbooker,
 		route:            cfg.Route,
 		freeCancels:      cfg.FreeCancels,
 		penaltyThreshold: penaltyThreshold,
@@ -407,7 +369,6 @@ func NewAuthManager(cfg *Config) *AuthManager {
 		latencyQ:         wait.NewTickerQueue(recheckInterval),
 		users:            make(map[account.AccountID]*clientInfo),
 		conns:            make(map[uint64]*clientInfo),
-		unbookers:        make(map[account.AccountID]*time.Timer),
 		bondWaiterIdx:    make(map[string]struct{}),
 		matchOutcomes:    make(map[account.AccountID]*latestOutcomes[*db.MatchResult]),
 		preimgOutcomes:   make(map[account.AccountID]*latestOutcomes[*db.PreimageOutcome]),
@@ -431,28 +392,6 @@ func NewAuthManager(cfg *Config) *AuthManager {
 	cfg.Route(msgjson.MatchStatusRoute, auth.handleMatchStatus)
 	cfg.Route(msgjson.OrderStatusRoute, auth.handleOrderStatus)
 	return auth
-}
-
-func (auth *AuthManager) unbookUserOrders(user account.AccountID) {
-	log.Tracef("Unbooking all orders for user %v", user)
-	auth.unbookFun(user)
-	auth.connMtx.Lock()
-	delete(auth.unbookers, user)
-	auth.connMtx.Unlock()
-}
-
-// ExpectUsers specifies which users are expected to connect within a certain
-// time or have their orders unbooked (revoked). This should be run prior to
-// starting the AuthManager. This is not part of the constructor since it is
-// convenient to obtain this information from the Market's Books, and Market
-// requires the AuthManager. The same information could be pulled from storage,
-// but the Market is the authoritative book. The AuthManager should be started
-// via Run immediately after calling ExpectUsers so the users can connect.
-func (auth *AuthManager) ExpectUsers(users map[account.AccountID]struct{}, within time.Duration) {
-	log.Debugf("Expecting %d users with booked orders to connect within %v", len(users), within)
-	for user := range users {
-		auth.unbookers[user] = time.AfterFunc(within, func() { auth.unbookUserOrders(user) })
-	}
 }
 
 // GraceLimit returns the number of initial orders allowed for a new user before
@@ -496,17 +435,6 @@ func (auth *AuthManager) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		}
 	}()
 
-	auth.wg.Add(1)
-	go func() {
-		defer auth.wg.Done()
-		<-ctx.Done()
-		auth.connMtx.Lock()
-		defer auth.connMtx.Unlock()
-		for user, ub := range auth.unbookers {
-			ub.Stop()
-			delete(auth.unbookers, user)
-		}
-	}()
 	// TODO: wait for running comms route handlers and other DB writers.
 	return &auth.wg, nil
 }
@@ -1039,89 +967,6 @@ func (auth *AuthManager) sendScoreChanged(acctID account.AccountID, rep *account
 	}
 }
 
-// sendBondExpired sends a bondexpired notification to an account.
-func (auth *AuthManager) sendBondExpired(acctID account.AccountID, bond *db.Bond, rep *account.Reputation) {
-	effectiveTier := rep.EffectiveTier()
-	log.Debugf("Sending bondexpired notification to %v for bond %v (%s), new tier = %d",
-		acctID, coinIDString(bond.AssetID, bond.CoinID), dex.BipIDSymbol(bond.AssetID), effectiveTier)
-	bondExpNtfn := &msgjson.BondExpiredNotification{
-		AssetID:    bond.AssetID,
-		BondCoinID: bond.CoinID,
-		AccountID:  acctID[:],
-		Tier:       effectiveTier,
-		Reputation: rep,
-	}
-	auth.Sign(bondExpNtfn)
-	resp, err := msgjson.NewNotification(msgjson.BondExpiredRoute, bondExpNtfn)
-	if err != nil {
-		log.Error("BondExpiredRoute encoding error: %v", err)
-		return
-	}
-	if err = auth.Send(acctID, resp); err != nil {
-		log.Warnf("Error sending bond expired notification to account %v: %v", acctID, err)
-		// The user will need to 'connect' to see their current tier and bonds.
-	}
-}
-
-// checkBonds checks all connected users' bonds expiry and recomputes user tier
-// on change. This should be run on a ticker.
-func (auth *AuthManager) checkBonds() {
-	lockTimeThresh := time.Now().Add(auth.bondExpiry).Unix()
-
-	checkClientBonds := func(client *clientInfo) ([]*db.Bond, *account.Reputation) {
-		client.mtx.Lock()
-		defer client.mtx.Unlock()
-		pruned, bondTier := client.pruneBonds(lockTimeThresh)
-		if len(pruned) == 0 {
-			return nil, nil // no tier change
-		}
-
-		auth.violationMtx.Lock()
-		score := auth.userScore(client.acct.ID)
-		auth.violationMtx.Unlock()
-
-		client.tier = auth.tier(bondTier, score)
-		client.score = score
-
-		return pruned, auth.userReputation(bondTier, score)
-	}
-
-	auth.connMtx.RLock()
-	defer auth.connMtx.RUnlock()
-
-	type checkRes struct {
-		rep   *account.Reputation
-		bonds []*db.Bond
-	}
-	expiredBonds := make(map[account.AccountID]checkRes)
-	for acct, client := range auth.users {
-		pruned, rep := checkClientBonds(client)
-		if len(pruned) > 0 {
-			log.Infof("Pruned %d expired bonds for user %v, new bond tier = %d, new trading tier = %d",
-				len(pruned), acct, rep.BondedTier, client.tier)
-			expiredBonds[acct] = checkRes{rep, pruned}
-		}
-	}
-
-	if len(expiredBonds) == 0 {
-		return // skip the goroutine alloc
-	}
-
-	auth.wg.Add(1)
-	go func() { // godspeed
-		defer auth.wg.Done()
-		for acct, prunes := range expiredBonds {
-			for _, bond := range prunes.bonds {
-				if err := auth.storage.DeleteBond(bond.AssetID, bond.CoinID); err != nil {
-					log.Errorf("Failed to delete expired bond %v (%s) for user %v: %v",
-						coinIDString(bond.AssetID, bond.CoinID), dex.BipIDSymbol(bond.AssetID), acct, err)
-				}
-				auth.sendBondExpired(acct, bond, prunes.rep)
-			}
-		}
-	}()
-}
-
 // addBond registers a new active bond for an authenticated user. This only
 // updates their clientInfo.{bonds,tier} fields. It does not touch the DB. If
 // the user is not authenticated, it returns -1, -1.
@@ -1146,18 +991,11 @@ func (auth *AuthManager) addBond(user account.AccountID, bond *db.Bond) *account
 	return rep
 }
 
-// addClient adds the client to the users and conns maps, and stops any unbook
-// timers started when they last disconnected.
+// addClient adds the client to the users and conns maps.
 func (auth *AuthManager) addClient(client *clientInfo) {
 	auth.connMtx.Lock()
 	defer auth.connMtx.Unlock()
 	user := client.acct.ID
-	if unbookTimer, found := auth.unbookers[user]; found {
-		if unbookTimer.Stop() {
-			log.Debugf("Stopped unbook timer for user %v", user)
-		}
-		delete(auth.unbookers, user)
-	}
 
 	oldClient := auth.users[user]
 	auth.users[user] = client
@@ -1188,30 +1026,21 @@ func (auth *AuthManager) addClient(client *clientInfo) {
 	}()
 }
 
-// removeClient removes the client from the users and conns map, and sets a
-// timer to unbook all of the user's orders if they do not return within a
-// certain time. This is idempotent for a given conn ID.
+// removeClient unregisters the client from the users and conns maps. It is
+// idempotent for a given conn ID.
 func (auth *AuthManager) removeClient(client *clientInfo) {
 	auth.connMtx.Lock()
-	defer auth.connMtx.Unlock()
 	connID := client.conn.ID()
-	_, connFound := auth.conns[connID]
-	if !connFound {
+	if _, connFound := auth.conns[connID]; !connFound {
 		// conn already removed manually when this user made a new connection.
 		// This user is still in the users map, so return.
+		auth.connMtx.Unlock()
 		return
 	}
-	user := client.acct.ID
-	delete(auth.users, user)
+	delete(auth.users, client.acct.ID)
 	delete(auth.conns, connID)
+	auth.connMtx.Unlock()
 	client.conn.Disconnect() // in case not triggered by disconnect
-	auth.unbookers[user] = time.AfterFunc(auth.miaUserTimeout, func() { auth.unbookUserOrders(user) })
-
-	auth.violationMtx.Lock()
-	delete(auth.matchOutcomes, user)
-	delete(auth.preimgOutcomes, user)
-	delete(auth.orderOutcomes, user)
-	auth.violationMtx.Unlock()
 }
 
 func legacyMatchOutcomeToOutcome(m *db.MatchOutcome) Outcome {
