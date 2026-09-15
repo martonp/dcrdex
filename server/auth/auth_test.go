@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -49,6 +50,7 @@ type ratioData struct {
 
 // TStorage satisfies the Storage interface
 type TStorage struct {
+	accountReadErr      error
 	acctInfo            *db.Account
 	acctInfoErr         error
 	acct                *account.Account
@@ -67,8 +69,11 @@ type TStorage struct {
 func (s *TStorage) AccountInfo(account.AccountID) (*db.Account, error) {
 	return s.acctInfo, s.acctInfoErr
 }
-func (s *TStorage) Account(acct account.AccountID, lockTimeThresh time.Time) (*account.Account, []*db.Bond) {
-	return s.acct, s.bonds
+func (s *TStorage) Account(ctx context.Context, acct account.AccountID, lockTimeThresh time.Time) (*account.Account, []*db.Bond, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return s.acct, s.bonds, s.accountReadErr
 }
 func (s *TStorage) setBondTier(tier uint32) {
 	s.bonds = []*db.Bond{{Strength: tier, LockTime: time.Now().Unix() * 2}}
@@ -1233,6 +1238,16 @@ func TestSend(t *testing.T) {
 	}
 }
 
+func TestUserReputationAccountError(t *testing.T) {
+	lookupErr := errors.New("account lookup failed")
+	rig.storage.accountReadErr = lookupErr
+	defer func() { rig.storage.accountReadErr = nil }()
+
+	if _, _, _, err := rig.mgr.UserReputation(newAccountID()); !errors.Is(err, lookupErr) {
+		t.Fatalf("UserReputation error = %v, want %v", err, lookupErr)
+	}
+}
+
 func TestConnectErrors(t *testing.T) {
 	user := tNewUser(t)
 	rig.storage.acct = nil
@@ -1262,6 +1277,13 @@ func TestConnectErrors(t *testing.T) {
 	rpcErr = rig.mgr.handleConnect(user.conn, msg)
 	ensureErr(rpcErr, "invalid account ID", msgjson.AuthenticationError)
 	connect.AccountID = user.acctID[:]
+
+	// account lookup fails
+	encodeMsg()
+	rig.storage.accountReadErr = errors.New("account lookup failed")
+	rpcErr = rig.mgr.handleConnect(user.conn, msg)
+	rig.storage.accountReadErr = nil
+	ensureErr(rpcErr, "account lookup failed", msgjson.RPCInternalError)
 
 	// user unknown to storage
 	encodeMsg()
@@ -1452,6 +1474,13 @@ func TestAuthManager_RecordCancel_RecordCompletedOrder(t *testing.T) {
 
 	ord = orderOutcomes.outcomes[2]
 	checkOrd(ord, coid, true, tCompleted.UnixMilli())
+
+	// Failed account lookups for offline users must not cause a panic.
+	rig.storage.accountReadErr = errors.New("account lookup failed")
+	defer func() { rig.storage.accountReadErr = nil }()
+	offlineUser := newAccountID()
+	rig.mgr.RecordCompletedOrder(offlineUser, oid, tCompleted)
+	rig.mgr.RecordCancel(offlineUser, coid, oid, 1, tCompleted)
 }
 
 func TestMatchStatus(t *testing.T) {
