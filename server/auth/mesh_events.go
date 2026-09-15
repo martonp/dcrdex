@@ -5,6 +5,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"decred.org/dcrdex/dex/msgjson"
@@ -36,6 +37,13 @@ func (auth *AuthManager) Events() map[string]mesh.EventApplier {
 			}
 			return auth.storage.ApplyPrepaidBondsCreatedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), created)
 		},
+		meshevents.EventKindReputationForgiven: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			forgiven, err := meshevents.DecodeReputationForgivenEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return auth.applyReputationForgivenEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), forgiven)
+		},
 	}
 }
 
@@ -66,6 +74,31 @@ func (auth *AuthManager) applyBondPostedEvent(applyCtx *mesh.EventApplyContext, 
 	auth.Sign(postBondRes)
 	applyCtx.SetResult(postBondRes)
 	return result.Log, nil
+}
+
+func (auth *AuthManager) applyReputationForgivenEvent(applyCtx *mesh.EventApplyContext, logMeta *db.EventLogMeta, event *meshevents.ReputationForgivenEvent) (*db.EventLogEntry, error) {
+	ctx := applyCtx.Context
+	stored, err := auth.storage.ApplyReputationForgivenEvent(ctx, logMeta, event)
+	if err != nil {
+		return nil, err
+	}
+	if stored == nil || stored.Log == nil {
+		return nil, fmt.Errorf("storage returned nil reputation forgiveness result")
+	}
+
+	result := &reputationForgivenessResult{
+		Forgiven: stored.Forgiven,
+	}
+	// Forgiveness is already committed. A failed reputation lookup only
+	// prevents us from confirming that the user can trade.
+	rep, refreshErr := auth.loadUserReputationWithTimeout(ctx, event.AccountID)
+	if refreshErr == nil {
+		result.Unbanned = rep != nil && rep.EffectiveTier() > 0
+	} else {
+		log.Errorf("failed to refresh reputation after forgiveness for account %v: %v", event.AccountID, refreshErr)
+	}
+	applyCtx.SetResult(result)
+	return stored.Log, nil
 }
 
 // dbEventLogMeta builds the storage event-log metadata for a replicated mesh

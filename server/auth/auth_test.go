@@ -92,6 +92,10 @@ type TStorage struct {
 	prepaidBondsCreatedErr    error
 	prepaidBondsCreatedMeta   *db.EventLogMeta
 	prepaidBondsCreatedUpdate *meshevents.PrepaidBondsCreatedEvent
+	reputationForgivenResult  *db.ReputationForgivenResult
+	reputationForgivenErr     error
+	reputationForgivenMeta    *db.EventLogMeta
+	reputationForgivenUpdate  *meshevents.ReputationForgivenEvent
 	repInputsListener         func(users ...account.AccountID)
 	ratio                     ratioData
 }
@@ -160,6 +164,12 @@ func (s *TStorage) ApplyBondPostedEvent(_ context.Context, meta *db.EventLogMeta
 	return s.bondPostedResult, s.bondPostedErr
 }
 
+func (s *TStorage) ApplyReputationForgivenEvent(_ context.Context, meta *db.EventLogMeta, event *meshevents.ReputationForgivenEvent) (*db.ReputationForgivenResult, error) {
+	s.reputationForgivenMeta = meta
+	s.reputationForgivenUpdate = event
+	return s.reputationForgivenResult, s.reputationForgivenErr
+}
+
 func (s *TStorage) FetchPrepaidBond(coinID []byte) (uint32, int64, error) {
 	if s.prepaidBonds != nil {
 		bond := s.prepaidBonds[string(coinID)]
@@ -188,6 +198,7 @@ func (s *TStorage) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN in
 func (s *TStorage) UserMatchFails(aid account.AccountID, lastN int) ([]*db.MatchFail, error) {
 	return nil, nil
 }
+
 func (s *TStorage) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
 	return s.userPreimageResults, nil
 }
@@ -2572,6 +2583,216 @@ func TestExecutePrepaidPostBond(t *testing.T) {
 	})
 }
 
+func TestExecuteForgiveReputation(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		scope      meshevents.ReputationForgivenessScope
+		forgiven   bool
+		storageErr error
+	}{
+		{"user", meshevents.ReputationForgivenessScopeUser, true, nil},
+		{"match", meshevents.ReputationForgivenessScopeMatch, true, nil},
+		{"match not forgiven", meshevents.ReputationForgivenessScopeMatch, false, nil},
+		{"match rejected by storage", meshevents.ReputationForgivenessScopeMatch, false, errors.New("match is not eligible")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			user := tNewUser(t)
+			authMgr, storage := newTestAuthManager(t)
+			authCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			authMgr.ctx = authCtx
+			storage.acct = &account.Account{ID: user.acctID, PubKey: user.privKey.PubKey()}
+			storage.bonds = []*db.Bond{{Strength: 1, LockTime: time.Now().Add(48 * time.Hour).Unix()}}
+			storage.reputationForgivenErr = tt.storageErr
+			if tt.storageErr == nil {
+				storage.reputationForgivenResult = &db.ReputationForgivenResult{
+					Forgiven: tt.forgiven,
+					Log:      &db.EventLogEntry{Seq: 1, Kind: meshevents.EventKindReputationForgiven},
+				}
+			}
+			svc, err := mesh.NewService(&mesh.ServiceConfig{
+				EventLogReader: emptyEventLogReader{},
+				OnHalt:         func(error) {},
+				Commands:       authMgr.Commands(),
+				Events:         authMgr.Events(),
+				Logger:         dex.Disabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			authMgr.SetMeshService(svc)
+
+			var matchID order.MatchID
+			if tt.scope == meshevents.ReputationForgivenessScopeUser {
+				err = authMgr.ForgiveUser(user.acctID)
+			} else {
+				matchID = randomMatchID()
+				var forgiven, unbanned bool
+				forgiven, unbanned, err = authMgr.ForgiveMatchFail(user.acctID, matchID)
+				if err == nil && (forgiven != tt.forgiven || !unbanned) {
+					t.Fatalf("forgiven/unbanned = %v/%v, want %v/true", forgiven, unbanned, tt.forgiven)
+				}
+			}
+			if tt.storageErr != nil {
+				var rpcErr *msgjson.Error
+				if !errors.As(err, &rpcErr) || rpcErr.Code != msgjson.RPCInternalError ||
+					rpcErr.Message != "failed to apply reputation forgiveness: "+tt.storageErr.Error() {
+					t.Fatalf("forgiveness error = %v, want storage rejection", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			update := storage.reputationForgivenUpdate
+			if update == nil || update.AccountID != user.acctID || update.Scope != tt.scope || update.Match() != matchID {
+				t.Fatalf("incorrect storage update: %+v", update)
+			}
+		})
+	}
+
+	t.Run("reject invalid commands before storage", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		user, other := tNewUser(t), tNewUser(t)
+		svc, err := mesh.NewService(&mesh.ServiceConfig{
+			EventLogReader: emptyEventLogReader{},
+			OnHalt:         func(error) {},
+			Commands:       authMgr.Commands(),
+			Events:         authMgr.Events(),
+			Logger:         dex.Disabled,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tt := range []struct {
+			name string
+			user account.AccountID
+			req  meshevents.ReputationForgivenEvent
+			code int
+		}{
+			{"account mismatch", other.acctID, meshevents.ReputationForgivenEvent{AccountID: user.acctID, Scope: meshevents.ReputationForgivenessScopeUser}, msgjson.RPCInternalError},
+			{"match scope without match", user.acctID, meshevents.ReputationForgivenEvent{AccountID: user.acctID, Scope: meshevents.ReputationForgivenessScopeMatch}, msgjson.RPCParseError},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				msg, err := msgjson.NewRequest(comms.NextID(), commandKindForgiveReputation, &tt.req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rpcErr := svc.ExecuteCommand(t.Context(), mesh.CommandRequest{
+					Kind: commandKindForgiveReputation, User: tt.user, Msg: msg,
+					Respond: func(*msgjson.Message) error {
+						t.Error("invalid command delivered a result")
+						return nil
+					},
+				})
+				if rpcErr == nil || rpcErr.Code != tt.code {
+					t.Fatalf("command error = %v, want code %d", rpcErr, tt.code)
+				}
+				if storage.reputationForgivenUpdate != nil {
+					t.Fatal("invalid command reached storage")
+				}
+			})
+		}
+	})
+}
+
+func TestReputationForgivenessCommandWrapper(t *testing.T) {
+	req := &meshevents.ReputationForgivenEvent{
+		AccountID: tNewUser(t).acctID,
+		Scope:     meshevents.ReputationForgivenessScopeUser,
+	}
+
+	t.Run("execute error", func(t *testing.T) {
+		authMgr, _ := newTestAuthManager(t)
+		wantErr := msgjson.NewError(msgjson.RPCInternalError, "mesh failed")
+		authMgr.SetMeshService(&tMesh{executeErr: wantErr})
+		_, err := authMgr.executeReputationForgivenessCommand(t.Context(), req)
+		if err != wantErr {
+			t.Fatalf("error = %v, want %v", err, wantErr)
+		}
+	})
+
+	for _, name := range []string{"caller cancellation", "auth shutdown"} {
+		t.Run(name, func(t *testing.T) {
+			authMgr, _ := newTestAuthManager(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			callCtx := ctx
+			if name == "auth shutdown" {
+				authMgr.ctx = ctx
+				callCtx = t.Context()
+			}
+			finished := make(chan struct{})
+			authMgr.SetMeshService(&tMesh{
+				executeHook: func(ctx context.Context, _ mesh.CommandRequest) *msgjson.Error {
+					defer close(finished)
+					cancel() // Cancel only after execution has started.
+					<-ctx.Done()
+					return nil
+				},
+			})
+			_, err := authMgr.executeReputationForgivenessCommand(callCtx, req)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("command error = %v, want cancellation", err)
+			}
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("execution context was not canceled")
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name      string
+		payload   any
+		malformed bool
+	}{
+		{"response after execution returns", &reputationForgivenessResult{Forgiven: true, Unbanned: true}, false},
+		{"malformed result", map[string]string{"forgiven": "not-bool"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authMgr, _ := newTestAuthManager(t)
+			requests := make(chan mesh.CommandRequest, 1)
+			authMgr.SetMeshService(&tMesh{
+				executeHook: func(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
+					requests <- req
+					return nil // The response is delivered separately below.
+				},
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			done := make(chan struct{})
+			var result *reputationForgivenessResult
+			var resultErr error
+			go func() {
+				defer close(done)
+				result, resultErr = authMgr.executeReputationForgivenessCommand(ctx, req)
+			}()
+			var command mesh.CommandRequest
+			select {
+			case command = <-requests:
+			case <-ctx.Done():
+				t.Fatal("command did not start")
+			}
+			resp, err := msgjson.NewResponse(command.Msg.ID, tt.payload, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := command.Respond(resp); err != nil {
+				t.Fatal(err)
+			}
+			<-done
+			if tt.malformed {
+				var typeErr *json.UnmarshalTypeError
+				if !errors.As(resultErr, &typeErr) {
+					t.Fatalf("command error = %v, want JSON type error", resultErr)
+				}
+			} else if resultErr != nil || result == nil || !result.Forgiven || !result.Unbanned {
+				t.Fatalf("command result = %+v, error = %v, want forgiven and unbanned", result, resultErr)
+			}
+		})
+	}
+}
+
 func TestApplyBondPostedEvent(t *testing.T) {
 	user := tNewUser(t)
 	event := meshevents.NewBondPostedEvent(&account.Account{
@@ -2679,6 +2900,76 @@ func TestApplyBondPostedEvent(t *testing.T) {
 		}
 		if storage.bondPostedEvent != nil {
 			t.Fatal("storage was called for invalid event")
+		}
+	})
+}
+
+func TestApplyReputationForgivenEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		forgiven     bool
+		unknown      bool
+		bonded       bool
+		readErr      error
+		wantUnbanned bool
+	}{
+		{name: "positive tier", forgiven: true, bonded: true, wantUnbanned: true},
+		{name: "not forgiven but positive tier", bonded: true, wantUnbanned: true},
+		{name: "known account with zero tier", forgiven: true},
+		{name: "unknown account", forgiven: true, unknown: true},
+		{name: "reputation read fails after commit", forgiven: true, bonded: true, readErr: errors.New("reputation lookup failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authMgr, storage := newTestAuthManager(t)
+			user := tNewUser(t)
+			if !tt.unknown {
+				storage.acct = &account.Account{ID: user.acctID, PubKey: user.privKey.PubKey()}
+			}
+			if tt.bonded {
+				storage.bonds = []*db.Bond{{Strength: 1, LockTime: time.Now().Add(48 * time.Hour).Unix()}}
+			}
+			storage.reputationErr = tt.readErr
+			event := &meshevents.ReputationForgivenEvent{
+				AccountID: user.acctID,
+				Scope:     meshevents.ReputationForgivenessScopeUser,
+			}
+			meta := &db.EventLogMeta{Seq: 9, Event: []byte("reputation-forgiven")}
+			logEntry := &db.EventLogEntry{Seq: 9, Kind: meshevents.EventKindReputationForgiven}
+			storage.reputationForgivenResult = &db.ReputationForgivenResult{Forgiven: tt.forgiven, Log: logEntry}
+			applyCtx := &mesh.EventApplyContext{Context: t.Context()}
+
+			applied, err := authMgr.applyReputationForgivenEvent(applyCtx, meta, event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if storage.reputationForgivenMeta != meta || storage.reputationForgivenUpdate != event {
+				t.Fatal("storage did not receive the supplied metadata and event")
+			}
+			if applied != logEntry {
+				t.Fatalf("applied log = %v, want stored log %v", applied, logEntry)
+			}
+			result, _ := applyCtx.Result().(*reputationForgivenessResult)
+			if result == nil || result.Forgiven != tt.forgiven || result.Unbanned != tt.wantUnbanned {
+				t.Fatalf("result = %+v, want forgiven %v, unbanned %v", result, tt.forgiven, tt.wantUnbanned)
+			}
+		})
+	}
+
+	// The Validate matrix is covered in meshevents; this only proves an
+	// invalid event is rejected before storage is touched.
+	t.Run("validation rejects bad events before storage", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		zeroAccount := &meshevents.ReputationForgivenEvent{Scope: meshevents.ReputationForgivenessScopeUser}
+		payload, err := zeroAccount.Encode()
+		if err != nil {
+			t.Fatalf("Encode error: %v", err)
+		}
+		applier := authMgr.Events()[meshevents.EventKindReputationForgiven]
+		if _, err := applier(&mesh.EventApplyContext{Context: context.Background()}, &mesh.Event{Payload: payload}); err == nil {
+			t.Fatalf("applying invalid reputation_forgiven event succeeded")
+		}
+		if storage.reputationForgivenUpdate != nil {
+			t.Fatalf("storage was called for invalid event")
 		}
 	})
 }
