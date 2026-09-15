@@ -70,7 +70,6 @@ type TStorage struct {
 	acct                      *account.Account
 	matches                   []*db.MatchData
 	matchStatuses             []*db.MatchStatus
-	userPreimageResults       []*db.PreimageResult
 	userMatchOutcomes         []*db.MatchOutcome
 	reputationPreimages       []*db.PreimageOutcome
 	reputationMatches         []*db.MatchResult
@@ -186,27 +185,12 @@ func (s *TStorage) ApplyPrepaidBondsCreatedEvent(_ context.Context, meta *db.Eve
 	return s.prepaidBondsCreatedLog, s.prepaidBondsCreatedErr
 }
 
-func (s *TStorage) DeletePrepaidBond(coinID []byte) (err error) { return nil }
-
-func (s *TStorage) StorePrepaidBonds(coinIDs [][]byte, strength uint32, lockTime int64) error {
-	return nil
-}
-
 func (s *TStorage) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {
 	return s.userMatchOutcomes, nil
 }
 func (s *TStorage) UserMatchFails(aid account.AccountID, lastN int) ([]*db.MatchFail, error) {
 	return nil, nil
 }
-
-func (s *TStorage) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
-	return s.userPreimageResults, nil
-}
-
-func (s *TStorage) ForgiveMatchFail(mid order.MatchID) (bool, error) {
-	return false, nil
-}
-
 func (s *TStorage) UserOrderStatuses(aid account.AccountID, base, quote uint32, oids []order.OrderID) ([]*db.OrderStatus, error) {
 	return s.orderStatuses, nil
 }
@@ -234,22 +218,6 @@ func (s *TStorage) setRatioData(dat *ratioData) {
 	s.ratio = *dat
 }
 
-func (s *TStorage) CompletedUserOrders(aid account.AccountID, _ int) (oids []order.OrderID, compTimes []int64, err error) {
-	return s.ratio.oidsCompleted, s.ratio.timesCompleted, nil
-}
-
-func (s *TStorage) ExecutedCancelsForUser(aid account.AccountID, _ int) (cancels []*db.CancelRecord, err error) {
-	for i := range s.ratio.oidsCanceled {
-		cancels = append(cancels, &db.CancelRecord{
-			ID:        s.ratio.oidsCancels[i],
-			TargetID:  s.ratio.oidsCanceled[i],
-			MatchTime: s.ratio.timesCanceled[i],
-			EpochGap:  s.ratio.epochGaps[i],
-		})
-	}
-	return cancels, nil
-}
-
 func (s *TStorage) GetUserReputationData(ctx context.Context, user account.AccountID, pimgSz, matchSz, orderSz int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) {
 	if s.getUserReputationData != nil {
 		return s.getUserReputationData(ctx, user, pimgSz, matchSz, orderSz)
@@ -275,42 +243,6 @@ func (s *TStorage) GetUserReputationData(ctx context.Context, user account.Accou
 		ords = ords[len(ords)-orderSz:]
 	}
 	return pimgs, matches, ords, nil
-}
-
-func (s *TStorage) AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*db.PreimageOutcome, error) {
-	return nil, nil
-}
-
-func (s *TStorage) AddMatchOutcome(ctx context.Context, user account.AccountID, mid order.MatchID, outcome Outcome) (*db.MatchResult, error) {
-	return nil, nil
-}
-
-var dbIDCounter int64
-
-func nextDBID() int64 {
-	return atomic.AddInt64(&dbIDCounter, 1)
-}
-
-func (s *TStorage) AddOrderOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, canceled bool) (*db.OrderOutcome, error) {
-	return &db.OrderOutcome{DBID: nextDBID(), OrderID: oid, Canceled: canceled}, nil
-}
-
-func (s *TStorage) PruneOutcomes(ctx context.Context, user account.AccountID, outcomeClass db.OutcomeClass, fromDBID int64) error {
-	return nil
-}
-
-func (s *TStorage) GetUserReputationVersion(ctx context.Context, user account.AccountID) (int16, error) {
-	return 0, nil
-}
-
-func (s *TStorage) UpgradeUserReputationV1(
-	ctx context.Context, user account.AccountID, pimgs []*db.PreimageOutcome, matches []*db.MatchResult, ords []*db.OrderOutcome, /* Without DB IDs */
-) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) /* With DB IDs */ {
-	return pimgs, matches, ords, nil
-}
-
-func (s *TStorage) ForgiveUser(ctx context.Context, user account.AccountID) error {
-	return nil
 }
 
 // TSigner satisfies the Signer interface

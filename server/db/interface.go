@@ -702,19 +702,9 @@ type CancelRecord struct {
 
 // Reputation
 
-// ReputationArchiver handles interactions with the points table as well as
-// upgrading the reputation version in the accounts table.
+// ReputationArchiver handles interactions with the reputation points table.
 type ReputationArchiver interface {
 	GetUserReputationData(ctx context.Context, user account.AccountID, pimgSz, matchSz, orderSz int) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error)
-	AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*PreimageOutcome, error)
-	AddMatchOutcome(ctx context.Context, user account.AccountID, mid order.MatchID, outcome Outcome) (*MatchResult, error)
-	AddOrderOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, canceled bool) (*OrderOutcome, error)
-	PruneOutcomes(ctx context.Context, user account.AccountID, outcomeClass OutcomeClass, fromDBID int64) error
-	GetUserReputationVersion(ctx context.Context, user account.AccountID) (int16, error)
-	UpgradeUserReputationV1(
-		ctx context.Context, user account.AccountID, pimgOutcomes []*PreimageOutcome, matchOutcomes []*MatchResult, orderOutcomes []*OrderOutcome, /* Without DB IDs */
-	) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error) /* With DB IDs */
-	ForgiveUser(ctx context.Context, user account.AccountID) error
 	ApplyReputationForgivenEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.ReputationForgivenEvent) (*ReputationForgivenResult, error)
 	SetReputationInputsListener(func(users ...account.AccountID))
 }

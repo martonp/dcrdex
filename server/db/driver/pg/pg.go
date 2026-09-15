@@ -77,10 +77,7 @@ type Archiver struct {
 	tables         archiverTables
 
 	queries struct {
-		selectPoints            *sql.Stmt // internal.SelectPoints
-		insertPoints            *sql.Stmt // internal.InsertPoints
-		prunePoints             *sql.Stmt // internal.PrunePoints
-		selectReputationVersion *sql.Stmt // internal.SelectReputationVersion
+		selectPoints *sql.Stmt // internal.SelectPoints
 	}
 
 	fatalMtx sync.RWMutex
@@ -245,18 +242,6 @@ func (a *Archiver) prepareQueries() (err error) {
 	a.queries.selectPoints, err = a.db.Prepare(fmt.Sprintf(internal.SelectPoints, a.tables.points))
 	if err != nil {
 		return fmt.Errorf("error constructing prepared statement for reputation points selection: %w", err)
-	}
-	a.queries.insertPoints, err = a.db.Prepare(fmt.Sprintf(internal.InsertPoints, a.tables.points))
-	if err != nil {
-		return fmt.Errorf("error constructing prepared statement for reputation points insertion: %w", err)
-	}
-	a.queries.prunePoints, err = a.db.Prepare(fmt.Sprintf(internal.PrunePoints, a.tables.points))
-	if err != nil {
-		return fmt.Errorf("error constructing prepared statement for reputation points pruning: %w", err)
-	}
-	a.queries.selectReputationVersion, err = a.db.Prepare(fmt.Sprintf(internal.SelectReputationVersion, a.tables.accounts))
-	if err != nil {
-		return fmt.Errorf("error constructing prepared statement for reputation version selection: %w", err)
 	}
 	return nil
 }
