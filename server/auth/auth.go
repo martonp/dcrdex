@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -25,6 +26,7 @@ import (
 	"decred.org/dcrdex/server/asset"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/mesh"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -122,6 +124,12 @@ type TxDataSource func(coinID []byte) (rawTx []byte, err error)
 type respHandler struct {
 	f      func(comms.Link, *msgjson.Message)
 	expire *time.Timer
+}
+
+// proxyResponseKey identifies a pending proxied request by account and request ID.
+type proxyResponseKey struct {
+	user account.AccountID
+	id   uint64
 }
 
 // clientInfo represents a DEX client, including account information and last
@@ -254,6 +262,11 @@ type AuthManager struct {
 
 	prepaidBondMtx sync.Mutex
 
+	mesh MeshService
+
+	proxyRespMtx      sync.Mutex
+	proxyRespHandlers map[proxyResponseKey]*respHandler
+
 	connectCallbackMtx sync.RWMutex
 	connectCallbacks   []func(account.AccountID)
 }
@@ -355,25 +368,26 @@ func NewAuthManager(cfg *Config) *AuthManager {
 	}
 
 	auth := &AuthManager{
-		storage:          cfg.Storage,
-		signer:           cfg.Signer,
-		bondAssets:       bondAssets,
-		bondExpiry:       time.Duration(cfg.BondExpiry) * time.Second,
-		parseBondTx:      cfg.BondTxParser, // e.g. dcr's ParseBondTx
-		checkBond:        cfg.BondChecker,  // e.g. dcr's BondCoin
-		route:            cfg.Route,
-		freeCancels:      cfg.FreeCancels,
-		penaltyThreshold: penaltyThreshold,
-		cancelThresh:     cfg.CancelThreshold,
-		rep:              newRepCache(repCacheCapacity, repCacheMaxAge),
-		latencyQ:         wait.NewTickerQueue(recheckInterval),
-		users:            make(map[account.AccountID]*clientInfo),
-		conns:            make(map[uint64]*clientInfo),
-		bondWaiterIdx:    make(map[string]struct{}),
-		matchOutcomes:    make(map[account.AccountID]*latestOutcomes[*db.MatchResult]),
-		preimgOutcomes:   make(map[account.AccountID]*latestOutcomes[*db.PreimageOutcome]),
-		orderOutcomes:    make(map[account.AccountID]*latestOutcomes[*db.OrderOutcome]),
-		txDataSources:    cfg.TxDataSources,
+		storage:           cfg.Storage,
+		signer:            cfg.Signer,
+		bondAssets:        bondAssets,
+		bondExpiry:        time.Duration(cfg.BondExpiry) * time.Second,
+		parseBondTx:       cfg.BondTxParser, // e.g. dcr's ParseBondTx
+		checkBond:         cfg.BondChecker,  // e.g. dcr's BondCoin
+		route:             cfg.Route,
+		freeCancels:       cfg.FreeCancels,
+		penaltyThreshold:  penaltyThreshold,
+		cancelThresh:      cfg.CancelThreshold,
+		rep:               newRepCache(repCacheCapacity, repCacheMaxAge),
+		latencyQ:          wait.NewTickerQueue(recheckInterval),
+		users:             make(map[account.AccountID]*clientInfo),
+		conns:             make(map[uint64]*clientInfo),
+		bondWaiterIdx:     make(map[string]struct{}),
+		matchOutcomes:     make(map[account.AccountID]*latestOutcomes[*db.MatchResult]),
+		preimgOutcomes:    make(map[account.AccountID]*latestOutcomes[*db.PreimageOutcome]),
+		orderOutcomes:     make(map[account.AccountID]*latestOutcomes[*db.OrderOutcome]),
+		txDataSources:     cfg.TxDataSources,
+		proxyRespHandlers: make(map[proxyResponseKey]*respHandler),
 	}
 
 	cfg.Storage.SetReputationInputsListener(func(users ...account.AccountID) {
@@ -392,6 +406,12 @@ func NewAuthManager(cfg *Config) *AuthManager {
 	cfg.Route(msgjson.MatchStatusRoute, auth.handleMatchStatus)
 	cfg.Route(msgjson.OrderStatusRoute, auth.handleOrderStatus)
 	return auth
+}
+
+// SetMeshService configures the mesh service. It must be set before the comms
+// routes serve traffic.
+func (auth *AuthManager) SetMeshService(svc MeshService) {
+	auth.mesh = svc
 }
 
 // GraceLimit returns the number of initial orders allowed for a new user before
@@ -509,92 +529,258 @@ func (auth *AuthManager) Sign(signables ...msgjson.Signable) {
 
 // Response and notification (non-request) messages
 
-// Send sends the non-Request-type msgjson.Message to the client identified by
-// the specified account ID. The message is sent asynchronously, so an error is
-// only generated if the specified user is not connected and authorized, if the
-// message fails marshalling, or if the link is in a failing state. See
-// dex/ws.(*WSLink).Send for more information.
+// Send sends a response or notification to the user on this node or the peer.
+// Local sends are queued; proxied sends wait for the peer's relay result.
+// It returns ErrUserNotConnected if the user is absent or no peer can relay.
 func (auth *AuthManager) Send(user account.AccountID, msg *msgjson.Message) error {
-	client := auth.user(user)
-	if client == nil {
+	if client := auth.user(user); client != nil {
+		return auth.send(client, msg)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultRequestTimeout)
+	defer cancel()
+	err := auth.mesh.ProxyClientMessage(ctx, &mesh.ClientProxyMessage{
+		User:            user,
+		Msg:             msg,
+		DeliverToClient: true,
+	})
+	if errors.Is(err, mesh.ErrClientProxyUnavailable) || errors.Is(err, mesh.ErrClientNotConnected) {
 		log.Debugf("Send requested for disconnected user %v", user)
 		return dex.NewError(ErrUserNotConnected, user.String())
 	}
+	return err
+}
 
+// Notify is identical to Send and remains only to keep existing callers compiling.
+// Remove it once all call sites use Send.
+func (auth *AuthManager) Notify(acctID account.AccountID, msg *msgjson.Message) error {
+	return auth.Send(acctID, msg)
+}
+
+// SendIfLocal sends a message to a locally connected user.
+// It returns nil if the user is not connected locally.
+func (auth *AuthManager) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
+	client := auth.user(user)
+	if client == nil {
+		return nil
+	}
+	return auth.send(client, msg)
+}
+
+func (auth *AuthManager) send(client *clientInfo, msg *msgjson.Message) error {
 	err := client.conn.Send(msg)
 	if err != nil {
 		log.Debugf("error sending on link: %v", err)
 		// Remove client assuming connection is broken, requiring reconnect.
 		auth.removeClient(client)
-		// client.conn.Disconnect() // async removal
 	}
 	return err
-}
-
-// SendIfLocal sends only to a locally connected user.
-func (auth *AuthManager) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
-	if auth.user(user) == nil {
-		return nil
-	}
-	return auth.Send(user, msg)
-}
-
-// Notify sends a message to a client. The message should be a notification.
-// See msgjson.NewNotification.
-func (auth *AuthManager) Notify(acctID account.AccountID, msg *msgjson.Message) {
-	if err := auth.Send(acctID, msg); err != nil {
-		log.Infof("Failed to send notification to user %s: %v", acctID, err)
-	}
 }
 
 // Requests
 
-// DefaultRequestTimeout is the default timeout for requests to wait for
-// responses from connected users after the request is successfully sent.
+// DefaultRequestTimeout is the default wait for a client response.
 const DefaultRequestTimeout = 30 * time.Second
 
-func (auth *AuthManager) request(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message),
-	expireTimeout time.Duration, expire func()) error {
-
-	client := auth.user(user)
-	if client == nil {
-		log.Debugf("Send requested for disconnected user %v", user)
-		return dex.NewError(ErrUserNotConnected, user.String())
-	}
-	// log.Tracef("Registering '%s' request ID %d for user %v (auth clientInfo)", msg.Route, msg.ID, user)
-	client.logReq(msg.ID, f, expireTimeout, expire)
-	// auth.handleResponse checks clientInfo map and the found client's request
-	// handler map, where the expire function should be found for msg.ID.
-	err := client.conn.Request(msg, auth.handleResponse, expireTimeout, func() {})
-	if err != nil {
-		log.Debugf("error sending request ID %d: %v", msg.ID, err)
-		// Remove the responseHandler registered by logReq and stop the expire
-		// timer so that it does not eventually fire and run the expire func.
-		// The caller receives a non-nil error to deal with it.
-		client.respHandler(msg.ID) // drop the removed handler
-		// Remove client assuming connection is broken, requiring reconnect.
-		auth.removeClient(client)
-		// client.conn.Disconnect() // async removal
-	}
-	return err
-}
-
-// Request sends the Request-type msgjson.Message to the client identified by
-// the specified account ID. The user must respond within DefaultRequestTimeout
-// of the request. Late responses are not handled.
+// Request sends a request using DefaultRequestTimeout. See RequestWithTimeout
+// for delivery, callback, and error behavior.
 func (auth *AuthManager) Request(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message)) error {
 	return auth.request(user, msg, f, DefaultRequestTimeout, func() {})
 }
 
-// RequestWithTimeout sends the Request-type msgjson.Message to the client
-// identified by the specified account ID. If the user responds within
-// expireTime of the request, the response handler is called, otherwise the
-// expire function is called. If the response handler is called, it is
-// guaranteed that the request Message.ID is equal to the response Message.ID
-// (see handleResponse).
+// RequestWithTimeout sends a request locally or through the peer. The response
+// handler receives the original request ID and a nil link for proxied responses.
+// Unanswered requests call expire after expireTimeout; nonpositive timeouts use
+// DefaultRequestTimeout. Local send failures return an error. Proxy failures
+// call expire asynchronously. Late responses are ignored.
 func (auth *AuthManager) RequestWithTimeout(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message),
 	expireTimeout time.Duration, expire func()) error {
 	return auth.request(user, msg, f, expireTimeout, expire)
+}
+
+// RequestIfLocal sends a request to a locally connected user.
+// It returns nil without sending if the user is not connected locally.
+func (auth *AuthManager) RequestIfLocal(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message)) error {
+	client := auth.user(user)
+	if client == nil {
+		return nil
+	}
+	return auth.requestLocal(client, msg, f, DefaultRequestTimeout, func() {})
+}
+
+func (auth *AuthManager) request(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message),
+	expireTimeout time.Duration, expire func()) error {
+	if expireTimeout <= 0 {
+		expireTimeout = DefaultRequestTimeout
+	}
+	if client := auth.user(user); client != nil {
+		return auth.requestLocal(client, msg, f, expireTimeout, expire)
+	}
+	return auth.requestPeer(user, msg, f, expireTimeout, expire)
+}
+
+func (auth *AuthManager) requestLocal(client *clientInfo, msg *msgjson.Message, f func(comms.Link, *msgjson.Message),
+	expireTimeout time.Duration, expire func()) error {
+
+	client.logReq(msg.ID, f, expireTimeout, expire)
+	// client.logReq handles expiration, so the connection needs no expiration callback.
+	err := client.conn.Request(msg, auth.handleResponse, expireTimeout, func() {})
+	if err != nil {
+		log.Debugf("error sending request ID %d: %v", msg.ID, err)
+		// Cancel expiration because the caller handles the send error.
+		client.respHandler(msg.ID)
+		// Remove client assuming connection is broken, requiring reconnect.
+		auth.removeClient(client)
+	}
+	return err
+}
+
+// requestPeer registers the response deadline before relaying the request.
+// Relay failures call expire asynchronously, just like an unanswered request.
+func (auth *AuthManager) requestPeer(user account.AccountID, msg *msgjson.Message, f func(comms.Link, *msgjson.Message),
+	expireTimeout time.Duration, expire func()) error {
+	timeoutMS := uint64(expireTimeout / time.Millisecond)
+
+	handler := auth.registerProxyRespHandler(user, msg.ID, f, expireTimeout, expire)
+	meshSvc := auth.mesh
+	go func() {
+		err := meshSvc.ProxyClientMessage(context.Background(), &mesh.ClientProxyMessage{
+			User:      user,
+			Msg:       msg,
+			TimeoutMS: timeoutMS,
+		})
+		if err != nil {
+			log.Debugf("proxied request %q for user %v failed: %v", msg.Route, user, err)
+			if auth.removeProxyRespHandler(proxyResponseKey{user: user, id: msg.ID}, handler) {
+				expire()
+			}
+		}
+	}()
+
+	return nil
+}
+
+// HandleProxiedClientMessage delivers a message to a local client or
+// dispatches a client response to its pending request handler.
+func (auth *AuthManager) HandleProxiedClientMessage(_ context.Context, req *mesh.ClientProxyMessage) error {
+	if req == nil {
+		return fmt.Errorf("nil proxied client message")
+	}
+	if req.Msg == nil {
+		return fmt.Errorf("nil proxied client message payload")
+	}
+
+	switch req.Msg.Type {
+	case msgjson.Request:
+		return auth.proxyClientRequest(req)
+	case msgjson.Response:
+		// Responses either go to a local client or complete a request
+		// this node sent through a peer.
+		if req.DeliverToClient {
+			return auth.sendProxiedClientMessage(req.User, req.Msg)
+		}
+		if handler := auth.takeProxyRespHandler(req.User, req.Msg.ID); handler != nil {
+			go handler.f(nil, req.Msg)
+			return nil
+		}
+		log.Debugf("Dropping late proxied client response %d for user %v", req.Msg.ID, req.User)
+		return nil
+	case msgjson.Notification:
+		return auth.sendProxiedClientMessage(req.User, req.Msg)
+	default:
+		return fmt.Errorf("unsupported proxied client message type %d", req.Msg.Type)
+	}
+}
+
+func (auth *AuthManager) proxyClientRequest(req *mesh.ClientProxyMessage) error {
+	client := auth.user(req.User)
+	if client == nil {
+		return mesh.ErrClientNotConnected
+	}
+	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = DefaultRequestTimeout
+	}
+
+	peerRequestID := req.Msg.ID
+	clientRequest := *req.Msg
+	// Avoid collisions with requests generated by this node.
+	clientRequest.ID = comms.NextID()
+
+	handleResponse := func(_ comms.Link, resp *msgjson.Message) {
+		if resp == nil {
+			log.Debugf("proxied client response %d for user %v was nil", peerRequestID, req.User)
+			return
+		}
+		peerResponse := *resp
+		peerResponse.ID = peerRequestID
+		meshSvc := auth.mesh
+		go func() {
+			err := meshSvc.ProxyClientMessage(context.Background(), &mesh.ClientProxyMessage{
+				User: req.User,
+				Msg:  &peerResponse,
+			})
+			if err != nil {
+				log.Debugf("proxied client response %d for user %v failed: %v", peerRequestID, req.User, err)
+			}
+		}()
+	}
+	return auth.requestLocal(client, &clientRequest, handleResponse, timeout, func() {
+		log.Debugf("proxied client request %q for user %v timed out locally", req.Msg.Route, req.User)
+	})
+}
+
+func (auth *AuthManager) sendProxiedClientMessage(user account.AccountID, msg *msgjson.Message) error {
+	client := auth.user(user)
+	if client == nil {
+		log.Debugf("Proxied send requested for disconnected user %v", user)
+		return mesh.ErrClientNotConnected
+	}
+	return auth.send(client, msg)
+}
+
+func (auth *AuthManager) registerProxyRespHandler(user account.AccountID, id uint64, f func(comms.Link, *msgjson.Message), expireTimeout time.Duration, expire func()) *respHandler {
+	key := proxyResponseKey{user: user, id: id}
+	handler := &respHandler{f: f}
+	auth.proxyRespMtx.Lock()
+	defer auth.proxyRespMtx.Unlock()
+	if previous := auth.proxyRespHandlers[key]; previous != nil {
+		previous.expire.Stop()
+	}
+	handler.expire = time.AfterFunc(expireTimeout, func() {
+		// A replacement may have registered after this timer started firing.
+		if auth.removeProxyRespHandler(key, handler) {
+			expire()
+		}
+	})
+	auth.proxyRespHandlers[key] = handler
+	return handler
+}
+
+// takeProxyRespHandler removes the response handler and stops its timer.
+func (auth *AuthManager) takeProxyRespHandler(user account.AccountID, id uint64) *respHandler {
+	key := proxyResponseKey{user: user, id: id}
+	auth.proxyRespMtx.Lock()
+	defer auth.proxyRespMtx.Unlock()
+
+	handler := auth.proxyRespHandlers[key]
+	if handler == nil {
+		return nil
+	}
+	handler.expire.Stop()
+	delete(auth.proxyRespHandlers, key)
+	return handler
+}
+
+// removeProxyRespHandler removes key only if it still refers to handler.
+func (auth *AuthManager) removeProxyRespHandler(key proxyResponseKey, handler *respHandler) bool {
+	auth.proxyRespMtx.Lock()
+	defer auth.proxyRespMtx.Unlock()
+	if auth.proxyRespHandlers[key] != handler {
+		return false
+	}
+	handler.expire.Stop()
+	delete(auth.proxyRespHandlers, key)
+	return true
 }
 
 func (auth *AuthManager) integrateOutcomes(
