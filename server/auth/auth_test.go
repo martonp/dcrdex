@@ -23,10 +23,12 @@ import (
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
 	ordertest "decred.org/dcrdex/dex/order/test"
+	"decred.org/dcrdex/dex/wait"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
@@ -80,6 +82,12 @@ type TStorage struct {
 	regAddr               string
 	regAsset              uint32
 	bonds                 []*db.Bond
+	bondPostedResult      *db.BondPostedResult
+	bondPostedErr         error
+	bondPostedLimits      [3]int
+	bondPostedMeta        *db.EventLogMeta
+	bondPostedEvent       *meshevents.BondPostedEvent
+	prepaidBonds          map[string]*meshevents.PrepaidBond
 	repInputsListener     func(users ...account.AccountID)
 	ratio                 ratioData
 }
@@ -141,8 +149,21 @@ func (s *TStorage) AddBond(acct account.AccountID, bond *db.Bond) error {
 	s.bonds = append(s.bonds, bond)
 	return nil
 }
+func (s *TStorage) ApplyBondPostedEvent(_ context.Context, meta *db.EventLogMeta, event *meshevents.BondPostedEvent, pimgSz, matchSz, orderSz int) (*db.BondPostedResult, error) {
+	s.bondPostedMeta = meta
+	s.bondPostedEvent = event
+	s.bondPostedLimits = [3]int{pimgSz, matchSz, orderSz}
+	return s.bondPostedResult, s.bondPostedErr
+}
 
-func (s *TStorage) FetchPrepaidBond([]byte) (uint32, int64, error) {
+func (s *TStorage) FetchPrepaidBond(coinID []byte) (uint32, int64, error) {
+	if s.prepaidBonds != nil {
+		bond := s.prepaidBonds[string(coinID)]
+		if bond == nil {
+			return 0, 0, fmt.Errorf("pre-paid bond not found")
+		}
+		return bond.Strength, bond.LockTime, nil
+	}
 	return 1, time.Now().Add(time.Hour * 48).Unix(), nil
 }
 
@@ -466,6 +487,10 @@ type testRig struct {
 }
 
 type tMesh struct {
+	executeErr     *msgjson.Error
+	executeHook    func(context.Context, mesh.CommandRequest) *msgjson.Error
+	executedReq    mesh.CommandRequest
+	executeCount   int
 	proxiedErr     error
 	proxiedUser    account.AccountID
 	proxiedMsg     *msgjson.Message
@@ -474,6 +499,15 @@ type tMesh struct {
 	proxyCount     int
 	proxyWait      <-chan struct{}
 	proxyReady     chan struct{}
+}
+
+func (m *tMesh) ExecuteCommand(ctx context.Context, req mesh.CommandRequest) *msgjson.Error {
+	m.executeCount++
+	m.executedReq = req
+	if m.executeHook != nil {
+		return m.executeHook(ctx, req)
+	}
+	return m.executeErr
 }
 
 func (m *tMesh) ProxyClientMessage(_ context.Context, req *mesh.ClientProxyMessage) error {
@@ -492,6 +526,15 @@ func (m *tMesh) ProxyClientMessage(_ context.Context, req *mesh.ClientProxyMessa
 		}
 	}
 	return m.proxiedErr
+}
+
+func setTestMeshService(t *testing.T, svc MeshService) {
+	t.Helper()
+	prev := rig.mgr.mesh
+	rig.mgr.SetMeshService(svc)
+	t.Cleanup(func() {
+		rig.mgr.SetMeshService(prev)
+	})
 }
 
 var rig *testRig
@@ -519,6 +562,22 @@ func tNewConnect(user *tUser) *msgjson.Connect {
 		APIVersion: 0,
 		Time:       uint64(time.Now().UnixMilli()),
 	}
+}
+
+func tNewPostBondRequest(t *testing.T, user *tUser, assetID uint32, coinID []byte) (*msgjson.Message, *msgjson.PostBond) {
+	t.Helper()
+	postBond := &msgjson.PostBond{
+		AcctPubKey: user.privKey.PubKey().SerializeCompressed(),
+		AssetID:    assetID,
+		Version:    0,
+		CoinID:     coinID,
+	}
+	postBond.SetSig(signMsg(user.privKey, postBond.Serialize()))
+	msg, err := msgjson.NewRequest(comms.NextID(), msgjson.PostBondRoute, postBond)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	return msg, postBond
 }
 
 func newTestAuthManager(t *testing.T) (*AuthManager, *TStorage) {
@@ -558,6 +617,21 @@ func (s *blockingAccountStorage) Account(ctx context.Context, _ account.AccountI
 	close(s.started)
 	<-ctx.Done()
 	return nil, nil, ctx.Err()
+}
+
+func eventsWithCapture(authMgr *AuthManager, captured *[]*mesh.Event) map[string]mesh.EventApplier {
+	events := authMgr.Events()
+	for kind, apply := range events {
+		kind, apply := kind, apply
+		events[kind] = func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			*captured = append(*captured, &mesh.Event{
+				Kind:    event.Kind,
+				Payload: append([]byte(nil), event.Payload...),
+			})
+			return apply(applyCtx, event)
+		}
+	}
+	return events
 }
 
 func extractConnectResult(t *testing.T, msg *msgjson.Message) *msgjson.ConnectResult {
@@ -1980,6 +2054,556 @@ func TestHandleProxiedClientMessageDisconnectedUser(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandlePostBondSubmitsCommand(t *testing.T) {
+	const assetID = 42
+	coinID := []byte{0x01, 0x02, 0x03}
+	user := tNewUser(t)
+	meshReq := &tMesh{}
+	setTestMeshService(t, meshReq)
+
+	msg, _ := tNewPostBondRequest(t, user, assetID, coinID)
+
+	rpcErr := rig.mgr.handlePostBond(user.conn, msg)
+	if rpcErr != nil {
+		t.Fatalf("handlePostBond error: %v", rpcErr)
+	}
+	if meshReq.executeCount != 1 {
+		t.Fatalf("wrong execute count. got %d, want 1", meshReq.executeCount)
+	}
+	if meshReq.executedReq.User != user.acctID {
+		t.Fatalf("wrong command user. got %v, want %v", meshReq.executedReq.User, user.acctID)
+	}
+	if meshReq.executedReq.Msg != msg {
+		t.Fatalf("executed wrong message")
+	}
+	if meshReq.executedReq.Kind != commandKindPostBond {
+		t.Fatalf("wrong command kind. got %q, want %q", meshReq.executedReq.Kind, commandKindPostBond)
+	}
+	if user.conn.sendCount() != 0 {
+		t.Fatalf("unexpected immediate postbond response")
+	}
+
+	resp, err := msgjson.NewResponse(msg.ID, &msgjson.PostBondResult{
+		AccountID: user.acctID[:],
+		AssetID:   assetID,
+		BondID:    coinID,
+		Strength:  2,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := meshReq.executedReq.Respond(resp); err != nil {
+		t.Fatal(err)
+	}
+	if sent := user.conn.getSend(); sent != resp {
+		t.Fatalf("delivered response = %v, want %v", sent, resp)
+	}
+}
+
+func decodePostBondResult(t *testing.T, msg *msgjson.Message) *msgjson.PostBondResult {
+	t.Helper()
+	resp, err := msg.Response()
+	if err != nil {
+		t.Fatalf("postbond response decode: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("postbond response error: %v", resp.Error)
+	}
+	var result msgjson.PostBondResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("postbond result decode: %v", err)
+	}
+	return &result
+}
+
+func TestExecutePostBond(t *testing.T) {
+	const (
+		assetID  = 42
+		strength = 1
+	)
+	coinID := []byte{0x01, 0x02, 0x03}
+
+	tests := []struct {
+		name           string
+		existingBond   bool
+		delayedConfirm bool
+		wantEvent      bool
+		accountReadErr error
+	}{
+		{
+			name:           "account lookup fails",
+			accountReadErr: errors.New("account lookup failed"),
+		},
+		{
+			name:      "confirmed new bond emits event",
+			wantEvent: true,
+		},
+		{
+			name:         "existing bond completes without event",
+			existingBond: true,
+		},
+		{
+			name:           "delayed confirmation responds after event",
+			delayedConfirm: true,
+			wantEvent:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user := tNewUser(t)
+			authMgr, storage := newTestAuthManager(t)
+			storage.accountReadErr = tt.accountReadErr
+			if tt.wantEvent {
+				// New bonds must use the transaction result without a second reputation read.
+				storage.reputationErr = errors.New("unexpected reputation lookup after apply")
+			}
+			authMgr.signer.(*TSigner).setSig(user.randomSignature())
+
+			// Build the bond that checkBond will report for this command.
+			lockTime := time.Now().Add(48 * time.Hour).Unix()
+			amount := int64(tRegFee * 10)
+			bond := &db.Bond{
+				Version:  0,
+				AssetID:  assetID,
+				CoinID:   coinID,
+				Amount:   amount,
+				Strength: strength,
+				LockTime: lockTime,
+			}
+			storage.bondPostedResult = &db.BondPostedResult{
+				BondAdded: true,
+				Log:       &db.EventLogEntry{Seq: 1, Kind: meshevents.EventKindBondPosted},
+				Bonds:     []*db.Bond{bond},
+			}
+
+			if tt.existingBond {
+				// Existing bonds are acknowledged without publishing another event.
+				storage.acct = &account.Account{ID: user.acctID, PubKey: user.privKey.PubKey()}
+				storage.bonds = []*db.Bond{bond}
+			}
+
+			// Capture published events while still routing them through the real applier.
+			var capturedEvents []*mesh.Event
+			meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+				EventLogReader: emptyEventLogReader{},
+				OnHalt:         func(error) {},
+				Commands:       authMgr.Commands(),
+				Events:         eventsWithCapture(authMgr, &capturedEvents),
+				Logger:         dex.Disabled,
+			})
+			if err != nil {
+				t.Fatalf("NewService error: %v", err)
+			}
+
+			var confirmed chan struct{}
+			if tt.delayedConfirm {
+				// Start under-confirmed, then close confirmed so the bond waiter can finish.
+				confirmed = make(chan struct{})
+				queueCtx, shutdownQueue := context.WithCancel(context.Background())
+				queueDone := make(chan struct{})
+				authMgr.latencyQ = wait.NewTickerQueue(time.Millisecond)
+				go func() {
+					defer close(queueDone)
+					authMgr.latencyQ.Run(queueCtx)
+				}()
+				t.Cleanup(func() {
+					shutdownQueue()
+					<-queueDone
+				})
+			}
+
+			// Mock the asset backend's bond lookup.
+			authMgr.checkBond = func(_ context.Context, gotAssetID uint32, ver uint16, gotCoinID []byte) (amt, gotLockTime, confs int64, acct account.AccountID, err error) {
+				if gotAssetID != assetID || ver != 0 || !bytes.Equal(gotCoinID, coinID) {
+					err = fmt.Errorf("bond lookup = %d/%d/%x, want %d/0/%x", gotAssetID, ver, gotCoinID, assetID, coinID)
+					t.Error(err)
+					return
+				}
+				if !tt.delayedConfirm {
+					confs = tBondConfs
+				} else {
+					select {
+					case <-confirmed:
+						confs = tBondConfs
+					default:
+					}
+				}
+				return amount, lockTime, confs, user.acctID, nil
+			}
+
+			// Execute the postbond command and collect the client response.
+			responses := make(chan *msgjson.Message, 1)
+			msg, _ := tNewPostBondRequest(t, user, assetID, coinID)
+			rpcErr := meshSvc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+				Kind: commandKindPostBond,
+				User: user.acctID,
+				Msg:  msg,
+				Respond: func(resp *msgjson.Message) error {
+					responses <- resp
+					return nil
+				},
+			})
+			if tt.accountReadErr != nil {
+				if rpcErr == nil || rpcErr.Code != msgjson.RPCInternalError {
+					t.Fatalf("account lookup error = %v, want RPCInternalError", rpcErr)
+				}
+				if len(capturedEvents) != 0 || storage.bondPostedEvent != nil {
+					t.Fatal("bond applied after failed account lookup")
+				}
+				return
+			}
+			if rpcErr != nil {
+				t.Fatalf("Execute postbond command error: %v", rpcErr)
+			}
+
+			var sent *msgjson.Message
+			// Confirmed and existing bonds respond now; delayed bonds wait for the queue.
+			select {
+			case sent = <-responses:
+				if tt.delayedConfirm {
+					t.Fatalf("unexpected response before delayed confirmation: %v", sent)
+				}
+			default:
+				if !tt.delayedConfirm {
+					t.Fatal("no immediate postbond response")
+				}
+			}
+
+			if tt.delayedConfirm {
+				// The waiter emits the event and responds after the bond reaches confirmations.
+				close(confirmed)
+				select {
+				case sent = <-responses:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for delayed postbond response")
+				}
+			}
+
+			if sent == nil {
+				t.Fatal("no postbond result delivered")
+			}
+			if sent.ID != msg.ID {
+				t.Fatalf("wrong response id. got %d, want %d", sent.ID, msg.ID)
+			}
+			// All successful postbond commands return a signed result.
+			result := decodePostBondResult(t, sent)
+			if len(result.SigBytes()) == 0 {
+				t.Fatalf("postbond result was not signed")
+			}
+			if result.Reputation == nil {
+				t.Fatalf("postbond result did not include reputation")
+			}
+			if result.Reputation.BondedTier != int64(strength) {
+				t.Fatalf("postbond reputation = %+v, want bonded tier %d", result.Reputation, strength)
+			}
+
+			// New bonds publish exactly one event; existing bonds only return the result.
+			wantEvents := 0
+			if tt.wantEvent {
+				wantEvents = 1
+			}
+			if len(capturedEvents) != wantEvents {
+				t.Fatalf("captured %d bond posted events, want %d", len(capturedEvents), wantEvents)
+			}
+			if !tt.wantEvent {
+				return
+			}
+
+			// The event payload should describe the accepted bond.
+			if capturedEvents[0].Kind != meshevents.EventKindBondPosted {
+				t.Fatalf("wrong event kind %q for bond posted", capturedEvents[0].Kind)
+			}
+			posted, err := meshevents.DecodeBondPostedEvent(capturedEvents[0].Payload)
+			if err != nil {
+				t.Fatalf("DecodeBondPostedEvent error: %v", err)
+			}
+			if posted.Account == nil || posted.Account.AccountID != user.acctID {
+				t.Fatalf("wrong event account in payload")
+			}
+			if posted.Bond == nil || posted.Bond.AssetID != assetID || !bytes.Equal(posted.Bond.CoinID, coinID) {
+				t.Fatalf("wrong event bond in payload")
+			}
+		})
+	}
+}
+
+func hasBondWaiter(authMgr *AuthManager, key string) bool {
+	authMgr.bondWaiterMtx.Lock()
+	defer authMgr.bondWaiterMtx.Unlock()
+	_, found := authMgr.bondWaiterIdx[key]
+	return found
+}
+
+func executePrepaidPostBondForTest(t *testing.T, authMgr *AuthManager, user *tUser, coinID []byte, capturedEvents *[]*mesh.Event) (*msgjson.Message, *msgjson.Error) {
+	t.Helper()
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands:       authMgr.Commands(),
+		Events:         eventsWithCapture(authMgr, capturedEvents),
+		Logger:         dex.Disabled,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+
+	responses := make(chan *msgjson.Message, 1)
+	msg, _ := tNewPostBondRequest(t, user, account.PrepaidBondID, coinID)
+	rpcErr := meshSvc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+		Kind: commandKindPostBond,
+		User: user.acctID,
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			responses <- resp
+			return nil
+		},
+	})
+	select {
+	case resp := <-responses:
+		return resp, rpcErr
+	default:
+		return nil, rpcErr
+	}
+}
+
+func TestExecutePrepaidPostBond(t *testing.T) {
+	user := tNewUser(t)
+	validLockTime := time.Now().Add(72 * time.Hour).Unix()
+	validCoinID := bytes.Repeat([]byte{0x05}, 16)
+
+	t.Run("redeem pre-paid bond and retry", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		authMgr.signer.(*TSigner).setSig(user.randomSignature())
+		storage.prepaidBonds = map[string]*meshevents.PrepaidBond{
+			string(validCoinID): {
+				CoinID:   validCoinID,
+				Strength: 4,
+				LockTime: validLockTime,
+			},
+		}
+		bond := &db.Bond{
+			AssetID:  account.PrepaidBondID,
+			CoinID:   validCoinID,
+			Strength: 4,
+			LockTime: validLockTime,
+		}
+		storage.bondPostedResult = &db.BondPostedResult{
+			BondAdded: true,
+			Log:       &db.EventLogEntry{Seq: 1, Kind: meshevents.EventKindBondPosted},
+			Bonds:     []*db.Bond{bond},
+		}
+
+		authMgr.checkBond = func(context.Context, uint32, uint16, []byte) (int64, int64, int64, account.AccountID, error) {
+			t.Fatal("checkBond called for pre-paid bond")
+			return 0, 0, 0, account.AccountID{}, nil
+		}
+
+		var capturedEvents []*mesh.Event
+		resp, rpcErr := executePrepaidPostBondForTest(t, authMgr, user, validCoinID, &capturedEvents)
+		if rpcErr != nil {
+			t.Fatalf("Execute postbond command error: %v", rpcErr)
+		}
+		if resp == nil {
+			t.Fatal("no pre-paid postbond response")
+		}
+		result := decodePostBondResult(t, resp)
+		if result.AssetID != account.PrepaidBondID || result.Amount != 0 || result.Strength != 4 || !bytes.Equal(result.BondID, validCoinID) {
+			t.Fatalf("wrong pre-paid postbond result: %+v", result)
+		}
+		if len(result.SigBytes()) == 0 {
+			t.Fatal("pre-paid postbond result was not signed")
+		}
+		if result.Reputation == nil || result.Reputation.BondedTier != 4 {
+			t.Fatalf("pre-paid postbond reputation = %+v, want bonded tier 4", result.Reputation)
+		}
+		if len(capturedEvents) != 1 || capturedEvents[0].Kind != meshevents.EventKindBondPosted {
+			t.Fatalf("captured events = %+v, want one bond_posted event", capturedEvents)
+		}
+		if storage.bondPostedEvent == nil || storage.bondPostedEvent.Bond == nil ||
+			storage.bondPostedEvent.Bond.AssetID != account.PrepaidBondID ||
+			!bytes.Equal(storage.bondPostedEvent.Bond.CoinID, validCoinID) {
+			t.Fatalf("wrong bond posted storage update: %+v", storage.bondPostedEvent)
+		}
+		if hasBondWaiter(authMgr, bondKey(account.PrepaidBondID, validCoinID)) {
+			t.Fatalf("pre-paid bond waiter was not removed after success")
+		}
+
+		// On retry, storage has the account and bond but no unredeemed token.
+		storage.acct = &account.Account{ID: user.acctID, PubKey: user.privKey.PubKey()}
+		storage.bonds = []*db.Bond{bond}
+		storage.prepaidBonds = map[string]*meshevents.PrepaidBond{}
+
+		// A retry must not return success if reputation cannot be loaded.
+		storage.reputationErr = errors.New("reputation lookup failed")
+		authMgr.rep.invalidate(user.acctID)
+		failed, rpcErr := executePrepaidPostBondForTest(t, authMgr, user, validCoinID, &capturedEvents)
+		if failed != nil || rpcErr == nil || rpcErr.Code != msgjson.RPCInternalError {
+			t.Fatalf("retry during reputation failure: response %v, error %v", failed, rpcErr)
+		}
+		storage.reputationErr = nil
+
+		// Retry after redemption without replenishing the consumed token.
+		resp, rpcErr = executePrepaidPostBondForTest(t, authMgr, user, validCoinID, &capturedEvents)
+		if rpcErr != nil {
+			t.Fatalf("Execute postbond command error: %v", rpcErr)
+		}
+		if resp == nil {
+			t.Fatal("no retry postbond response")
+		}
+		result = decodePostBondResult(t, resp)
+		if result.Reputation == nil || result.Reputation.BondedTier != 4 {
+			t.Fatalf("retry reputation = %+v, want bonded tier 4", result.Reputation)
+		}
+		if len(capturedEvents) != 1 {
+			t.Fatalf("total events after same-account retry = %d, want 1", len(capturedEvents))
+		}
+	})
+
+	t.Run("unknown token releases waiter", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		authMgr.signer.(*TSigner).setSig(user.randomSignature())
+		storage.prepaidBonds = map[string]*meshevents.PrepaidBond{}
+
+		var capturedEvents []*mesh.Event
+		resp, rpcErr := executePrepaidPostBondForTest(t, authMgr, user, validCoinID, &capturedEvents)
+		if resp != nil {
+			t.Fatalf("unexpected pre-paid postbond response: %v", resp)
+		}
+		if rpcErr == nil || rpcErr.Code != msgjson.BondError {
+			t.Fatalf("unknown token error = %v, want BondError", rpcErr)
+		}
+		if hasBondWaiter(authMgr, bondKey(account.PrepaidBondID, validCoinID)) {
+			t.Fatalf("pre-paid bond waiter was not removed after unknown token")
+		}
+	})
+
+	t.Run("account lookup fails", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		storage.accountReadErr = errors.New("account lookup failed")
+
+		var capturedEvents []*mesh.Event
+		_, rpcErr := executePrepaidPostBondForTest(t, authMgr, user, validCoinID, &capturedEvents)
+		if rpcErr == nil || rpcErr.Code != msgjson.RPCInternalError {
+			t.Fatalf("account lookup error = %v, want RPCInternalError", rpcErr)
+		}
+		if len(capturedEvents) != 0 || storage.bondPostedEvent != nil {
+			t.Fatal("bond applied after failed account lookup")
+		}
+	})
+}
+
+func TestApplyBondPostedEvent(t *testing.T) {
+	user := tNewUser(t)
+	event := meshevents.NewBondPostedEvent(&account.Account{
+		ID: user.acctID, PubKey: user.privKey.PubKey(),
+	}, &meshevents.Bond{
+		AssetID:  42,
+		CoinID:   []byte{0x09, 0x08, 0x07},
+		Amount:   int64(tRegFee * 10),
+		Strength: 1,
+		LockTime: time.Now().Add(48 * time.Hour).Unix(),
+	})
+	meta := &db.EventLogMeta{
+		Seq:             7,
+		Event:           []byte("bond-posted-event"),
+		ExpectedTipHash: bytes.Repeat([]byte{0x7a}, db.EventLogTipHashSize),
+	}
+	logEntry := &db.EventLogEntry{Seq: meta.Seq, Kind: meshevents.EventKindBondPosted}
+	stored := &db.BondPostedResult{
+		Log: logEntry,
+		Bonds: []*db.Bond{
+			{Strength: 3, LockTime: event.Bond.LockTime},
+			{Strength: 5, LockTime: time.Now().Add(12 * time.Hour).Unix()}, // expired for tier purposes
+		},
+		Preimages: []*db.PreimageOutcome{{Miss: true}},
+		Matches: []*db.MatchResult{
+			{MatchOutcome: db.OutcomeNoSwapAsTaker},
+			{MatchOutcome: db.OutcomeNoSwapAsTaker},
+		},
+	}
+
+	for _, tt := range []struct {
+		name   string
+		result *db.BondPostedResult
+		err    error
+	}{
+		{"returns stored log and signed reputation", stored, nil},
+		{"storage error", nil, errors.New("storage failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			authMgr, storage := newTestAuthManager(t)
+			storage.bondPostedResult = tt.result
+			storage.bondPostedErr = tt.err
+			applyCtx := &mesh.EventApplyContext{Context: context.Background()}
+			authMgr.signer.(*TSigner).setSig(user.randomSignature())
+			storage.reputationErr = errors.New("unexpected reputation lookup after apply")
+			minThreshold := time.Now().Add(authMgr.bondExpiry).Unix()
+			applied, err := authMgr.applyBondPostedEvent(applyCtx, meta, event)
+			maxThreshold := time.Now().Add(authMgr.bondExpiry).Unix()
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("applyBondPostedEvent error = %v, want %v", err, tt.err)
+			}
+			if storage.bondPostedMeta != meta || storage.bondPostedEvent != event {
+				t.Fatal("storage received incorrect metadata or event")
+			}
+			if want := [3]int{scoringOrderLimit, ScoringMatchLimit, cancelThreshWindow}; storage.bondPostedLimits != want {
+				t.Fatalf("reputation limits = %v, want %v", storage.bondPostedLimits, want)
+			}
+
+			if tt.err != nil {
+				if applied != nil {
+					t.Fatal("returned an event log entry on storage error")
+				}
+				if applyCtx.Result() != nil {
+					t.Fatal("set a result after storage failure")
+				}
+				return
+			}
+			if applied != tt.result.Log {
+				t.Fatalf("applied log = %+v, want %+v", applied, tt.result.Log)
+			}
+			result := applyCtx.Result().(*msgjson.PostBondResult)
+			if len(result.SigBytes()) == 0 {
+				t.Fatal("postbond result was not signed")
+			}
+			rep := result.Reputation
+			// Two failed swaps (-22) and one preimage miss (-2) produce one penalty.
+			const wantScore = -24
+			if rep == nil || rep.BondedTier != 3 || rep.Score != wantScore || rep.Penalties != 1 {
+				t.Fatalf("reputation = %+v, want tier 3 and score %d", rep, wantScore)
+			}
+			if rep.BondExpiryThreshold < minThreshold || rep.BondExpiryThreshold > maxThreshold {
+				t.Fatalf("bond expiry threshold %d outside [%d, %d]", rep.BondExpiryThreshold, minThreshold, maxThreshold)
+			}
+			if !bytes.Equal(result.AccountID, user.acctID[:]) || result.AssetID != event.Bond.AssetID ||
+				!bytes.Equal(result.BondID, event.Bond.CoinID) || result.Amount != uint64(event.Bond.Amount) ||
+				result.Strength != event.Bond.Strength || result.Expiry != uint64(time.Unix(event.Bond.LockTime, 0).Add(-authMgr.bondExpiry).Unix()) {
+				t.Fatalf("postbond result does not match event: %+v", result)
+			}
+		})
+	}
+
+	t.Run("account id mismatch rejected before storage", func(t *testing.T) {
+		authMgr, storage := newTestAuthManager(t)
+		invalid := *event
+		invalidAccount := *event.Account
+		invalidAccount.AccountID = tNewUser(t).acctID
+		invalid.Account = &invalidAccount
+		meshEvent, err := mesh.NewEvent(&invalid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		apply := authMgr.Events()[meshevents.EventKindBondPosted]
+		if _, err := apply(&mesh.EventApplyContext{Context: context.Background()}, meshEvent); err == nil {
+			t.Fatal("event handler accepted mismatched account id")
+		}
+		if storage.bondPostedEvent != nil {
+			t.Fatal("storage was called for invalid event")
+		}
+	})
 }
 
 func TestAuth(t *testing.T) {
