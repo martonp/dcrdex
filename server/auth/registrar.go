@@ -235,7 +235,11 @@ func (auth *AuthManager) handlePostBond(conn comms.Link, msg *msgjson.Message) *
 
 	// See if the account exists, and get known unexpired bonds. Also see if the
 	// account has previously paid a legacy registration fee.
-	dbAcct, bonds := auth.storage.Account(acctID, lockTimeThresh)
+	dbAcct, bonds, err := auth.storage.Account(auth.ctx, acctID, lockTimeThresh)
+	if err != nil {
+		log.Errorf("Account read failed for user %v in postbond: %v", acctID, err)
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve account")
+	}
 
 	bondStr := coinIDString(assetID, bondCoinID)
 	bondAssetSym := dex.BipIDSymbol(assetID)
@@ -335,6 +339,10 @@ func (auth *AuthManager) storeBondAndRespond(conn comms.Link, bond *db.Bond, acc
 	if rep == nil { // user not authenticated, use DB
 		rep = auth.ComputeUserReputation(acctID)
 	}
+	if rep == nil {
+		conn.SendError(reqID, msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve reputation"))
+		return
+	}
 	postBondRes.Reputation = rep
 
 	log.Infof("Bond accepted: acct %v from %v locked %d in %v. Bond total %d, tier %d",
@@ -384,7 +392,11 @@ func (auth *AuthManager) processPrepaidBond(conn comms.Link, msg *msgjson.Messag
 	auth.Sign(postBondRes)
 
 	lockTimeThresh := time.Now().Add(auth.bondExpiry)
-	dbAcct, _ := auth.storage.Account(acct.ID, lockTimeThresh)
+	dbAcct, _, err := auth.storage.Account(auth.ctx, acct.ID, lockTimeThresh)
+	if err != nil {
+		log.Errorf("Account read failed for user %v in prepaid postbond: %v", acct.ID, err)
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve account")
+	}
 
 	dbBond := &db.Bond{
 		AssetID:  account.PrepaidBondID,
@@ -416,6 +428,9 @@ func (auth *AuthManager) processPrepaidBond(conn comms.Link, msg *msgjson.Messag
 	rep := auth.addBond(acct.ID, dbBond)
 	if rep == nil { // user not authenticated, use DB
 		rep = auth.ComputeUserReputation(acct.ID)
+	}
+	if rep == nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve reputation")
 	}
 	postBondRes.Reputation = rep
 

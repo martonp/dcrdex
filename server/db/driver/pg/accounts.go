@@ -4,6 +4,7 @@
 package pg
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -15,32 +16,24 @@ import (
 	"github.com/decred/dcrd/dcrutil/v4" // TODO: consider a move to "crypto/sha256" instead of dcrutil.Hash160
 )
 
-// Account retrieves the account pubkey, active bonds, and if the account has a
-// legacy registration fee address and transaction recorded. If the account does
-// not exist or there is in an error retrieving any data, a nil *account.Account
-// is returned.
-func (a *Archiver) Account(aid account.AccountID, bondExpiry time.Time) (acct *account.Account, bonds []*db.Bond) {
-	acct, err := getAccount(a.db, a.tables.accounts, aid)
+// Account returns the account and bonds whose lock time is at least
+// lockTimeThresh. It returns a nil account and nil error if the account
+// does not exist.
+func (a *Archiver) Account(ctx context.Context, aid account.AccountID, lockTimeThresh time.Time) (acct *account.Account, bonds []*db.Bond, err error) {
+	acct, err = getAccount(ctx, a.db, a.tables.accounts, aid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return nil, nil
-	case err == nil:
-	default:
-		log.Errorf("getAccount error: %v", err)
-		return nil, nil
+		return nil, nil, nil
+	case err != nil:
+		return nil, nil, fmt.Errorf("getAccount error: %w", err)
 	}
 
-	bonds, err = getBondsForAccount(a.db, a.tables.bonds, aid, bondExpiry.Unix())
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		bonds = nil
-	case err == nil:
-	default:
-		log.Errorf("getBondsForAccount error: %v", err)
-		return nil, nil
+	bonds, err = getBondsForAccount(ctx, a.db, a.tables.bonds, aid, lockTimeThresh.Unix())
+	if err != nil {
+		return nil, nil, fmt.Errorf("getBondsForAccount error: %w", err)
 	}
 
-	return acct, bonds
+	return acct, bonds, nil
 }
 
 // AccountInfo returns data for an account.
@@ -186,10 +179,10 @@ func createAccountTables(db sqlQueryExecutor) error {
 // getAccount gets retrieves the account details, including the pubkey, a flag
 // indicating if the account was created with a legacy fee address (not a
 // fidelity bond), and a flag indicating if that legacy fee was paid.
-func getAccount(dbe sqlQueryer, tableName string, aid account.AccountID) (acct *account.Account, err error) {
+func getAccount(ctx context.Context, dbe sqlQueryer, tableName string, aid account.AccountID) (acct *account.Account, err error) {
 	var pubkey []byte
 	stmt := fmt.Sprintf(internal.SelectAccount, tableName)
-	err = dbe.QueryRow(stmt, aid).Scan(&pubkey)
+	err = dbe.QueryRowContext(ctx, stmt, aid).Scan(&pubkey)
 	if err != nil {
 		return
 	}
@@ -220,9 +213,9 @@ func deleteBond(dbe sqlExecutor, tableName string, assetID uint32, coinID []byte
 	return err
 }
 
-func getBondsForAccount(dbe sqlQueryer, tableName string, acct account.AccountID, bondExpiryTime int64) ([]*db.Bond, error) {
+func getBondsForAccount(ctx context.Context, dbe sqlQueryer, tableName string, acct account.AccountID, bondExpiryTime int64) ([]*db.Bond, error) {
 	stmt := fmt.Sprintf(internal.SelectActiveBondsForUser, tableName)
-	rows, err := dbe.Query(stmt, acct, bondExpiryTime)
+	rows, err := dbe.QueryContext(ctx, stmt, acct, bondExpiryTime)
 	if err != nil {
 		return nil, err
 	}

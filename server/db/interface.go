@@ -246,14 +246,10 @@ type Bond struct {
 // AccountArchiver is the interface required for storage and retrieval of all
 // account data.
 type AccountArchiver interface {
-	// Account retrieves the account information for the specified account ID. A
-	// nil pointer will be returned for unknown or closed accounts. Bond and
-	// registration fee payment status is returned as well. A bond is active if
-	// its lockTime is after the lockTimeThresh Time, which should be
-	// time.Now().Add(bondExpiry). The legacy bool return refers to the legacy
-	// registration fee system, and legacyPaid indicates if the account has a
-	// recorded fee coin (paid legacy fee).
-	Account(acctID account.AccountID, lockTimeThresh time.Time) (acct *account.Account, activeBonds []*Bond)
+	// Account returns the account and bonds whose lock time is at least
+	// lockTimeThresh. It returns a nil account and nil error if the account
+	// does not exist.
+	Account(ctx context.Context, acctID account.AccountID, lockTimeThresh time.Time) (acct *account.Account, activeBonds []*Bond, err error)
 
 	// CreateAccountWithBond creates a new account with the given bond. This is
 	// used for the new postbond request protocol. The bond tx should be

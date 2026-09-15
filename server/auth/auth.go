@@ -55,9 +55,10 @@ func unixMsNow() time.Time {
 // Storage updates and fetches account-related data from what is presumably a
 // database.
 type Storage interface {
-	// Account retrieves account info for the specified account ID and lock time
-	// threshold, which determines when a bond is considered expired.
-	Account(account.AccountID, time.Time) (acct *account.Account, bonds []*db.Bond)
+	// Account returns the account and bonds whose lock time is at least
+	// lockTimeThresh. It returns a nil account and nil error if the account
+	// does not exist.
+	Account(ctx context.Context, acctID account.AccountID, lockTimeThresh time.Time) (acct *account.Account, bonds []*db.Bond, err error)
 
 	CreateAccountWithBond(acct *account.Account, bond *db.Bond) error
 	AddBond(acct account.AccountID, bond *db.Bond) error
@@ -447,7 +448,11 @@ func (auth *AuthManager) GraceLimit() int {
 func (auth *AuthManager) RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time) {
 	score := auth.recordOrderDone(user, oid, &target, epochGap, t.UnixMilli())
 
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score)
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return
+	}
 	effectiveTier := rep.EffectiveTier()
 	log.Debugf("RecordCancel: user %v strikes %d, bond tier %v => trading tier %v",
 		user, score, rep.BondedTier, effectiveTier)
@@ -469,7 +474,11 @@ func (auth *AuthManager) RecordCancel(user account.AccountID, oid, target order.
 // longer on the books if it ever was.
 func (auth *AuthManager) RecordCompletedOrder(user account.AccountID, oid order.OrderID, t time.Time) {
 	score := auth.recordOrderDone(user, oid, nil, db.EpochGapNA, t.UnixMilli())
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score) // may raise tier
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score) // may raise tier
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return
+	}
 	if tierChanged {
 		log.Tracef("RecordCompletedOrder: tier changed for user %v strikes %d, bond tier %v => trading tier %v",
 			user, score, rep.BondedTier, rep.EffectiveTier())
@@ -781,7 +790,10 @@ func (auth *AuthManager) UserReputation(user account.AccountID) (tier int64, sco
 	if err != nil {
 		return
 	}
-	r, _, _ := auth.computeUserReputation(user, score)
+	r, _, _, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		return 0, 0, maxScore, err
+	}
 	if r != nil {
 		return r.EffectiveTier(), r.Score, ScoringMatchLimit, nil
 
@@ -812,17 +824,20 @@ func (auth *AuthManager) tier(bondTier int64, score int32) int64 {
 // asset, and is just for logging, and it may be removed or changed to a map by
 // asset ID. For online users, this will also indicate if the tier changed; this
 // will always return false for offline users.
-func (auth *AuthManager) computeUserReputation(user account.AccountID, score int32) (r *account.Reputation, tierChanged, scoreChanged bool) {
+func (auth *AuthManager) computeUserReputation(user account.AccountID, score int32) (r *account.Reputation, tierChanged, scoreChanged bool, err error) {
 	client := auth.user(user)
 	if client == nil {
-		// Offline. Load active bonds and legacyFeePaid flag from DB.
+		// Load active bonds for the offline user.
 		lockTimeThresh := time.Now().Add(auth.bondExpiry)
-		_, bonds := auth.storage.Account(user, lockTimeThresh)
+		_, bonds, err := auth.storage.Account(auth.ctx, user, lockTimeThresh)
+		if err != nil {
+			return nil, false, false, fmt.Errorf("account lookup for user %v: %w", user, err)
+		}
 		var bondTier int64
 		for _, bond := range bonds {
 			bondTier += int64(bond.Strength)
 		}
-		return auth.userReputation(bondTier, score), false, false
+		return auth.userReputation(bondTier, score), false, false, nil
 	}
 
 	client.mtx.Lock()
@@ -848,7 +863,11 @@ func (auth *AuthManager) ComputeUserReputation(user account.AccountID) *account.
 		log.Errorf("failed to load user score: %v", err)
 		return nil
 	}
-	r, _, _ := auth.computeUserReputation(user, score)
+	r, _, _, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return nil
+	}
 	return r
 }
 
@@ -890,7 +909,11 @@ func (auth *AuthManager) registerMatchOutcome(user account.AccountID, outcome Ou
 // has no clue about lot size, and neither does DB!
 func (auth *AuthManager) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, redeemTime time.Time) {
 	score := auth.registerMatchOutcome(user, db.OutcomeSwapSuccess, mmid)
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score) // may raise tier
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score) // may raise tier
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return
+	}
 	effectiveTier := rep.EffectiveTier()
 	log.Debugf("Match success for user %v: strikes %d, bond tier %v => tier %v",
 		user, score, rep.BondedTier, effectiveTier)
@@ -915,7 +938,11 @@ func (auth *AuthManager) Inaction(user account.AccountID, outcome Outcome, mmid 
 	score := auth.registerMatchOutcome(user, outcome, mmid)
 
 	// Recompute tier.
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score)
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return
+	}
 	effectiveTier := rep.EffectiveTier()
 	log.Infof("Match failure for user %v: %q (badness %v), strikes %d, bond tier %v => trading tier %v",
 		user, outcome, outcomeScores[outcome], score, rep.BondedTier, effectiveTier)
@@ -969,7 +996,9 @@ func (auth *AuthManager) registerPreimageOutcome(user account.AccountID, miss bo
 // PreimageSuccess registers an accepted preimage for the user.
 func (auth *AuthManager) PreimageSuccess(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
 	score := auth.registerPreimageOutcome(user, false, oid, epochEnd)
-	auth.computeUserReputation(user, score) // may raise tier, but no action needed
+	if _, _, _, err := auth.computeUserReputation(user, score); err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+	}
 }
 
 // MissedPreimage registers a missed preimage violation by the user.
@@ -980,7 +1009,11 @@ func (auth *AuthManager) MissedPreimage(user account.AccountID, epochEnd time.Ti
 	}
 
 	// Recompute tier.
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score)
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
+		return
+	}
 	effectiveTier := rep.EffectiveTier()
 	log.Debugf("MissedPreimage: user %v strikes %d, bond tier %v => trading tier %v", user, score, rep.BondedTier, effectiveTier)
 	// If their tier sinks below 1, unbook their orders and send a note.
@@ -1067,7 +1100,10 @@ func (auth *AuthManager) reRepUser(user account.AccountID) (*account.Reputation,
 	score, _, _ := auth.integrateOutcomes(matches, pimgs, ords)
 
 	// Recompute tier.
-	rep, tierChanged, scoreChanged := auth.computeUserReputation(user, score)
+	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
+	if err != nil {
+		return nil, err
+	}
 	if tierChanged {
 		go auth.sendTierChanged(user, rep, "user forgiven")
 	} else if scoreChanged {
@@ -1567,7 +1603,14 @@ func (auth *AuthManager) handleConnect(conn comms.Link, msg *msgjson.Message) *m
 	var user account.AccountID
 	copy(user[:], connect.AccountID[:])
 	lockTimeThresh := time.Now().Add(auth.bondExpiry).Truncate(time.Second)
-	acctInfo, bonds := auth.storage.Account(user, lockTimeThresh)
+	acctInfo, bonds, err := auth.storage.Account(auth.ctx, user, lockTimeThresh)
+	if err != nil {
+		log.Errorf("Account read failed for user %v on connect: %v", user, err)
+		return &msgjson.Error{
+			Code:    msgjson.RPCInternalError,
+			Message: "failed to retrieve account",
+		}
+	}
 	if acctInfo == nil {
 		return &msgjson.Error{
 			Code:    msgjson.AccountNotFoundError,
