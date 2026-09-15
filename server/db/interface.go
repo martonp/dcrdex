@@ -715,6 +715,7 @@ type ReputationArchiver interface {
 		ctx context.Context, user account.AccountID, pimgOutcomes []*PreimageOutcome, matchOutcomes []*MatchResult, orderOutcomes []*OrderOutcome, /* Without DB IDs */
 	) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error) /* With DB IDs */
 	ForgiveUser(ctx context.Context, user account.AccountID) error
+	ApplyReputationForgivenEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.ReputationForgivenEvent) (*ReputationForgivenResult, error)
 	SetReputationInputsListener(func(users ...account.AccountID))
 }
 

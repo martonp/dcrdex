@@ -53,7 +53,10 @@ var (
 	ErrUserNotConnected = dex.ErrorKind("user not connected")
 )
 
-const reputationEventRefreshTimeout = 5 * time.Second
+const (
+	reputationForgivenessCommandTimeout = 2 * time.Minute
+	reputationEventRefreshTimeout       = 5 * time.Second
+)
 
 func unixMsNow() time.Time {
 	return time.Now().Truncate(time.Millisecond).UTC()
@@ -1042,24 +1045,19 @@ func (auth *AuthManager) reRepUser(user account.AccountID) (*account.Reputation,
 	return rep, nil
 }
 
-// ForgiveMatchFail forgives a user for a specific match failure, potentially
-// allowing them to resume trading if their score becomes passing. NOTE: This
-// may become deprecated with mesh, unless matches may be forgiven in some
-// automatic network reconciliation process.
+// ForgiveMatchFail forgives a user's match failure. It reports whether the match
+// was forgiven and whether refreshed reputation confirms a positive effective
+// tier. If reputation cannot be determined, unbanned is false.
 func (auth *AuthManager) ForgiveMatchFail(user account.AccountID, mid order.MatchID) (forgiven, unbanned bool, err error) {
-	// Forgive the specific match failure in the DB.
-	forgiven, err = auth.storage.ForgiveMatchFail(mid)
+	result, err := auth.executeReputationForgivenessCommand(context.Background(), &meshevents.ReputationForgivenEvent{
+		AccountID: user,
+		Scope:     meshevents.ReputationForgivenessScopeMatch,
+		MatchID:   &mid,
+	})
 	if err != nil {
-		return
+		return false, false, err
 	}
-	rep, err := auth.reRepUser(user)
-	if err != nil {
-		return
-	}
-
-	unbanned = rep.EffectiveTier() > 0
-
-	return
+	return result.Forgiven, result.Unbanned, nil
 }
 
 // CreatePrepaidBonds creates and stores n prepaid bond tokens with the given
@@ -1960,12 +1958,95 @@ func (auth *AuthManager) handleMatchStatus(conn comms.Link, msg *msgjson.Message
 	return nil
 }
 
+// ForgiveUser forgives all penalty outcomes for a user.
 func (auth *AuthManager) ForgiveUser(user account.AccountID) error {
-	if err := auth.storage.ForgiveUser(auth.ctx, user); err != nil {
-		return err
+	_, err := auth.executeReputationForgivenessCommand(context.Background(), &meshevents.ReputationForgivenEvent{
+		AccountID: user,
+		Scope:     meshevents.ReputationForgivenessScopeUser,
+	})
+	return err
+}
+
+type reputationForgivenessResult struct {
+	Forgiven bool `json:"forgiven"`
+	Unbanned bool `json:"unbanned"`
+}
+
+func (auth *AuthManager) executeReputationForgivenessCommand(ctx context.Context, req *meshevents.ReputationForgivenEvent) (*reputationForgivenessResult, error) {
+	if auth.mesh == nil {
+		return nil, fmt.Errorf("mesh service is not configured")
 	}
-	if _, err := auth.reRepUser(user); err != nil {
-		log.Errorf("Error updating user reputation after forgiveness: %v", err)
+	cmdCtx, cancel := context.WithTimeout(ctx, reputationForgivenessCommandTimeout)
+	defer cancel()
+
+	msg, err := msgjson.NewRequest(comms.NextID(), commandKindForgiveReputation, req)
+	if err != nil {
+		return nil, err
+	}
+
+	responses := make(chan *msgjson.Message, 1)
+	execErrs := make(chan *msgjson.Error, 1)
+	go func() {
+		if rpcErr := auth.mesh.ExecuteCommand(cmdCtx, mesh.CommandRequest{
+			Kind: commandKindForgiveReputation,
+			User: req.AccountID,
+			Msg:  msg,
+			Respond: func(resp *msgjson.Message) error {
+				select {
+				case responses <- resp:
+				default:
+				}
+				return nil
+			},
+		}); rpcErr != nil {
+			execErrs <- rpcErr
+		}
+	}()
+
+	var authDone <-chan struct{}
+	if auth.ctx != nil {
+		authDone = auth.ctx.Done()
+	}
+
+	select {
+	case rpcErr := <-execErrs:
+		return nil, rpcErr
+	case resp := <-responses:
+		if resp == nil {
+			return nil, fmt.Errorf("nil reputation forgiveness response")
+		}
+		var result reputationForgivenessResult
+		if err := resp.UnmarshalResult(&result); err != nil {
+			return nil, err
+		}
+		return &result, nil
+	case <-authDone:
+		return nil, auth.ctx.Err()
+	case <-cmdCtx.Done():
+		return nil, cmdCtx.Err()
+	}
+}
+
+func (auth *AuthManager) executeForgiveReputation(cmdCtx *mesh.CommandContext) *msgjson.Error {
+	var event meshevents.ReputationForgivenEvent
+	if err := cmdCtx.Request.Msg.Unmarshal(&event); err != nil {
+		return msgjson.NewError(msgjson.RPCParseError, "error parsing reputation forgiveness request")
+	}
+	if event.AccountID != cmdCtx.Request.User {
+		return msgjson.NewError(msgjson.RPCInternalError, "reputation forgiveness command account mismatch")
+	}
+
+	if err := event.Validate(); err != nil {
+		return msgjson.NewError(msgjson.RPCParseError, "invalid reputation forgiveness request: %v", err)
+	}
+	meshEvent, err := mesh.NewEvent(&event)
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to encode reputation forgiveness event")
+	}
+
+	if err = cmdCtx.Completion.Emit(cmdCtx.Context, meshEvent, nil); err != nil {
+		mesh.LogApplyFailure(log, err, "Failed to apply reputation forgiveness event for account %v: %v", event.AccountID, err)
+		return mesh.ClientError(err, msgjson.RPCInternalError, "failed to apply reputation forgiveness: %v", err)
 	}
 	return nil
 }
