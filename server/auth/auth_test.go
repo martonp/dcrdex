@@ -131,8 +131,6 @@ func (s *TStorage) AddBond(acct account.AccountID, bond *db.Bond) error {
 	return nil
 }
 
-func (s *TStorage) DeleteBond(assetID uint32, coinID []byte) error { return nil }
-
 func (s *TStorage) FetchPrepaidBond([]byte) (uint32, int64, error) {
 	return 1, time.Now().Add(time.Hour * 48).Unix(), nil
 }
@@ -641,8 +639,6 @@ func TestMain(m *testing.M) {
 				},
 			},
 			BondTxParser:    tParseBondTx,
-			UserUnbooker:    func(account.AccountID) {},
-			MiaUserTimeout:  90 * time.Second, // TODO: test
 			CancelThreshold: 0.9,
 			TxDataSources:   make(map[uint32]TxDataSource),
 			Route: func(route string, handler comms.MsgHandler) {

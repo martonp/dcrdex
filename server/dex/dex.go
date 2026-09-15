@@ -892,13 +892,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, err
 	}
 
-	// Create the user order unbook dispatcher for the AuthManager.
 	markets := make(map[string]*market.Market, len(cfg.Markets))
-	userUnbookFun := func(user account.AccountID) {
-		for _, mkt := range markets {
-			mkt.UnbookUserOrders(user)
-		}
-	}
 
 	bondChecker := func(ctx context.Context, assetID uint32, version uint16, coinID []byte) (amt, lockTime, confs int64,
 		acct account.AccountID, err error) {
@@ -940,8 +934,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		BondTxParser:     bondTxParser,
 		BondChecker:      bondChecker,
 		BondExpiry:       uint64(dex.BondExpiry(cfg.Network)),
-		UserUnbooker:     userUnbookFun,
-		MiaUserTimeout:   cfg.BroadcastTimeout,
 		CancelThreshold:  cfg.CancelThreshold,
 		FreeCancels:      cfg.FreeCancels,
 		PenaltyThreshold: cfg.PenaltyThreshold,
@@ -1028,7 +1020,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	// Markets
 	var orderRouter *market.OrderRouter
-	usersWithOrders := make(map[account.AccountID]struct{})
 	for _, mktInf := range cfg.Markets {
 		// nilness of the coin locker signals account-based asset.
 		var baseCoinLocker, quoteCoinLocker coinlock.CoinLocker
@@ -1073,24 +1064,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		if err != nil {
 			return nil, fmt.Errorf("DataSource.AddMarketSource: %w", err)
 		}
-
-		// Having loaded the book, get the accounts owning the orders.
-		_, buys, sells := mkt.Book()
-		for _, lo := range buys {
-			usersWithOrders[lo.AccountID] = struct{}{}
-		}
-		for _, lo := range sells {
-			usersWithOrders[lo.AccountID] = struct{}{}
-		}
 	}
 
-	// Having enumerated all users with booked orders, configure the AuthManager
-	// to expect them to connect in a certain time period.
-	authMgr.ExpectUsers(usersWithOrders, cfg.BroadcastTimeout)
-
-	// Start the AuthManager and Swapper subsystems after populating the markets
-	// map used by the unbook callbacks, and setting the AuthManager's unbook
-	// timers for the users with currently booked orders.
+	// Start the AuthManager and Swapper subsystems.
 	startSubSys("Auth manager", authMgr)
 	startSubSys("Swapper", swapper)
 
