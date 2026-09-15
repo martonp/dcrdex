@@ -78,21 +78,59 @@ func (s *TStorage) Account(ctx context.Context, acct account.AccountID, lockTime
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	return s.acct, s.bonds, s.accountReadErr
+	if s.accountReadErr != nil {
+		return nil, nil, s.accountReadErr
+	}
+	// Mirror the DB query: only bonds at or past the lock-time threshold.
+	bonds := make([]*db.Bond, 0, len(s.bonds))
+	for _, bond := range s.bonds {
+		if bond.LockTime >= lockTimeThresh.Unix() {
+			bonds = append(bonds, bond)
+		}
+	}
+	return s.acct, bonds, nil
 }
 func (s *TStorage) setBondTier(tier uint32) {
 	s.bonds = []*db.Bond{{Strength: tier, LockTime: time.Now().Unix() * 2}}
 }
-func (s *TStorage) CreateAccountWithBond(acct *account.Account, bond *db.Bond) error { return nil }
-func (s *TStorage) AddBond(acct account.AccountID, bond *db.Bond) error              { return nil }
-func (s *TStorage) DeleteBond(assetID uint32, coinID []byte) error                   { return nil }
+func (s *TStorage) CreateAccountWithBond(acct *account.Account, bond *db.Bond) error {
+	s.acct = acct
+	if acct != nil && acct.PubKey != nil {
+		s.acctInfo = &db.Account{
+			AccountID: acct.ID,
+			Pubkey:    acct.PubKey.SerializeCompressed(),
+		}
+	}
+	if bond != nil {
+		s.AddBond(acct.ID, bond)
+	}
+	return nil
+}
+func (s *TStorage) AddBond(acct account.AccountID, bond *db.Bond) error {
+	if bond == nil {
+		return nil
+	}
+	for _, existing := range s.bonds {
+		if existing.AssetID == bond.AssetID && bytes.Equal(existing.CoinID, bond.CoinID) {
+			return nil
+		}
+	}
+	s.bonds = append(s.bonds, bond)
+	return nil
+}
+
+func (s *TStorage) DeleteBond(assetID uint32, coinID []byte) error { return nil }
+
 func (s *TStorage) FetchPrepaidBond([]byte) (uint32, int64, error) {
 	return 1, time.Now().Add(time.Hour * 48).Unix(), nil
 }
+
 func (s *TStorage) DeletePrepaidBond(coinID []byte) (err error) { return nil }
+
 func (s *TStorage) StorePrepaidBonds(coinIDs [][]byte, strength uint32, lockTime int64) error {
 	return nil
 }
+
 func (s *TStorage) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {
 	return s.userMatchOutcomes, nil
 }
@@ -102,9 +140,11 @@ func (s *TStorage) UserMatchFails(aid account.AccountID, lastN int) ([]*db.Match
 func (s *TStorage) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
 	return s.userPreimageResults, nil
 }
+
 func (s *TStorage) ForgiveMatchFail(mid order.MatchID) (bool, error) {
 	return false, nil
 }
+
 func (s *TStorage) UserOrderStatuses(aid account.AccountID, base, quote uint32, oids []order.OrderID) ([]*db.OrderStatus, error) {
 	return s.orderStatuses, nil
 }
@@ -131,9 +171,11 @@ func (s *TStorage) CreateAccount(acct *account.Account, assetID uint32, addr str
 func (s *TStorage) setRatioData(dat *ratioData) {
 	s.ratio = *dat
 }
+
 func (s *TStorage) CompletedUserOrders(aid account.AccountID, _ int) (oids []order.OrderID, compTimes []int64, err error) {
 	return s.ratio.oidsCompleted, s.ratio.timesCompleted, nil
 }
+
 func (s *TStorage) ExecutedCancelsForUser(aid account.AccountID, _ int) (cancels []*db.CancelRecord, err error) {
 	for i := range s.ratio.oidsCanceled {
 		cancels = append(cancels, &db.CancelRecord{
@@ -384,6 +426,34 @@ func tNewConnect(user *tUser) *msgjson.Connect {
 		APIVersion: 0,
 		Time:       uint64(time.Now().UnixMilli()),
 	}
+}
+
+func newTestAuthManager(t *testing.T) (*AuthManager, *TStorage) {
+	t.Helper()
+	storage := &TStorage{}
+	dexKey, err := secp256k1.ParsePubKey(tDexPubKeyBytes)
+	if err != nil {
+		t.Fatalf("ParsePubKey error: %v", err)
+	}
+	authMgr := NewAuthManager(&Config{
+		Storage:    storage,
+		Signer:     &TSigner{pubkey: dexKey},
+		BondExpiry: 86400,
+		BondAssets: map[string]*msgjson.BondAsset{
+			"dcr": {
+				Version: 0,
+				ID:      42,
+				Confs:   uint32(tBondConfs),
+				Amt:     tRegFee * 10,
+			},
+		},
+		BondTxParser:    tParseBondTx,
+		CancelThreshold: 0.9,
+		TxDataSources:   make(map[uint32]TxDataSource),
+		Route:           func(string, comms.MsgHandler) {},
+	})
+	authMgr.ctx = t.Context()
+	return authMgr, storage
 }
 
 func extractConnectResult(t *testing.T, msg *msgjson.Message) *msgjson.ConnectResult {
@@ -771,6 +841,114 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	}
 }
 
+func TestLoadUserReputationAccountError(t *testing.T) {
+	authMgr, storage := newTestAuthManager(t)
+	user := testAcctID(5)
+
+	storage.accountReadErr = errors.New("db down")
+	if _, err := authMgr.loadUserReputation(context.Background(), user); err == nil {
+		t.Fatal("expected an error from a failed account read")
+	}
+
+	// Failure must not have been cached as a nonexistent account.
+	storage.accountReadErr = nil
+	storage.acct = &account.Account{ID: user}
+	storage.bonds = []*db.Bond{{Strength: 2, LockTime: time.Now().Add(48 * time.Hour).Unix()}}
+	before := time.Now().Add(authMgr.bondExpiry).Unix()
+	rep, err := authMgr.loadUserReputation(context.Background(), user)
+	after := time.Now().Add(authMgr.bondExpiry).Unix()
+	if err != nil {
+		t.Fatalf("loadUserReputation error after recovery: %v", err)
+	}
+	if rep == nil {
+		t.Fatal("user read as unknown after a transient account read error")
+	}
+	if rep.BondedTier != 2 {
+		t.Fatalf("bonded tier = %d, want 2", rep.BondedTier)
+	}
+	if rep.BondExpiryThreshold < before || rep.BondExpiryThreshold > after {
+		t.Fatalf("bond expiry threshold = %d, want between %d and %d", rep.BondExpiryThreshold, before, after)
+	}
+}
+
+func TestUserReputationAt(t *testing.T) {
+	authMgr, storage := newTestAuthManager(t)
+	user := testAcctID(0xac)
+	storage.acct = &account.Account{ID: user}
+	// The bond is expired now but was active at the earlier time.
+	lockTime := time.Now().Add(-time.Hour)
+	storage.bonds = []*db.Bond{{Strength: 2, LockTime: lockTime.Unix()}}
+
+	tier, _, _, err := authMgr.UserReputationAt(user, lockTime.Add(-authMgr.bondExpiry).Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("UserReputationAt error: %v", err)
+	}
+	if tier != 2 {
+		t.Fatalf("tier at pre-expiry as-of = %d, want 2", tier)
+	}
+
+	tier, _, _, err = authMgr.UserReputationAt(user, time.Now())
+	if err != nil {
+		t.Fatalf("UserReputationAt error: %v", err)
+	}
+	if tier != 0 {
+		t.Fatalf("wall-clock tier = %d, want 0 for expired bond", tier)
+	}
+}
+
+func TestAcctRepStatus(t *testing.T) {
+	authMgr, storage := newTestAuthManager(t)
+	user := testAcctID(0xaa)
+	storage.acct = &account.Account{ID: user}
+	storage.setBondTier(1)
+
+	connected, rep, err := authMgr.AcctRepStatus(user)
+	if err != nil {
+		t.Fatalf("AcctRepStatus error: %v", err)
+	}
+	if connected {
+		t.Fatal("reported connected with no client connection")
+	}
+	if rep == nil || rep.EffectiveTier() != 1 {
+		t.Fatalf("rep = %+v, want effective tier 1", rep)
+	}
+
+	// A failed lookup must not be reported as tier 0.
+	storage.reputationErr = errors.New("db down")
+	authMgr.rep.invalidate(user)
+	if _, rep, err = authMgr.AcctRepStatus(user); err == nil {
+		t.Fatal("no error from failed score load")
+	} else if rep != nil {
+		t.Fatal("non-nil rep with load error")
+	}
+
+	// Connectivity is independent of the lookup result.
+	authMgr.connMtx.Lock()
+	authMgr.users[user] = &clientInfo{}
+	authMgr.connMtx.Unlock()
+	if connected, _, err = authMgr.AcctRepStatus(user); !connected || err == nil {
+		t.Fatalf("AcctRepStatus on load error = (connected %v, err %v), want connected with error", connected, err)
+	}
+	authMgr.connMtx.Lock()
+	delete(authMgr.users, user)
+	authMgr.connMtx.Unlock()
+
+	// Account-read failure is also an error.
+	storage.reputationErr = nil
+	storage.accountReadErr = errors.New("db down")
+	if _, _, err = authMgr.AcctRepStatus(user); err == nil {
+		t.Fatal("no error from failed account read")
+	}
+
+	// Unknown account: nil rep, nil error.
+	storage.accountReadErr = nil
+	storage.acct = nil
+	authMgr.rep.invalidate(user)
+	if _, rep, err = authMgr.AcctRepStatus(user); err != nil || rep != nil {
+		t.Fatalf("unknown account: rep %+v, err %v", rep, err)
+	}
+}
+
 func TestConnect(t *testing.T) {
 	user := tNewUser(t)
 	rig.signer.sig = user.randomSignature()
@@ -926,8 +1104,13 @@ func TestConnect(t *testing.T) {
 	// }
 
 	// Connect the user.
+	before := time.Now().Add(rig.mgr.bondExpiry).Unix()
 	respMsg := connectUser(t, user)
+	after := time.Now().Add(rig.mgr.bondExpiry).Unix()
 	cResp := extractConnectResult(t, respMsg)
+	if cResp.Reputation.BondExpiryThreshold < before || cResp.Reputation.BondExpiryThreshold > after {
+		t.Fatalf("bond expiry threshold = %d, want between %d and %d", cResp.Reputation.BondExpiryThreshold, before, after)
+	}
 	if len(cResp.ActiveOrderStatuses) != 1 {
 		t.Fatalf("no active orders")
 	}
@@ -1095,7 +1278,7 @@ func TestAccountErrors(t *testing.T) {
 	initPenaltyThresh := rig.mgr.penaltyThreshold
 	defer func() { rig.mgr.penaltyThreshold = initPenaltyThresh }()
 	rig.mgr.penaltyThreshold = score
-	if client.tier > 0 {
+	if _, tier := rig.mgr.AcctStatus(user.acctID); tier > 0 {
 		t.Errorf("client should have been tier 0")
 	}
 
@@ -1112,7 +1295,7 @@ func TestAccountErrors(t *testing.T) {
 	if client == nil {
 		t.Fatalf("client not found")
 	}
-	if client.tier < 1 {
+	if _, tier := rig.mgr.AcctStatus(user.acctID); tier < 1 {
 		t.Errorf("client should have unbanned automatically")
 	}
 
@@ -1256,16 +1439,6 @@ func TestSend(t *testing.T) {
 	}
 	if tr.A != 10 {
 		t.Fatalf("expected A = 10, got A = %d", tr.A)
-	}
-}
-
-func TestUserReputationAccountError(t *testing.T) {
-	lookupErr := errors.New("account lookup failed")
-	rig.storage.accountReadErr = lookupErr
-	defer func() { rig.storage.accountReadErr = nil }()
-
-	if _, _, _, err := rig.mgr.UserReputation(newAccountID()); !errors.Is(err, lookupErr) {
-		t.Fatalf("UserReputation error = %v, want %v", err, lookupErr)
 	}
 }
 
