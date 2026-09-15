@@ -16,8 +16,6 @@ import (
 	"decred.org/dcrdex/server/meshevents"
 )
 
-const newReputationVersion int16 = 1
-
 var _ db.ReputationArchiver = (*Archiver)(nil)
 
 func (a *Archiver) GetUserReputationData(
@@ -85,18 +83,6 @@ func getUserReputationData(ctx context.Context, stmt *sql.Stmt, user account.Acc
 		orders = orders[len(orders)-orderSz:]
 	}
 	return pimgs, matches, orders, nil
-}
-
-func (a *Archiver) insertPoints(
-	ctx context.Context,
-	user account.AccountID,
-	link [32]byte,
-	outcomeClass db.OutcomeClass,
-	outcome db.Outcome,
-) (dbID int64, _ error) {
-	var oid order.OrderID // need a sql.Scanner
-	copy(oid[:], link[:])
-	return dbID, a.queries.insertPoints.QueryRowContext(ctx, user, oid, outcomeClass, outcome).Scan(&dbID)
 }
 
 // applyUserForgivenessTx deletes the account's non-success outcomes.
@@ -182,131 +168,6 @@ func (a *Archiver) ApplyReputationForgivenEvent(ctx context.Context, meta *db.Ev
 		Forgiven: forgiven,
 		Log:      logEntry,
 	}, nil
-}
-
-func (a *Archiver) AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*db.PreimageOutcome, error) {
-	outcome := db.OutcomePreimageSuccess
-	if miss {
-		outcome = db.OutcomePreimageMiss
-	}
-	dbID, err := a.insertPoints(ctx, user, oid, db.OutcomeClassPreimage, outcome)
-	if err != nil {
-		return nil, err
-	}
-	return &db.PreimageOutcome{
-		DBID:    dbID,
-		OrderID: oid,
-		Miss:    miss,
-	}, nil
-}
-
-func (a *Archiver) AddMatchOutcome(ctx context.Context, user account.AccountID, mid order.MatchID, outcome db.Outcome) (*db.MatchResult, error) {
-	switch outcome {
-	case db.OutcomeSwapSuccess, db.OutcomeNoSwapAsMaker, db.OutcomeNoSwapAsTaker,
-		db.OutcomeNoRedeemAsMaker, db.OutcomeNoRedeemAsTaker, db.OutcomeNoAddrAsTaker:
-	default:
-		return nil, fmt.Errorf("invalid outcome for a match: %d", outcome)
-	}
-	dbID, err := a.insertPoints(ctx, user, mid, db.OutcomeClassMatch, outcome)
-	if err != nil {
-		return nil, err
-	}
-	return &db.MatchResult{
-		DBID:         dbID,
-		MatchID:      mid,
-		MatchOutcome: outcome,
-	}, nil
-}
-
-func (a *Archiver) AddOrderOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, canceled bool) (*db.OrderOutcome, error) {
-	outcome := db.OutcomeOrderComplete
-	if canceled {
-		outcome = db.OutcomeOrderCanceled
-	}
-	dbID, err := a.insertPoints(ctx, user, oid, db.OutcomeClassOrder, outcome)
-	if err != nil {
-		return nil, err
-	}
-	return &db.OrderOutcome{
-		DBID:     dbID,
-		OrderID:  oid,
-		Canceled: canceled,
-	}, nil
-}
-
-func (a *Archiver) PruneOutcomes(ctx context.Context, user account.AccountID, outcomeClass db.OutcomeClass, fromDBID int64) (err error) {
-	_, err = a.queries.prunePoints.ExecContext(ctx, user, outcomeClass, fromDBID)
-	return err
-}
-
-func (a *Archiver) GetUserReputationVersion(ctx context.Context, user account.AccountID) (ver int16, err error) {
-	if err := a.queries.selectReputationVersion.QueryRowContext(ctx, user).Scan(&ver); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// New user.
-			return newReputationVersion, nil
-		}
-		return 0, err
-	}
-	return ver, nil
-}
-
-func (a *Archiver) UpgradeUserReputationV1(
-	ctx context.Context, user account.AccountID, pimgs []*db.PreimageOutcome, matches []*db.MatchResult, orders []*db.OrderOutcome, /* Without DB IDs */
-) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) /* With DB IDs */ {
-	tx, err := a.db.Begin()
-	if err != nil {
-		a.fatalBackendErr(err)
-		return nil, nil, nil, err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback() // rollback on error
-		} else {
-			tx.Commit() // commit if all went well
-		}
-	}()
-
-	stmt, err := tx.Prepare(fmt.Sprintf(internal.InsertPoints, a.tables.points))
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("error constructing prepared statement for reputation points selection: %w", err)
-	}
-	defer stmt.Close()
-	for _, o := range pimgs {
-		outcome := db.OutcomePreimageSuccess
-		if o.Miss {
-			outcome = db.OutcomePreimageMiss
-		}
-		if err = stmt.QueryRowContext(ctx, user, o.OrderID, db.OutcomeClassPreimage, outcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting preimage row during reputation upgrade: %w", err)
-		}
-	}
-	for _, o := range matches {
-		if err = stmt.QueryRowContext(ctx, user, o.MatchID, db.OutcomeClassMatch, o.MatchOutcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting match row during reputation upgrade: %w", err)
-		}
-	}
-	for _, o := range orders {
-		outcome := db.OutcomeOrderComplete
-		if o.Canceled {
-			outcome = db.OutcomeOrderCanceled
-		}
-		if err = stmt.QueryRowContext(ctx, user, o.OrderID, db.OutcomeClassOrder, outcome).Scan(&o.DBID); err != nil {
-			return nil, nil, nil, fmt.Errorf("error inserting order row during reputation upgrade: %w", err)
-		}
-	}
-	query := fmt.Sprintf(internal.UpdateReputationVersion, a.tables.accounts)
-	if _, err = tx.ExecContext(ctx, query, newReputationVersion, user); err != nil {
-		return nil, nil, nil, fmt.Errorf("error updating reputation version: %w", err)
-	}
-	return pimgs, matches, orders, nil
-}
-
-func (a *Archiver) ForgiveUser(ctx context.Context, user account.AccountID) error {
-	query := fmt.Sprintf(internal.ForgiveUser, a.tables.points)
-	if _, err := a.db.ExecContext(ctx, query, user, db.OutcomeSwapSuccess, db.OutcomePreimageSuccess, db.OutcomeOrderComplete); err != nil {
-		return fmt.Errorf("error forgiving user: %w", err)
-	}
-	return nil
 }
 
 // SetReputationInputsListener registers a callback for changes to the data used

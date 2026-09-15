@@ -18,8 +18,6 @@ const (
 
 	SelectPoints = `SELECT id, link, class, outcome FROM %s WHERE account = $1 ORDER BY id;`
 
-	PrunePoints = `DELETE FROM %s WHERE account = $1 AND class = $2 AND id <= $3;`
-
 	// ForgiveUser deletes every non-success outcome for the account. $2-$4 are
 	// the success outcomes: swap success, preimage success, order complete.
 	ForgiveUser = `DELETE FROM %s WHERE account = $1 AND outcome NOT IN ($2, $3, $4);`
