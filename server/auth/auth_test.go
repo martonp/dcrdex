@@ -26,11 +26,22 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/mesh"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
 func noop() {}
+
+type emptyEventLogReader struct{}
+
+func (emptyEventLogReader) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
+	return &db.EventLogPosition{}, nil
+}
+
+func (emptyEventLogReader) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
+	return nil, nil
+}
 
 func randBytes(l int) []byte {
 	b := make([]byte, l)
@@ -297,6 +308,7 @@ func (s *TSigner) setSig(sig *ecdsa.Signature) {
 func (s *TSigner) PubKey() *secp256k1.PublicKey { return s.pubkey }
 
 type tReq struct {
+	timeout  time.Duration
 	msg      *msgjson.Message
 	respFunc func(comms.Link, *msgjson.Message)
 }
@@ -343,10 +355,11 @@ func (c *TRPCClient) SendRaw(b []byte) error {
 }
 func (c *TRPCClient) SendError(id uint64, msg *msgjson.Error) {
 }
-func (c *TRPCClient) Request(msg *msgjson.Message, f func(comms.Link, *msgjson.Message), _ time.Duration, _ func()) error {
+func (c *TRPCClient) Request(msg *msgjson.Message, f func(comms.Link, *msgjson.Message), timeout time.Duration, _ func()) error {
 	c.mtx.Lock()
 	c.reqs = append(c.reqs, &tReq{
 		msg:      msg,
+		timeout:  timeout,
 		respFunc: f,
 	})
 	c.mtx.Unlock()
@@ -450,6 +463,35 @@ type testRig struct {
 	mgr     *AuthManager
 	storage *TStorage
 	signer  *TSigner
+}
+
+type tMesh struct {
+	proxiedErr     error
+	proxiedUser    account.AccountID
+	proxiedMsg     *msgjson.Message
+	proxiedTimeout time.Duration
+	proxiedDeliver bool
+	proxyCount     int
+	proxyWait      <-chan struct{}
+	proxyReady     chan struct{}
+}
+
+func (m *tMesh) ProxyClientMessage(_ context.Context, req *mesh.ClientProxyMessage) error {
+	if m.proxyWait != nil {
+		<-m.proxyWait
+	}
+	m.proxyCount++
+	m.proxiedUser = req.User
+	m.proxiedMsg = req.Msg
+	m.proxiedTimeout = time.Duration(req.TimeoutMS) * time.Millisecond
+	m.proxiedDeliver = req.DeliverToClient
+	if m.proxyReady != nil {
+		select {
+		case m.proxyReady <- struct{}{}:
+		default:
+		}
+	}
+	return m.proxiedErr
 }
 
 var rig *testRig
@@ -645,6 +687,16 @@ func TestMain(m *testing.M) {
 				tRoutes[route] = handler
 			},
 		})
+		meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+			EventLogReader: emptyEventLogReader{},
+			OnHalt:         func(error) {},
+			Logger:         dex.Disabled,
+		})
+		if err != nil {
+			fmt.Printf("NewService error: %v\n", err)
+			return 1
+		}
+		authMgr.SetMeshService(meshSvc)
 		cm := dex.NewConnectionMaster(authMgr)
 		cm.Connect(ctx)
 		defer cm.Disconnect()
@@ -1489,6 +1541,447 @@ func TestRoute(t *testing.T) {
 	}
 }
 
+func TestRequestWithTimeoutProxiesThroughMesh(t *testing.T) {
+	auth, _ := newTestAuthManager(t)
+	user := tNewUser(t)
+	req, err := msgjson.NewRequest(comms.NextID(), msgjson.PreimageRoute, map[string]string{"market": "dcr_btc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Sig = randBytes(16)
+	id, wantRequest := req.ID, req.String()
+	resp, err := msgjson.NewResponse(id, map[string]string{"status": "ok"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Sig = randBytes(16)
+	wantResponse := resp.String()
+	proxyReady := make(chan struct{}, 1)
+	peer := &tMesh{proxyReady: proxyReady}
+	auth.SetMeshService(peer)
+	t.Cleanup(func() { auth.takeProxyRespHandler(user.acctID, id) })
+
+	got := make(chan *msgjson.Message, 1)
+	expired := make(chan struct{}, 1)
+	err = auth.RequestWithTimeout(user.acctID, req, func(conn comms.Link, msg *msgjson.Message) {
+		if conn != nil {
+			t.Errorf("expected nil proxied conn, got %T", conn)
+		}
+		got <- msg
+	}, time.Minute, func() { expired <- struct{}{} })
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-proxyReady:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for proxied request")
+	}
+
+	if peer.proxiedMsg.String() != wantRequest {
+		t.Fatalf("proxied request = %s, want %s", peer.proxiedMsg, wantRequest)
+	}
+	if peer.proxyCount != 1 || peer.proxiedUser != user.acctID {
+		t.Fatalf("proxy count/user = %d/%v", peer.proxyCount, peer.proxiedUser)
+	}
+	if peer.proxiedTimeout != time.Minute {
+		t.Fatalf("proxied timeout = %v, want %v", peer.proxiedTimeout, time.Minute)
+	}
+
+	if err := auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{User: user.acctID, Msg: resp}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-got:
+		if msg.String() != wantResponse {
+			t.Fatalf("callback response = %s, want %s", msg, wantResponse)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for proxied callback")
+	}
+	select {
+	case <-expired:
+		t.Fatal("unexpected expire callback")
+	default:
+	}
+}
+
+func TestRequestPeerFailureAndTimeout(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		err     error
+		timeout time.Duration
+	}{
+		{"relay failure", errors.New("proxy failed"), time.Minute},
+		{"response timeout", nil, time.Millisecond},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, _ := newTestAuthManager(t)
+			user := tNewUser(t)
+			auth.SetMeshService(&tMesh{proxiedErr: tt.err})
+			req, err := msgjson.NewRequest(comms.NextID(), msgjson.PreimageRoute, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			responded := make(chan struct{}, 1)
+			expired := make(chan struct{}, 2)
+			err = auth.RequestWithTimeout(user.acctID, req, func(comms.Link, *msgjson.Message) { responded <- struct{}{} }, tt.timeout, func() { expired <- struct{}{} })
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { auth.takeProxyRespHandler(user.acctID, req.ID) })
+			select {
+			case <-expired:
+			case <-responded:
+				t.Fatal("unexpected response callback")
+			case <-time.After(time.Second):
+				t.Fatal("request did not expire")
+			}
+			if tt.err == nil {
+				// A late response must not reach a client that has since connected here.
+				auth.users[user.acctID] = &clientInfo{acct: &account.Account{ID: user.acctID}, conn: user.conn}
+				late, err := msgjson.NewResponse(req.ID, nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{User: user.acctID, Msg: late}); err != nil {
+					t.Fatal(err)
+				}
+				if user.conn.getSend() != nil {
+					t.Fatal("late response delivered to client")
+				}
+			}
+			if auth.takeProxyRespHandler(user.acctID, req.ID) != nil {
+				t.Fatal("expired handler remains registered")
+			}
+			select {
+			case <-responded:
+				t.Fatal("unexpected response callback")
+			case <-expired:
+				t.Fatal("request expired twice")
+			default:
+			}
+		})
+	}
+}
+
+func TestProxyResponseHandlerReplacement(t *testing.T) {
+	auth, _ := newTestAuthManager(t)
+	user := testAcctID(1)
+	id := comms.NextID()
+	expired := make(chan string, 3)
+	old := auth.registerProxyRespHandler(user, id, func(comms.Link, *msgjson.Message) {}, time.Hour, func() { expired <- "old" })
+	auth.registerProxyRespHandler(user, id, func(comms.Link, *msgjson.Message) {}, 100*time.Millisecond, func() { expired <- "replacement" })
+	t.Cleanup(func() { old.expire.Stop(); auth.takeProxyRespHandler(user, id) })
+	if old.expire.Stop() {
+		t.Fatal("replacement did not stop the old timer")
+	}
+	// Force the old timer's real callback to run, as if it had already been
+	// queued when the replacement stopped it.
+	old.expire.Reset(0)
+	select {
+	case name := <-expired:
+		if name != "replacement" {
+			t.Fatalf("%s request expired, want replacement", name)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement request did not expire")
+	}
+	if auth.takeProxyRespHandler(user, id) != nil {
+		t.Fatal("expired handler remains registered")
+	}
+	select {
+	case name := <-expired:
+		t.Fatalf("unexpected additional expiry: %s", name)
+	default:
+	}
+}
+
+func TestRequestPeerLateFailure(t *testing.T) {
+	auth, _ := newTestAuthManager(t)
+	user := testAcctID(1)
+	req, err := msgjson.NewRequest(comms.NextID(), msgjson.PreimageRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRelay := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseRelay)
+	relayed := make(chan struct{}, 1)
+	auth.SetMeshService(&tMesh{proxyWait: release, proxyReady: relayed, proxiedErr: errors.New("late relay failure")})
+	completed := make(chan string, 4)
+	if err = auth.RequestWithTimeout(user, req, func(comms.Link, *msgjson.Message) { completed <- "response" }, time.Minute, func() { completed <- "timeout" }); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { auth.takeProxyRespHandler(user, req.ID) })
+	resp, err := msgjson.NewResponse(req.ID, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{User: user, Msg: resp}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-completed:
+		if got != "response" {
+			t.Fatalf("completion = %s, want response", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original request did not complete")
+	}
+	// Reuse the entry only after the original request has completed. Its
+	// blocked relay must not expire this new registration when it fails.
+	auth.SetMeshService(&tMesh{})
+	if err = auth.RequestWithTimeout(user, req, func(comms.Link, *msgjson.Message) { completed <- "replacement response" }, 100*time.Millisecond, func() { completed <- "replacement timeout" }); err != nil {
+		t.Fatal(err)
+	}
+	releaseRelay()
+	select {
+	case <-relayed:
+	case <-time.After(time.Second):
+		t.Fatal("blocked relay did not return")
+	}
+	select {
+	case got := <-completed:
+		if got != "replacement timeout" {
+			t.Fatalf("late failure caused %s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement request did not expire")
+	}
+	select {
+	case got := <-completed:
+		t.Fatalf("unexpected extra callback: %s", got)
+	default:
+	}
+}
+
+func TestProxyClientMessageResponseDelivery(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		pendingRequest bool
+		sendErr        error
+	}{
+		{name: "matching server request ID", pendingRequest: true},
+		{name: "send failure", sendErr: errors.New("send failed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, _ := newTestAuthManager(t)
+			user := tNewUser(t)
+			client := &clientInfo{acct: &account.Account{ID: user.acctID}, conn: user.conn}
+			auth.users[user.acctID] = client
+			auth.conns[user.conn.ID()] = client
+			resp, err := msgjson.NewResponse(comms.NextID(), map[string]string{"status": "ok"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var handler *respHandler
+			if tt.pendingRequest {
+				handler = auth.registerProxyRespHandler(user.acctID, resp.ID, func(comms.Link, *msgjson.Message) {}, time.Hour, func() {})
+				t.Cleanup(func() { auth.takeProxyRespHandler(user.acctID, resp.ID) })
+			}
+			user.conn.sendErr = tt.sendErr
+			err = auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{User: user.acctID, Msg: resp, DeliverToClient: true})
+			if !errors.Is(err, tt.sendErr) {
+				t.Fatalf("delivery error = %v, want %v", err, tt.sendErr)
+			}
+			if tt.sendErr != nil {
+				if auth.user(user.acctID) != nil {
+					t.Fatal("failed connection remains registered")
+				}
+				return
+			}
+			sent := user.conn.getSend()
+			if sent == nil || sent.ID != resp.ID {
+				t.Fatalf("delivered message = %v, want response %d", sent, resp.ID)
+			}
+			if handler != nil && auth.takeProxyRespHandler(user.acctID, resp.ID) != handler {
+				t.Fatal("client response consumed server-request handler")
+			}
+		})
+	}
+}
+
+func TestProxyClientMessageRequest(t *testing.T) {
+	auth, _ := newTestAuthManager(t)
+	user := tNewUser(t)
+	client := &clientInfo{acct: &account.Account{ID: user.acctID}, conn: user.conn, respHandlers: make(map[uint64]*respHandler)}
+	auth.users[user.acctID] = client
+	auth.conns[user.conn.ID()] = client
+
+	req, err := msgjson.NewRequest(comms.NextID(), msgjson.PreimageRoute, map[string]string{"market": "dcr_btc"})
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+
+	proxyReady := make(chan struct{}, 1)
+	peer := &tMesh{proxyReady: proxyReady}
+	auth.SetMeshService(peer)
+
+	err = auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{
+		User:      user.acctID,
+		Msg:       req,
+		TimeoutMS: uint64(time.Minute / time.Millisecond),
+	})
+	if err != nil {
+		t.Fatalf("ProxyClientMessage request error: %v", err)
+	}
+
+	localReq := user.conn.getReq()
+	if localReq == nil {
+		t.Fatal("no local proxied request sent")
+	}
+	t.Cleanup(func() { client.respHandler(localReq.msg.ID) })
+	if localReq.msg.ID == req.ID {
+		t.Fatalf("proxied local request id was not rewritten")
+	}
+	wantRequest := *req
+	wantRequest.ID = localReq.msg.ID
+	if localReq.msg.String() != wantRequest.String() {
+		t.Fatalf("local request = %s, want %s", localReq.msg, &wantRequest)
+	}
+
+	localResp, err := msgjson.NewResponse(localReq.msg.ID, map[string]string{"status": "ok"}, nil)
+	if err != nil {
+		t.Fatalf("NewResponse error: %v", err)
+	}
+	localResp.Sig = randBytes(16)
+	wantResponse := *localResp
+	wantResponse.ID = req.ID
+	wantResponseJSON := wantResponse.String()
+	localReq.respFunc(user.conn, localResp)
+	if localResp.ID != localReq.msg.ID {
+		t.Fatal("forwarding the response changed its original ID")
+	}
+
+	select {
+	case <-proxyReady:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for proxied client response")
+	}
+
+	if peer.proxiedMsg.String() != wantResponseJSON {
+		t.Fatalf("relayed response = %s, want %s", peer.proxiedMsg, wantResponseJSON)
+	}
+	if peer.proxiedDeliver {
+		t.Fatal("client response marked for client delivery")
+	}
+	if peer.proxyCount != 1 {
+		t.Fatalf("proxy count = %d, want 1", peer.proxyCount)
+	}
+	if peer.proxiedUser != user.acctID {
+		t.Fatalf("proxied response user = %v, want %v", peer.proxiedUser, user.acctID)
+	}
+}
+
+func TestSendPeer(t *testing.T) {
+	relayErr := errors.New("relay failed")
+	for _, tt := range []struct {
+		name    string
+		err     error
+		wantErr error
+	}{
+		{"delivery", nil, nil},
+		{"no mesh peer", mesh.ErrClientProxyUnavailable, ErrUserNotConnected},
+		{"peer disconnected", fmt.Errorf("%w to peer", mesh.ErrClientNotConnected), ErrUserNotConnected},
+		{"relay error", relayErr, relayErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, _ := newTestAuthManager(t)
+			user := tNewUser(t)
+			resp, err := msgjson.NewResponse(comms.NextID(), map[string]string{"status": "ok"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := &tMesh{proxiedErr: tt.err}
+			auth.SetMeshService(peer)
+			if err = auth.Send(user.acctID, resp); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Send error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil {
+				return
+			}
+			if peer.proxyCount != 1 || peer.proxiedUser != user.acctID {
+				t.Fatalf("proxy count/user = %d/%v", peer.proxyCount, peer.proxiedUser)
+			}
+			if peer.proxiedMsg.String() != resp.String() {
+				t.Fatalf("proxied response = %s, want %s", peer.proxiedMsg, resp)
+			}
+			if !peer.proxiedDeliver {
+				t.Fatal("response not marked for client delivery")
+			}
+		})
+	}
+}
+
+func TestLocalClientMessages(t *testing.T) {
+	for _, connected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("connected=%v", connected), func(t *testing.T) {
+			auth, _ := newTestAuthManager(t)
+			user := tNewUser(t)
+			peer := &tMesh{}
+			auth.SetMeshService(peer)
+			if connected {
+				client := &clientInfo{acct: &account.Account{ID: user.acctID}, conn: user.conn, respHandlers: make(map[uint64]*respHandler)}
+				auth.users[user.acctID] = client
+				auth.conns[user.conn.ID()] = client
+			}
+			resp, err := msgjson.NewResponse(comms.NextID(), nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = auth.SendIfLocal(user.acctID, resp); err != nil {
+				t.Fatal(err)
+			}
+			if (user.conn.getSend() != nil) != connected {
+				t.Fatal("incorrect local send result")
+			}
+			req, err := msgjson.NewRequest(comms.NextID(), msgjson.PreimageRoute, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = auth.RequestIfLocal(user.acctID, req, func(comms.Link, *msgjson.Message) {}); err != nil {
+				t.Fatal(err)
+			}
+			if (user.conn.getReq() != nil) != connected {
+				t.Fatal("incorrect local request result")
+			}
+			if connected {
+				client := auth.user(user.acctID)
+				client.respHandler(req.ID)
+				for _, timeout := range []time.Duration{0, -time.Second} {
+					if err = auth.RequestWithTimeout(user.acctID, req, func(comms.Link, *msgjson.Message) {}, timeout, func() {}); err != nil {
+						t.Fatal(err)
+					}
+					client.respHandler(req.ID)
+					got := user.conn.getReq()
+					if got == nil || got.timeout != DefaultRequestTimeout {
+						t.Fatalf("local request with timeout %v = %+v, want default timeout", timeout, got)
+					}
+				}
+			}
+			if peer.proxyCount != 0 {
+				t.Fatal("local-only delivery used mesh")
+			}
+		})
+	}
+}
+
+func TestHandleProxiedClientMessageDisconnectedUser(t *testing.T) {
+	auth, _ := newTestAuthManager(t)
+	user := tNewUser(t)
+	for _, kind := range []msgjson.MessageType{msgjson.Request, msgjson.Response, msgjson.Notification} {
+		t.Run(fmt.Sprintf("type=%d", kind), func(t *testing.T) {
+			msg := &msgjson.Message{Type: kind, ID: comms.NextID(), Route: msgjson.PreimageRoute, Payload: json.RawMessage(`{}`)}
+			err := auth.HandleProxiedClientMessage(context.Background(), &mesh.ClientProxyMessage{User: user.acctID, Msg: msg, DeliverToClient: true})
+			if !errors.Is(err, mesh.ErrClientNotConnected) {
+				t.Fatalf("delivery error = %v, want ErrClientNotConnected", err)
+			}
+		})
+	}
+}
+
 func TestAuth(t *testing.T) {
 	user := tNewUser(t)
 	rig.signer.setSig(user.randomSignature())
@@ -1532,7 +2025,7 @@ func TestSign(t *testing.T) {
 
 func TestSend(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 	foreigner := tNewUser(t)
 
@@ -1545,7 +2038,9 @@ func TestSend(t *testing.T) {
 	req, _ := msgjson.NewRequest(comms.NextID(), "testroute", payload)
 
 	// Send a message to a foreigner
-	rig.mgr.Send(foreigner.acctID, resp)
+	if err := rig.mgr.Send(foreigner.acctID, resp); !errors.Is(err, ErrUserNotConnected) {
+		t.Fatalf("Send with no mesh peer = %v, want ErrUserNotConnected", err)
+	}
 	if foreigner.conn.getSend() != nil {
 		t.Fatalf("message magically got through to foreigner")
 	}
