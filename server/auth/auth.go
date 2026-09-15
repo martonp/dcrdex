@@ -27,6 +27,7 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -84,6 +85,8 @@ type Storage interface {
 	PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error)
 	AllActiveUserMatches(aid account.AccountID) ([]*db.MatchData, error)
 	MatchStatuses(aid account.AccountID, base, quote uint32, matchIDs []order.MatchID) ([]*db.MatchStatus, error)
+
+	ApplyBondPostedEvent(context.Context, *db.EventLogMeta, *meshevents.BondPostedEvent, int, int, int) (*db.BondPostedResult, error)
 
 	db.ReputationArchiver
 }
@@ -259,8 +262,6 @@ type AuthManager struct {
 	orderOutcomes  map[account.AccountID]*latestOutcomes[*db.OrderOutcome] // cancel/complete, was in clientInfo.recentOrders
 
 	txDataSources map[uint32]TxDataSource
-
-	prepaidBondMtx sync.Mutex
 
 	mesh MeshService
 
