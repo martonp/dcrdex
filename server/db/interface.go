@@ -277,6 +277,10 @@ type AccountArchiver interface {
 	// account is left unchanged, but the event is still recorded. A bond owned
 	// by another account is an error.
 	ApplyBondPostedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.BondPostedEvent, pimgSz, matchSz, orderSz int) (*BondPostedResult, error)
+
+	// ApplyPrepaidBondsCreatedEvent stores the prepaid bond tokens and event
+	// log entry in one transaction.
+	ApplyPrepaidBondsCreatedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.PrepaidBondsCreatedEvent) (*EventLogEntry, error)
 }
 
 // MatchData represents an order pair match, but with just the order IDs instead
