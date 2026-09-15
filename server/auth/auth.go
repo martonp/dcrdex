@@ -1400,21 +1400,23 @@ func matchStatusToOutcome(s order.MatchStatus) Outcome {
 	}
 }
 
-// loadUserOutcomes returns user's latest match and preimage outcomes from order
-// and swap data retrieved from the DB.
+// loadUserOutcomes returns the user's latest reputation outcomes from the
+// reputation points table.
 func (auth *AuthManager) loadUserOutcomes(user account.AccountID) (pimgs *latestOutcomes[*db.PreimageOutcome], matches *latestOutcomes[*db.MatchResult], ords *latestOutcomes[*db.OrderOutcome], err error) {
-	repVer, err := auth.storage.GetUserReputationVersion(auth.ctx, user)
+	return auth.loadUserOutcomesContext(auth.ctx, user)
+}
+
+func (auth *AuthManager) loadUserOutcomesContext(ctx context.Context, user account.AccountID) (pimgs *latestOutcomes[*db.PreimageOutcome], matches *latestOutcomes[*db.MatchResult], ords *latestOutcomes[*db.OrderOutcome], err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dbPimgs, dbMatches, dbOrds, err := auth.storage.GetUserReputationData(ctx, user, scoringOrderLimit, ScoringMatchLimit, cancelThreshWindow)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("error getting current user reputation version: %w", err)
+		return nil, nil, nil, fmt.Errorf("error loading reputation data for user %s: %w", user, err)
 	}
-	switch repVer {
-	case 0:
-		return auth.upgradeUserOutcomesV0(user)
-	case 1:
-		return auth.loadUserOutcomesV1(user)
-	default:
-		return nil, nil, nil, fmt.Errorf("unknown user reputation version %d", repVer)
-	}
+	return newLatestOutcomes(dbPimgs, scoringOrderLimit),
+		newLatestOutcomes(dbMatches, ScoringMatchLimit),
+		newLatestOutcomes(dbOrds, cancelThreshWindow), nil
 }
 
 func (auth *AuthManager) upgradeUserOutcomesV0(user account.AccountID) (*latestOutcomes[*db.PreimageOutcome], *latestOutcomes[*db.MatchResult], *latestOutcomes[*db.OrderOutcome], error) {
@@ -1571,6 +1573,16 @@ func (auth *AuthManager) UserMatchFails(user account.AccountID, n int) ([]*Match
 	return fails, nil
 }
 
+func (auth *AuthManager) loadUserScoreContext(ctx context.Context, user account.AccountID) (int32, error) {
+	latestPreimageResults, latestMatches, latestFinished, err := auth.loadUserOutcomesContext(ctx, user)
+	if err != nil {
+		return 0, err
+	}
+
+	score, _, _ := auth.integrateOutcomes(latestMatches, latestPreimageResults, latestFinished)
+	return score, nil
+}
+
 // loadUserScore computes the user's current score from order and swap data
 // retrieved from the DB. Use this instead of userScore if the user is offline.
 func (auth *AuthManager) loadUserScore(user account.AccountID) (int32, error) {
@@ -1640,7 +1652,6 @@ func (auth *AuthManager) handleConnect(conn comms.Link, msg *msgjson.Message) *m
 		oldClient.mtx.Unlock()
 	}
 
-	// Compute the user's score, loading the preimage/order/match outcomes.
 	latestPreimageResults, latestMatches, latestFinished, err := auth.loadUserOutcomes(user)
 	if err != nil {
 		log.Errorf("Failed to compute user %v score: %v", user, err)
