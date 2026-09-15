@@ -14,6 +14,7 @@ import (
 	"decred.org/dcrdex/dex/candles"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 // EpochResults represents the outcome of epoch order processing, including
@@ -269,6 +270,13 @@ type AccountArchiver interface {
 
 	// AccountInfo returns data for an account.
 	AccountInfo(account.AccountID) (*Account, error)
+
+	// ApplyBondPostedEvent stores the account and bond changes with the event
+	// log entry in one transaction. It creates the account if needed and
+	// consumes the token for a prepaid bond. An existing bond for the same
+	// account is left unchanged, but the event is still recorded. A bond owned
+	// by another account is an error.
+	ApplyBondPostedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.BondPostedEvent, pimgSz, matchSz, orderSz int) (*BondPostedResult, error)
 }
 
 // MatchData represents an order pair match, but with just the order IDs instead
@@ -817,4 +825,18 @@ func (o *OrderOutcome) Outcome() Outcome {
 
 func (o *OrderOutcome) ID() int64 {
 	return o.DBID
+}
+
+// BondPostedResult contains the result of applying a bond_posted event.
+type BondPostedResult struct {
+	// BondAdded is true if the bond was inserted, or false if the account
+	// already had the bond.
+	BondAdded bool
+	Log       *EventLogEntry
+
+	// Reputation inputs read after storing the bond, in the same transaction.
+	Bonds     []*Bond
+	Preimages []*PreimageOutcome
+	Matches   []*MatchResult
+	Orders    []*OrderOutcome
 }

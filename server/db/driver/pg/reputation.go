@@ -22,9 +22,14 @@ var _ db.ReputationArchiver = (*Archiver)(nil)
 func (a *Archiver) GetUserReputationData(
 	ctx context.Context,
 	user account.AccountID,
-	pimgSz, matchSz, orderSz int, /* pre-allocation sizes */
+	pimgSz, matchSz, orderSz int,
 ) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) {
-	rows, err := a.queries.selectPoints.QueryContext(ctx, user)
+	return getUserReputationData(ctx, a.queries.selectPoints, user, pimgSz, matchSz, orderSz)
+}
+
+// getUserReputationData returns the latest outcomes for each class, ordered by ID.
+func getUserReputationData(ctx context.Context, stmt *sql.Stmt, user account.AccountID, pimgSz, matchSz, orderSz int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) {
+	rows, err := stmt.QueryContext(ctx, user)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("error querying reputation points: %w", err)
 	}
@@ -68,6 +73,7 @@ func (a *Archiver) GetUserReputationData(
 	if rows.Err() != nil {
 		return nil, nil, nil, fmt.Errorf("error iterating points rows: %w", rows.Err())
 	}
+
 	if len(pimgs) > pimgSz {
 		pimgs = pimgs[len(pimgs)-pimgSz:]
 	}
@@ -226,4 +232,22 @@ func (a *Archiver) SetReputationInputsListener(listener func(users ...account.Ac
 		panic("reputation inputs listener already registered")
 	}
 	a.repListener = listener
+}
+
+func commitMayHaveLanded(err error) bool {
+	return err == nil || errors.As(err, new(*db.EventCommitUnknownError))
+}
+
+// notifyRepInputsOnCommit notifies the listener after a successful commit or
+// when the commit outcome is unknown, so cached reputation can be invalidated.
+func (a *Archiver) notifyRepInputsOnCommit(err error, users ...account.AccountID) {
+	if len(users) == 0 || !commitMayHaveLanded(err) {
+		return
+	}
+	a.repListenerMtx.RLock()
+	listener := a.repListener
+	a.repListenerMtx.RUnlock()
+	if listener != nil {
+		listener(users...)
+	}
 }
