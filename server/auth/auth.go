@@ -462,89 +462,11 @@ func (auth *AuthManager) GraceLimit() int {
 	return int(math.Round(1e8*auth.cancelThresh/(1-auth.cancelThresh))) / 1e8
 }
 
-// RecordCancel records a user's executed cancel order, including the canceled
-// order ID, and the time when the cancel was executed.
+// These callbacks are retained until market and swap record reputation through mesh events.
 func (auth *AuthManager) RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time) {
-	score := auth.recordOrderDone(user, oid, &target, epochGap, t.UnixMilli())
-
-	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return
-	}
-	effectiveTier := rep.EffectiveTier()
-	log.Debugf("RecordCancel: user %v strikes %d, bond tier %v => trading tier %v",
-		user, score, rep.BondedTier, effectiveTier)
-	// If their tier sinks below 1, unbook their orders and send a note.
-	if tierChanged && effectiveTier < 1 {
-		details := fmt.Sprintf("excessive cancellation rate, new tier = %d", effectiveTier)
-		auth.Penalize(user, account.CancellationRate, details)
-	}
-	if tierChanged {
-		go auth.sendTierChanged(user, rep, "excessive, cancellation rate")
-	} else if scoreChanged {
-		go auth.sendScoreChanged(user, rep)
-	}
-
 }
 
-// RecordCompletedOrder records a user's completed order, where completed means
-// a swap involving the order was successfully completed and the order is no
-// longer on the books if it ever was.
 func (auth *AuthManager) RecordCompletedOrder(user account.AccountID, oid order.OrderID, t time.Time) {
-	score := auth.recordOrderDone(user, oid, nil, db.EpochGapNA, t.UnixMilli())
-	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score) // may raise tier
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return
-	}
-	if tierChanged {
-		log.Tracef("RecordCompletedOrder: tier changed for user %v strikes %d, bond tier %v => trading tier %v",
-			user, score, rep.BondedTier, rep.EffectiveTier())
-		go auth.sendTierChanged(user, rep, "successful order completion")
-	} else if scoreChanged {
-		go auth.sendScoreChanged(user, rep)
-	}
-}
-
-// recordOrderDone records that an order has finished processing. This can be a
-// cancel order, which matched and unbooked another order, or a trade order that
-// completed the swap negotiation. Note that in the case of a cancel, oid refers
-// to the ID of the cancel order itself, while target is non-nil for cancel
-// orders. The user's new score is returned, which can be used to compute the
-// user's tier with computeUserTier.
-func (auth *AuthManager) recordOrderDone(user account.AccountID, oid order.OrderID, target *order.OrderID, epochGap int32, tMS int64) (score int32) {
-	canceled := target != nil && epochGap >= 0 && epochGap < freeCancelThreshold
-	o, err := auth.storage.AddOrderOutcome(auth.ctx, user, oid, canceled)
-	if err != nil {
-		log.Errorf("Error storing order outcome for order %s, user %s: %v", oid, user, err)
-		return
-	}
-	auth.violationMtx.Lock()
-	if orderOutcomes, found := auth.orderOutcomes[user]; found {
-		if popped := orderOutcomes.add(o); popped != 0 {
-			if err := auth.storage.PruneOutcomes(auth.ctx, user, db.OutcomeClassOrder, popped); err != nil {
-				log.Errorf("Error pruning order outcomes for user %s: %v", user, err)
-			}
-		}
-		score = auth.userScore(user)
-		auth.violationMtx.Unlock()
-		log.Debugf("Recorded order %v that has finished processing: user=%v, time=%v, target=%v",
-			oid, user, tMS, target)
-		return
-	}
-	auth.violationMtx.Unlock()
-
-	// The user is currently not connected and authenticated. When the user logs
-	// back in, their history will be reloaded (loadUserScore) and their tier
-	// recomputed, but compute their score now from DB for the caller.
-	score, err = auth.loadUserScore(user)
-	if err != nil {
-		log.Errorf("Failed to load order and match outcomes for user %v: %v", user, err)
-		return 0
-	}
-
-	return
 }
 
 // Connect runs the AuthManager until the context is canceled. Satisfies the
@@ -950,193 +872,16 @@ func (auth *AuthManager) AcctRepStatus(user account.AccountID) (connected bool, 
 	return
 }
 
-func (auth *AuthManager) registerMatchOutcome(user account.AccountID, outcome Outcome, mmid db.MarketMatchID) (score int32) {
-	o, err := auth.storage.AddMatchOutcome(auth.ctx, user, mmid.MatchID, outcome)
-	if err != nil {
-		log.Errorf("Error storing match outcome %s for user %s: %w", user, mmid.MatchID, err)
-		return
-	}
-
-	auth.violationMtx.Lock()
-	if matchOutcomes, found := auth.matchOutcomes[user]; found {
-		if popped := matchOutcomes.add(o); popped != 0 {
-			if err := auth.storage.PruneOutcomes(auth.ctx, user, db.OutcomeClassMatch, popped); err != nil {
-				log.Errorf("Error pruning match outcomes for user %s: %v", user, err)
-			}
-		}
-
-		score = auth.userScore(user)
-		auth.violationMtx.Unlock()
-		return
-	}
-	auth.violationMtx.Unlock()
-
-	// The user is currently not connected and authenticated. When the user logs
-	// back in, their history will be reloaded (loadUserScore) and their tier
-	// recomputed, but compute their score now from DB for the caller.
-	score, err = auth.loadUserScore(user)
-	if err != nil {
-		log.Errorf("Failed to load order and match outcomes for user %v: %v", user, err)
-		return 0
-	}
-
-	return
-}
-
-// SwapSuccess registers the successful completion of a swap by the given user.
-// TODO: provide lots instead of value, or convert to lots somehow. But, Swapper
-// has no clue about lot size, and neither does DB!
 func (auth *AuthManager) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, redeemTime time.Time) {
-	score := auth.registerMatchOutcome(user, db.OutcomeSwapSuccess, mmid)
-	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score) // may raise tier
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return
-	}
-	effectiveTier := rep.EffectiveTier()
-	log.Debugf("Match success for user %v: strikes %d, bond tier %v => tier %v",
-		user, score, rep.BondedTier, effectiveTier)
-	if tierChanged {
-		log.Infof("SwapSuccess: tier change for user %v, strikes %d, bond tier %v => trading tier %v",
-			user, score, rep.BondedTier, effectiveTier)
-		go auth.sendTierChanged(user, rep, "successful swap completion")
-	} else if scoreChanged {
-		go auth.sendScoreChanged(user, rep)
-	}
 }
 
-// Inaction registers an inaction violation by the user at the given step. The
-// refTime is time to which the at-fault user's inaction deadline for the match
-// is referenced. e.g. For a swap that failed in TakerSwapCast, refTime would be
-// the maker's redeem time, which is recorded in the DB when the server
-// validates the maker's redemption and informs the taker, and is roughly when
-// the actor was first able to take the missed action.
-// TODO: provide lots instead of value, or convert to lots somehow. But, Swapper
-// has no clue about lot size, and neither does DB!
 func (auth *AuthManager) Inaction(user account.AccountID, outcome Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-	score := auth.registerMatchOutcome(user, outcome, mmid)
-
-	// Recompute tier.
-	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return
-	}
-	effectiveTier := rep.EffectiveTier()
-	log.Infof("Match failure for user %v: %q (badness %v), strikes %d, bond tier %v => trading tier %v",
-		user, outcome, outcomeScores[outcome], score, rep.BondedTier, effectiveTier)
-	// If their tier sinks below 1, unbook their orders and send a note.
-	if tierChanged && effectiveTier < 1 {
-		details := fmt.Sprintf("swap %v failure (%v) for order %v, new tier = %d",
-			mmid.MatchID, outcome, oid, effectiveTier)
-		auth.Penalize(user, account.FailureToAct, details)
-	}
-	if tierChanged {
-		reason := fmt.Sprintf("swap failure for match %v order %v: %v", mmid.MatchID, oid, outcome)
-		go auth.sendTierChanged(user, rep, reason)
-	} else if scoreChanged {
-		go auth.sendScoreChanged(user, rep)
-	}
 }
 
-func (auth *AuthManager) registerPreimageOutcome(user account.AccountID, miss bool, oid order.OrderID, refTime time.Time) (score int32) {
-	o, err := auth.storage.AddPreimageOutcome(auth.ctx, user, oid, miss)
-	if err != nil {
-		log.Errorf("Error storing order outcome for order %s, user %s: %v", oid, user, err)
-		return
-	}
-	auth.violationMtx.Lock()
-	piOutcomes, found := auth.preimgOutcomes[user]
-	if found {
-
-		if popped := piOutcomes.add(o); popped != 0 {
-			if err := auth.storage.PruneOutcomes(auth.ctx, user, db.OutcomeClassPreimage, popped); err != nil {
-				log.Errorf("Error pruning preimage outcomes for user %s: %v", user, err)
-			}
-		}
-		score = auth.userScore(user)
-		auth.violationMtx.Unlock()
-		return
-	}
-	auth.violationMtx.Unlock()
-
-	// The user is currently not connected and authenticated. When the user logs
-	// back in, their history will be reloaded (loadUserScore) and their tier
-	// recomputed, but compute their score now from DB for the caller.
-	score, err = auth.loadUserScore(user)
-	if err != nil {
-		log.Errorf("Failed to load order and match outcomes for user %v: %v", user, err)
-		return 0
-	}
-
-	return
-}
-
-// PreimageSuccess registers an accepted preimage for the user.
 func (auth *AuthManager) PreimageSuccess(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
-	score := auth.registerPreimageOutcome(user, false, oid, epochEnd)
-	if _, _, _, err := auth.computeUserReputation(user, score); err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-	}
 }
 
-// MissedPreimage registers a missed preimage violation by the user.
 func (auth *AuthManager) MissedPreimage(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
-	score := auth.registerPreimageOutcome(user, true, oid, epochEnd)
-	if score < auth.penaltyThreshold {
-		return
-	}
-
-	// Recompute tier.
-	rep, tierChanged, scoreChanged, err := auth.computeUserReputation(user, score)
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return
-	}
-	effectiveTier := rep.EffectiveTier()
-	log.Debugf("MissedPreimage: user %v strikes %d, bond tier %v => trading tier %v", user, score, rep.BondedTier, effectiveTier)
-	// If their tier sinks below 1, unbook their orders and send a note.
-	if tierChanged && effectiveTier < 1 {
-		details := fmt.Sprintf("preimage for order %v not provided upon request: new tier = %d", oid, effectiveTier)
-		auth.Penalize(user, account.PreimageReveal, details)
-	}
-	if tierChanged {
-		reason := fmt.Sprintf("preimage not provided upon request for order %v", oid)
-		go auth.sendTierChanged(user, rep, reason)
-	} else if scoreChanged {
-		go auth.sendScoreChanged(user, rep)
-	}
-}
-
-// Penalize unbooks all of their orders, and notifies them of this action while
-// citing the provided rule that corresponds to their most recent infraction.
-// This method is to be used when a user's tier drops below 1.
-// NOTE: There is now a 'tierchange' route for *any* tier change, but this
-// method still handles unbooking of the user's orders.
-func (auth *AuthManager) Penalize(user account.AccountID, lastRule account.Rule, extraDetails string) {
-	// Unbook all of the user's orders across all markets.
-	auth.unbookUserOrders(user)
-
-	log.Debugf("User %v account penalized. Last rule broken = %v. Detail: %s", user, lastRule, extraDetails)
-
-	// Notify user of penalty.
-	details := "Ordering has been suspended for this account. Post additional bond to offset violations."
-	details = fmt.Sprintf("%s\nLast Broken Rule Details: %s\n%s", details, lastRule.Description(), extraDetails)
-	penalty := &msgjson.Penalty{
-		Rule:    lastRule,
-		Time:    uint64(time.Now().UnixMilli()),
-		Details: details,
-	}
-	penaltyNote := &msgjson.PenaltyNote{
-		Penalty: penalty,
-	}
-	penaltyNote.Sig = auth.SignMsg(penaltyNote.Serialize())
-	note, err := msgjson.NewNotification(msgjson.PenaltyRoute, penaltyNote)
-	if err != nil {
-		log.Errorf("error creating penalty notification: %w", err)
-		return
-	}
-	auth.Notify(user, note)
 }
 
 // AcctStatus indicates if the user is presently connected and their tier.
