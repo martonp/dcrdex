@@ -9,6 +9,7 @@ import (
 
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
 )
@@ -24,7 +25,7 @@ func TestReputation(t *testing.T) {
 	acct := tNewAccount(t)
 	user := acct.ID
 
-	if err := archie.CreateAccountWithBond(acct, &db.Bond{}); err != nil {
+	if err := archie.CreateAccountWithBond(acct, &db.Bond{CoinID: []byte{1}}); err != nil {
 		t.Fatalf("Error creating account: %v", err)
 	}
 
@@ -194,5 +195,63 @@ func TestReputation(t *testing.T) {
 	}
 	if loadedPimgs[0].Miss || loadedMatches[0].MatchOutcome != db.OutcomeSwapSuccess || loadedOrds[0].Canceled {
 		t.Fatal("Forgiving didn't forgive", loadedPimgs[0].Miss, loadedMatches[0].MatchOutcome, loadedOrds[0].Canceled)
+	}
+}
+
+func randomReputationOrderID() (oid order.OrderID) {
+	copy(oid[:], encode.RandomBytes(32))
+	return
+}
+
+func randomReputationMatchID() (mid order.MatchID) {
+	copy(mid[:], encode.RandomBytes(32))
+	return
+}
+
+func captureRepListener(t *testing.T) *[][]account.AccountID {
+	t.Helper()
+	var calls [][]account.AccountID
+	archie.repListenerMtx.Lock()
+	prev := archie.repListener
+	archie.repListener = func(users ...account.AccountID) {
+		calls = append(calls, append([]account.AccountID(nil), users...))
+	}
+	archie.repListenerMtx.Unlock()
+	t.Cleanup(func() {
+		archie.repListenerMtx.Lock()
+		archie.repListener = prev
+		archie.repListenerMtx.Unlock()
+	})
+	return &calls
+}
+
+func requireRepListenerCall(t *testing.T, calls [][]account.AccountID, wantCalls int, wantUsers ...account.AccountID) {
+	t.Helper()
+	if len(calls) != wantCalls {
+		t.Fatalf("listener called %d times, want %d: %v", len(calls), wantCalls, calls)
+	}
+	if wantCalls == 0 {
+		return
+	}
+	last := calls[len(calls)-1]
+	if len(last) != len(wantUsers) {
+		t.Fatalf("last notification = %v, want users %v", last, wantUsers)
+	}
+	notified := make(map[account.AccountID]bool, len(last))
+	for _, user := range last {
+		notified[user] = true
+	}
+	for _, user := range wantUsers {
+		if !notified[user] {
+			t.Fatalf("last notification = %v, missing user %v", last, user)
+		}
+	}
+}
+
+func seedReputationOutcome(t *testing.T, ctx context.Context, user account.AccountID, link [32]byte, class db.OutcomeClass, outcome db.Outcome) {
+	t.Helper()
+	stmt := "INSERT INTO " + archie.tables.points + " (account, link, class, outcome) VALUES ($1, $2, $3, $4)"
+	if _, err := archie.db.ExecContext(ctx, stmt, user, order.OrderID(link), class, outcome); err != nil {
+		t.Fatalf("insert reputation outcome: %v", err)
 	}
 }
