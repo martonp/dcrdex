@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
 )
@@ -66,12 +67,14 @@ type archiverTables struct {
 // Archiver must implement server/db.DEXArchivist.
 // So far: OrderArchiver, AccountArchiver.
 type Archiver struct {
-	ctx          context.Context
-	queryTimeout time.Duration
-	db           *sql.DB
-	dbName       string
-	markets      map[string]*dex.MarketInfo
-	tables       archiverTables
+	repListenerMtx sync.RWMutex
+	repListener    func(users ...account.AccountID)
+	ctx            context.Context
+	queryTimeout   time.Duration
+	db             *sql.DB
+	dbName         string
+	markets        map[string]*dex.MarketInfo
+	tables         archiverTables
 
 	queries struct {
 		selectPoints            *sql.Stmt // internal.SelectPoints

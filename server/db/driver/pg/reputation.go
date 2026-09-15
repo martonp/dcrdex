@@ -216,3 +216,14 @@ func (a *Archiver) ForgiveUser(ctx context.Context, user account.AccountID) erro
 	}
 	return nil
 }
+
+// SetReputationInputsListener registers a callback for changes to the data used
+// to calculate reputation. It panics if a listener is already registered.
+func (a *Archiver) SetReputationInputsListener(listener func(users ...account.AccountID)) {
+	a.repListenerMtx.Lock()
+	defer a.repListenerMtx.Unlock()
+	if a.repListener != nil {
+		panic("reputation inputs listener already registered")
+	}
+	a.repListener = listener
+}

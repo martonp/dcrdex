@@ -694,6 +694,7 @@ type ReputationArchiver interface {
 		ctx context.Context, user account.AccountID, pimgOutcomes []*PreimageOutcome, matchOutcomes []*MatchResult, orderOutcomes []*OrderOutcome, /* Without DB IDs */
 	) ([]*PreimageOutcome, []*MatchResult, []*OrderOutcome, error) /* With DB IDs */
 	ForgiveUser(ctx context.Context, user account.AccountID) error
+	SetReputationInputsListener(func(users ...account.AccountID))
 }
 
 // OutcomeClass is the type of interaction for which the user's reputation
