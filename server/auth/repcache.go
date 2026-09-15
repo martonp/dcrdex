@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"decred.org/dcrdex/server/account"
+	"decred.org/dcrdex/server/db"
 )
 
 const (
@@ -29,6 +30,21 @@ type repData struct {
 	exists bool // false for an unknown account
 	score  int32
 	bonds  []cachedBond
+}
+
+func newRepData(exists bool, score int32, bonds []*db.Bond) *repData {
+	data := &repData{
+		exists: exists,
+		score:  score,
+		bonds:  make([]cachedBond, len(bonds)),
+	}
+	for i, bond := range bonds {
+		data.bonds[i] = cachedBond{
+			strength: bond.Strength,
+			lockTime: bond.LockTime,
+		}
+	}
+	return data
 }
 
 // bondTier sums strengths with lockTime >= expiryThresh.

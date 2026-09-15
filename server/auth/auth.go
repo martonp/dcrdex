@@ -1,6 +1,8 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+// Package auth authenticates clients, manages their sessions, and handles
+// account bonds and reputation.
 package auth
 
 import (
@@ -233,10 +235,9 @@ func (client *clientInfo) respHandler(id uint64) *respHandler {
 	return handler
 }
 
-// AuthManager handles authentication-related tasks, including validating client
-// signatures, maintaining association between accounts and `comms.Link`s, and
-// signing messages with the DEX's private key. AuthManager manages requests to
-// the 'connect' route.
+// AuthManager authenticates clients, manages their sessions, and processes
+// bond and reputation requests. It signs outgoing messages and routes
+// communication to authenticated clients.
 type AuthManager struct {
 	wg             sync.WaitGroup
 	ctx            context.Context
@@ -254,6 +255,9 @@ type AuthManager struct {
 	freeCancels      bool
 	penaltyThreshold int32
 	cancelThresh     float64
+
+	// rep caches account scores and bonds, including expired bonds.
+	rep *repCache
 
 	// latencyQ is a queue for fee coin waiters to deal with latency.
 	latencyQ *wait.TickerQueue
@@ -335,8 +339,8 @@ type Config struct {
 
 	Route func(route string, handler comms.MsgHandler)
 
-	// BondExpiry is the time in seconds left until a bond's LockTime is reached
-	// that defines when a bond is considered expired.
+	// BondExpiry is the minimum remaining lock time, in seconds, for a bond
+	// to contribute to the account's tier.
 	BondExpiry uint64
 	// BondAssets indicates the supported bond assets and parameters.
 	BondAssets map[string]*msgjson.BondAsset
@@ -359,8 +363,8 @@ type Config struct {
 	CancelThreshold float64
 	FreeCancels     bool
 
-	// PenaltyThreshold defines the score deficit at which a user's bond is
-	// revoked.
+	// PenaltyThreshold is the number of negative score points per reputation
+	// penalty. Each penalty reduces the account's effective tier by one.
 	PenaltyThreshold uint32
 }
 
@@ -394,6 +398,7 @@ func NewAuthManager(cfg *Config) *AuthManager {
 		freeCancels:      cfg.FreeCancels,
 		penaltyThreshold: penaltyThreshold,
 		cancelThresh:     cfg.CancelThreshold,
+		rep:              newRepCache(repCacheCapacity, repCacheMaxAge),
 		latencyQ:         wait.NewTickerQueue(recheckInterval),
 		users:            make(map[account.AccountID]*clientInfo),
 		conns:            make(map[uint64]*clientInfo),
@@ -535,23 +540,24 @@ func (auth *AuthManager) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 	auth.wg.Add(1)
 	go func() {
 		defer auth.wg.Done()
-		t := time.NewTicker(20 * time.Second)
-		defer t.Stop()
-
-		for {
-			select {
-			case <-t.C:
-				auth.checkBonds()
-			case <-ctx.Done():
-				return
-			}
-		}
+		auth.latencyQ.Run(ctx)
 	}()
 
 	auth.wg.Add(1)
 	go func() {
 		defer auth.wg.Done()
-		auth.latencyQ.Run(ctx)
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				hits, misses, invalidations, evictions := auth.rep.stats()
+				log.Debugf("Reputation cache: %d hits, %d misses, %d invalidations, %d evictions",
+					hits, misses, invalidations, evictions)
+			case <-ctx.Done():
+				return
+			}
+		}
 	}()
 
 	auth.wg.Add(1)
@@ -579,9 +585,7 @@ func (auth *AuthManager) OnConnect(f func(account.AccountID)) {
 	auth.connectCallbackMtx.Unlock()
 }
 
-// Route wraps the comms.Route function, storing the response handler with the
-// associated clientInfo, and sending the message on the current comms.Link for
-// the client.
+// Route registers a message handler that requires an authenticated client.
 func (auth *AuthManager) Route(route string, handler func(account.AccountID, *msgjson.Message) *msgjson.Error) {
 	auth.route(route, func(conn comms.Link, msg *msgjson.Message) *msgjson.Error {
 		client := auth.conn(conn)
@@ -753,6 +757,21 @@ func (auth *AuthManager) integrateOutcomes(
 	return
 }
 
+// UserReputationAt returns the user's tier, score, and maximum score,
+// with bond expiry evaluated at asOf.
+func (auth *AuthManager) UserReputationAt(user account.AccountID, asOf time.Time) (tier int64, score, maxScore int32, err error) {
+	maxScore = ScoringMatchLimit
+	data, err := auth.rep.get(auth.ctx, user, auth.loadUserRepData)
+	if err != nil {
+		return
+	}
+	if !data.exists {
+		return 0, data.score, maxScore, nil
+	}
+	r := auth.reputationFromData(data, asOf.Add(auth.bondExpiry).Unix())
+	return r.EffectiveTier(), r.Score, maxScore, nil
+}
+
 // userScore computes an authenticated user's score from their recent order and
 // match outcomes. They must have entries in the outcome maps. Use loadUserScore
 // to compute score from history in DB. This must be called with the
@@ -782,23 +801,9 @@ func (auth *AuthManager) UserScore(user account.AccountID) (score int32, err err
 	return
 }
 
-// UserReputation calculates some quantities related to the user's reputation.
-// UserReputation satisfies market.AuthManager.
+// UserReputation returns the user's tier, score, and maximum score at the current time.
 func (auth *AuthManager) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
-	maxScore = ScoringMatchLimit
-	score, err = auth.UserScore(user)
-	if err != nil {
-		return
-	}
-	r, _, _, err := auth.computeUserReputation(user, score)
-	if err != nil {
-		return 0, 0, maxScore, err
-	}
-	if r != nil {
-		return r.EffectiveTier(), r.Score, ScoringMatchLimit, nil
-
-	}
-	return
+	return auth.UserReputationAt(user, time.Now())
 }
 
 // userReputation computes the breakdown of a user's tier and score.
@@ -812,6 +817,44 @@ func (auth *AuthManager) userReputation(bondTier int64, score int32) *account.Re
 		Penalties:  uint16(penalties),
 		Score:      score,
 	}
+}
+
+// reputationFromData calculates reputation using bonds locked until at least
+// bondExpiryThreshold.
+func (auth *AuthManager) reputationFromData(data *repData, bondExpiryThreshold int64) *account.Reputation {
+	rep := auth.userReputation(data.bondTier(bondExpiryThreshold), data.score)
+	rep.BondExpiryThreshold = bondExpiryThreshold
+	return rep
+}
+
+func (auth *AuthManager) loadUserReputation(ctx context.Context, user account.AccountID) (*account.Reputation, error) {
+	data, err := auth.rep.get(ctx, user, auth.loadUserRepData)
+	if err != nil {
+		return nil, err
+	}
+	if !data.exists {
+		return nil, nil
+	}
+	bondExpiryThreshold := time.Now().Add(auth.bondExpiry).Unix()
+	return auth.reputationFromData(data, bondExpiryThreshold), nil
+}
+
+// loadUserRepData loads a user's score and bonds.
+func (auth *AuthManager) loadUserRepData(ctx context.Context, user account.AccountID) (*repData, error) {
+	score, err := auth.loadUserScoreContext(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(mesh): Remove old expired bonds once we know they are no longer
+	// needed to replay events. All nodes must agree on when to remove them.
+	// Until then, the database, snapshots, and cached bond lists keep growing.
+	acct, bonds, err := auth.storage.Account(ctx, user, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+
+	return newRepData(acct != nil, score, bonds), nil
 }
 
 // tier computes a user's tier from their conduct score and bond tier.
@@ -854,21 +897,26 @@ func (auth *AuthManager) computeUserReputation(user account.AccountID, score int
 	return
 }
 
-// ComputeUserReputation computes the user's reputation from their active bonds and conduct
-// score. The DB is always consulted for computing the conduct score. Summing bond amounts
-// may access the DB if the user is not presently connected. Returns nil for an unknown user.
+// ComputeUserReputation computes the user's reputation from their active bonds
+// and conduct score. Returns nil for an unknown user, and also (with the
+// error only logged) when the reputation load fails; use AcctRepStatus to
+// distinguish the two.
 func (auth *AuthManager) ComputeUserReputation(user account.AccountID) *account.Reputation {
-	score, err := auth.loadUserScore(user)
+	rep, err := auth.loadUserReputation(auth.ctx, user)
 	if err != nil {
-		log.Errorf("failed to load user score: %v", err)
+		log.Errorf("failed to load user reputation: %v", err)
 		return nil
 	}
-	r, _, _, err := auth.computeUserReputation(user, score)
-	if err != nil {
-		log.Errorf("Failed to compute reputation for user %v: %v", user, err)
-		return nil
-	}
-	return r
+	return rep
+}
+
+// AcctRepStatus reports local connectivity and reputation. Unlike AcctStatus,
+// a reputation load failure is returned as an error, not as tier 0. For an
+// unknown account, rep and err are both nil.
+func (auth *AuthManager) AcctRepStatus(user account.AccountID) (connected bool, rep *account.Reputation, err error) {
+	connected = auth.user(user) != nil
+	rep, err = auth.loadUserReputation(auth.ctx, user)
+	return
 }
 
 func (auth *AuthManager) registerMatchOutcome(user account.AccountID, outcome Outcome, mmid db.MarketMatchID) (score int32) {
@@ -1062,21 +1110,11 @@ func (auth *AuthManager) Penalize(user account.AccountID, lastRule account.Rule,
 
 // AcctStatus indicates if the user is presently connected and their tier.
 func (auth *AuthManager) AcctStatus(user account.AccountID) (connected bool, tier int64) {
-	client := auth.user(user)
-	if client == nil {
-		// Load user info from DB.
-		rep := auth.ComputeUserReputation(user)
-		if rep != nil {
-			tier = rep.EffectiveTier()
-		}
-		return
+	connected = auth.user(user) != nil
+	rep := auth.ComputeUserReputation(user)
+	if rep != nil {
+		tier = rep.EffectiveTier()
 	}
-	connected = true
-
-	client.mtx.Lock()
-	tier = client.tier
-	client.mtx.Unlock()
-
 	return
 }
 
@@ -1782,11 +1820,11 @@ func (auth *AuthManager) handleConnect(conn comms.Link, msg *msgjson.Message) *m
 		activeBonds = append(activeBonds, bond)
 	}
 
-	// Ensure tier and filtered bonds agree.
 	rep := auth.userReputation(bondTier, score)
 	client.tier = rep.EffectiveTier()
 	client.score = score
 	client.bonds = activeBonds
+	rep.BondExpiryThreshold = lockTimeThresh.Unix()
 
 	// Sign and send the connect response.
 	sig := auth.SignMsg(sigMsg)
@@ -1815,7 +1853,7 @@ func (auth *AuthManager) handleConnect(conn comms.Link, msg *msgjson.Message) *m
 
 	log.Infof("Authenticated account %v from %v with %d active orders, %d active matches, tier = %v, "+
 		"bond tier = %v, score = %v",
-		user, conn.Addr(), len(msgOrderStatuses), len(msgMatches), client.tier, bondTier, score)
+		user, conn.Addr(), len(msgOrderStatuses), len(msgMatches), rep.EffectiveTier(), bondTier, score)
 	auth.addClient(client)
 
 	auth.connectCallbackMtx.RLock()

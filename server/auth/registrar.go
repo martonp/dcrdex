@@ -335,10 +335,8 @@ func (auth *AuthManager) storeBondAndRespond(conn comms.Link, bond *db.Bond, acc
 	}
 
 	// Integrate active bonds and score to report tier.
-	rep := auth.addBond(acctID, bond)
-	if rep == nil { // user not authenticated, use DB
-		rep = auth.ComputeUserReputation(acctID)
-	}
+	auth.rep.invalidate(acctID)
+	rep := auth.ComputeUserReputation(acctID)
 	if rep == nil {
 		conn.SendError(reqID, msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve reputation"))
 		return
@@ -425,10 +423,8 @@ func (auth *AuthManager) processPrepaidBond(conn comms.Link, msg *msgjson.Messag
 		log.Errorf("Error deleting pre-paid bond id = %s from database: %v", dex.Bytes(coinID), err)
 	}
 
-	rep := auth.addBond(acct.ID, dbBond)
-	if rep == nil { // user not authenticated, use DB
-		rep = auth.ComputeUserReputation(acct.ID)
-	}
+	auth.rep.invalidate(acct.ID)
+	rep := auth.ComputeUserReputation(acct.ID)
 	if rep == nil {
 		return msgjson.NewError(msgjson.RPCInternalError, "failed to retrieve reputation")
 	}
