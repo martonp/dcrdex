@@ -50,20 +50,25 @@ type ratioData struct {
 
 // TStorage satisfies the Storage interface
 type TStorage struct {
-	accountReadErr      error
-	acctInfo            *db.Account
-	acctInfoErr         error
-	acct                *account.Account
-	matches             []*db.MatchData
-	matchStatuses       []*db.MatchStatus
-	userPreimageResults []*db.PreimageResult
-	userMatchOutcomes   []*db.MatchOutcome
-	orderStatuses       []*db.OrderStatus
-	acctErr             error
-	regAddr             string
-	regAsset            uint32
-	bonds               []*db.Bond
-	ratio               ratioData
+	accountReadErr        error
+	acctInfo              *db.Account
+	acctInfoErr           error
+	acct                  *account.Account
+	matches               []*db.MatchData
+	matchStatuses         []*db.MatchStatus
+	userPreimageResults   []*db.PreimageResult
+	userMatchOutcomes     []*db.MatchOutcome
+	reputationPreimages   []*db.PreimageOutcome
+	reputationMatches     []*db.MatchResult
+	reputationOrders      []*db.OrderOutcome
+	reputationErr         error
+	getUserReputationData func(context.Context, account.AccountID, int, int, int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error)
+	orderStatuses         []*db.OrderStatus
+	acctErr               error
+	regAddr               string
+	regAsset              uint32
+	bonds                 []*db.Bond
+	ratio                 ratioData
 }
 
 func (s *TStorage) AccountInfo(account.AccountID) (*db.Account, error) {
@@ -142,7 +147,30 @@ func (s *TStorage) ExecutedCancelsForUser(aid account.AccountID, _ int) (cancels
 }
 
 func (s *TStorage) GetUserReputationData(ctx context.Context, user account.AccountID, pimgSz, matchSz, orderSz int) ([]*db.PreimageOutcome, []*db.MatchResult, []*db.OrderOutcome, error) {
-	return nil, nil, nil, nil
+	if s.getUserReputationData != nil {
+		return s.getUserReputationData(ctx, user, pimgSz, matchSz, orderSz)
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	if s.reputationErr != nil {
+		return nil, nil, nil, s.reputationErr
+	}
+	pimgs := append([]*db.PreimageOutcome(nil), s.reputationPreimages...)
+	matches := append([]*db.MatchResult(nil), s.reputationMatches...)
+	ords := append([]*db.OrderOutcome(nil), s.reputationOrders...)
+	if len(pimgs) > pimgSz {
+		pimgs = pimgs[len(pimgs)-pimgSz:]
+	}
+	if len(matches) > matchSz {
+		matches = matches[len(matches)-matchSz:]
+	}
+	if len(ords) > orderSz {
+		ords = ords[len(ords)-orderSz:]
+	}
+	return pimgs, matches, ords, nil
 }
 
 func (s *TStorage) AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*db.PreimageOutcome, error) {
@@ -583,69 +611,62 @@ func TestGraceLimit(t *testing.T) {
 	}
 }
 
-var t0 = int64(1601418963000)
-
-func nextTime() int64 {
-	t0 += 10
-	return t0
-}
-
-func newMatchOutcome(status order.MatchStatus, mid order.MatchID, fail bool, val uint64, t int64) *db.MatchOutcome {
-	switch status {
-	case order.NewlyMatched, order.MakerSwapCast, order.TakerSwapCast:
-		if !fail {
-			panic("wrong")
-		}
-	case order.MatchComplete:
-		if fail {
-			panic("wrong")
-		}
-	}
-	return &db.MatchOutcome{
-		Status: status,
-		ID:     mid,
-		Fail:   fail,
-		Time:   t,
-		Value:  val,
-	}
-}
-
 func randomOrderID() (oid order.OrderID) {
 	copy(oid[:], encode.RandomBytes(32))
 	return
 }
 
-func newPreimageResult(miss bool, t int64) *db.PreimageResult {
-	return &db.PreimageResult{
-		Miss: miss,
-		Time: t,
-		ID:   randomOrderID(),
+var reputationDBID int64
+
+func nextReputationDBID() int64 {
+	reputationDBID++
+	return reputationDBID
+}
+
+func newMatchResult(status order.MatchStatus, fail bool) *db.MatchResult {
+	outcome := db.OutcomeSwapSuccess
+	if fail {
+		outcome = matchStatusToOutcome(status)
+	}
+	return &db.MatchResult{
+		DBID:         nextReputationDBID(),
+		MatchID:      randomMatchID(),
+		MatchOutcome: outcome,
+	}
+}
+
+func newPreimageOutcome(miss bool) *db.PreimageOutcome {
+	return &db.PreimageOutcome{
+		DBID:    nextReputationDBID(),
+		OrderID: randomOrderID(),
+		Miss:    miss,
 	}
 }
 
 func setViolations() (wantScore int32) {
-	rig.storage.userMatchOutcomes = []*db.MatchOutcome{
-		newMatchOutcome(order.NewlyMatched, randomMatchID(), true, 7, nextTime()),
-		newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()), // success
-		newMatchOutcome(order.NewlyMatched, randomMatchID(), true, 7, nextTime()),
-		newMatchOutcome(order.MakerSwapCast, randomMatchID(), true, 7, nextTime()), // noSwapAsTaker at index 3
-		newMatchOutcome(order.TakerSwapCast, randomMatchID(), true, 7, nextTime()),
-		newMatchOutcome(order.MakerRedeemed, randomMatchID(), false, 7, nextTime()), // success (for maker)
-		newMatchOutcome(order.MakerRedeemed, randomMatchID(), true, 7, nextTime()),
-		newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()), // success
-		newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()), // success
+	rig.storage.reputationMatches = []*db.MatchResult{
+		newMatchResult(order.NewlyMatched, true),
+		newMatchResult(order.MatchComplete, false), // success
+		newMatchResult(order.NewlyMatched, true),
+		newMatchResult(order.MakerSwapCast, true), // noSwapAsTaker at index 3
+		newMatchResult(order.TakerSwapCast, true),
+		newMatchResult(order.MakerRedeemed, false), // success (for maker)
+		newMatchResult(order.MakerRedeemed, true),
+		newMatchResult(order.MatchComplete, false), // success
+		newMatchResult(order.MatchComplete, false), // success
 	}
-	t0 -= 4000
-	rig.storage.userPreimageResults = []*db.PreimageResult{newPreimageResult(true, nextTime())}
-	for range rig.storage.userMatchOutcomes {
-		rig.storage.userPreimageResults = append(rig.storage.userPreimageResults, newPreimageResult(false, nextTime()))
+	rig.storage.reputationPreimages = []*db.PreimageOutcome{newPreimageOutcome(true)}
+	for range rig.storage.reputationMatches {
+		rig.storage.reputationPreimages = append(rig.storage.reputationPreimages, newPreimageOutcome(false))
 	}
 	return 4*matchCompletedScore + 1*preimageMissScore +
 		2*noSwapAsMakerScore + noSwapAsTakerScore + noRedeemAsMakerScore + 1*noRedeemAsTakerScore
 }
 
 func clearViolations() {
-	rig.storage.userMatchOutcomes = []*db.MatchOutcome{}
+	rig.storage.reputationPreimages = nil
+	rig.storage.reputationMatches = nil
+	rig.storage.reputationOrders = nil
 }
 
 func TestAuthManager_loadUserScore(t *testing.T) {
@@ -653,7 +674,7 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	wantScore := setViolations()
 	defer clearViolations()
 	user := tNewUser(t)
-	score, err := rig.mgr.loadUserScore(user.acctID)
+	score, err := rig.mgr.loadUserScoreContext(context.Background(), user.acctID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,11 +683,11 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	}
 
 	// add one NoSwapAsTaker (match inactive at MakerSwapCast)
-	rig.storage.userMatchOutcomes = append(rig.storage.userMatchOutcomes,
-		newMatchOutcome(order.MakerSwapCast, randomMatchID(), true, 7, nextTime()))
+	rig.storage.reputationMatches = append(rig.storage.reputationMatches,
+		newMatchResult(order.MakerSwapCast, true))
 	wantScore += noSwapAsTakerScore
 
-	score, err = rig.mgr.loadUserScore(user.acctID)
+	score, err = rig.mgr.loadUserScoreContext(context.Background(), user.acctID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -677,59 +698,59 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	tests := []struct {
 		name           string
 		user           account.AccountID
-		matchOutcomes  []*db.MatchOutcome
-		preimageMisses []*db.PreimageResult
+		matchOutcomes  []*db.MatchResult
+		preimageMisses []*db.PreimageOutcome
 		wantScore      int32
 	}{
 		{
 			name: "negative",
 			user: user.acctID,
-			matchOutcomes: []*db.MatchOutcome{
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
+			matchOutcomes: []*db.MatchResult{
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
 			},
 			wantScore: 4,
 		},
 		{
 			name:          "nuthin",
 			user:          user.acctID,
-			matchOutcomes: []*db.MatchOutcome{},
+			matchOutcomes: []*db.MatchResult{},
 			wantScore:     0,
 		},
 		{
 			name: "balance",
 			user: user.acctID,
-			matchOutcomes: []*db.MatchOutcome{
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
+			matchOutcomes: []*db.MatchResult{
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
 			},
-			preimageMisses: []*db.PreimageResult{
-				newPreimageResult(true, nextTime()),
-				newPreimageResult(true, nextTime()),
+			preimageMisses: []*db.PreimageOutcome{
+				newPreimageOutcome(true),
+				newPreimageOutcome(true),
 			},
 			wantScore: 0,
 		},
 		{
 			name: "tipping red",
 			user: user.acctID,
-			matchOutcomes: []*db.MatchOutcome{
-				newMatchOutcome(order.NewlyMatched, randomMatchID(), true, 7, nextTime()),
-				newMatchOutcome(order.MakerSwapCast, randomMatchID(), true, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.NewlyMatched, randomMatchID(), true, 7, nextTime()),
-				newMatchOutcome(order.MakerRedeemed, randomMatchID(), true, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
-				newMatchOutcome(order.MatchComplete, randomMatchID(), false, 7, nextTime()),
+			matchOutcomes: []*db.MatchResult{
+				newMatchResult(order.NewlyMatched, true),
+				newMatchResult(order.MakerSwapCast, true),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.NewlyMatched, true),
+				newMatchResult(order.MakerRedeemed, true),
+				newMatchResult(order.MatchComplete, false),
+				newMatchResult(order.MatchComplete, false),
 			},
-			preimageMisses: []*db.PreimageResult{
-				newPreimageResult(true, nextTime()),
-				newPreimageResult(false, nextTime()),
+			preimageMisses: []*db.PreimageOutcome{
+				newPreimageOutcome(true),
+				newPreimageOutcome(false),
 			},
 			wantScore: 2*noSwapAsMakerScore + 1*noSwapAsTakerScore + 0*noRedeemAsMakerScore +
 				1*noRedeemAsTakerScore + 1*preimageMissScore + 5*matchCompletedScore,
@@ -737,9 +758,9 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rig.storage.userMatchOutcomes = tt.matchOutcomes
-			rig.storage.userPreimageResults = tt.preimageMisses
-			score, err := rig.mgr.loadUserScore(tt.user)
+			rig.storage.reputationMatches = tt.matchOutcomes
+			rig.storage.reputationPreimages = tt.preimageMisses
+			score, err := rig.mgr.loadUserScoreContext(context.Background(), tt.user)
 			if err != nil {
 				t.Fatalf("got err: %v", err)
 			}
@@ -878,7 +899,7 @@ func TestConnect(t *testing.T) {
 	}
 
 	// Test loadUserScore while here.
-	_, err := rig.mgr.loadUserScore(user.acctID)
+	_, err := rig.mgr.loadUserScoreContext(context.Background(), user.acctID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,12 +912,12 @@ func TestConnect(t *testing.T) {
 	tryConnectUser(t, user, false)
 
 	makerSwapCastIdx := 3
-	rig.storage.userMatchOutcomes = append(rig.storage.userMatchOutcomes[:makerSwapCastIdx], rig.storage.userMatchOutcomes[makerSwapCastIdx+1:]...)
+	rig.storage.reputationMatches = append(rig.storage.reputationMatches[:makerSwapCastIdx], rig.storage.reputationMatches[makerSwapCastIdx+1:]...)
 	wantScore -= noSwapAsTakerScore
 	if wantScore <= rig.mgr.penaltyThreshold {
 		t.Fatalf("test score of %v is not more than the penalty threshold of %v, revise the test", wantScore, rig.mgr.penaltyThreshold)
 	}
-	_, err = rig.mgr.loadUserScore(user.acctID)
+	_, err = rig.mgr.loadUserScoreContext(context.Background(), user.acctID)
 	if err != nil {
 		t.Fatal(err)
 	}
