@@ -87,6 +87,7 @@ type Storage interface {
 	MatchStatuses(aid account.AccountID, base, quote uint32, matchIDs []order.MatchID) ([]*db.MatchStatus, error)
 
 	ApplyBondPostedEvent(context.Context, *db.EventLogMeta, *meshevents.BondPostedEvent, int, int, int) (*db.BondPostedResult, error)
+	ApplyPrepaidBondsCreatedEvent(context.Context, *db.EventLogMeta, *meshevents.PrepaidBondsCreatedEvent) (*db.EventLogEntry, error)
 
 	db.ReputationArchiver
 }
@@ -1061,18 +1062,106 @@ func (auth *AuthManager) ForgiveMatchFail(user account.AccountID, mid order.Matc
 	return
 }
 
-// CreatePrepaidBonds generates pre-paid bonds.
+// CreatePrepaidBonds creates and stores n prepaid bond tokens with the given
+// strength and lifetime in seconds, and returns their coin IDs.
 func (auth *AuthManager) CreatePrepaidBonds(n int, strength uint32, durSecs int64) ([][]byte, error) {
-	coinIDs := make([][]byte, n)
-	const prepaidBondIDLength = 16
-	for i := 0; i < n; i++ {
-		coinIDs[i] = encode.RandomBytes(prepaidBondIDLength)
+	if n < 0 {
+		return nil, fmt.Errorf("pre-paid bond count cannot be negative")
 	}
-	lockTime := time.Now().Add(auth.bondExpiry).Add(time.Duration(durSecs) * time.Second)
-	if err := auth.storage.StorePrepaidBonds(coinIDs, strength, lockTime.Unix()); err != nil {
+	if n == 0 {
+		return [][]byte{}, nil
+	}
+	if auth.mesh == nil {
+		return nil, fmt.Errorf("mesh service not configured")
+	}
+
+	reqMsg, err := msgjson.NewRequest(comms.NextID(), commandKindCreatePrepaidBonds, &createPrepaidBondsRequest{
+		Count:        n,
+		Strength:     strength,
+		DurationSecs: durSecs,
+	})
+	if err != nil {
 		return nil, err
 	}
-	return coinIDs, nil
+
+	responses := make(chan *msgjson.Message, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), txWaitExpiration)
+	defer cancel()
+
+	if rpcErr := auth.mesh.ExecuteCommand(ctx, mesh.CommandRequest{
+		Kind: commandKindCreatePrepaidBonds,
+		Msg:  reqMsg,
+		Respond: func(resp *msgjson.Message) error {
+			select {
+			case responses <- resp:
+			default:
+			}
+			return nil
+		},
+	}); rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	select {
+	case resp := <-responses:
+		var result createPrepaidBondsResult
+		if err := resp.UnmarshalResult(&result); err != nil {
+			return nil, err
+		}
+		return result.CoinIDs, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type createPrepaidBondsRequest struct {
+	Count        int    `json:"n"`
+	Strength     uint32 `json:"strength"`
+	DurationSecs int64  `json:"durSecs"`
+}
+
+type createPrepaidBondsResult struct {
+	CoinIDs [][]byte `json:"coinIDs"`
+}
+
+func (auth *AuthManager) executeCreatePrepaidBonds(cmdCtx *mesh.CommandContext) *msgjson.Error {
+	var req createPrepaidBondsRequest
+	if err := cmdCtx.Request.Msg.Unmarshal(&req); err != nil {
+		return msgjson.NewError(msgjson.RPCParseError, "error parsing create prepaid bonds request: %v", err)
+	}
+	if req.Count < 0 {
+		return msgjson.NewError(msgjson.RPCArgumentsError, "pre-paid bond count cannot be negative")
+	}
+	if req.Count == 0 {
+		if err := cmdCtx.Completion.Complete(cmdCtx.Context, &createPrepaidBondsResult{CoinIDs: [][]byte{}}); err != nil {
+			return msgjson.NewError(msgjson.RPCInternalError, "failed to complete pre-paid bond creation")
+		}
+		return nil
+	}
+
+	lockTime := time.Now().Add(auth.bondExpiry).Add(time.Duration(req.DurationSecs) * time.Second).Unix()
+	coinIDs := make([][]byte, req.Count)
+	bonds := make([]*meshevents.PrepaidBond, req.Count)
+	for i := 0; i < req.Count; i++ {
+		coinIDs[i] = encode.RandomBytes(prepaidBondIDLength)
+		bonds[i] = &meshevents.PrepaidBond{
+			CoinID:   coinIDs[i],
+			Strength: req.Strength,
+			LockTime: lockTime,
+		}
+	}
+	event, err := mesh.NewEvent(&meshevents.PrepaidBondsCreatedEvent{Bonds: bonds})
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to encode pre-paid bond creation event")
+	}
+
+	if err = cmdCtx.Completion.Emit(cmdCtx.Context, event, func() any {
+		return &createPrepaidBondsResult{CoinIDs: coinIDs}
+	}); err != nil {
+		mesh.LogApplyFailure(log, err, "Failed to store pre-paid bonds: %v", err)
+		return mesh.ClientError(err, msgjson.RPCInternalError, "failed to store pre-paid bonds")
+	}
+	return nil
 }
 
 // TODO: a way to manipulate/forgive cancellation rate violation.
