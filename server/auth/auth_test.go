@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,7 +69,18 @@ type TStorage struct {
 	regAddr               string
 	regAsset              uint32
 	bonds                 []*db.Bond
+	repInputsListener     func(users ...account.AccountID)
 	ratio                 ratioData
+}
+
+func (s *TStorage) SetReputationInputsListener(listener func(users ...account.AccountID)) {
+	s.repInputsListener = listener
+}
+
+func (s *TStorage) notifyRepInputs(users ...account.AccountID) {
+	if s.repInputsListener != nil {
+		s.repInputsListener(users...)
+	}
 }
 
 func (s *TStorage) AccountInfo(account.AccountID) (*db.Account, error) {
@@ -253,14 +265,38 @@ func (s *TStorage) ForgiveUser(ctx context.Context, user account.AccountID) erro
 
 // TSigner satisfies the Signer interface
 type TSigner struct {
+	mtx sync.Mutex
 	sig *ecdsa.Signature
 	//privKey *secp256k1.PrivateKey
 	pubkey *secp256k1.PublicKey
 }
 
+// tDefaultSig is returned when a test has not supplied a signature.
+var tDefaultSig = func() *ecdsa.Signature {
+	priv, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		panic(err)
+	}
+	return ecdsa.Sign(priv, randBytes(32))
+}()
+
 // Maybe actually change this to an ecdsa.Sign with a private key instead?
-func (s *TSigner) Sign(hash []byte) *ecdsa.Signature { return s.sig }
-func (s *TSigner) PubKey() *secp256k1.PublicKey      { return s.pubkey }
+func (s *TSigner) Sign(hash []byte) *ecdsa.Signature {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.sig == nil {
+		return tDefaultSig
+	}
+	return s.sig
+}
+
+func (s *TSigner) setSig(sig *ecdsa.Signature) {
+	s.mtx.Lock()
+	s.sig = sig
+	s.mtx.Unlock()
+}
+
+func (s *TSigner) PubKey() *secp256k1.PublicKey { return s.pubkey }
 
 type tReq struct {
 	msg      *msgjson.Message
@@ -276,10 +312,12 @@ type TRPCClient struct {
 	sendRawErr error
 	requestErr error
 	banished   bool
-	sends      []*msgjson.Message
-	reqs       []*tReq
-	on         uint32
-	closed     chan struct{}
+	// mtx protects sends and reqs from concurrent reputation notifications.
+	mtx    sync.Mutex
+	sends  []*msgjson.Message
+	reqs   []*tReq
+	on     uint32
+	closed chan struct{}
 }
 
 func (c *TRPCClient) ID() uint64    { return c.id }
@@ -287,7 +325,9 @@ func (c *TRPCClient) IP() dex.IPKey { return c.ip }
 func (c *TRPCClient) Addr() string  { return c.addr }
 func (c *TRPCClient) Authorized()   {}
 func (c *TRPCClient) Send(msg *msgjson.Message) error {
+	c.mtx.Lock()
 	c.sends = append(c.sends, msg)
+	c.mtx.Unlock()
 	return c.sendErr
 }
 func (c *TRPCClient) SendRaw(b []byte) error {
@@ -298,16 +338,20 @@ func (c *TRPCClient) SendRaw(b []byte) error {
 	if err != nil {
 		return err
 	}
+	c.mtx.Lock()
 	c.sends = append(c.sends, msg)
+	c.mtx.Unlock()
 	return nil
 }
 func (c *TRPCClient) SendError(id uint64, msg *msgjson.Error) {
 }
 func (c *TRPCClient) Request(msg *msgjson.Message, f func(comms.Link, *msgjson.Message), _ time.Duration, _ func()) error {
+	c.mtx.Lock()
 	c.reqs = append(c.reqs, &tReq{
 		msg:      msg,
 		respFunc: f,
 	})
+	c.mtx.Unlock()
 	return c.requestErr
 }
 func (c *TRPCClient) RequestRaw(msgID uint64, rawMsg []byte, f func(comms.Link, *msgjson.Message), expireTime time.Duration, expire func()) error {
@@ -324,6 +368,8 @@ func (c *TRPCClient) Disconnect() {
 }
 func (c *TRPCClient) Banish() { c.banished = true }
 func (c *TRPCClient) getReq() *tReq {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if len(c.reqs) == 0 {
 		return nil
 	}
@@ -332,12 +378,19 @@ func (c *TRPCClient) getReq() *tReq {
 	return req
 }
 func (c *TRPCClient) getSend() *msgjson.Message {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
 	if len(c.sends) == 0 {
 		return nil
 	}
 	msg := c.sends[0]
 	c.sends = c.sends[1:]
 	return msg
+}
+func (c *TRPCClient) sendCount() int {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return len(c.sends)
 }
 
 func (c *TRPCClient) CustomID() string {
@@ -454,6 +507,17 @@ func newTestAuthManager(t *testing.T) (*AuthManager, *TStorage) {
 	})
 	authMgr.ctx = t.Context()
 	return authMgr, storage
+}
+
+type blockingAccountStorage struct {
+	*TStorage
+	started chan struct{}
+}
+
+func (s *blockingAccountStorage) Account(ctx context.Context, _ account.AccountID, _ time.Time) (*account.Account, []*db.Bond, error) {
+	close(s.started)
+	<-ctx.Done()
+	return nil, nil, ctx.Err()
 }
 
 func extractConnectResult(t *testing.T, msg *msgjson.Message) *msgjson.ConnectResult {
@@ -841,6 +905,33 @@ func TestAuthManager_loadUserScore(t *testing.T) {
 	}
 }
 
+func TestRepCacheStorageListener(t *testing.T) {
+	authMgr, storage := newTestAuthManager(t)
+	if storage.repInputsListener == nil {
+		t.Fatal("NewAuthManager did not register a reputation-inputs listener with storage")
+	}
+
+	user := testAcctID(0xbb)
+	ctx := context.Background()
+	var calls int32
+	for i := 0; i < 2; i++ {
+		if _, err := authMgr.rep.get(ctx, user, fixedRepFetcher(5, &calls)); err != nil {
+			t.Fatalf("rep.get error: %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("fetches before notification = %d, want 1 (second get cached)", calls)
+	}
+
+	storage.notifyRepInputs(user)
+	if _, err := authMgr.rep.get(ctx, user, fixedRepFetcher(5, &calls)); err != nil {
+		t.Fatalf("rep.get after notification error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fetches after notification = %d, want 2 (entry invalidated)", calls)
+	}
+}
+
 func TestLoadUserReputationAccountError(t *testing.T) {
 	authMgr, storage := newTestAuthManager(t)
 	user := testAcctID(5)
@@ -868,6 +959,29 @@ func TestLoadUserReputationAccountError(t *testing.T) {
 	}
 	if rep.BondExpiryThreshold < before || rep.BondExpiryThreshold > after {
 		t.Fatalf("bond expiry threshold = %d, want between %d and %d", rep.BondExpiryThreshold, before, after)
+	}
+}
+
+func TestLoadUserReputationCancellation(t *testing.T) {
+	auth, storage := newTestAuthManager(t)
+	blocking := &blockingAccountStorage{TStorage: storage, started: make(chan struct{})}
+	auth.storage = blocking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := auth.loadUserReputationWithTimeout(ctx, testAcctID(1))
+		done <- err
+	}()
+	<-blocking.started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("reputation error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("account read did not stop after cancellation")
 	}
 }
 
@@ -949,9 +1063,52 @@ func TestAcctRepStatus(t *testing.T) {
 	}
 }
 
+func TestReputationInputsNotify(t *testing.T) {
+	authMgr, storage := newTestAuthManager(t)
+	user := tNewUser(t)
+	storage.acct = &account.Account{ID: user.acctID, PubKey: user.privKey.PubKey()}
+	storage.setBondTier(1)
+	storage.reputationMatches = []*db.MatchResult{{
+		DBID: 1, MatchID: randomMatchID(), MatchOutcome: db.OutcomeSwapSuccess,
+	}}
+	authMgr.signer.(*TSigner).setSig(user.randomSignature())
+	authMgr.connMtx.Lock()
+	authMgr.users[user.acctID] = &clientInfo{
+		acct: &account.Account{ID: user.acctID},
+		conn: user.conn,
+	}
+	authMgr.connMtx.Unlock()
+
+	storage.notifyRepInputs(user.acctID)
+	var msg *msgjson.Message
+	deadline := time.Now().Add(time.Second)
+	for msg == nil && time.Now().Before(deadline) {
+		msg = user.conn.getSend()
+		if msg == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if msg == nil {
+		t.Fatal("no score_changed notification")
+	}
+	if msg.Route != msgjson.ScoreChangeRoute {
+		t.Fatalf("route = %s, want %s", msg.Route, msgjson.ScoreChangeRoute)
+	}
+	note := new(msgjson.ScoreChangedNotification)
+	if err := msg.Unmarshal(note); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if note.Reputation.Score != 1 {
+		t.Fatalf("score = %d, want 1", note.Reputation.Score)
+	}
+	if note.Reputation.BondExpiryThreshold == 0 {
+		t.Fatal("missing bond expiry threshold")
+	}
+}
+
 func TestConnect(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 
 	// Before connecting, put an activeOrder and activeMatch in storage.
 	matchData, userMatch := userMatchData(user.acctID)
@@ -1212,7 +1369,7 @@ func TestConnect(t *testing.T) {
 
 func TestAccountErrors(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connect := queueUser(t, user)
 
 	// Put a match in storage
@@ -1303,7 +1460,7 @@ func TestAccountErrors(t *testing.T) {
 
 func TestRoute(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 
 	var translated account.AccountID
@@ -1338,7 +1495,7 @@ func TestRoute(t *testing.T) {
 
 func TestAuth(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 
 	msgBytes := randBytes(50)
@@ -1365,7 +1522,7 @@ func TestAuth(t *testing.T) {
 func TestSign(t *testing.T) {
 	sig1 := tNewUser(t).randomSignature()
 	sig1Bytes := sig1.Serialize()
-	rig.signer.sig = sig1
+	rig.signer.setSig(sig1)
 	s := &tSignable{b: randBytes(25)}
 	rig.mgr.Sign(s)
 	if !bytes.Equal(sig1Bytes, s.SigBytes()) {
@@ -1445,7 +1602,7 @@ func TestSend(t *testing.T) {
 func TestConnectErrors(t *testing.T) {
 	user := tNewUser(t)
 	rig.storage.acct = nil
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 
 	ensureErr := makeEnsureErr(t)
 
@@ -1524,7 +1681,7 @@ func TestConnectErrors(t *testing.T) {
 
 func TestHandleResponse(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 	foreigner := tNewUser(t)
 	unknownResponse, err := msgjson.NewResponse(comms.NextID(), 10, nil)
@@ -1679,7 +1836,7 @@ func TestAuthManager_RecordCancel_RecordCompletedOrder(t *testing.T) {
 
 func TestMatchStatus(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 
 	rig.storage.matchStatuses = []*db.MatchStatus{{
@@ -1750,7 +1907,7 @@ func TestMatchStatus(t *testing.T) {
 
 func TestOrderStatus(t *testing.T) {
 	user := tNewUser(t)
-	rig.signer.sig = user.randomSignature()
+	rig.signer.setSig(user.randomSignature())
 	connectUser(t, user)
 
 	rig.storage.orderStatuses = []*db.OrderStatus{{}}

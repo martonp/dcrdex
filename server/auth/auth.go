@@ -50,6 +50,8 @@ var (
 	ErrUserNotConnected = dex.ErrorKind("user not connected")
 )
 
+const reputationEventRefreshTimeout = 5 * time.Second
+
 func unixMsNow() time.Time {
 	return time.Now().Truncate(time.Millisecond).UTC()
 }
@@ -270,6 +272,9 @@ type AuthManager struct {
 	conns     map[uint64]*clientInfo
 	unbookers map[account.AccountID]*time.Timer
 
+	// repNotifyMtx serializes reputation updates sent to clients.
+	repNotifyMtx sync.Mutex
+
 	violationMtx   sync.Mutex
 	matchOutcomes  map[account.AccountID]*latestOutcomes[*db.MatchResult]
 	preimgOutcomes map[account.AccountID]*latestOutcomes[*db.PreimageOutcome]
@@ -409,6 +414,15 @@ func NewAuthManager(cfg *Config) *AuthManager {
 		orderOutcomes:    make(map[account.AccountID]*latestOutcomes[*db.OrderOutcome]),
 		txDataSources:    cfg.TxDataSources,
 	}
+
+	cfg.Storage.SetReputationInputsListener(func(users ...account.AccountID) {
+		if len(users) == 0 {
+			return
+		}
+		auth.rep.invalidate(users...)
+		notifyUsers := append([]account.AccountID(nil), users...)
+		go auth.notifyReputationInputsChanged(notifyUsers)
+	})
 
 	// Unauthenticated
 	cfg.Route(msgjson.ConnectRoute, auth.handleConnect)
@@ -667,6 +681,14 @@ func (auth *AuthManager) Send(user account.AccountID, msg *msgjson.Message) erro
 	return err
 }
 
+// SendIfLocal sends only to a locally connected user.
+func (auth *AuthManager) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
+	if auth.user(user) == nil {
+		return nil
+	}
+	return auth.Send(user, msg)
+}
+
 // Notify sends a message to a client. The message should be a notification.
 // See msgjson.NewNotification.
 func (auth *AuthManager) Notify(acctID account.AccountID, msg *msgjson.Message) {
@@ -837,6 +859,15 @@ func (auth *AuthManager) loadUserReputation(ctx context.Context, user account.Ac
 	}
 	bondExpiryThreshold := time.Now().Add(auth.bondExpiry).Unix()
 	return auth.reputationFromData(data, bondExpiryThreshold), nil
+}
+
+func (auth *AuthManager) loadUserReputationWithTimeout(ctx context.Context, user account.AccountID) (*account.Reputation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	readCtx, cancel := context.WithTimeout(ctx, reputationEventRefreshTimeout)
+	defer cancel()
+	return auth.loadUserReputation(readCtx, user)
 }
 
 // loadUserRepData loads a user's score and bonds.
@@ -1200,6 +1231,30 @@ func (auth *AuthManager) conn(conn comms.Link) *clientInfo {
 	return auth.conns[conn.ID()]
 }
 
+// notifyReputationInputsChanged loads and sends reputation to locally
+// connected users, even if their score and tier have not changed.
+//
+// TODO(mesh): Avoid sending notifications when only reputation inputs,
+// rather than the user's score or tier, have changed.
+func (auth *AuthManager) notifyReputationInputsChanged(users []account.AccountID) {
+	auth.repNotifyMtx.Lock()
+	defer auth.repNotifyMtx.Unlock()
+	for _, user := range users {
+		if auth.user(user) == nil {
+			continue
+		}
+		rep, err := auth.loadUserReputationWithTimeout(context.Background(), user)
+		if err != nil {
+			log.Errorf("failed to load reputation after inputs change for account %v: %v", user, err)
+			continue
+		}
+		if rep == nil {
+			continue
+		}
+		auth.sendScoreChanged(user, rep)
+	}
+}
+
 // sendTierChanged sends a tierchanged notification to an account.
 func (auth *AuthManager) sendTierChanged(acctID account.AccountID, rep *account.Reputation, reason string) {
 	effectiveTier := rep.EffectiveTier()
@@ -1230,10 +1285,10 @@ func (auth *AuthManager) sendScoreChanged(acctID account.AccountID, rep *account
 	auth.Sign(note)
 	resp, err := msgjson.NewNotification(msgjson.ScoreChangeRoute, note)
 	if err != nil {
-		log.Error("TierChangeRoute encoding error: %v", err)
+		log.Errorf("ScoreChangeRoute encoding error: %v", err)
 		return
 	}
-	if err = auth.Send(acctID, resp); err != nil {
+	if err = auth.SendIfLocal(acctID, resp); err != nil {
 		log.Warnf("Error sending score changed notification to account %v: %v", acctID, err)
 		// The user will need to 'connect' to see their current tier and bonds.
 	}
