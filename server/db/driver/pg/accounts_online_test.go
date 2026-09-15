@@ -5,6 +5,8 @@ package pg
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -82,6 +84,48 @@ func tBondPostedTip(t *testing.T, prevTip []byte, seq uint64, event []byte, acct
 		t.Fatalf("newEventLogAppend error: %v", err)
 	}
 	return eventLogHash(prevTip, seq, req.entry.Kind, req.entry.Event, req.entry.TxData)
+}
+
+func tPrepaidBondsCreatedTip(t *testing.T, prevTip []byte, seq uint64, event []byte, created *meshevents.PrepaidBondsCreatedEvent) []byte {
+	t.Helper()
+
+	txData, err := created.EventTxData()
+	if err != nil {
+		t.Fatalf("EventTxData error: %v", err)
+	}
+	req, err := newEventLogAppend(&db.EventLogMeta{Seq: seq, Event: event}, meshevents.EventKindPrepaidBondsCreated, txData)
+	if err != nil {
+		t.Fatalf("newEventLogAppend error: %v", err)
+	}
+	return eventLogHash(prevTip, seq, req.entry.Kind, req.entry.Event, req.entry.TxData)
+}
+
+func tApplyPrepaidBondsCreated(t *testing.T, ctx context.Context, event []byte, bonds ...*meshevents.PrepaidBond) *db.EventLogEntry {
+	t.Helper()
+
+	created := &meshevents.PrepaidBondsCreatedEvent{Bonds: bonds}
+	tip := tPrepaidBondsCreatedTip(t, nil, 1, event, created)
+	logEntry, err := archie.ApplyPrepaidBondsCreatedEvent(ctx, &db.EventLogMeta{Event: event}, created)
+	if err != nil {
+		t.Fatalf("ApplyPrepaidBondsCreatedEvent error: %v", err)
+	}
+	if logEntry.Seq != 1 || logEntry.Kind != meshevents.EventKindPrepaidBondsCreated || !bytes.Equal(logEntry.TipHash, tip) {
+		t.Fatalf("prepaid created log = %+v, want seq 1 kind %q tip %x",
+			logEntry, meshevents.EventKindPrepaidBondsCreated, tip)
+	}
+	return logEntry
+}
+
+func requireEventFrontier(t *testing.T, ctx context.Context, seq uint64, tip []byte) {
+	t.Helper()
+
+	frontier, err := archie.EventLogFrontier(ctx)
+	if err != nil {
+		t.Fatalf("EventLogFrontier error: %v", err)
+	}
+	if frontier.Seq != seq || !bytes.Equal(frontier.TipHash, tip) {
+		t.Fatalf("frontier = (%d, %x), want (%d, %x)", frontier.Seq, frontier.TipHash, seq, tip)
+	}
 }
 
 func TestApplyBondPostedEvent(t *testing.T) {
@@ -229,4 +273,201 @@ func TestApplyBondPostedEvent(t *testing.T) {
 		t.Fatalf("frontier = (%d, %x), want (2, %x)", frontier.Seq, frontier.TipHash, duplicateRes.Log.TipHash)
 	}
 	requireRepListenerCall(t, *calls, 2, acct.ID) // rejected apply: no notify
+}
+
+func TestApplyPrepaidBondsCreatedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	created := &meshevents.PrepaidBondsCreatedEvent{
+		Bonds: []*meshevents.PrepaidBond{
+			{
+				CoinID:   []byte("prepaid-create-one"),
+				Strength: 2,
+				LockTime: time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			},
+			{
+				CoinID:   []byte("prepaid-create-two"),
+				Strength: 4,
+				LockTime: time.Date(2100, 2, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			},
+		},
+	}
+	event := []byte("prepaid-bonds-created-event")
+	tip := tPrepaidBondsCreatedTip(t, nil, 1, event, created)
+
+	logEntry, err := archie.ApplyPrepaidBondsCreatedEvent(ctx, &db.EventLogMeta{Event: event}, created)
+	if err != nil {
+		t.Fatalf("ApplyPrepaidBondsCreatedEvent error: %v", err)
+	}
+	if logEntry.Seq != 1 || logEntry.Kind != meshevents.EventKindPrepaidBondsCreated ||
+		!bytes.Equal(logEntry.Event, event) || !bytes.Equal(logEntry.TipHash, tip) {
+		t.Fatalf("log entry = %+v, want seq 1 kind %q event %q tip %x",
+			logEntry, meshevents.EventKindPrepaidBondsCreated, event, tip)
+	}
+	wantTxData, err := created.EventTxData()
+	if err != nil {
+		t.Fatalf("EventTxData error: %v", err)
+	}
+	if !bytes.Equal(logEntry.TxData, wantTxData) {
+		t.Fatalf("tx data = %x, want %x", logEntry.TxData, wantTxData)
+	}
+	for _, bond := range created.Bonds {
+		strength, lockTime, err := archie.FetchPrepaidBond(bond.CoinID)
+		if err != nil {
+			t.Fatalf("FetchPrepaidBond %x error: %v", bond.CoinID, err)
+		}
+		if strength != bond.Strength || lockTime != bond.LockTime {
+			t.Fatalf("stored prepaid bond %x = (%d, %d), want (%d, %d)",
+				bond.CoinID, strength, lockTime, bond.Strength, bond.LockTime)
+		}
+	}
+}
+
+func TestApplyBondPostedEventPrepaid(t *testing.T) {
+	t.Run("redeem and retry", func(t *testing.T) {
+		if err := cleanTables(archie.db); err != nil {
+			t.Fatalf("cleanTables: %v", err)
+		}
+
+		ctx := context.Background()
+		acct := tNewAccount(t)
+		coinID := []byte("prepaid-posted-coin")
+		bond := &db.Bond{
+			Version:  0,
+			AssetID:  account.PrepaidBondID,
+			CoinID:   coinID,
+			Amount:   0,
+			Strength: 3,
+			LockTime: time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+		}
+		createdLog := tApplyPrepaidBondsCreated(t, ctx, []byte("prepaid-created-for-posted-event"), &meshevents.PrepaidBond{
+			CoinID:   coinID,
+			Strength: bond.Strength,
+			LockTime: bond.LockTime,
+		})
+
+		event := []byte("prepaid-bond-posted-event")
+		tip := tBondPostedTip(t, createdLog.TipHash, 2, event, acct, bond)
+		res, err := archie.ApplyBondPostedEvent(ctx, &db.EventLogMeta{
+			Seq:             2,
+			Event:           event,
+			ExpectedTipHash: tip,
+		}, tBondPostedEvent(acct, bond), 10, 10, 10)
+		if err != nil {
+			t.Fatalf("ApplyBondPostedEvent prepaid error: %v", err)
+		}
+		if res == nil || res.Log == nil || !res.BondAdded {
+			t.Fatalf("prepaid apply result = %+v, want added log", res)
+		}
+		if res.Log.Seq != 2 || res.Log.Kind != meshevents.EventKindBondPosted || !bytes.Equal(res.Log.TipHash, tip) {
+			t.Fatalf("prepaid apply log = %+v, want seq 2 kind %q tip %x", res.Log, meshevents.EventKindBondPosted, tip)
+		}
+		storedAcct, bonds, err := archie.Account(ctx, acct.ID, time.Unix(bond.LockTime-1, 0))
+		if err != nil {
+			t.Fatalf("Account error: %v", err)
+		}
+		if storedAcct == nil || len(bonds) != 1 {
+			t.Fatalf("stored prepaid account %v bonds %v, want one bond", storedAcct, bonds)
+		}
+		tAssertBond(t, bonds[0], bond)
+		if _, _, err := archie.FetchPrepaidBond(coinID); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("consumed pre-paid bond lookup error = %v, want sql.ErrNoRows", err)
+		}
+
+		duplicateEvent := []byte("prepaid-bond-posted-duplicate")
+		duplicateTip := tBondPostedTip(t, res.Log.TipHash, 3, duplicateEvent, acct, bond)
+		duplicateRes, err := archie.ApplyBondPostedEvent(ctx, &db.EventLogMeta{
+			Seq:             3,
+			Event:           duplicateEvent,
+			ExpectedTipHash: duplicateTip,
+		}, tBondPostedEvent(acct, bond), 10, 10, 10)
+		if err != nil {
+			t.Fatalf("duplicate prepaid ApplyBondPostedEvent error: %v", err)
+		}
+		if duplicateRes.BondAdded {
+			t.Fatalf("duplicate prepaid BondAdded = true, want false")
+		}
+		requireEventFrontier(t, ctx, 3, duplicateRes.Log.TipHash)
+	})
+
+	tests := []struct {
+		name                  string
+		missingToken          bool
+		strengthDelta         uint32
+		lockTimeDelta         int64
+		reputationReadFailure bool
+	}{
+		{name: "missing token", missingToken: true},
+		{name: "strength mismatch", strengthDelta: 1},
+		{name: "lock time mismatch", lockTimeDelta: 86400},
+		{name: "reputation read fails", reputationReadFailure: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+
+			ctx := context.Background()
+			acct := tNewAccount(t)
+			bond := &db.Bond{
+				AssetID:  account.PrepaidBondID,
+				CoinID:   []byte("prepaid-rejected-coin"),
+				Strength: 3,
+				LockTime: time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC).Unix(),
+			}
+			token := &meshevents.PrepaidBond{
+				CoinID:   bond.CoinID,
+				Strength: bond.Strength + tt.strengthDelta,
+				LockTime: bond.LockTime + tt.lockTimeDelta,
+			}
+			var priorLog *db.EventLogEntry
+			if !tt.missingToken {
+				priorLog = tApplyPrepaidBondsCreated(t, ctx, []byte("prepaid-created-"+tt.name), token)
+			}
+
+			if tt.reputationReadFailure {
+				// Fail the read after the account, bond, and token changes have been made.
+				stmt, err := archie.db.Prepare("SELECT $1::bytea")
+				if err != nil {
+					t.Fatal(err)
+				}
+				stmt.Close()
+				original := archie.queries.selectPoints
+				archie.queries.selectPoints = stmt
+				t.Cleanup(func() { archie.queries.selectPoints = original })
+			}
+
+			_, err := archie.ApplyBondPostedEvent(ctx, &db.EventLogMeta{Event: []byte(tt.name)}, tBondPostedEvent(acct, bond), 10, 10, 10)
+			if err == nil {
+				t.Fatalf("ApplyBondPostedEvent %s succeeded", tt.name)
+			}
+			if priorLog == nil {
+				requireEventFrontier(t, ctx, 0, nil)
+			} else {
+				requireEventFrontier(t, ctx, priorLog.Seq, priorLog.TipHash)
+			}
+
+			storedAcct, bonds, err := archie.Account(ctx, acct.ID, time.Unix(bond.LockTime-1, 0))
+			if err != nil {
+				t.Fatalf("Account error: %v", err)
+			}
+			if storedAcct != nil || len(bonds) != 0 {
+				t.Fatalf("rejected prepaid apply stored account %v bonds %v", storedAcct, bonds)
+			}
+			if !tt.missingToken {
+				strength, lockTime, err := archie.FetchPrepaidBond(token.CoinID)
+				if err != nil {
+					t.Fatalf("rejected prepaid apply consumed token: %v", err)
+				}
+				if strength != token.Strength || lockTime != token.LockTime {
+					t.Fatalf("stored token after rejection = (%d, %d), want (%d, %d)",
+						strength, lockTime, token.Strength, token.LockTime)
+				}
+			}
+		})
+	}
 }

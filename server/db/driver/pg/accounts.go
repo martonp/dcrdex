@@ -135,6 +135,27 @@ func (a *Archiver) ApplyBondPostedEvent(ctx context.Context, meta *db.EventLogMe
 	return result, nil
 }
 
+// ApplyPrepaidBondsCreatedEvent stores the prepaid bond tokens and the
+// prepaid_bonds_created event log entry in one transaction.
+func (a *Archiver) ApplyPrepaidBondsCreatedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.PrepaidBondsCreatedEvent) (*db.EventLogEntry, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyEventTx(ctx, meta, meshevents.EventKindPrepaidBondsCreated, txData, func(dbTx *sql.Tx) error {
+		for _, bond := range event.Bonds {
+			if err := insertPrepaidBond(dbTx, a.tables.prepaidBonds, bond); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // AccountInfo returns data for an account.
 func (a *Archiver) AccountInfo(aid account.AccountID) (*db.Account, error) {
 	// bondExpiry time.Time and bonds return needed?
@@ -347,5 +368,11 @@ func getPrepaidBond(dbe sqlQueryer, tableName string, coinID []byte) (strength u
 func deletePrepaidBond(dbe sqlExecutor, tableName string, coinID []byte) error {
 	stmt := fmt.Sprintf(internal.DeletePrepaidBond, tableName)
 	_, err := dbe.Exec(stmt, coinID)
+	return err
+}
+
+func insertPrepaidBond(dbe sqlExecutor, tableName string, bond *meshevents.PrepaidBond) error {
+	stmt := fmt.Sprintf(internal.InsertPrepaidBond, tableName)
+	_, err := dbe.Exec(stmt, bond.CoinID, bond.Strength, bond.LockTime)
 	return err
 }
