@@ -379,6 +379,15 @@ type MarketMatchID struct {
 	Base, Quote uint32 // market
 }
 
+// ReputationForgivenResult contains the result of applying a reputation_forgiven event.
+type ReputationForgivenResult struct {
+	// Forgiven reports whether user forgiveness deleted any outcomes or match
+	// forgiveness updated an inactive match. An already-forgiven inactive
+	// match also reports true.
+	Forgiven bool
+	Log      *EventLogEntry
+}
+
 const EventLogTipHashSize = sha256.Size
 
 // EventLogMeta specifies how to record a database update in the event log.

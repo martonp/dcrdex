@@ -13,6 +13,7 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 const newReputationVersion int16 = 1
@@ -96,6 +97,91 @@ func (a *Archiver) insertPoints(
 	var oid order.OrderID // need a sql.Scanner
 	copy(oid[:], link[:])
 	return dbID, a.queries.insertPoints.QueryRowContext(ctx, user, oid, outcomeClass, outcome).Scan(&dbID)
+}
+
+// applyUserForgivenessTx deletes the account's non-success outcomes.
+// It reports whether any rows were deleted.
+func (a *Archiver) applyUserForgivenessTx(ctx context.Context, tx *sql.Tx, accountID account.AccountID) (forgiven bool, err error) {
+	stmt := fmt.Sprintf(internal.ForgiveUser, a.tables.points)
+	res, err := tx.ExecContext(ctx, stmt, accountID, db.OutcomeSwapSuccess, db.OutcomePreimageSuccess, db.OutcomeOrderComplete)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// applyMatchForgivenessTx marks an inactive match as forgiven and deletes
+// the account's failure outcomes for that match. It reports whether a match
+// row was updated, including a match that was already forgiven.
+func (a *Archiver) applyMatchForgivenessTx(ctx context.Context, tx *sql.Tx, accountID account.AccountID, matchID order.MatchID) (forgiven bool, err error) {
+	for schema := range a.markets {
+		stmt := fmt.Sprintf(internal.ForgiveMatchFail, fullMatchesTableName(a.dbName, schema))
+		res, err := tx.ExecContext(ctx, stmt, matchID)
+		if err != nil {
+			return false, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if n > 0 { // at most one market has the match, matchid is the primary key
+			forgiven = true
+			break
+		}
+	}
+	if !forgiven {
+		return false, nil
+	}
+
+	stmt := fmt.Sprintf(internal.ForgiveMatchFailures, a.tables.points)
+	var link order.OrderID // need a sql driver Valuer
+	copy(link[:], matchID[:])
+	if _, err := tx.ExecContext(ctx, stmt, accountID, link, db.OutcomeClassMatch, db.OutcomeSwapSuccess); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ApplyReputationForgivenEvent removes penalty outcomes for an account or a
+// specific match, marking the match forgiven when applicable. It commits these
+// changes together with the event log entry.
+func (a *Archiver) ApplyReputationForgivenEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.ReputationForgivenEvent) (*db.ReputationForgivenResult, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	accountID := event.AccountID
+	matchID := event.Match()
+
+	var forgiven bool
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindReputationForgiven, txData, func(tx *sql.Tx) error {
+		var err error
+		switch event.Scope {
+		case meshevents.ReputationForgivenessScopeUser:
+			forgiven, err = a.applyUserForgivenessTx(ctx, tx, accountID)
+		case meshevents.ReputationForgivenessScopeMatch:
+			forgiven, err = a.applyMatchForgivenessTx(ctx, tx, accountID, matchID)
+		default:
+			err = fmt.Errorf("invalid reputation forgiveness scope %d", event.Scope)
+		}
+		return err
+	})
+	a.notifyRepInputsOnCommit(err, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &db.ReputationForgivenResult{
+		Forgiven: forgiven,
+		Log:      logEntry,
+	}, nil
 }
 
 func (a *Archiver) AddPreimageOutcome(ctx context.Context, user account.AccountID, oid order.OrderID, miss bool) (*db.PreimageOutcome, error) {
