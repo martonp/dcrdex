@@ -25,7 +25,20 @@ func decodeEvent[T any, PT interface {
 }
 
 const (
-	EventKindBondPosted          = "bond_posted"
-	EventKindPrepaidBondsCreated = "prepaid_bonds_created"
-	EventKindReputationForgiven  = "reputation_forgiven"
+	EventKindBondPosted             = "bond_posted"
+	EventKindPrepaidBondsCreated    = "prepaid_bonds_created"
+	EventKindOrderAccepted          = "order_accepted"
+	EventKindMarketStarted          = "market_started"
+	EventKindMarketLifecycle        = "market_lifecycle"
+	EventKindAdvanceEpoch           = "advance_epoch"
+	EventKindEpochProcessed         = "epoch_processed"
+	EventKindSuspendedCancel        = "suspended_cancel"
+	EventKindMatchAcksRecorded      = "match_acks_recorded"
+	EventKindSwapContractRecorded   = "swap_contract_recorded"
+	EventKindAuditAckRecorded       = "audit_ack_recorded"
+	EventKindSwapRedemptionRecorded = "swap_redemption_recorded"
+	EventKindRedemptionAckRecorded  = "redemption_ack_recorded"
+	EventKindMatchFailed            = "match_failed"
+	EventKindOrdersRevoked          = "orders_revoked"
+	EventKindReputationForgiven     = "reputation_forgiven"
 )
