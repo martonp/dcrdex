@@ -256,6 +256,148 @@ func (a *Archiver) ApplyOrderAcceptedEvent(ctx context.Context, meta *db.EventLo
 	})
 }
 
+// ApplySuspendedCancelEvent records an executed cancel, marks its booked
+// target as canceled, and stores the cancellation match.
+func (a *Archiver) ApplySuspendedCancelEvent(ctx context.Context, meta *db.EventLogMeta, update *db.SuspendedCancelUpdate) (*db.SuspendedCancelApplyResult, error) {
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	if err := a.validateLifecycleMarket(update.Market, update.Base, update.Quote); err != nil {
+		return nil, err
+	}
+	result := &db.SuspendedCancelApplyResult{Cancel: update.Cancel}
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindSuspendedCancel, txData, func(tx *sql.Tx) error {
+		target, match, err := a.applySuspendedCancelTx(ctx, tx, update)
+		if err != nil {
+			return err
+		}
+		result.TargetOrder = target
+		result.Match = match
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Log = logEntry
+	return result, nil
+}
+
+// applySuspendedCancelTx cancels a booked order in a suspended market and records
+// the executed cancel and match. It returns the stored target and derived match.
+func (a *Archiver) applySuspendedCancelTx(ctx context.Context, tx *sql.Tx, update *db.SuspendedCancelUpdate) (*order.LimitOrder, *order.Match, error) {
+	lifecycle, err := a.marketLifecycleForUpdate(tx, update.Market)
+	if err != nil {
+		return nil, nil, err
+	}
+	if lifecycle == nil || lifecycle.State != db.MarketStateSuspended {
+		return nil, nil, fmt.Errorf("suspended_cancel requires suspended lifecycle for market %s", update.Market)
+	}
+	if update.Cancel.Base() != update.Base || update.Cancel.Quote() != update.Quote {
+		return nil, nil, fmt.Errorf("suspended_cancel market mismatch")
+	}
+	if update.Cancel.TargetOrderID != update.TargetOrderID {
+		return nil, nil, fmt.Errorf("suspended_cancel target mismatch")
+	}
+	if update.Cancel.AccountID != update.TargetAccount {
+		return nil, nil, fmt.Errorf("suspended_cancel account mismatch")
+	}
+	marketSchema, err := a.marketSchema(update.Base, update.Quote)
+	if err != nil {
+		return nil, nil, err
+	}
+	tableName := fullOrderTableName(a.dbName, marketSchema, orderStatusBooked.active())
+	ord, status, err := loadTradeFromTable(ctx, tx, tableName, update.TargetOrderID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if status != orderStatusBooked {
+		return nil, nil, fmt.Errorf("order %v has status %v, want booked", update.TargetOrderID, status)
+	}
+	target, ok := ord.(*order.LimitOrder)
+	if !ok || target.Force != order.StandingTiF {
+		return nil, nil, fmt.Errorf("order %v is not a booked standing limit order", update.TargetOrderID)
+	}
+	target.BaseAsset = update.Base
+	target.QuoteAsset = update.Quote
+	if target.AccountID != update.TargetAccount || target.Sell != update.TargetSell {
+		return nil, nil, fmt.Errorf("suspended_cancel target order mismatch")
+	}
+	// Derive the match from the stored target to check the supplied match
+	// against its current remaining quantity.
+	expectedMatch := newSuspendedCancelMatch(update.Cancel, target, update.EpochIdx, update.EpochDur,
+		update.FeeRateBase, update.FeeRateQuote)
+	if err := validateSuspendedCancelMatch(update.Match, expectedMatch); err != nil {
+		return nil, nil, err
+	}
+	if found, oid, err := a.orderWithCommit(ctx, tx, update.Cancel.Commitment()); err != nil {
+		return nil, nil, err
+	} else if found {
+		return nil, nil, fmt.Errorf("suspended_cancel order %v reuses commitment from %v", update.Cancel.ID(), oid)
+	}
+	cancelTable := fullCancelOrderTableName(a.dbName, marketSchema, orderStatusExecuted.active())
+	n, err := storeCancelOrder(tx, cancelTable, update.Cancel, orderStatusExecuted, update.EpochIdx, update.EpochDur, db.EpochGapNA)
+	if err != nil {
+		return nil, nil, err
+	}
+	if n != 1 {
+		return nil, nil, fmt.Errorf("stored suspended cancel rows = %d, want 1", n)
+	}
+	if err := a.updateOrderStatus(tx, target, orderStatusCanceled); err != nil {
+		return nil, nil, err
+	}
+	matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
+	n, err = upsertMatch(tx, matchesTableName, expectedMatch)
+	if err != nil {
+		return nil, nil, err
+	}
+	if n != 1 {
+		return nil, nil, fmt.Errorf("upsertMatch: updated %d rows, expected 1", n)
+	}
+	return target, expectedMatch, nil
+}
+
+func newSuspendedCancelMatch(cancel *order.CancelOrder, target *order.LimitOrder, epochIdx, epochDur int64, feeRateBase, feeRateQuote uint64) *order.Match {
+	return &order.Match{
+		Taker:        cancel,
+		Maker:        target,
+		Quantity:     target.Remaining(),
+		Rate:         target.Rate,
+		Epoch:        order.EpochID{Idx: uint64(epochIdx), Dur: uint64(epochDur)},
+		FeeRateBase:  feeRateBase,
+		FeeRateQuote: feeRateQuote,
+		Status:       order.MatchComplete,
+	}
+}
+
+func validateSuspendedCancelMatch(supplied, expected *order.Match) error {
+	if supplied == nil {
+		return fmt.Errorf("nil suspended cancel match")
+	}
+	if supplied.Taker == nil || supplied.Maker == nil {
+		return fmt.Errorf("nil suspended cancel match order")
+	}
+	if supplied.ID() != expected.ID() {
+		return fmt.Errorf("suspended_cancel match ID mismatch")
+	}
+	if supplied.Taker.ID() != expected.Taker.ID() || supplied.Maker.ID() != expected.Maker.ID() {
+		return fmt.Errorf("suspended_cancel match order mismatch")
+	}
+	if supplied.Quantity != expected.Quantity || supplied.Rate != expected.Rate {
+		return fmt.Errorf("suspended_cancel match quantity/rate mismatch")
+	}
+	if supplied.Epoch != expected.Epoch {
+		return fmt.Errorf("suspended_cancel match epoch mismatch")
+	}
+	if supplied.FeeRateBase != expected.FeeRateBase || supplied.FeeRateQuote != expected.FeeRateQuote {
+		return fmt.Errorf("suspended_cancel match fee-rate mismatch")
+	}
+	if supplied.Status != order.MatchComplete {
+		return fmt.Errorf("suspended_cancel match status %d, want %d", supplied.Status, order.MatchComplete)
+	}
+	return nil
+}
+
 // ApplyAdvanceEpochEvent advances the market's active epoch, or enters
 // the draining state when its final epoch closes.
 func (a *Archiver) ApplyAdvanceEpochEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
@@ -1572,7 +1714,7 @@ func loadTrade(ctx context.Context, dbe *sql.DB, dbName, marketSchema string, oi
 }
 
 // loadTradeFromTable does NOT set BaseAsset and QuoteAsset!
-func loadTradeFromTable(ctx context.Context, dbe *sql.DB, fullTable string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
+func loadTradeFromTable(ctx context.Context, dbe sqlQueryer, fullTable string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
 	stmt := fmt.Sprintf(internal.SelectOrder, fullTable)
 
 	var prefix order.Prefix
