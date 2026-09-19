@@ -1017,7 +1017,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	marketTunnels := make(map[string]market.MarketTunnel, len(cfg.Markets))
 	pendingAccounters := make(map[string]market.PendingAccounter, len(cfg.Markets))
 
-	dexBalancer, err := market.NewDEXBalancer(pendingAccounters, backedAssets, swapper)
+	dexBalancer, err := market.NewDEXBalancer(backedAssets, swapper)
 	if err != nil {
 		return nil, fmt.Errorf("NewDEXBalancer error: %w", err)
 	}
@@ -1069,6 +1069,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			return nil, fmt.Errorf("DataSource.AddMarketSource: %w", err)
 		}
 	}
+
+	dexBalancer.SetMarkets(pendingAccounters)
 
 	// Start the AuthManager and Swapper subsystems.
 	startSubSys("Auth manager", authMgr)
