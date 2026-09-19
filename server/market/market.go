@@ -820,6 +820,81 @@ func marketOrderError(err error) *msgjson.Error {
 	return mesh.ClientError(err, code, "%v", err)
 }
 
+// resendResultWindow bounds archived-order lookups for resubmitted requests.
+// It must exceed the client's maximum order retry duration.
+const resendResultWindow = 30 * time.Minute
+
+// matchOrderAndSetTime compares incoming with stored using stored's server time.
+// If they match, incoming keeps that time; otherwise its server time is cleared.
+func matchOrderAndSetTime(incoming, stored order.Order) bool {
+	incoming.SetTime(time.UnixMilli(stored.Time()))
+	if incoming.ID() == stored.ID() {
+		return true
+	}
+	// Restore the unstamped state on a miss.
+	incoming.SetTime(time.Time{})
+	return false
+}
+
+// HandleOrderResubmission checks whether a request matches a previously accepted
+// order. For active orders, it completes the command with the original order ID
+// and server time. For archived orders accepted within resendResultWindow, it
+// returns an error. A database lookup failure returns a retryable error.
+// It returns handled=false if no matching order is found.
+//
+// Call it before validating a new order, since an already accepted order may
+// no longer pass those checks. Its timestamp may be too old, market parameters
+// may have changed, or the original order's funding locks would cause the retry
+// to be rejected.
+func (m *Market) HandleOrderResubmission(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) (handled bool, rpcErr *msgjson.Error) {
+	commit := rec.order.Commitment()
+
+	m.epochMtx.RLock()
+	oid, found := m.epochCommitments[commit]
+	epochOrd := m.epochOrders[oid]
+	m.epochMtx.RUnlock()
+	if found && epochOrd != nil && matchOrderAndSetTime(rec.order, epochOrd) {
+		m.completeResubmittedOrder(ctx, rec, completion)
+		return true, nil
+	}
+
+	// Commitments can be reused after an order is archived, so a matching
+	// commitment does not necessarily identify the same order request.
+	candidates, err := m.storage.OrdersWithCommit(ctx, m.base, m.quote, commit,
+		time.Now().Add(-resendResultWindow))
+	if err != nil {
+		log.Errorf("Resend lookup for commitment %v failed: %v", commit, err)
+		return true, msgjson.NewError(msgjson.TryAgainLaterError,
+			"order resend lookup unavailable; retry the request")
+	}
+	for _, candidate := range candidates {
+		if !matchOrderAndSetTime(rec.order, candidate.Order) {
+			continue
+		}
+		switch candidate.Status {
+		case order.OrderStatusEpoch, order.OrderStatusBooked:
+			m.completeResubmittedOrder(ctx, rec, completion)
+			return true, nil
+		default:
+			// A success response would make the client track an archived order.
+			return true, msgjson.NewError(msgjson.UnknownOrderError,
+				"order %v with this commitment was already accepted and retired", candidate.Order.ID())
+		}
+	}
+	return false, nil
+}
+
+// completeResubmittedOrder signs and sends an acceptance response using the
+// original server time set by matchOrderAndSetTime. It does not emit an event.
+func (m *Market) completeResubmittedOrder(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) {
+	result := m.orderResult(rec)
+	log.Debugf("Answering resubmission of accepted order %v.", rec.order.ID())
+	if err := completion.Complete(ctx, result); err != nil {
+		// The order is already accepted; the client can retry delivery.
+		log.Errorf("failed to deliver resubmitted order result for %v: %v", rec.order.ID(), err)
+	}
+}
+
 // stampedOrderAcceptedEvent sets the order's server time, checks its eligibility,
 // and builds the order_accepted event and client result.
 func (m *Market) stampedOrderAcceptedEvent(rec *orderRecord) (*mesh.Event, *msgjson.OrderResult, *msgjson.Error) {
@@ -871,6 +946,11 @@ func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, compl
 	otherOID, found := m.epochCommitments[commit]
 	m.epochMtx.RUnlock()
 	if found {
+		// An identical request may have been accepted since the router's lookup.
+		// Return its result before rejecting a reused commitment.
+		if handled, rpcErr := m.HandleOrderResubmission(ctx, rec, completion); handled {
+			return rpcErr
+		}
 		log.Debugf("Received order with commitment %x also used in previous order %v!",
 			commit, otherOID)
 		return marketOrderError(ErrInvalidCommitment)
@@ -894,6 +974,10 @@ func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, compl
 	}
 
 	if db.IsErrReusedCommit(err) {
+		// Check whether a concurrent identical request was accepted.
+		if handled, rpcErr := m.HandleOrderResubmission(ctx, rec, completion); handled {
+			return rpcErr
+		}
 		return marketOrderError(ErrInvalidCommitment)
 	}
 	return marketOrderError(err)

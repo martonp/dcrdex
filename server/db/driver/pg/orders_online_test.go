@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -394,6 +395,98 @@ func TestApplyOrderAcceptedEvent(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOrdersWithCommit(t *testing.T) {
+	ctx := context.Background()
+	const epochDur int64 = 6000
+
+	requireIDs := func(t *testing.T, got []db.OrderWithStatus, want ...db.OrderWithStatus) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("OrdersWithCommit returned %d rows, want %d", len(got), len(want))
+		}
+		byID := make(map[order.OrderID]order.OrderStatus, len(got))
+		for _, row := range got {
+			byID[row.Order.ID()] = row.Status
+		}
+		for _, w := range want {
+			st, ok := byID[w.Order.ID()]
+			if !ok || st != w.Status {
+				t.Fatalf("missing or wrong status for %v: got %v, want %v", w.Order.ID(), st, w.Status)
+			}
+		}
+	}
+
+	for _, test := range []struct {
+		name     string
+		newOrder func(int64) order.Order
+	}{
+		{"limit", func(offset int64) order.Order {
+			return newLimitOrder(false, 4_900_000, 1, order.StandingTiF, offset)
+		}},
+		{"cancel", func(offset int64) order.Order {
+			return newCancelOrder(order.OrderID{1}, AssetDCR, AssetBTC, offset)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			older, newer := test.newOrder(0), test.newOrder(10)
+			newer.Prefix().Commit = older.Commitment()
+			lookup := func(cutoff time.Time, want ...db.OrderWithStatus) {
+				t.Helper()
+				got, err := archie.OrdersWithCommit(ctx, older.Base(), older.Quote(), older.Commitment(), cutoff)
+				if err != nil {
+					t.Fatalf("OrdersWithCommit: %v", err)
+				}
+				requireIDs(t, got, want...)
+			}
+			olderTime, newerTime := older.Prefix().ServerTime, newer.Prefix().ServerTime
+			lookup(olderTime)
+
+			if err := storeOrderForTest(archie, older, older.Time()/epochDur, epochDur, order.OrderStatusEpoch); err != nil {
+				t.Fatalf("store older: %v", err)
+			}
+			// The cutoff applies only to archived orders.
+			lookup(newerTime, db.OrderWithStatus{Order: older, Status: order.OrderStatusEpoch})
+
+			if err := archie.updateOrderStatus(archie.db, older, orderStatusExecuted); err != nil {
+				t.Fatalf("archive older: %v", err)
+			}
+			if err := storeOrderForTest(archie, newer, newer.Time()/epochDur, epochDur, order.OrderStatusEpoch); err != nil {
+				t.Fatalf("store newer: %v", err)
+			}
+			lookup(olderTime,
+				db.OrderWithStatus{Order: older, Status: order.OrderStatusExecuted},
+				db.OrderWithStatus{Order: newer, Status: order.OrderStatusEpoch})
+
+			if err := archie.updateOrderStatus(archie.db, newer, orderStatusExecuted); err != nil {
+				t.Fatalf("archive newer: %v", err)
+			}
+			lookup(olderTime,
+				db.OrderWithStatus{Order: older, Status: order.OrderStatusExecuted},
+				db.OrderWithStatus{Order: newer, Status: order.OrderStatusExecuted})
+			lookup(newerTime, db.OrderWithStatus{Order: newer, Status: order.OrderStatusExecuted})
+		})
+	}
+
+	t.Run("cancellation", func(t *testing.T) {
+		reader := &Archiver{
+			db: archie.db, dbName: archie.dbName, markets: archie.markets,
+			fatal: make(chan struct{}),
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err := reader.OrdersWithCommit(ctx, AssetDCR, AssetBTC, order.Commitment{}, time.Time{})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled lookup error = %v", err)
+		}
+		if err := reader.LastErr(); err != nil {
+			t.Fatalf("canceled lookup marked backend failed: %v", err)
+		}
+	})
 }
 
 func TestBookOrder(t *testing.T) {
@@ -1386,7 +1479,7 @@ func TestFailCancelOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
-	_, status, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, co.ID())
+	_, status, err := loadCancelOrder(context.Background(), archie.db, archie.dbName, mktInfo.Name, co.ID())
 	if err != nil {
 		t.Errorf("loadCancelOrder failed: %v", err)
 	}
@@ -1982,7 +2075,7 @@ func TestExecutedCancelsForUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteOrder failed: %v", err)
 	}
-	_, status, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, co.ID())
+	_, status, err := loadCancelOrder(context.Background(), archie.db, archie.dbName, mktInfo.Name, co.ID())
 	if err != nil {
 		t.Errorf("loadCancelOrder failed: %v", err)
 	}
@@ -2005,7 +2098,7 @@ func TestExecutedCancelsForUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StoreOrder failed: %v", err)
 	}
-	coOut, coStatusOut, err := loadCancelOrder(archie.db, archie.dbName, mktInfo.Name, coID)
+	coOut, coStatusOut, err := loadCancelOrder(context.Background(), archie.db, archie.dbName, mktInfo.Name, coID)
 	// loadCancelOrder does not set base and quote
 	coOut.BaseAsset, coOut.QuoteAsset = mktInfo.Base, mktInfo.Quote
 	if err != nil {

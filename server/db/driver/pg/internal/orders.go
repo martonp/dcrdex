@@ -129,6 +129,11 @@ const (
 	// commitment value. This applies to the cancel order tables as well.
 	SelectOrderByCommit = `SELECT oid FROM %s WHERE commit = $1;`
 
+	// SelectOrderByCommitSince retrieves order IDs with the given commitment
+	// accepted at or after a cutoff. Archived orders may share a commitment,
+	// so several rows can match.
+	SelectOrderByCommitSince = `SELECT oid FROM %s WHERE commit = $1 AND server_time >= $2;`
+
 	// SelectOrderPreimage retrieves the preimage for the order ID;
 	SelectOrderPreimage = `SELECT preimage FROM %s WHERE oid = $1;`
 

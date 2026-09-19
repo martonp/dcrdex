@@ -52,6 +52,8 @@ type TArchivist struct {
 	orderAcceptedUpdates []*db.OrderAcceptedUpdate
 	marketStartedUpdates []*db.MarketStartedUpdate
 	lifecycle            *db.MarketLifecycle
+	commitOrders         []db.OrderWithStatus
+	commitOrdersErr      error
 }
 
 type tMesh struct {
@@ -187,6 +189,52 @@ func (rig *marketEventRig) subscribeBook(t *testing.T) *TLink {
 	return link
 }
 
+func prepareOrderCommand(t *testing.T, mkt *Market, auth *TAuth, rec *orderRecord) (*mesh.Service, mesh.CommandRequest) {
+	t.Helper()
+
+	var kind string
+	switch rec.order.Type() {
+	case order.LimitOrderType:
+		kind = commandKindLimit
+	case order.MarketOrderType:
+		kind = commandKindMarket
+	case order.CancelOrderType:
+		kind = commandKindCancel
+	default:
+		t.Fatalf("unknown order type %v", rec.order.Type())
+	}
+
+	tm, ok := mkt.mesh.(*tMesh)
+	if !ok {
+		t.Fatalf("test market mesh has type %T, not *tMesh", mkt.mesh)
+	}
+	svc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands: map[string]mesh.CommandExecutor{
+			kind: func(cmd *mesh.CommandContext) *msgjson.Error {
+				return mkt.AcceptOrderCommand(cmd.Context, rec, cmd.Completion)
+			},
+		},
+		Events: tm.events,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+	msg, err := msgjson.NewRequest(rec.msgID, kind, nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	return svc, mesh.CommandRequest{
+		Kind: kind,
+		User: rec.order.User(),
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			return auth.Send(rec.order.User(), resp)
+		},
+	}
+}
+
 type epochOrderWrite struct {
 	ord      order.Order
 	epochIdx int64
@@ -199,6 +247,21 @@ func (ta *TArchivist) LastErr() error         { return nil }
 func (ta *TArchivist) Fatal() <-chan struct{} { return nil }
 func (ta *TArchivist) Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error) {
 	return nil, order.OrderStatusUnknown, errors.New("boom")
+}
+
+func (ta *TArchivist) OrdersWithCommit(_ context.Context, _, _ uint32, commit order.Commitment, _ time.Time) ([]db.OrderWithStatus, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if ta.commitOrdersErr != nil {
+		return nil, ta.commitOrdersErr
+	}
+	var out []db.OrderWithStatus
+	for _, stored := range ta.commitOrders {
+		if stored.Order.Commitment() == commit {
+			out = append(out, stored)
+		}
+	}
+	return out, nil
 }
 func (ta *TArchivist) BookOrders(base, quote uint32) ([]*order.LimitOrder, error) {
 	ta.mtx.Lock()
@@ -3215,6 +3278,149 @@ func orderFromAcceptedEvent(t *testing.T, event *mesh.Event) order.Order {
 		t.Fatalf("accepted order error: %v", err)
 	}
 	return ord
+}
+
+func TestHandleOrderResubmission(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		inMemory       bool
+		differentOrder bool
+		storedStatus   order.OrderStatus
+		lookupErr      error
+		wantHandled    bool
+		wantCode       int
+	}{
+		{name: "unknown"},
+		{name: "epoch memory", inMemory: true, wantHandled: true},
+		{name: "stored epoch", storedStatus: order.OrderStatusEpoch, wantHandled: true},
+		{name: "booked", storedStatus: order.OrderStatusBooked, wantHandled: true},
+		{name: "archived", storedStatus: order.OrderStatusRevoked, wantHandled: true, wantCode: msgjson.UnknownOrderError},
+		{name: "different order with same commitment", inMemory: true, differentOrder: true},
+		{name: "archived match after memory mismatch", inMemory: true, differentOrder: true,
+			storedStatus: order.OrderStatusRevoked, wantHandled: true, wantCode: msgjson.UnknownOrderError},
+		{name: "lookup failure", lookupErr: errors.New("db down"), wantHandled: true, wantCode: msgjson.TryAgainLaterError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mkt, storage, _, cleanup, err := newTestMarket()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			stored := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+			stored.SetTime(time.Now().Truncate(time.Millisecond))
+			incoming := order.LimitOrder{P: stored.P, T: *stored.T.Copy(), Rate: stored.Rate, Force: stored.Force}
+			incoming.SetTime(time.Time{})
+			rec := &orderRecord{order: &incoming, req: &msgjson.LimitOrder{}, msgID: 42}
+			if test.inMemory {
+				epochOrder := order.LimitOrder{P: stored.P, T: *stored.T.Copy(), Rate: stored.Rate, Force: stored.Force}
+				if test.differentOrder {
+					epochOrder.Quantity *= 2
+				}
+				epochID := epochOrder.ID()
+				mkt.epochCommitments[stored.Commitment()] = epochID
+				mkt.epochOrders[epochID] = &epochOrder
+			}
+			if test.storedStatus != order.OrderStatusUnknown {
+				storage.commitOrders = []db.OrderWithStatus{{Order: stored, Status: test.storedStatus}}
+			}
+			storage.commitOrdersErr = test.lookupErr
+			var response *msgjson.Message
+			var executed, handled bool
+			svc, err := mesh.NewService(&mesh.ServiceConfig{
+				EventLogReader: emptyEventLogReader{},
+				OnHalt:         func(error) {},
+				Commands: map[string]mesh.CommandExecutor{
+					commandKindLimit: func(cmd *mesh.CommandContext) *msgjson.Error {
+						executed = true
+						var rpcErr *msgjson.Error
+						handled, rpcErr = mkt.HandleOrderResubmission(cmd.Context, rec, cmd.Completion)
+						return rpcErr
+					},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := msgjson.NewRequest(rec.msgID, msgjson.LimitRoute, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rpcErr := svc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+				Kind: commandKindLimit, User: stored.User(), Msg: msg,
+				Respond: func(resp *msgjson.Message) error { response = resp; return nil },
+			})
+			if !executed {
+				t.Fatal("command executor was not called")
+			}
+			if handled != test.wantHandled {
+				t.Errorf("handled = %v, want %v", handled, test.wantHandled)
+			}
+			code := 0
+			if rpcErr != nil {
+				code = rpcErr.Code
+			}
+			if code != test.wantCode {
+				t.Fatalf("RPC error = %v, want code %d", rpcErr, test.wantCode)
+			}
+			if !test.wantHandled {
+				if !incoming.ServerTime.IsZero() {
+					t.Error("unrecognized order kept a candidate's server time")
+				}
+				if response != nil {
+					t.Fatal("unrecognized order received a response")
+				}
+				return
+			}
+			if test.wantCode != 0 {
+				return
+			}
+			if response == nil {
+				t.Fatal("missing acceptance response")
+			}
+			var result msgjson.OrderResult
+			if err := response.UnmarshalResult(&result); err != nil {
+				t.Fatal(err)
+			}
+			id := stored.ID()
+			if response.ID != rec.msgID || !bytes.Equal(result.OrderID, id[:]) || result.ServerTime != uint64(stored.Time()) {
+				t.Fatalf("resubmission did not return the original order ID and server time: %+v", result)
+			}
+		})
+	}
+}
+
+func TestAcceptOrderCommandResubmission(t *testing.T) {
+	mkt, _, auth, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	mkt.running.Store(true)
+
+	accepted := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	accepted.SetTime(time.Now().Truncate(time.Millisecond))
+	oid := accepted.ID()
+	mkt.epochOrders[oid] = accepted
+	mkt.epochCommitments[accepted.Commitment()] = oid
+
+	incoming := order.LimitOrder{P: accepted.P, T: *accepted.T.Copy(), Rate: accepted.Rate, Force: accepted.Force}
+	incoming.SetTime(time.Time{})
+	rec := &orderRecord{order: &incoming, req: &msgjson.LimitOrder{}, msgID: 42}
+	svc, req := prepareOrderCommand(t, mkt, auth, rec)
+	if rpcErr := svc.ExecuteCommand(context.Background(), req); rpcErr != nil {
+		t.Fatalf("resubmission: %v", rpcErr)
+	}
+	response := auth.getSend()
+	if response == nil {
+		t.Fatal("resubmission delivered no result")
+	}
+	var result msgjson.OrderResult
+	if err := response.UnmarshalResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if response.ID != rec.msgID || !bytes.Equal(result.OrderID, oid[:]) || result.ServerTime != uint64(accepted.Time()) {
+		t.Fatalf("resubmission did not return the original order ID and server time: %+v", result)
+	}
 }
 
 func TestAcceptOrderCommandRestampsAfterMissedEpoch(t *testing.T) {
