@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"runtime"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"decred.org/dcrdex/server/coinlock"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
 )
 
@@ -42,6 +44,15 @@ type TArchivist struct {
 	archivedCancels      []*order.CancelOrder
 	epochInserted        chan struct{}
 	revoked              order.Order
+	epochOrders          []epochOrderWrite
+	lifecycle            *db.MarketLifecycle
+}
+
+type epochOrderWrite struct {
+	ord      order.Order
+	epochIdx int64
+	epochDur int64
+	epochGap int32
 }
 
 func (ta *TArchivist) Close() error           { return nil }
@@ -56,7 +67,13 @@ func (ta *TArchivist) BookOrders(base, quote uint32) ([]*order.LimitOrder, error
 	return ta.bookedOrders, nil
 }
 func (ta *TArchivist) EpochOrders(base, quote uint32) ([]order.Order, error) {
-	return nil, nil
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ords := make([]order.Order, 0, len(ta.epochOrders))
+	for _, write := range ta.epochOrders {
+		ords = append(ords, write.ord)
+	}
+	return ords, nil
 }
 func (ta *TArchivist) MarketMatches(base, quote uint32) ([]*db.MatchDataWithCoins, error) {
 	return nil, nil
@@ -109,6 +126,27 @@ func (ta *TArchivist) ExecutedCancelsForUser(aid account.AccountID, N int) ([]*d
 func (ta *TArchivist) OrderStatus(order.Order) (order.OrderStatus, order.OrderType, int64, error) {
 	return order.OrderStatusUnknown, order.UnknownOrderType, -1, errors.New("boom")
 }
+func (ta *TArchivist) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
+	return new(db.EventLogPosition), nil
+}
+
+func (ta *TArchivist) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
+	return nil, nil
+}
+func (ta *TArchivist) MarketLifecycle(string) (*db.MarketLifecycle, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if ta.lifecycle == nil {
+		return nil, nil
+	}
+	cpy := *ta.lifecycle
+	if ta.lifecycle.PersistBook != nil {
+		persist := *ta.lifecycle.PersistBook
+		cpy.PersistBook = &persist
+	}
+	return &cpy, nil
+}
+
 func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
 	ta.mtx.Lock()
 	defer ta.mtx.Unlock()
@@ -135,8 +173,6 @@ func (ta *TArchivist) LastEpochRate(base, quote uint32) (rate uint64, err error)
 func (ta *TArchivist) BookOrder(lo *order.LimitOrder) error {
 	ta.mtx.Lock()
 	defer ta.mtx.Unlock()
-	// Note that the other storage functions like ExecuteOrder and CancelOrder
-	// do not change this order slice.
 	ta.bookedOrders = append(ta.bookedOrders, lo)
 	return nil
 }
@@ -357,6 +393,9 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	if err != nil {
 		return nil, nil, nil, func() {}, fmt.Errorf("Failed to create test market: %w", err)
 	}
+	if err := mkt.LoadState(); err != nil {
+		return nil, nil, nil, func() {}, fmt.Errorf("Failed to load test market state: %w", err)
+	}
 
 	swapDone = mkt.SwapDone
 
@@ -370,75 +409,516 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	return mkt, storage, authMgr, cleanup, nil
 }
 
-func TestMarket_NewMarket_BookOrders(t *testing.T) {
-	mkt, storage, _, cleanup, err := newTestMarket()
-	if err != nil {
-		t.Fatalf("newTestMarket failure: %v", err)
-	}
-
-	// With no book orders in the DB, the market should have an empty book after
-	// construction.
-	_, buys, sells := mkt.Book()
-	if len(buys) > 0 || len(sells) > 0 {
-		cleanup()
-		t.Fatalf("Fresh market had %d buys and %d sells, expected none.",
-			len(buys), len(sells))
-	}
-	cleanup()
-
+func TestMarket_LoadState_BookOrders(t *testing.T) {
 	rnd.Seed(12)
-
 	randCoinDCR := func() []byte {
 		coinID := make([]byte, 36)
 		rnd.Read(coinID[:])
 		return coinID
 	}
-
-	// Now store some book orders to verify NewMarket sees them.
 	loBuy := makeLO(buyer3, mkRate3(0.8, 1.0), randLots(10), order.StandingTiF)
-	loBuy.FillAmt = mkt.marketInfo.LotSize // partial fill to cover utxo check alt. path
+	loBuy.FillAmt = dcrLotSize
+	loBuy.Coins = []order.CoinID{randCoinDCR()}
 	loSell := makeLO(seller3, mkRate3(1.0, 1.2), randLots(10)+1, order.StandingTiF)
-	fundingCoinDCR := randCoinDCR()
-	loSell.Coins = []order.CoinID{fundingCoinDCR}
-	// let VerifyUnspentCoin find this coin as unspent
-	oRig.dcr.addUTXO(&msgjson.Coin{ID: fundingCoinDCR}, 1234)
+	loSell.Coins = []order.CoinID{randCoinDCR()}
+	storage := &TArchivist{bookedOrders: []*order.LimitOrder{loBuy, loSell}}
 
-	_ = storage.BookOrder(loBuy)  // the stub does not error
-	_ = storage.BookOrder(loSell) // the stub does not error
-
-	mkt, storage, _, cleanup, err = newTestMarket(storage)
+	mkt, _, _, cleanup, err := newTestMarket(storage)
 	if err != nil {
 		t.Fatalf("newTestMarket failure: %v", err)
 	}
 	defer cleanup()
 
-	_, buys, sells = mkt.Book()
+	_, buys, sells := mkt.Book()
 	if len(buys) != 1 || len(sells) != 1 {
-		t.Fatalf("Fresh market had %d buys and %d sells, expected 1 buy, 1 sell.",
-			len(buys), len(sells))
+		t.Fatalf("Fresh market had %d buys and %d sells, expected 1 buy, 1 sell.", len(buys), len(sells))
 	}
 	if buys[0].ID() != loBuy.ID() {
-		t.Errorf("booked buy order has incorrect ID. Expected %v, got %v",
-			loBuy.ID(), buys[0].ID())
+		t.Errorf("booked buy order has incorrect ID. Expected %v, got %v", loBuy.ID(), buys[0].ID())
 	}
 	if sells[0].ID() != loSell.ID() {
-		t.Errorf("booked sell order has incorrect ID. Expected %v, got %v",
-			loSell.ID(), sells[0].ID())
+		t.Errorf("booked sell order has incorrect ID. Expected %v, got %v", loSell.ID(), sells[0].ID())
+	}
+	// Both unfilled and partially filled booked orders retain their coin locks.
+	for _, lo := range []*order.LimitOrder{loBuy, loSell} {
+		assetID := mkt.Quote()
+		if lo.Sell {
+			assetID = mkt.Base()
+		}
+		for _, coin := range lo.Coins {
+			if !mkt.CoinLocked(assetID, coin) {
+				t.Errorf("booked order %v coin %x not locked", lo.ID(), coin)
+			}
+		}
+	}
+}
+
+func TestLoadStateAdoptsRowParams(t *testing.T) {
+	storage := &TArchivist{}
+	const epochDur int64 = 1000 // Different from newTestMarket's configuration.
+	row := seedLifecycleRow(db.MarketStateSuspended, db.MarketPendingNone, 40, epochDur)
+	row.RunParams = meshevents.MarketRunParams{
+		LotSize:                dcrLotSize * 2,
+		RateStep:               btcRateStep * 2,
+		ParcelSize:             2,
+		MaxUserCancelsPerEpoch: 3,
+		MinimumRate:            btcRateStep,
+	}
+	storage.lifecycle = row
+	compatible := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+	compatible.Coins = []order.CoinID{[]byte{0x82, 0x01}}
+	storage.bookedOrders = []*order.LimitOrder{compatible}
+
+	mkt, _, _, cleanup, err := newTestMarket(storage)
+	if err != nil {
+		t.Fatalf("newTestMarket: %v", err)
+	}
+	defer cleanup()
+
+	gotParams := meshevents.MarketRunParams{
+		LotSize:                mkt.LotSize(),
+		RateStep:               mkt.RateStep(),
+		ParcelSize:             mkt.ParcelSize(),
+		MaxUserCancelsPerEpoch: mkt.maxUserCancelsPerEpoch(),
+		MinimumRate:            mkt.minimumRate(),
+	}
+	if gotParams != row.RunParams {
+		t.Fatalf("restored run parameters = %+v, want %+v", gotParams, row.RunParams)
+	}
+	if got := mkt.EpochDuration(); got != uint64(epochDur) {
+		t.Fatalf("restored epoch duration = %d, want %d", got, epochDur)
+	}
+	if got := mkt.book.LotSize(); got != uint64(dcrLotSize*2) {
+		t.Fatalf("book lot size = %d, want %d", got, dcrLotSize*2)
+	}
+	if mkt.book.Order(compatible.ID()) == nil {
+		t.Fatalf("row-compatible order was not rebooked")
+	}
+}
+
+// TestLoadStateRejectsIncompatibleBookedOrder pins that a booked DB row
+// which does not fit the logged lot size is a LoadState error, not a skip.
+func TestLoadStateRejectsIncompatibleBookedOrder(t *testing.T) {
+	storage := &TArchivist{}
+	const epochDur int64 = 500
+	row := seedLifecycleRow(db.MarketStateSuspended, db.MarketPendingNone, 40, epochDur)
+	row.RunParams.LotSize = dcrLotSize * 2
+	storage.lifecycle = row
+	incompatible := makeLO(seller3, mkRate3(1.1, 1.3), 1, order.StandingTiF)
+	incompatible.Coins = []order.CoinID{[]byte{0x82, 0x02}}
+	storage.bookedOrders = []*order.LimitOrder{incompatible}
+
+	_, _, _, _, err := newTestMarket(storage)
+	if err == nil || !strings.Contains(err.Error(), "failed to restore booked order") {
+		t.Fatalf("LoadState err = %v, want insert failure", err)
+	}
+}
+
+func newStartupLockTestMarket(storage *TArchivist, baseLocker, quoteLocker coinlock.CoinLocker) (*Market, error) {
+	mktInfo, err := dex.NewMarketInfo(assetDCR.ID, assetBTC.ID, dcrLotSize, btcRateStep, 500, 1.1)
+	if err != nil {
+		return nil, err
+	}
+	mkt, err := NewMarket(&Config{
+		MarketInfo:      mktInfo,
+		Storage:         storage,
+		CoinLockerBase:  baseLocker,
+		CoinLockerQuote: quoteLocker,
+		DataCollector:   new(TCollector),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := mkt.LoadState(); err != nil {
+		return nil, err
+	}
+	return mkt, nil
+}
+
+func TestMarket_LoadState_DuplicateBookedCoinLockRollbackAcrossAssets(t *testing.T) {
+	baseCoin := order.CoinID([]byte{0x10, 0x20, 0x30})
+	sharedQuoteCoin := order.CoinID([]byte{0x40, 0x50, 0x60})
+
+	var sell, buyA, buyB *order.LimitOrder
+	var conflict *order.LimitOrder
+	// Choose IDs so both a base and a quote coin are locked before the second
+	// buy order fails, exercising rollback in both lockers.
+	for i := 0; i < 1000; i++ {
+		sell = makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		sell.Coins = []order.CoinID{baseCoin}
+		buyA = makeLO(buyer3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		buyA.Coins = []order.CoinID{sharedQuoteCoin}
+		buyB = makeLO(buyer3, mkRate3(1.1, 1.3), 1, order.StandingTiF)
+		buyB.Coins = []order.CoinID{sharedQuoteCoin}
+
+		maxOrder := sell
+		for _, lo := range []*order.LimitOrder{buyA, buyB} {
+			maxID, oid := maxOrder.ID(), lo.ID()
+			if bytes.Compare(maxID[:], oid[:]) < 0 {
+				maxOrder = lo
+			}
+		}
+		if maxOrder.ID() == buyA.ID() || maxOrder.ID() == buyB.ID() {
+			conflict = maxOrder
+			break
+		}
+	}
+	if conflict == nil {
+		t.Fatalf("failed to generate deterministic cross-asset rollback order IDs")
 	}
 
-	// PurgeBook should clear the in memory book and those in storage.
-	mkt.PurgeBook()
-	_, buys, sells = mkt.Book()
-	if len(buys) > 0 || len(sells) > 0 {
-		t.Fatalf("purged market had %d buys and %d sells, expected none.",
-			len(buys), len(sells))
+	storage := &TArchivist{}
+	for _, lo := range []*order.LimitOrder{sell, buyA, buyB} {
+		if err := storage.BookOrder(lo); err != nil {
+			t.Fatalf("BookOrder error: %v", err)
+		}
 	}
 
-	los, _ := storage.BookOrders(mkt.marketInfo.Base, mkt.marketInfo.Quote)
-	if len(los) != 0 {
-		t.Errorf("stored book orders were not flushed")
+	baseLocker := coinlock.NewAssetCoinLocker()
+	quoteLocker := coinlock.NewAssetCoinLocker()
+	_, err := newStartupLockTestMarket(storage, baseLocker, quoteLocker)
+	if err == nil {
+		t.Fatalf("LoadState succeeded with duplicate quote booked coins")
+	}
+	if !strings.Contains(err.Error(), conflict.ID().String()) {
+		t.Fatalf("LoadState error = %v, want conflicting order %v", err, conflict.ID())
+	}
+	if baseLocker.CoinLocked(baseCoin) {
+		t.Fatalf("base coin remains locked after quote-side restoration failure")
+	}
+	if quoteLocker.CoinLocked(sharedQuoteCoin) {
+		t.Fatalf("quote coin remains locked after quote-side restoration failure")
+	}
+}
+
+func TestLoadStateEpochs(t *testing.T) {
+	const epochDur int64 = 500 // newTestMarket's epoch duration
+	const active int64 = 40
+
+	noCursor := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, active, epochDur)
+	noCursor.ActiveEpochIdx = 0
+	differentDuration := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, active, epochDur)
+	differentDuration.StartEpochDur = epochDur * 2
+	stray := epochStampedLO(t, active+2, epochDur, 1, order.CoinID{0x60, 0x02})
+	leftover := epochStampedLO(t, active, epochDur, 1, order.CoinID{0x60, 0x03})
+
+	pending := epochStampedLO(t, active-1, epochDur, 0, order.CoinID{0x30, 0x01}) // closed, awaiting epoch_processed
+	curStart := epochStampedLO(t, active, epochDur, 0, order.CoinID{0x31, 0x01})
+	curEnd := epochStampedLO(t, active+1, epochDur, -1, order.CoinID{0x31, 0x02})
+	nextStart := epochStampedLO(t, active+1, epochDur, 0, order.CoinID{0x32, 0x01})
+	curCancel := epochStampedCO(t, curStart.ID(), active, epochDur, 2)
+	finalLO := epochStampedLO(t, active, epochDur, 1, order.CoinID{0x60, 0x04})
+	drainA := epochStampedLO(t, active, epochDur, 1, order.CoinID{0x71, 0x01})
+	drainB := epochStampedLO(t, active, epochDur, 2, order.CoinID{0x71, 0x02})
+
+	cases := []struct {
+		name    string
+		row     *db.MarketLifecycle
+		orders  []epochOrderWrite
+		wantErr string // non-empty: loading must fail with this
+
+		wantCurrent  int64         // expected active epoch, 0 = no epochs seeded
+		wantQueued   []order.Order // seeded into the epoch queues and indexes
+		wantUnqueued []order.Order // coin-locked but kept out of the queues
+	}{{
+		name:    "rejects running row without cursor",
+		row:     noCursor,
+		wantErr: "no active epoch cursor",
+	}, {
+		name:        "seeds with log duration on config mismatch",
+		row:         differentDuration,
+		wantCurrent: active,
+	}, {
+		name:    "rejects order beyond the next epoch window",
+		row:     seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, active, epochDur),
+		orders:  []epochOrderWrite{{ord: stray, epochIdx: active + 2, epochDur: epochDur}},
+		wantErr: "beyond the next epoch window",
+	}, {
+		name:    "rejects suspended market with epoch orders",
+		row:     seedLifecycleRow(db.MarketStateSuspended, db.MarketPendingNone, active, epochDur),
+		orders:  []epochOrderWrite{{ord: leftover, epochIdx: active, epochDur: epochDur}},
+		wantErr: "storage is inconsistent",
+	}, {
+		name: "partitions windows around the cursor",
+		row:  seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, active, epochDur),
+		orders: []epochOrderWrite{
+			{ord: pending, epochIdx: active - 1, epochDur: epochDur},
+			{ord: curStart, epochIdx: active, epochDur: epochDur},
+			{ord: curEnd, epochIdx: active, epochDur: epochDur},
+			{ord: curCancel, epochIdx: active, epochDur: epochDur},
+			{ord: nextStart, epochIdx: active + 1, epochDur: epochDur},
+		},
+		wantCurrent:  active,
+		wantQueued:   []order.Order{curStart, curEnd, curCancel, nextStart},
+		wantUnqueued: []order.Order{pending},
+	}, {
+		name:        "pending suspend seeds the final epoch with an empty next queue",
+		row:         seedLifecycleRow(db.MarketStateRunning, db.MarketPendingSuspend, active, epochDur),
+		orders:      []epochOrderWrite{{ord: finalLO, epochIdx: active, epochDur: epochDur}},
+		wantCurrent: active,
+		wantQueued:  []order.Order{finalLO},
+	}, {
+		name: "drain seeds no queues but locks the final epoch orders",
+		row:  seedLifecycleRow(db.MarketStateDraining, db.MarketPendingNone, active, epochDur),
+		orders: []epochOrderWrite{
+			{ord: drainA, epochIdx: active, epochDur: epochDur},
+			{ord: drainB, epochIdx: active, epochDur: epochDur},
+		},
+		wantUnqueued: []order.Order{drainA, drainB},
+	}, {
+		name: "no lifecycle row is never started",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := &TArchivist{
+				lifecycle:   tc.row,
+				epochOrders: tc.orders,
+			}
+			mkt, _, _, cleanup, loadErr := newTestMarket(storage)
+			defer cleanup()
+			if tc.wantErr != "" {
+				if loadErr == nil || !strings.Contains(loadErr.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", loadErr, tc.wantErr)
+				}
+				return
+			}
+			if loadErr != nil {
+				t.Fatalf("loading failed: %v", loadErr)
+			}
+			if mkt.Running() {
+				t.Fatalf("loading opened order admission")
+			}
+			if tc.row == nil {
+				_, buys, sells := mkt.Book()
+				if len(buys) > 0 || len(sells) > 0 {
+					t.Fatalf("Fresh market had %d buys and %d sells, expected none.", len(buys), len(sells))
+				}
+			}
+			requireSeededState(t, mkt, tc.wantCurrent, tc.wantQueued, tc.wantUnqueued)
+		})
 	}
 
+	t.Run("rolls back coin locks on an epoch order conflict", func(t *testing.T) {
+		mkt, storage, _, cleanup, err := newTestMarket()
+		if err != nil {
+			t.Fatalf("newTestMarket: %v", err)
+		}
+		defer cleanup()
+
+		coin := order.CoinID{0x72, 0x01}
+		first := epochStampedLO(t, active, epochDur, 1, coin)
+		second := epochStampedLO(t, active, epochDur, 2, coin)
+		firstID, secondID := first.ID(), second.ID()
+		if bytes.Compare(firstID[:], secondID[:]) > 0 {
+			first, second = second, first
+		}
+		// Storage order must not determine which conflicting order fails.
+		storage.mtx.Lock()
+		storage.epochOrders = []epochOrderWrite{{ord: second}, {ord: first}}
+		storage.mtx.Unlock()
+		row := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, active, epochDur)
+		mkt.epochMtx.Lock()
+		mkt.projectMarketLifecycleLocked(row)
+		mkt.epochMtx.Unlock()
+		err = mkt.restoreEpochState(row)
+		wantErr := fmt.Sprintf("failed to lock epoch order %v coins", second.ID())
+		if err == nil || err.Error() != wantErr {
+			t.Fatalf("restoreEpochState error = %v, want %q", err, wantErr)
+		}
+		if mkt.coinLockerBase.CoinLocked(coin) {
+			t.Fatal("coin remains locked after epoch restoration failed")
+		}
+		for _, lo := range []*order.LimitOrder{first, second} {
+			if len(mkt.coinLockerBase.OrderCoinsLocked(lo.ID())) != 0 {
+				t.Fatalf("order %v retains coin locks after epoch restoration failed", lo.ID())
+			}
+		}
+		mkt.epochMtx.RLock()
+		defer mkt.epochMtx.RUnlock()
+		if mkt.currentEpoch != nil || mkt.nextEpoch != nil || mkt.activeEpochIdx != 0 {
+			t.Fatal("epoch queues were published despite failed coin locking")
+		}
+		if len(mkt.epochOrders) != 0 || len(mkt.epochCommitments) != 0 {
+			t.Fatal("epoch indexes were populated despite failed coin locking")
+		}
+	})
+}
+
+// requireSeededState checks the restored epoch queues, indexes, and coin locks.
+// Only queued orders belong in the queues and indexes; trade orders in both
+// groups must have their funding coins locked under their order IDs.
+func requireSeededState(t *testing.T, mkt *Market, wantCurrent int64, queued, unqueued []order.Order) {
+	t.Helper()
+	epochDur := int64(mkt.EpochDuration())
+
+	requireEpochWindow := func(label string, epoch *EpochQueue, wantIdx int64) {
+		t.Helper()
+		if epoch == nil || epoch.Epoch != wantIdx || epoch.Duration != epochDur {
+			t.Fatalf("%s epoch = %v, want %d/%d", label, epoch, wantIdx, epochDur)
+		}
+	}
+	// An order's stamp picks its queue: wantCurrent's window is the current
+	// queue, the following window is next.
+	queueFor := func(ord order.Order) *EpochQueue {
+		if ord.Time()/epochDur == wantCurrent {
+			return mkt.currentEpoch
+		}
+		return mkt.nextEpoch
+	}
+
+	func() {
+		t.Helper()
+		mkt.epochMtx.RLock()
+		defer mkt.epochMtx.RUnlock()
+
+		// The epoch windows and the active cursor.
+		if wantCurrent == 0 {
+			if mkt.currentEpoch != nil || mkt.nextEpoch != nil || mkt.activeEpochIdx != 0 {
+				t.Fatalf("epochs = %v/%v (active %d), want none",
+					mkt.currentEpoch, mkt.nextEpoch, mkt.activeEpochIdx)
+			}
+		} else {
+			requireEpochWindow("current", mkt.currentEpoch, wantCurrent)
+			requireEpochWindow("next", mkt.nextEpoch, wantCurrent+1)
+			if mkt.activeEpochIdx != wantCurrent {
+				t.Fatalf("active epoch = %d, want %d", mkt.activeEpochIdx, wantCurrent)
+			}
+		}
+
+		// Exactly the queued orders are indexed, each in its stamp-selected
+		// queue, cancels with their bookkeeping.
+		if len(mkt.epochOrders) != len(queued) {
+			t.Fatalf("epoch order index has %d orders, want %d", len(mkt.epochOrders), len(queued))
+		}
+		for _, ord := range queued {
+			epoch := queueFor(ord)
+			if epoch.Orders[ord.ID()] == nil {
+				t.Fatalf("order %v missing from the epoch %d queue", ord.ID(), epoch.Epoch)
+			}
+			if mkt.epochOrders[ord.ID()] == nil {
+				t.Fatalf("order %v missing from the epoch order index", ord.ID())
+			}
+			if oid := mkt.epochCommitments[ord.Commitment()]; oid != ord.ID() {
+				t.Fatalf("commitment index for order %v = %v", ord.ID(), oid)
+			}
+			if co, ok := ord.(*order.CancelOrder); ok {
+				if epoch.CancelTargets[co.TargetOrderID] == nil {
+					t.Fatalf("cancel %v missing target bookkeeping", co.ID())
+				}
+				if epoch.UserCancels[co.AccountID] == 0 {
+					t.Fatalf("cancel %v missing user cancel bookkeeping", co.ID())
+				}
+			}
+		}
+
+		// The unqueued orders stay out of the queues and indexes.
+		for _, ord := range unqueued {
+			if mkt.epochOrders[ord.ID()] != nil {
+				t.Fatalf("order %v was seeded into the epoch queues", ord.ID())
+			}
+			if oid, found := mkt.epochCommitments[ord.Commitment()]; found {
+				t.Fatalf("order %v commitment still indexed to %v", ord.ID(), oid)
+			}
+		}
+	}()
+
+	// The book epoch cursor follows the active epoch.
+	if wantCurrent != 0 {
+		mkt.bookMtx.Lock()
+		bookEpochIdx := mkt.bookEpochIdx
+		mkt.bookMtx.Unlock()
+		if bookEpochIdx != wantCurrent {
+			t.Fatalf("bookEpochIdx = %d, want %d", bookEpochIdx, wantCurrent)
+		}
+	}
+
+	// Every trade's funding coins are locked under its own order ID in the
+	// side-appropriate locker, so later unlocks by order ID find them.
+	for _, group := range [][]order.Order{queued, unqueued} {
+		for _, ord := range group {
+			trade := ord.Trade()
+			if trade == nil {
+				continue // cancels fund nothing
+			}
+			locker := mkt.coinLockerQuote
+			if trade.Sell {
+				locker = mkt.coinLockerBase
+			}
+			locked := make(map[string]bool)
+			for _, coin := range locker.OrderCoinsLocked(ord.ID()) {
+				locked[string(coin)] = true
+			}
+			for _, coin := range trade.Coins {
+				if !locked[string(coin)] {
+					t.Fatalf("coin %v of order %v is not locked under the order's ID", coin, ord.ID())
+				}
+			}
+		}
+	}
+}
+
+func epochStampedLO(t *testing.T, epochIdx, epochDur, offset int64, coin order.CoinID) *order.LimitOrder {
+	t.Helper()
+	lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	lo.SetTime(time.UnixMilli(epochIdx*epochDur + offset))
+	lo.Coins = []order.CoinID{coin}
+	return lo
+}
+
+func epochStampedCO(t *testing.T, targetID order.OrderID, epochIdx, epochDur, offset int64) *order.CancelOrder {
+	t.Helper()
+	co := makeCO(seller3, targetID)
+	co.SetTime(time.UnixMilli(epochIdx*epochDur + offset))
+	return co
+}
+
+func seedLifecycleRow(state db.MarketState, pending db.MarketPendingAction, epochIdx, epochDur int64) *db.MarketLifecycle {
+	persist := true
+	lc := &db.MarketLifecycle{
+		Market:        "dcr_btc", // matches newTestMarket
+		State:         state,
+		StartEpochIdx: epochIdx - 3,
+		StartEpochDur: epochDur,
+		PendingAction: pending,
+		PersistBook:   &persist,
+		// Matches newTestMarket's config, so adoption pins the same values
+		// the tests' orders are built for.
+		RunParams: meshevents.MarketRunParams{
+			LotSize:                dcrLotSize,
+			RateStep:               btcRateStep,
+			ParcelSize:             1,
+			MaxUserCancelsPerEpoch: math.MaxUint32,
+		},
+	}
+	switch {
+	case state == db.MarketStateSuspended:
+		lc.FinalEpochIdx, lc.FinalEpochDur = epochIdx, epochDur
+		lc.ProcessedEpochIdx = epochIdx
+	case pending == db.MarketPendingSuspend:
+		lc.FinalEpochIdx, lc.FinalEpochDur = epochIdx, epochDur
+		lc.PendingEpochIdx, lc.PendingEpochDur = epochIdx, epochDur
+		lc.ActiveEpochIdx = epochIdx
+		lc.ProcessedEpochIdx = epochIdx - 1
+	case state == db.MarketStateDraining:
+		lc.FinalEpochIdx, lc.FinalEpochDur = epochIdx, epochDur
+		lc.ProcessedEpochIdx = epochIdx - 1
+	default: // running, nothing pending
+		lc.PersistBook = nil
+		lc.ActiveEpochIdx = epochIdx
+		lc.ProcessedEpochIdx = epochIdx - 1
+	}
+	return lc
+}
+
+func seedEpochOrder(storage *TArchivist, ord order.Order, epochIdx, epochDur int64) {
+	storage.mtx.Lock()
+	storage.epochOrders = append(storage.epochOrders, epochOrderWrite{
+		ord:      ord,
+		epochIdx: epochIdx,
+		epochDur: epochDur,
+	})
+	storage.mtx.Unlock()
 }
 
 func TestMarket_Book(t *testing.T) {

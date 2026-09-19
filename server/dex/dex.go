@@ -1014,22 +1014,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, err
 	}
 
-	// Because the dexBalancer relies on the marketTunnels map, and NewMarket
-	// checks necessary balances for account-based assets using the dexBalancer,
-	// that means that each market can only query orders for the markets that
-	// were initialized before it was, which is fine, but notable. The
-	// resulting behavior is that a user could have orders involving an
-	// account-based asset approved for re-booking on one market, but have
-	// orders rejected on a market involving the same asset created afterwards,
-	// since the later balance query is accounting for the earlier market.
-	//
-	// The current behavior is to reject all orders for the market if the
-	// account balance is too low to support them all, though an algorithm could
-	// be developed to do reject only some orders, based on available funding.
-	//
-	// This pattern is only safe because the markets are not Run until after
-	// they are all instantiated, so we are synchronous in our use of the
-	// marketTunnels map.
 	marketTunnels := make(map[string]market.MarketTunnel, len(cfg.Markets))
 	pendingAccounters := make(map[string]market.PendingAccounter, len(cfg.Markets))
 
