@@ -3,7 +3,15 @@
 
 package db
 
-import "fmt"
+import (
+	"fmt"
+
+	"decred.org/dcrdex/server/meshevents"
+)
+
+// MaxUnprocessedClosedEpochs limits how many closed epochs may be waiting
+// for processing after an epoch closes.
+const MaxUnprocessedClosedEpochs = 2
 
 // ProjectMarketStartedLifecycle returns the lifecycle state after startup
 // recovery. It performs no storage I/O. changed is false when no update is needed.
@@ -81,6 +89,61 @@ func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedU
 	}
 }
 
+// ProjectAdvanceEpochLifecycle returns the lifecycle state after closing an
+// epoch. It opens the next epoch, or enters MarketStateDraining when the
+// final epoch of a scheduled suspension closes.
+func ProjectAdvanceEpochLifecycle(prev *MarketLifecycle, event *meshevents.AdvanceEpochEvent) (*MarketLifecycle, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", event.Market)
+	}
+	if prev.State != MarketStateRunning {
+		return nil, fmt.Errorf("advance_epoch for non-running market %s", event.Market)
+	}
+	if event.EpochDur != prev.StartEpochDur {
+		return nil, fmt.Errorf("advance_epoch duration %d mismatches run duration %d for market %s",
+			event.EpochDur, prev.StartEpochDur, event.Market)
+	}
+	if event.ClosedEpochIdx != prev.ActiveEpochIdx {
+		return nil, fmt.Errorf("advance_epoch closed epoch %d does not match active epoch cursor %d for market %s",
+			event.ClosedEpochIdx, prev.ActiveEpochIdx, event.Market)
+	}
+	if prev.ProcessedEpochIdx < event.ClosedEpochIdx-MaxUnprocessedClosedEpochs {
+		return nil, fmt.Errorf("advance_epoch closing epoch %d would exceed %d unprocessed epochs (last processed epoch %d) for market %s",
+			event.ClosedEpochIdx, MaxUnprocessedClosedEpochs, prev.ProcessedEpochIdx, event.Market)
+	}
+	switch prev.PendingAction {
+	case MarketPendingNone:
+		if event.OpenedEpochIdx <= 0 {
+			return nil, fmt.Errorf("advance_epoch opened epoch must be positive for market %s", event.Market)
+		}
+	case MarketPendingSuspend:
+		if event.OpenedEpochIdx == 0 {
+			if !sameLifecycleEpoch(prev.PendingEpochIdx, prev.PendingEpochDur, event.ClosedEpochIdx, event.EpochDur) {
+				return nil, fmt.Errorf("final-close epoch mismatch for market %s", event.Market)
+			}
+			next := *prev
+			next.State = MarketStateDraining
+			next.PendingAction = MarketPendingNone
+			next.PendingEpochIdx = 0
+			next.PendingEpochDur = 0
+			next.ActiveEpochIdx = 0
+			return &next, nil
+		}
+		if event.ClosedEpochIdx >= prev.PendingEpochIdx || event.OpenedEpochIdx > prev.PendingEpochIdx {
+			return nil, fmt.Errorf("advance_epoch crosses pending suspend final epoch for market %s", event.Market)
+		}
+	default:
+		return nil, fmt.Errorf("advance_epoch rejected for market %s lifecycle pending action %d",
+			event.Market, prev.PendingAction)
+	}
+	next := *prev
+	next.ActiveEpochIdx = event.OpenedEpochIdx
+	return &next, nil
+}
+
 func newRunningMarketLifecycle(update *MarketStartedUpdate) *MarketLifecycle {
 	return &MarketLifecycle{
 		Market:            update.Market,
@@ -92,4 +155,8 @@ func newRunningMarketLifecycle(update *MarketStartedUpdate) *MarketLifecycle {
 		ProcessedEpochIdx: update.CurrentEpochIdx - 1,
 		RunParams:         update.RunParams,
 	}
+}
+
+func sameLifecycleEpoch(idxA, durA, idxB, durB int64) bool {
+	return idxA == idxB && durA == durB
 }

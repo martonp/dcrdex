@@ -22,6 +22,14 @@ func orderTypeBytes(t order.OrderType) []byte {
 	return []byte{byte(t)}
 }
 
+func orderIDListTxData(ids []order.OrderID) []byte {
+	b := encode.BuildyBytes{0}
+	for _, id := range ids {
+		b = b.AddData(id[:])
+	}
+	return b
+}
+
 func startupOrderRevokesTxData(ords []*StartupOrderRevoke) ([]byte, error) {
 	b := encode.BuildyBytes{0}
 	for _, revoke := range ords {
@@ -91,4 +99,3 @@ func (u *MarketStartedUpdate) EventTxData() ([]byte, error) {
 		AddData(bookedRevokes).
 		AddData(epochRevokes), nil
 }
-

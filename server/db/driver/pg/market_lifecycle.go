@@ -12,6 +12,7 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 // MarketLifecycle returns the stored market lifecycle, or nil if none exists.
@@ -124,6 +125,18 @@ func (a *Archiver) validateLifecycleMarket(market string, base, quote uint32) er
 			market, base, quote, mkt.Name)
 	}
 	return nil
+}
+
+func (a *Archiver) applyAdvanceEpochLifecycleTx(tx *sql.Tx, event *meshevents.AdvanceEpochEvent) error {
+	lifecycle, err := a.marketLifecycleForUpdate(tx, event.Market)
+	if err != nil {
+		return err
+	}
+	next, err := db.ProjectAdvanceEpochLifecycle(lifecycle, event)
+	if err != nil {
+		return err
+	}
+	return a.updateMarketLifecycleTx(tx, next)
 }
 
 // checkOrderAcceptanceTx locks the market's lifecycle row and checks

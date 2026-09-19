@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -140,12 +141,32 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("InsertCandles: %v", err)
 	}
 
+	persist := true
+	lifecycle := &db.MarketLifecycle{
+		RunParams: testMarketRunParams(),
+		Market:    "dcr_btc", State: db.MarketStateDraining,
+		StartEpochIdx: 10, StartEpochDur: int64(EpochDuration),
+		FinalEpochIdx: 20, FinalEpochDur: int64(EpochDuration),
+		ProcessedEpochIdx: 19, PersistBook: &persist,
+	}
+	seedMarketLifecycle(t, lifecycle)
+
 	pointID := insertSnapshotTestPoint(t, ctx, []byte{0xaa}, []byte{0xbb})
 
 	appendSnapshotTestEvent(t, ctx, []byte("e1"))
 	wantFrontier := appendSnapshotTestEvent(t, ctx, []byte("e2"))
 
 	loadFrontier := reloadFromSnapshot(t, ctx)
+
+	t.Run("draining lifecycle", func(t *testing.T) {
+		restored, err := archie.MarketLifecycle(lifecycle.Market)
+		if err != nil {
+			t.Fatalf("MarketLifecycle: %v", err)
+		}
+		if !reflect.DeepEqual(restored, lifecycle) {
+			t.Fatalf("restored lifecycle = %+v, want %+v", restored, lifecycle)
+		}
+	})
 
 	t.Run("orders", func(t *testing.T) {
 		checkStoredOrder(t, bookedOrder, order.OrderStatusBooked)

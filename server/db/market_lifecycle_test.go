@@ -104,3 +104,102 @@ func TestProjectMarketStartedLifecycle(t *testing.T) {
 		}
 	})
 }
+
+func TestProjectAdvanceEpochLifecycle(t *testing.T) {
+	persist := true
+	const market = "dcr_btc"
+	const dur int64 = 10_000
+
+	running := func(active int64) *MarketLifecycle {
+		return &MarketLifecycle{
+			Market:            market,
+			State:             MarketStateRunning,
+			StartEpochIdx:     10,
+			StartEpochDur:     dur,
+			PendingAction:     MarketPendingNone,
+			ActiveEpochIdx:    active,
+			ProcessedEpochIdx: active - 1,
+		}
+	}
+
+	checkAdvance := func(t *testing.T, prev *MarketLifecycle, update *meshevents.AdvanceEpochEvent, want *MarketLifecycle) {
+		t.Helper()
+		before := *prev
+		next, err := ProjectAdvanceEpochLifecycle(prev, update)
+		if err != nil {
+			t.Fatalf("ProjectAdvanceEpochLifecycle: %v", err)
+		}
+		if !reflect.DeepEqual(next, want) {
+			t.Fatalf("lifecycle = %+v, want %+v", next, want)
+		}
+		if !reflect.DeepEqual(*prev, before) {
+			t.Fatal("projection modified the previous lifecycle")
+		}
+	}
+
+	for _, test := range []struct {
+		name          string
+		pendingFinal  int64
+		active        int64
+		opened        int64
+		processingLag int64
+	}{
+		{"normal advance", 0, 15, 16, 1},
+		{"pending suspension", 20, 15, 16, 1},
+		{"final close", 20, 20, 0, 1},
+		{"maximum processing lag", 0, 15, 16, MaxUnprocessedClosedEpochs},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prev := running(test.active)
+			prev.ProcessedEpochIdx = test.active - test.processingLag
+			if test.pendingFinal != 0 {
+				prev.PendingAction = MarketPendingSuspend
+				prev.PendingEpochIdx, prev.PendingEpochDur = test.pendingFinal, dur
+				prev.FinalEpochIdx, prev.FinalEpochDur = test.pendingFinal, dur
+				prev.PersistBook = &persist
+			}
+			want := *prev
+			want.ActiveEpochIdx = test.opened
+			if test.opened == 0 {
+				want.State = MarketStateDraining
+				want.PendingAction = MarketPendingNone
+				want.PendingEpochIdx, want.PendingEpochDur = 0, 0
+			}
+			checkAdvance(t, prev, &meshevents.AdvanceEpochEvent{
+				Market: market, ClosedEpochIdx: test.active, OpenedEpochIdx: test.opened, EpochDur: dur,
+			}, &want)
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		change func(*MarketLifecycle, *meshevents.AdvanceEpochEvent)
+	}{
+		{"closed epoch mismatch", func(_ *MarketLifecycle, u *meshevents.AdvanceEpochEvent) {
+			u.ClosedEpochIdx--
+			u.OpenedEpochIdx--
+		}},
+		{"duration mismatch", func(_ *MarketLifecycle, u *meshevents.AdvanceEpochEvent) { u.EpochDur++ }},
+		{"too many unprocessed epochs", func(lc *MarketLifecycle, _ *meshevents.AdvanceEpochEvent) {
+			lc.ProcessedEpochIdx = lc.ActiveEpochIdx - MaxUnprocessedClosedEpochs - 1
+		}},
+		{"draining market", func(lc *MarketLifecycle, _ *meshevents.AdvanceEpochEvent) { lc.State = MarketStateDraining }},
+		{"premature final close", func(_ *MarketLifecycle, u *meshevents.AdvanceEpochEvent) { u.OpenedEpochIdx = 0 }},
+		{"advance past final epoch", func(lc *MarketLifecycle, _ *meshevents.AdvanceEpochEvent) {
+			lc.PendingEpochIdx, lc.FinalEpochIdx = lc.ActiveEpochIdx, lc.ActiveEpochIdx
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prev := running(15)
+			prev.PendingAction = MarketPendingSuspend
+			prev.PendingEpochIdx, prev.PendingEpochDur = 20, dur
+			prev.FinalEpochIdx, prev.FinalEpochDur = 20, dur
+			prev.PersistBook = &persist
+			update := &meshevents.AdvanceEpochEvent{Market: market, ClosedEpochIdx: 15, OpenedEpochIdx: 16, EpochDur: dur}
+			test.change(prev, update)
+			if _, err := ProjectAdvanceEpochLifecycle(prev, update); err == nil {
+				t.Fatal("expected advance to be rejected")
+			}
+		})
+	}
+}
