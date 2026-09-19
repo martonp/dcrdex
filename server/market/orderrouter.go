@@ -36,6 +36,7 @@ type AuthManager interface {
 	Send(account.AccountID, *msgjson.Message) error
 	SendIfLocal(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
+	RequestIfLocal(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message), time.Duration, func()) error
 	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
 	PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID)

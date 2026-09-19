@@ -63,6 +63,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func
 		meshevents.EventKindMarketResumed: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketResumedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
+		meshevents.EventKindSuspendedCancel: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applySuspendedCancelEvent(applyCtx, markets, bookRouter, event)
+		},
 		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
 		},
@@ -255,6 +258,12 @@ type validatedOrderAcceptedEvent struct {
 	book           *msgBook
 	update         *db.OrderAcceptedUpdate
 	alreadyApplied bool
+}
+
+type validatedSuspendedCancelEvent struct {
+	mkt    *Market
+	book   *msgBook
+	update *db.SuspendedCancelUpdate
 }
 
 type revokeTarget struct {
@@ -563,6 +572,90 @@ func applyMarketResumedEvent(applyCtx *mesh.EventApplyContext, markets map[strin
 	}
 	bookRouter.applyMarketResumedEvent(book, result.Lifecycle.StartEpochIdx, removed)
 	return result.Log, nil
+}
+
+func applySuspendedCancelEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter,
+	event *mesh.Event) (*db.EventLogEntry, error) {
+
+	validated, err := validateSuspendedCancelEvent(markets, bookRouter, event)
+	if err != nil {
+		return nil, err
+	}
+	result, err := validated.mkt.storage.ApplySuspendedCancelEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), validated.update)
+	if err != nil {
+		return nil, err
+	}
+	mkt := validated.mkt
+	target := result.TargetOrder
+	mkt.bookMtx.Lock()
+	delete(mkt.settling, target.ID())
+	mkt.book.Remove(target.ID())
+	mkt.bookMtx.Unlock()
+	mkt.unlockOrderCoins(target)
+
+	// Attempt the acceptance response before sending the cancellation match.
+	notifySuspendedCancel := func(context.Context) {
+		bookRouter.unbookOrder(validated.book, target)
+		mkt.sendSuspendedCancelMatchRequest(result.Cancel.User(), result.Match, validated.update.MatchServerTime)
+	}
+	if !applyCtx.AfterCommandResult(notifySuspendedCancel) {
+		bookRouter.unbookOrder(validated.book, target)
+	}
+	return result.Log, nil
+}
+
+func validateSuspendedCancelEvent(markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*validatedSuspendedCancelEvent, error) {
+	cancelEvent, err := meshevents.DecodeSuspendedCancelEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	cancel, err := cancelEvent.CancelOrder()
+	if err != nil {
+		return nil, err
+	}
+	target, err := cancelEvent.TargetOrder()
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, cancelEvent.Market)
+	if err != nil {
+		return nil, err
+	}
+	if cancel.Base() != mkt.base || cancel.Quote() != mkt.quote {
+		return nil, fmt.Errorf("suspended_cancel market mismatch")
+	}
+	if target.Base() != mkt.base || target.Quote() != mkt.quote {
+		return nil, fmt.Errorf("suspended_cancel target market mismatch")
+	}
+	match := &order.Match{
+		Taker:        cancel,
+		Maker:        target,
+		Quantity:     target.Remaining(),
+		Rate:         target.Rate,
+		Epoch:        order.EpochID{Idx: uint64(cancelEvent.EpochIdx), Dur: uint64(cancelEvent.EpochDur)},
+		FeeRateBase:  cancelEvent.FeeRateBase,
+		FeeRateQuote: cancelEvent.FeeRateQuote,
+		Status:       order.MatchComplete,
+	}
+	return &validatedSuspendedCancelEvent{
+		mkt:  mkt,
+		book: book,
+		update: &db.SuspendedCancelUpdate{
+			Market:          cancelEvent.Market,
+			Base:            cancelEvent.Base,
+			Quote:           cancelEvent.Quote,
+			Cancel:          cancel,
+			TargetOrderID:   target.ID(),
+			TargetAccount:   target.AccountID,
+			TargetSell:      target.Sell,
+			EpochIdx:        cancelEvent.EpochIdx,
+			EpochDur:        cancelEvent.EpochDur,
+			FeeRateBase:     cancelEvent.FeeRateBase,
+			FeeRateQuote:    cancelEvent.FeeRateQuote,
+			MatchServerTime: cancelEvent.MatchTime(),
+			Match:           match,
+		},
+	}, nil
 }
 
 func applyAdvanceEpochEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*db.EventLogEntry, error) {

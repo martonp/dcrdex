@@ -206,7 +206,6 @@ type Storage interface {
 	Close() error
 	LastEpochRate(base, quote uint32) (uint64, error)
 	MarketMatches(base, quote uint32) ([]*db.MatchDataWithCoins, error)
-	InsertMatch(match *order.Match) error
 }
 
 // NewMarket initializes a market for the configured base and quote assets.
@@ -1151,8 +1150,10 @@ func (m *Market) orderAtOrAfterSuspendBoundaryLocked(ord order.Order) bool {
 	return ord.Time() >= (finalIdx+1)*finalDur
 }
 
-// AcceptOrderCommand submits an order_accepted event, restamping the order
-// if its epoch closed before the event could be applied.
+// AcceptOrderCommand validates an order and emits order_accepted, or
+// suspended_cancel for a cancel on a suspended market. The router checks for
+// resubmissions first; duplicate commitments trigger another lookup here to
+// handle requests accepted concurrently.
 func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
 	if err := m.validateOrder(rec.order); err != nil {
 		log.Debugf("AcceptOrderCommand: Invalid order received from user %v with commitment %v: %v",
@@ -1161,7 +1162,16 @@ func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, compl
 	}
 
 	if !m.Running() {
-		return msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+		if rec.order.Type() != order.CancelOrderType {
+			log.Infof("AcceptOrderCommand: Market stopped with an order in submission (commitment %v).",
+				rec.order.Commitment())
+			return msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+		}
+		if handled, rpcErr := m.acceptSuspendedCancel(ctx, rec, completion); handled {
+			return rpcErr
+		}
+		// The market resumed while acquiring resumeSubmitMtx; take the normal
+		// running-market path below.
 	}
 
 	commit := rec.order.Commitment()
@@ -1206,6 +1216,73 @@ func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, compl
 	return marketOrderError(err)
 }
 
+// acceptSuspendedCancel submits a cancellation for a booked order in a suspended
+// market. It returns handled=false if the market resumed while waiting for
+// resumeSubmitMtx, so the caller can accept the cancel into an epoch instead.
+func (m *Market) acceptSuspendedCancel(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) (handled bool, rpcErr *msgjson.Error) {
+	m.resumeSubmitMtx.RLock()
+	defer m.resumeSubmitMtx.RUnlock()
+
+	if m.Running() {
+		return false, nil
+	}
+	m.epochMtx.RLock()
+	suspended := m.lifecycleState == db.MarketStateSuspended &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingResume)
+	m.epochMtx.RUnlock()
+	if !suspended {
+		return true, msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+	}
+	event, result, rpcErr := m.stampedSuspendedCancelEvent(rec)
+	if rpcErr != nil {
+		// Once an identical duplicate applied, CancelableBy no longer sees
+		// the target it unbooked.
+		if handled, resendErr := m.HandleOrderResubmission(ctx, rec, completion); handled {
+			return true, resendErr
+		}
+		return true, rpcErr
+	}
+	if err := completion.Emit(ctx, event, func() any { return result }); err != nil {
+		// Check whether a concurrent identical request was accepted.
+		if handled, resendErr := m.HandleOrderResubmission(ctx, rec, completion); handled {
+			return true, resendErr
+		}
+		return true, marketOrderError(err)
+	}
+	return true, nil
+}
+
+// stampedSuspendedCancelEvent checks the cancellation target, sets the
+// cancel's server time, and builds the event and acceptance response.
+func (m *Market) stampedSuspendedCancelEvent(rec *orderRecord) (*mesh.Event, *msgjson.OrderResult, *msgjson.Error) {
+	co, ok := rec.order.(*order.CancelOrder)
+	if !ok {
+		return nil, nil, marketOrderError(ErrInvalidOrder)
+	}
+	if cancelable, _, err := m.CancelableBy(co.TargetOrderID, co.AccountID); !cancelable {
+		return nil, nil, marketOrderError(err)
+	}
+	m.bookMtx.Lock()
+	target := m.book.Order(co.TargetOrderID)
+	m.bookMtx.Unlock()
+	if target == nil {
+		return nil, nil, marketOrderError(ErrTargetNotCancelable)
+	}
+
+	sTime := time.Now().Truncate(time.Millisecond).UTC()
+	co.SetTime(sTime)
+	result := m.orderResult(rec)
+	dur := int64(m.EpochDuration())
+	epochIdx := sTime.UnixMilli() / dur
+	event, err := mesh.NewEvent(meshevents.NewSuspendedCancelEvent(m.name, m.base,
+		m.quote, co, target, epochIdx, dur, m.getFeeRate(m.Base(), m.baseFeeFetcher),
+		m.getFeeRate(m.Quote(), m.quoteFeeFetcher), sTime))
+	if err != nil {
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build suspended cancel event: %v", err)
+	}
+	return event, result, nil
+}
+
 // OrderFeed provides a new order book update channel. Channels provided before
 // the market starts and while a market is running are both valid. When the
 // market stops, channels are closed (invalidated), and new channels should be
@@ -1248,116 +1325,32 @@ func (m *Market) sendToFeeds(sig *updateSignal) {
 	m.orderFeedMtx.RUnlock()
 }
 
-// processCancelOrderWhileSuspended is called when cancelling an order while
-// the market is suspended and Run is not running. The error sent on errChan
-// is returned to the client.
-//
-// This function:
-// 1. Removes the target order from the book.
-// 2. Unlocks the order coins.
-// 3. Updates the storage with the new cancel order and cancels the existing limit order.
-// 4. Responds to the client that the order was received.
-// 5. Sends the unbooked order to the order feeds.
-// 6. Creates a match object, stores it, and notifies the client of the match.
-func (m *Market) processCancelOrderWhileSuspended(rec *orderRecord, errChan chan<- error) {
-	co, ok := rec.order.(*order.CancelOrder)
-	if !ok {
-		errChan <- ErrInvalidOrder
+// sendSuspendedCancelMatchRequest signs and sends the maker and taker match
+// notifications for a cancellation to the locally connected order owner.
+func (m *Market) sendSuspendedCancelMatchRequest(user account.AccountID, match *order.Match, serverTime time.Time) {
+	if match == nil {
 		return
 	}
-
-	if cancelable, _, err := m.CancelableBy(co.TargetOrderID, co.AccountID); !cancelable {
-		errChan <- err
-		return
-	}
-
-	m.bookMtx.Lock()
-	delete(m.settling, co.TargetOrderID)
-	lo, ok := m.book.Remove(co.TargetOrderID)
-	m.bookMtx.Unlock()
-	if !ok {
-		errChan <- ErrTargetNotCancelable
-		return
-	}
-
-	m.unlockOrderCoins(lo)
-
-	sTime := time.Now().Truncate(time.Millisecond).UTC()
-	co.SetTime(sTime)
-
-	// Create the client response here, but don't send it until the order has been
-	// committed to the storage.
-	respMsg, err := msgjson.NewResponse(rec.msgID, m.orderResult(rec), nil)
-	if err != nil {
-		errChan <- fmt.Errorf("failed to create order response: %w", err)
-		return
-	}
-
-	dur := int64(m.EpochDuration())
-	now := time.Now().UnixMilli()
-	epochIdx := now / dur
-	if err := m.storage.NewArchivedCancel(co, epochIdx, dur); err != nil {
-		errChan <- err
-		return
-	}
-	if err := m.storage.CancelOrder(lo); err != nil {
-		errChan <- err
-		return
-	}
-
-	err = m.auth.Send(rec.order.User(), respMsg)
-	if err != nil {
-		log.Errorf("Failed to send cancel order response: %v", err)
-	}
-
-	sig := &updateSignal{
-		action: unbookAction,
-		data: sigDataUnbookedOrder{
-			order:    lo,
-			epochIdx: 0,
-		},
-	}
-	m.sendToFeeds(sig)
-
-	match := order.Match{
-		Taker:    co,
-		Maker:    lo,
-		Quantity: lo.Remaining(),
-		Rate:     lo.Rate,
-		Epoch: order.EpochID{
-			Idx: uint64(epochIdx),
-			Dur: m.EpochDuration(),
-		},
-		FeeRateBase:  m.getFeeRate(m.Base(), m.baseFeeFetcher),
-		FeeRateQuote: m.getFeeRate(m.Quote(), m.quoteFeeFetcher),
-	}
-	// insertMatchErr is sent on errChan at the end of the function. We
-	// want to send the match request to the client even if this insertion
-	// fails.
-	insertMatchErr := m.storage.InsertMatch(&match)
-
-	makerMsg, takerMsg := matchNotifications(&match)
+	makerMsg, takerMsg := matchNotifications(match, serverTime)
 	m.auth.Sign(makerMsg)
 	m.auth.Sign(takerMsg)
 	msgs := []msgjson.Signable{makerMsg, takerMsg}
 	req, err := msgjson.NewRequest(comms.NextID(), msgjson.MatchRoute, msgs)
 	if err != nil {
-		log.Errorf("Failed to create match request: %v", err)
-	} else {
-		err = m.auth.Request(rec.order.User(), req, func(_ comms.Link, resp *msgjson.Message) {
-			m.processMatchAcksForCancel(rec.order.User(), resp)
-		})
-		if err != nil {
-			log.Errorf("Failed to send match request: %v", err)
-		}
+		log.Errorf("Failed to create suspended cancel match request: %v", err)
+		return
 	}
-
-	errChan <- insertMatchErr
+	if err = m.auth.RequestIfLocal(user, req, func(_ comms.Link, resp *msgjson.Message) {
+		m.processMatchAcksForCancel(user, resp)
+	}); err != nil {
+		log.Errorf("Failed to send suspended cancel match request: %v", err)
+	}
 }
 
-// matchNotifications creates a pair of msgjson.Match from a match.
-func matchNotifications(match *order.Match) (makerMsg *msgjson.Match, takerMsg *msgjson.Match) {
-	stamp := uint64(time.Now().UnixMilli())
+// matchNotifications creates a pair of msgjson.Match from a match, stamped
+// with the given server time.
+func matchNotifications(match *order.Match, serverTime time.Time) (makerMsg *msgjson.Match, takerMsg *msgjson.Match) {
+	stamp := uint64(serverTime.UnixMilli())
 	return &msgjson.Match{
 			OrderID:      idToBytes(match.Maker.ID()),
 			MatchID:      idToBytes(match.ID()),

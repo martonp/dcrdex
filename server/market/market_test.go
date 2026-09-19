@@ -60,6 +60,7 @@ type TArchivist struct {
 	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
+	suspendedCancels              []*db.SuspendedCancelUpdate
 	ordersRevokedUpdates          []*db.OrdersRevokedUpdate
 	commitOrders                  []db.OrderWithStatus
 	commitOrdersErr               error
@@ -217,6 +218,52 @@ func (rig *marketEventRig) subscribeBook(t *testing.T) *TLink {
 	}
 	_ = link.getSend() // initial order book response
 	return link
+}
+
+func prepareOrderCommand(t *testing.T, mkt *Market, auth *TAuth, rec *orderRecord) (*mesh.Service, mesh.CommandRequest) {
+	t.Helper()
+
+	var kind string
+	switch rec.order.Type() {
+	case order.LimitOrderType:
+		kind = commandKindLimit
+	case order.MarketOrderType:
+		kind = commandKindMarket
+	case order.CancelOrderType:
+		kind = commandKindCancel
+	default:
+		t.Fatalf("unknown order type %v", rec.order.Type())
+	}
+
+	tm, ok := mkt.mesh.(*tMesh)
+	if !ok {
+		t.Fatalf("test market mesh has type %T, not *tMesh", mkt.mesh)
+	}
+	svc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands: map[string]mesh.CommandExecutor{
+			kind: func(cmd *mesh.CommandContext) *msgjson.Error {
+				return mkt.AcceptOrderCommand(cmd.Context, rec, cmd.Completion)
+			},
+		},
+		Events: tm.events,
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+	msg, err := msgjson.NewRequest(rec.msgID, kind, nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	return svc, mesh.CommandRequest{
+		Kind: kind,
+		User: rec.order.User(),
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			return auth.Send(rec.order.User(), resp)
+		},
+	}
 }
 
 type epochOrderWrite struct {
@@ -461,6 +508,17 @@ func (ta *TArchivist) ApplyEpochProcessedEvent(_ context.Context, _ *db.EventLog
 		epochInserted <- struct{}{}
 	}
 	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplySuspendedCancelEvent(_ context.Context, _ *db.EventLogMeta, update *db.SuspendedCancelUpdate) (*db.SuspendedCancelApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.suspendedCancels = append(ta.suspendedCancels, update)
+	return &db.SuspendedCancelApplyResult{
+		Log:         new(db.EventLogEntry),
+		Cancel:      update.Cancel,
+		TargetOrder: update.Match.Maker,
+		Match:       update.Match,
+	}, nil
 }
 func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
 	if ta.epochInserted != nil { // the test wants to know
@@ -3528,6 +3586,214 @@ func TestAcceptOrderCommandRestampsAfterMissedEpoch(t *testing.T) {
 	}
 	if result.ServerTime != uint64(secondOrder.Time()) {
 		t.Fatalf("response server time = %d, want %d", result.ServerTime, secondOrder.Time())
+	}
+}
+
+func seedPendingResumeState(mkt *Market) {
+	mkt.epochMtx.Lock()
+	mkt.lifecycleState = db.MarketStateSuspended
+	mkt.pendingLifecycleAction = db.MarketPendingResume
+	mkt.pendingLifecycleEpochIdx = 123
+	mkt.pendingLifecycleEpochDur = int64(mkt.EpochDuration())
+	mkt.persistBook = true
+	mkt.persistBookSet = true
+	mkt.epochMtx.Unlock()
+}
+
+func suspendedCancelRecord(t *testing.T, mkt *Market, storage *TArchivist, msgID uint64) (*order.LimitOrder, order.CoinID, *orderRecord) {
+	t.Helper()
+	coin := order.CoinID([]byte{0x61, 0x62, 0x63})
+	target := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	target.Coins = []order.CoinID{coin}
+	mkt.bookMtx.Lock()
+	inserted := mkt.book.Insert(target)
+	mkt.bookMtx.Unlock()
+	if !inserted {
+		t.Fatalf("failed to insert target order")
+	}
+	if !mkt.lockOrderCoins(target) {
+		t.Fatalf("failed to lock target order coins")
+	}
+	if err := storage.BookOrder(target); err != nil {
+		t.Fatalf("BookOrder error: %v", err)
+	}
+
+	targetID := target.ID()
+	aid := target.User()
+	cancelTime := time.Now().UnixMilli()
+	pi := test.RandomPreimage()
+	commit := pi.Commit()
+	cancelMsg := &msgjson.CancelOrder{
+		Prefix: msgjson.Prefix{
+			AccountID:  aid[:],
+			Base:       target.Base(),
+			Quote:      target.Quote(),
+			OrderType:  msgjson.CancelOrderNum,
+			ClientTime: uint64(cancelTime),
+			Commit:     commit[:],
+		},
+		TargetID: targetID[:],
+	}
+	co := &order.CancelOrder{
+		P: order.Prefix{
+			AccountID:  aid,
+			BaseAsset:  target.Base(),
+			QuoteAsset: target.Quote(),
+			OrderType:  order.CancelOrderType,
+			ClientTime: time.UnixMilli(cancelTime),
+			Commit:     commit,
+		},
+		TargetOrderID: targetID,
+	}
+	rec := &orderRecord{
+		order: co,
+		req:   cancelMsg,
+		msgID: msgID,
+	}
+	return target, coin, rec
+}
+
+func TestMarketAcceptOrderCommandSuspendedCancel(t *testing.T) {
+	tests := []struct {
+		name          string
+		state         db.MarketState
+		pendingResume bool
+		wantErr       bool
+	}{
+		{name: "suspended", state: db.MarketStateSuspended},
+		{name: "pending resume", state: db.MarketStateSuspended, pendingResume: true},
+		{name: "draining", state: db.MarketStateDraining, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mkt, storage, auth, cleanup, err := newTestMarket()
+			if err != nil {
+				t.Fatalf("newTestMarket: %v", err)
+			}
+			defer cleanup()
+			mkt.lifecycleState = tt.state
+			if tt.pendingResume {
+				seedPendingResumeState(mkt)
+			}
+			target, coin, rec := suspendedCancelRecord(t, mkt, storage, 42)
+			targetID := target.ID()
+			auth.handleMatchDone = make(chan *msgjson.Message, 1)
+			svc, req := prepareOrderCommand(t, mkt, auth, rec)
+			respond := req.Respond
+			req.Respond = func(response *msgjson.Message) error {
+				if len(auth.handleMatchDone) != 0 {
+					t.Error("match request sent before acceptance response")
+				}
+				return respond(response)
+			}
+			rpcErr := svc.ExecuteCommand(context.Background(), req)
+			if tt.wantErr {
+				if rpcErr == nil || rpcErr.Code != msgjson.MarketNotRunningError {
+					t.Fatalf("cancel error = %v, want market not running", rpcErr)
+				}
+				if len(storage.suspendedCancels) != 0 || !mkt.book.HaveOrder(targetID) || !mkt.CoinLocked(mkt.Base(), coin) {
+					t.Fatal("rejected cancellation changed storage, book, or funding locks")
+				}
+				if auth.getSend() != nil || len(auth.handleMatchDone) != 0 {
+					t.Fatal("rejected cancellation sent an acceptance response or match request")
+				}
+				return
+			}
+			if rpcErr != nil {
+				t.Fatalf("cancel: %v", rpcErr)
+			}
+			if len(storage.suspendedCancels) != 1 {
+				t.Fatalf("stored cancellations = %d, want 1", len(storage.suspendedCancels))
+			}
+			update := storage.suspendedCancels[0]
+			if update.TargetOrderID != targetID {
+				t.Fatalf("stored target = %v, want %v", update.TargetOrderID, targetID)
+			}
+			if mkt.book.HaveOrder(targetID) || mkt.CoinLocked(mkt.Base(), coin) {
+				t.Fatal("canceled target remains booked or has locked funding")
+			}
+
+			response := auth.getSend()
+			if response == nil || response.ID != rec.msgID || auth.getSend() != nil {
+				t.Fatal("expected exactly one acceptance response with the request ID")
+			}
+			var result msgjson.OrderResult
+			if err := response.UnmarshalResult(&result); err != nil {
+				t.Fatalf("decode acceptance response: %v", err)
+			}
+			cancelID := rec.order.ID()
+			if !bytes.Equal(result.OrderID, cancelID[:]) || result.ServerTime != uint64(rec.order.Time()) {
+				t.Fatalf("acceptance response = %+v, want cancel %v at %d", result, cancelID, rec.order.Time())
+			}
+			if update.MatchServerTime.UnixMilli() != rec.order.Time() || update.EpochIdx != rec.order.Time()/update.EpochDur {
+				t.Fatal("cancel, match, and epoch do not use the same server time")
+			}
+
+			var matchRequest *msgjson.Message
+			select {
+			case matchRequest = <-auth.handleMatchDone:
+			default:
+				t.Fatal("missing cancellation match request")
+			}
+			var matches []msgjson.Match
+			if err := json.Unmarshal(matchRequest.Payload, &matches); err != nil {
+				t.Fatalf("decode match request: %v", err)
+			}
+			if len(matches) != 2 {
+				t.Fatalf("match notifications = %d, want maker and taker", len(matches))
+			}
+			matchID := update.Match.ID()
+			for i, oid := range []order.OrderID{targetID, cancelID} {
+				note := matches[i]
+				if !bytes.Equal(note.OrderID, oid[:]) || !bytes.Equal(note.MatchID, matchID[:]) ||
+					note.Side != uint8(i) || note.Quantity != target.Remaining() || note.ServerTime != result.ServerTime {
+					t.Fatalf("match notification %d = %+v, want order %v, match %v at %d", i, note, oid, matchID, result.ServerTime)
+				}
+			}
+		})
+	}
+}
+
+func TestMarketAcceptOrderCommandSuspendedCancelBlocksDuringResumePreparation(t *testing.T) {
+	mkt, storage, auth, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket: %v", err)
+	}
+	defer cleanup()
+	seedPendingResumeState(mkt)
+	_, _, rec := suspendedCancelRecord(t, mkt, storage, 43)
+	svc, req := prepareOrderCommand(t, mkt, auth, rec)
+	result := make(chan *msgjson.Error, 1)
+
+	func() {
+		mkt.resumeSubmitMtx.Lock()
+		defer mkt.resumeSubmitMtx.Unlock()
+		go func() {
+			result <- svc.ExecuteCommand(context.Background(), req)
+		}()
+		select {
+		case rpcErr := <-result:
+			t.Fatalf("cancel completed during resume preparation: %v", rpcErr)
+		case <-time.After(100 * time.Millisecond):
+		}
+		storage.mtx.Lock()
+		n := len(storage.suspendedCancels)
+		storage.mtx.Unlock()
+		if n != 0 {
+			t.Fatalf("stored cancellations during resume preparation = %d, want 0", n)
+		}
+	}()
+
+	select {
+	case rpcErr := <-result:
+		if rpcErr != nil {
+			t.Fatalf("cancel after resume preparation: %v", rpcErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not complete after resume preparation")
+	}
+	if len(storage.suspendedCancels) != 1 {
+		t.Fatalf("stored cancellations = %d, want 1", len(storage.suspendedCancels))
 	}
 }
 
