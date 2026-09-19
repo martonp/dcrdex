@@ -41,6 +41,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated
 		meshevents.EventKindMarketStarted: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketStartedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
+		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
+		},
 	}
 }
 
@@ -264,4 +267,28 @@ func validateOrderAcceptedEvent(markets map[string]*Market, bookRouter *BookRout
 		return nil, err
 	}
 	return mkt.validateOrderAcceptedEvent(ord, book)
+}
+
+func applyAdvanceEpochEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*db.EventLogEntry, error) {
+	advance, err := meshevents.DecodeAdvanceEpochEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, advance.Market)
+	if err != nil {
+		return nil, err
+	}
+	closedOrders, err := mkt.validateAdvanceEpochState(advance)
+	if err != nil {
+		return nil, err
+	}
+	logEntry, err := mkt.storage.ApplyAdvanceEpochEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), advance)
+	if err != nil {
+		return nil, err
+	}
+	mkt.applyAdvanceEpochEvent(advance, closedOrders)
+	if advance.OpenedEpochIdx > 0 {
+		book.setEpoch(advance.OpenedEpochIdx)
+	}
+	return logEntry, nil
 }
