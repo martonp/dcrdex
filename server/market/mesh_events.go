@@ -4,8 +4,11 @@
 package market
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
+	"sort"
 	"time"
 
 	"decred.org/dcrdex/dex"
@@ -47,6 +50,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func
 		},
 		meshevents.EventKindEpochProcessed: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyEpochProcessedEvent(applyCtx, markets, bookRouter, sendIfLocal, event)
+		},
+		meshevents.EventKindOrdersRevoked: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyOrdersRevokedEvent(applyCtx, markets, bookRouter, event)
 		},
 	}
 }
@@ -231,6 +237,135 @@ type validatedOrderAcceptedEvent struct {
 	book           *msgBook
 	update         *db.OrderAcceptedUpdate
 	alreadyApplied bool
+}
+
+type revokeTarget struct {
+	mkt  *Market
+	book *msgBook
+	lo   *order.LimitOrder
+}
+
+type resolvedOrdersRevokedEvent struct {
+	reason     meshevents.OrderRevokeReason
+	revokeTime time.Time
+	targets    []revokeTarget
+}
+
+func applyOrdersRevokedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter,
+	event *mesh.Event) (*db.EventLogEntry, error) {
+
+	resolved, err := resolveOrdersRevokedEvent(markets, bookRouter, event)
+	if err != nil {
+		return nil, err
+	}
+	update := &db.OrdersRevokedUpdate{
+		Reason:     resolved.reason,
+		RevokeTime: resolved.revokeTime,
+		Orders:     make([]*order.LimitOrder, 0, len(resolved.targets)),
+	}
+	for _, target := range resolved.targets {
+		update.Orders = append(update.Orders, target.lo)
+	}
+	mkt := resolved.targets[0].mkt
+	logEntry, err := mkt.storage.ApplyOrdersRevokedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event),
+		mkt.auth.ReputationOutcomePolicy(), update)
+	if err != nil {
+		return nil, err
+	}
+	applyOrdersRevokedMemory(bookRouter, resolved)
+	applyCtx.SetResult(update.Orders)
+	return logEntry, nil
+}
+
+// resolveOrdersRevokedEvent finds the booked orders identified by the event's
+// account or order IDs. It skips orders no longer booked. For spent-funding
+// revocations with explicit order IDs, it also skips orders that have since
+// partially filled.
+func resolveOrdersRevokedEvent(markets map[string]*Market, bookRouter *BookRouter, evt *mesh.Event) (*resolvedOrdersRevokedEvent, error) {
+	event, err := meshevents.DecodeOrdersRevokedEvent(evt.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	var targets []revokeTarget
+	if len(event.User) > 0 {
+		// Find the account's booked orders across all markets.
+		user := account.AccountID(event.User)
+		mktNames := make([]string, 0, len(markets))
+		for name := range markets {
+			mktNames = append(mktNames, name)
+		}
+		sort.Strings(mktNames)
+		for _, name := range mktNames {
+			mkt, book, err := marketAndBook(markets, bookRouter, name)
+			if err != nil {
+				return nil, err
+			}
+			buys, sells := mkt.book.UserOrders(user)
+			for _, lo := range append(buys, sells...) {
+				targets = append(targets, revokeTarget{mkt: mkt, book: book, lo: lo})
+			}
+		}
+	} else {
+		// Look up the explicitly listed orders.
+		mkt, book, err := marketAndBook(markets, bookRouter, event.Market)
+		if err != nil {
+			return nil, err
+		}
+		for _, rawID := range event.OrderIDs {
+			oid := order.OrderID(rawID)
+			lo := mkt.book.Order(oid)
+			if lo == nil {
+				log.Debugf("Skipping orders_revoked target %v: no longer booked on market %s",
+					oid, event.Market)
+				continue
+			}
+			if event.Reason == meshevents.OrderRevokeReasonFundingSpent && lo.Filled() != 0 {
+				log.Debugf("Skipping funding-spent orders_revoked target %v: order has partially filled", oid)
+				continue
+			}
+			targets = append(targets, revokeTarget{mkt: mkt, book: book, lo: lo})
+		}
+	}
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("orders_revoked event has no booked targets")
+	}
+	// ID order keeps database updates and notifications deterministic.
+	slices.SortFunc(targets, func(a, b revokeTarget) int {
+		aID, bID := a.lo.ID(), b.lo.ID()
+		return bytes.Compare(aID[:], bID[:])
+	})
+	// An explicit list may name the same order more than once.
+	targets = slices.CompactFunc(targets, func(a, b revokeTarget) bool {
+		return a.lo.ID() == b.lo.ID()
+	})
+
+	return &resolvedOrdersRevokedEvent{
+		reason:     event.Reason,
+		revokeTime: time.UnixMilli(event.RevokeTime).UTC(),
+		targets:    targets,
+	}, nil
+}
+
+func applyOrdersRevokedMemory(bookRouter *BookRouter, resolved *resolvedOrdersRevokedEvent) {
+	for _, target := range resolved.targets {
+		if target.mkt.applyOrderRevokedMemory(target.lo) {
+			bookRouter.unbookOrder(target.book, target.lo)
+		}
+	}
+	if resolved.reason != meshevents.OrderRevokeReasonPenalty {
+		return
+	}
+	notified := make(map[account.AccountID]bool, 1)
+	for _, target := range resolved.targets {
+		user := target.lo.User()
+		if notified[user] {
+			continue
+		}
+		notified[user] = true
+		target.mkt.sendPenaltyNote(user, resolved.revokeTime)
+	}
 }
 
 func applyOrderAcceptedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*db.EventLogEntry, error) {

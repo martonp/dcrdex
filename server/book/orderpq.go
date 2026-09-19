@@ -108,6 +108,17 @@ func (pq *OrderPQ) copy(newCap uint32) *OrderPQ {
 	return newPQ
 }
 
+// UserOrders retrieves all orders for a given user.
+func (pq *OrderPQ) UserOrders(user account.AccountID) []*order.LimitOrder {
+	pq.mtx.RLock()
+	defer pq.mtx.RUnlock()
+	orders := make([]*order.LimitOrder, 0, len(pq.userOrders[user]))
+	for _, lo := range pq.userOrders[user] {
+		orders = append(orders, lo)
+	}
+	return orders
+}
+
 // UnfilledForUser retrieves all completely unfilled orders for a given user.
 func (pq *OrderPQ) UnfilledForUser(user account.AccountID) []*order.LimitOrder {
 	pq.mtx.RLock()

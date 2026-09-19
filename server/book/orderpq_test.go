@@ -522,7 +522,7 @@ func TestOrderPQ_Remove(t *testing.T) {
 	}
 }
 
-func TestOrderPQ_RemoveUserOrders(t *testing.T) {
+func TestOrderPQ_UserOrders(t *testing.T) {
 	pq := NewMaxOrderPQ(6)
 
 	ok := pq.Insert(orders[0])
@@ -561,6 +561,19 @@ func TestOrderPQ_RemoveUserOrders(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("wanted %d orders, got %d", 1, count)
+	}
+
+	for _, user := range []account.AccountID{user0, user1} {
+		got := pq.UserOrders(user)
+		_, count := pq.UserOrderTotals(user)
+		if len(got) != int(count) {
+			t.Fatalf("UserOrders returned %d orders, want %d", len(got), count)
+		}
+		for _, lo := range got {
+			if lo.User() != user {
+				t.Fatalf("UserOrders returned an order for another account")
+			}
+		}
 	}
 
 	removed := pq.RemoveUserOrders(user0)
