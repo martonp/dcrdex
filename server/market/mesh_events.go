@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
@@ -34,6 +35,9 @@ type LifecycleUpdated func(transition LifecycleTransition, lc *db.MarketLifecycl
 // Events returns the market event appliers keyed by event kind.
 func Events(markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated LifecycleUpdated) map[string]mesh.EventApplier {
 	return map[string]mesh.EventApplier{
+		meshevents.EventKindOrderAccepted: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyOrderAcceptedEvent(applyCtx, markets, bookRouter, event)
+		},
 		meshevents.EventKindMarketStarted: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketStartedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
@@ -213,4 +217,51 @@ func marketAndBook(markets map[string]*Market, bookRouter *BookRouter, marketNam
 		return nil, nil, fmt.Errorf("unknown event book market %q", marketName)
 	}
 	return mkt, book, nil
+}
+
+type validatedOrderAcceptedEvent struct {
+	mkt            *Market
+	book           *msgBook
+	update         *db.OrderAcceptedUpdate
+	alreadyApplied bool
+}
+
+func applyOrderAcceptedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*db.EventLogEntry, error) {
+	validated, err := validateOrderAcceptedEvent(markets, bookRouter, event)
+	if err != nil {
+		return nil, err
+	}
+	mkt, update := validated.mkt, validated.update
+	logEntry, err := mkt.storage.ApplyOrderAcceptedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), update)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to store accepted order %v: %w", errEpochOrderStorage, update.Order.ID(), err)
+	}
+
+	// The event is logged even if the order is already in epoch memory.
+	if !validated.alreadyApplied {
+		mkt.applyOrderAcceptedMemory(update)
+		note := epochOrderNote(update.Order, mkt.name, update.EpochIdx)
+		bookRouter.applyOrderAcceptedEvent(validated.book, note, update.EpochIdx)
+	}
+	return logEntry, nil
+}
+
+func validateOrderAcceptedEvent(markets map[string]*Market, bookRouter *BookRouter, event *mesh.Event) (*validatedOrderAcceptedEvent, error) {
+	accepted, err := meshevents.DecodeOrderAcceptedEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	ord, err := accepted.Order()
+	if err != nil {
+		return nil, err
+	}
+	mktName, err := dex.MarketName(ord.Base(), ord.Quote())
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, mktName)
+	if err != nil {
+		return nil, err
+	}
+	return mkt.validateOrderAcceptedEvent(ord, book)
 }

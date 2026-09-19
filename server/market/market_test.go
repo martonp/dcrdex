@@ -49,6 +49,7 @@ type TArchivist struct {
 	epochInserted        chan struct{}
 	revoked              order.Order
 	epochOrders          []epochOrderWrite
+	orderAcceptedUpdates []*db.OrderAcceptedUpdate
 	marketStartedUpdates []*db.MarketStartedUpdate
 	lifecycle            *db.MarketLifecycle
 }
@@ -271,6 +272,16 @@ func (ta *TArchivist) EventLogFrontier(context.Context) (*db.EventLogPosition, e
 func (ta *TArchivist) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
 	return nil, nil
 }
+func (ta *TArchivist) ApplyOrderAcceptedEvent(_ context.Context, _ *db.EventLogMeta, update *db.OrderAcceptedUpdate) (*db.EventLogEntry, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if ta.poisonEpochOrder != nil && update.Order.ID() == ta.poisonEpochOrder.ID() {
+		return nil, errors.New("barf")
+	}
+	ta.orderAcceptedUpdates = append(ta.orderAcceptedUpdates, update)
+	return new(db.EventLogEntry), nil
+}
+
 func (ta *TArchivist) ApplyMarketStartedEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketStartedUpdate) (*db.MarketStartedApplyResult, error) {
 	ta.mtx.Lock()
 	defer ta.mtx.Unlock()
@@ -466,6 +477,11 @@ const (
 
 var parcelLimit = float64(calcParcelLimit(tUserTier, tUserScore, tMaxScore))
 
+// tMasterLockers is the swap-side lockers behind the market's book lockers.
+type tMasterLockers struct {
+	base, quote *coinlock.MasterCoinLocker
+}
+
 func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	// The DEX will make MasterCoinLockers for each asset.
 	masterLockerBase := coinlock.NewMasterCoinLocker()
@@ -486,6 +502,8 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		switch optT := opt.(type) {
 		case *TArchivist:
 			storage = optT
+		case *tMasterLockers:
+			optT.base, optT.quote = masterLockerBase, masterLockerQuote
 		case [2]*asset.BackedAsset:
 			baseAsset, quoteAsset = optT[0], optT[1]
 			if baseAsset.ID == assetETH.ID || baseAsset.ID == assetMATIC.ID {
@@ -547,9 +565,9 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		CoinLockerQuote: bookLockerQuote,
 		DataCollector:   new(TCollector),
 		Balancer:        balancer,
-		CheckParcelLimit: func(_ account.AccountID, f MarketParcelCalculator) bool {
+		CheckParcelLimit: func(_ account.AccountID, _ time.Time, f MarketParcelCalculator) (bool, error) {
 			parcels := f(0)
-			return parcels <= parcelLimit
+			return parcels <= parcelLimit, nil
 		},
 	})
 	if err != nil {
@@ -3183,6 +3201,314 @@ func TestMarket_lockOrderCoins(t *testing.T) {
 	}
 }
 
+func TestApplyOrderAcceptedEvent(t *testing.T) {
+	type applyCase struct {
+		name           string
+		ord            order.Order
+		epochGap       int32
+		lockedCoin     order.CoinID
+		wantCancelable bool
+		wantOrderType  uint8
+	}
+
+	coinAssetID := func(mkt *Market, ord order.Order) uint32 {
+		if ord.Trade().Sell {
+			return mkt.Base()
+		}
+		return mkt.Quote()
+	}
+
+	requireOrderApplied := func(t *testing.T, mkt *Market, ord order.Order, lockedCoin order.CoinID, wantCancelable bool) {
+		t.Helper()
+		oid := ord.ID()
+		if got := mkt.epochOrders[oid]; got == nil || got.ID() != oid {
+			t.Fatalf("epochOrders entry mismatch. got %v, want %v", got, oid)
+		}
+		if got := mkt.epochCommitments[ord.Commitment()]; got != oid {
+			t.Fatalf("epochCommitments entry mismatch. got %v, want %v", got, oid)
+		}
+		if lockedCoin != nil && !mkt.CoinLocked(coinAssetID(mkt, ord), lockedCoin) {
+			t.Fatalf("accepted order coin was not locked")
+		}
+		if got := mkt.Cancelable(oid); got != wantCancelable {
+			t.Fatalf("cancelable = %t, want %t", got, wantCancelable)
+		}
+		if mkt.book.HaveOrder(oid) {
+			t.Fatalf("accepted order %v should not be in the booked order book", oid)
+		}
+	}
+
+	requireOrderAcceptedUpdate := func(t *testing.T, update *db.OrderAcceptedUpdate, tt applyCase, epochIdx, epochDur int64) {
+		t.Helper()
+		oid := tt.ord.ID()
+		if update.Order == nil || update.Order.ID() != oid {
+			t.Fatalf("order accepted update order mismatch. got %v, want %v", update.Order, oid)
+		}
+		if update.EpochIdx != epochIdx {
+			t.Fatalf("order accepted update epoch idx = %d, want %d", update.EpochIdx, epochIdx)
+		}
+		if update.EpochDur != epochDur {
+			t.Fatalf("order accepted update epoch dur = %d, want %d", update.EpochDur, epochDur)
+		}
+		if update.EpochGap != tt.epochGap {
+			t.Fatalf("order accepted update epoch gap = %d, want %d", update.EpochGap, tt.epochGap)
+		}
+	}
+
+	requireOrderRejected := func(t *testing.T, mkt *Market, storage *TArchivist, ord order.Order, wantStorageWrites int) {
+		t.Helper()
+		if got := len(storage.orderAcceptedUpdates); got != wantStorageWrites {
+			t.Fatalf("order accepted updates = %d, want %d", got, wantStorageWrites)
+		}
+		mkt.epochMtx.RLock()
+		_, inserted := mkt.epochOrders[ord.ID()]
+		mkt.epochMtx.RUnlock()
+		if inserted {
+			t.Fatalf("rejected order %v was inserted into epoch memory", ord.ID())
+		}
+	}
+
+	t.Run("rejects order with no active epoch", func(t *testing.T) {
+		// Startup seeding rebuilds epoch memory for every running market
+		// before any event applies, so an order_accepted reaching a market
+		// with no current epoch is an invariant violation and must fail
+		// without any durable or memory effect.
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		link := rig.subscribeBook(t)
+		mkt, storage := rig.mkt, rig.storage
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(1234)
+		lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		lo.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		lo.Coins = []order.CoinID{[]byte{0x01, 0x02, 0x03}}
+
+		err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(lo))
+		if err == nil || !strings.Contains(err.Error(), "no active epoch") {
+			t.Fatalf("apply error = %v, want no active epoch", err)
+		}
+		requireOrderRejected(t, mkt, storage, lo, 0)
+		requireNoBookNoteFromLink(t, link)
+	})
+
+	t.Run("applies order types", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		link := rig.subscribeBook(t)
+		mkt, storage := rig.mkt, rig.storage
+		limitCoin := order.CoinID([]byte{0x01, 0x02, 0x03})
+		marketCoin := order.CoinID([]byte{0x41, 0x42, 0x43})
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(1234)
+		rig.submitMarketStarted(t, epochIdx)
+		lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		lo.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		lo.Coins = []order.CoinID{limitCoin}
+		mo := makeMO(seller3, 1)
+		mo.SetTime(time.UnixMilli(epochIdx*epochDur + 2))
+		mo.Coins = []order.CoinID{marketCoin}
+		co := makeCO(seller3, lo.ID())
+		co.SetTime(time.UnixMilli(epochIdx*epochDur + 3))
+
+		tests := []applyCase{
+			{
+				name:           "limit",
+				ord:            lo,
+				epochGap:       db.EpochGapNA,
+				lockedCoin:     limitCoin,
+				wantCancelable: true,
+				wantOrderType:  msgjson.LimitOrderNum,
+			},
+			{
+				name:          "market",
+				ord:           mo,
+				epochGap:      db.EpochGapNA,
+				lockedCoin:    marketCoin,
+				wantOrderType: msgjson.MarketOrderNum,
+			},
+			{
+				name:          "cancel",
+				ord:           co,
+				epochGap:      0,
+				wantOrderType: msgjson.CancelOrderNum,
+			},
+		}
+
+		for i, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				rig.apply(t, meshevents.NewOrderAcceptedEvent(tt.ord))
+				if got := len(storage.orderAcceptedUpdates); got != i+1 {
+					t.Fatalf("order accepted updates = %d, want %d", got, i+1)
+				}
+				requireOrderAcceptedUpdate(t, storage.orderAcceptedUpdates[i], tt, epochIdx, epochDur)
+				requireOrderApplied(t, mkt, tt.ord, tt.lockedCoin, tt.wantCancelable)
+				requireEpochNoteFromLink(t, link, mkt, tt.ord, epochIdx, tt.wantOrderType)
+			})
+		}
+	})
+
+	t.Run("uses active run parameters", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		mkt := rig.mkt
+
+		// Use a lot size and cancel limit that differ from the configured values.
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(2345)
+		runParams := mkt.configuredParams.MarketRunParams
+		runParams.LotSize *= 2
+		runParams.MaxUserCancelsPerEpoch = 1
+		rig.apply(t, newMarketStartedEvent(mkt.name, epochIdx, epochDur, runParams,
+			time.UnixMilli(1).UTC(), nil))
+
+		// One configured lot is too small for the active run.
+		badLO := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		badLO.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		badLO.Coins = []order.CoinID{[]byte{0x71, 0x01}}
+		if err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(badLO)); !errors.Is(err, ErrInvalidOrder) {
+			t.Fatalf("config-lot order apply error = %v, want %v", err, ErrInvalidOrder)
+		}
+
+		// Two configured lots make one lot for the active run.
+		goodLO := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		goodLO.SetTime(time.UnixMilli(epochIdx*epochDur + 2))
+		goodLO.Coins = []order.CoinID{[]byte{0x71, 0x02}}
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(goodLO))
+		goodLO2 := makeLO(seller3, mkRate3(1.1, 1.3), 2, order.StandingTiF)
+		goodLO2.SetTime(time.UnixMilli(epochIdx*epochDur + 3))
+		goodLO2.Coins = []order.CoinID{[]byte{0x71, 0x03}}
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(goodLO2))
+
+		// The adopted cancel cap of one: the first cancel applies, a second
+		// cancel against a different target is capped.
+		co := makeCO(seller3, goodLO.ID())
+		co.SetTime(time.UnixMilli(epochIdx*epochDur + 4))
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(co))
+		co2 := makeCO(seller3, goodLO2.ID())
+		co2.SetTime(time.UnixMilli(epochIdx*epochDur + 5))
+		if err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(co2)); !errors.Is(err, ErrTooManyCancelOrders) {
+			t.Fatalf("capped cancel apply error = %v, want %v", err, ErrTooManyCancelOrders)
+		}
+	})
+
+	t.Run("duplicate cancel event appends storage without reprojecting memory", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		link := rig.subscribeBook(t)
+		mkt, storage := rig.mkt, rig.storage
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(1234)
+		rig.submitMarketStarted(t, epochIdx)
+		lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		lo.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		co := makeCO(seller3, lo.ID())
+		co.SetTime(time.UnixMilli(epochIdx*epochDur + 2))
+
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(lo))
+		requireEpochNoteFromLink(t, link, mkt, lo, epochIdx, msgjson.LimitOrderNum)
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(co))
+		requireEpochNoteFromLink(t, link, mkt, co, epochIdx, msgjson.CancelOrderNum)
+
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(co))
+		if got, want := len(storage.orderAcceptedUpdates), 3; got != want {
+			t.Fatalf("storage writes = %d, want %d", got, want)
+		}
+		if got := storage.orderAcceptedUpdates[len(storage.orderAcceptedUpdates)-1].EpochGap; got != 0 {
+			t.Fatalf("duplicate cancel stored epoch gap = %d, want 0", got)
+		}
+		if got := len(mkt.currentEpoch.Orders); got != 2 {
+			t.Fatalf("epoch order count after duplicate cancel = %d, want 2", got)
+		}
+		if got := mkt.currentEpoch.UserCancels[co.AccountID]; got != 1 {
+			t.Fatalf("cancel count after duplicate cancel = %d, want 1", got)
+		}
+		requireNoBookNoteFromLink(t, link)
+	})
+
+	t.Run("locked coin rejected before db apply", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		mkt, storage := rig.mkt, rig.storage
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(1234)
+		rig.submitMarketStarted(t, epochIdx)
+		coin := order.CoinID([]byte{0x0a, 0x0b, 0x0c})
+		lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		lo.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		lo.Coins = []order.CoinID{coin}
+		if !mkt.lockOrderCoins(lo) {
+			t.Fatalf("test setup failed to lock order coin")
+		}
+
+		err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(lo))
+		if err == nil || !strings.Contains(err.Error(), "already-locked") {
+			t.Fatalf("apply error = %v, want already-locked coin error", err)
+		}
+		requireOrderRejected(t, mkt, storage, lo, 0)
+	})
+
+	t.Run("rejects parcel limit before mutation", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		mkt, storage := rig.mkt, rig.storage
+		var wantAsOf time.Time
+		mkt.checkParcelLimit = func(_ account.AccountID, asOf time.Time, calcParcels MarketParcelCalculator) (bool, error) {
+			if !asOf.Equal(wantAsOf) {
+				t.Fatalf("parcel check time = %v, want order server time %v", asOf, wantAsOf)
+			}
+			return calcParcels(0) <= 1, nil
+		}
+
+		epochDur := int64(mkt.EpochDuration())
+		epochIdx := int64(2345)
+		rig.submitMarketStarted(t, epochIdx)
+		first := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		first.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+		first.Coins = []order.CoinID{[]byte{0x01, 0x11, 0x21}}
+		second := makeLO(seller3, mkRate3(1.1, 1.3), 1, order.StandingTiF)
+		second.SetTime(time.UnixMilli(epochIdx*epochDur + 2))
+		secondCoin := order.CoinID([]byte{0x02, 0x12, 0x22})
+		second.Coins = []order.CoinID{secondCoin}
+
+		wantAsOf = first.ServerTime
+		rig.apply(t, meshevents.NewOrderAcceptedEvent(first))
+
+		wantAsOf = second.ServerTime
+		if err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(second)); !errors.Is(err, ErrQuantityTooHigh) {
+			t.Fatalf("second apply error = %v, want %v", err, ErrQuantityTooHigh)
+		}
+		requireOrderRejected(t, mkt, storage, second, 1)
+		if mkt.CoinLocked(mkt.Base(), secondCoin) {
+			t.Fatalf("rejected order coin was locked")
+		}
+	})
+}
+
+func TestMarket_SwapLockedCoinsRejectOrders(t *testing.T) {
+	lockers := &tMasterLockers{}
+	rig := newMarketEventRig(t, lockers)
+	defer rig.cleanup()
+	mkt := rig.mkt
+	epochDur := int64(mkt.EpochDuration())
+	epochIdx := int64(1234)
+	rig.submitMarketStarted(t, epochIdx)
+
+	coin := order.CoinID([]byte{0x0a, 0x0b, 0x0c})
+	inSwap := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+	inSwap.Coins = []order.CoinID{coin}
+	if failed := lockers.base.Swap().LockOrdersCoins([]order.Order{inSwap}); len(failed) > 0 {
+		t.Fatalf("test setup failed to lock the in-swap coin")
+	}
+
+	lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	lo.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+	lo.Coins = []order.CoinID{coin}
+	err := rig.applyErr(t, meshevents.NewOrderAcceptedEvent(lo))
+	if err == nil || !strings.Contains(err.Error(), "already-locked") {
+		t.Fatalf("apply error = %v, want already-locked coin error", err)
+	}
+}
+
 func collectOwnerNotes(t *testing.T, auth *TAuth) (revokes, nomatches map[order.OrderID]bool) {
 	t.Helper()
 	revokes = make(map[order.OrderID]bool)
@@ -3356,6 +3682,54 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 			t.Fatalf("current epoch = %v, want empty %d", mkt.currentEpoch, finalEpochIdx)
 		}
 	})
+}
+
+func requireEpochNoteFromLink(t *testing.T, link *TLink, mkt *Market, ord order.Order, epochIdx int64, wantOrderType uint8) {
+	t.Helper()
+	note := getEpochNoteFromLink(t, link)
+	if note.MarketID != mkt.name {
+		t.Fatalf("epoch note market = %q, want %q", note.MarketID, mkt.name)
+	}
+	if note.Epoch != uint64(epochIdx) {
+		t.Fatalf("epoch note epoch = %d, want %d", note.Epoch, epochIdx)
+	}
+	if note.Seq == 0 {
+		t.Fatalf("expected non-zero epoch note sequence")
+	}
+	if note.OrderType != wantOrderType {
+		t.Fatalf("epoch note order type = %d, want %d", note.OrderType, wantOrderType)
+	}
+	oid := ord.ID()
+	if !bytes.Equal(note.OrderID, oid[:]) {
+		t.Fatalf("epoch note order id = %x, want %x", note.OrderID, oid)
+	}
+
+	switch ord := ord.(type) {
+	case *order.LimitOrder:
+		if note.Rate != ord.Rate {
+			t.Fatalf("limit note rate = %d, want %d", note.Rate, ord.Rate)
+		}
+		tif := uint8(msgjson.StandingOrderNum)
+		if ord.Force == order.ImmediateTiF {
+			tif = msgjson.ImmediateOrderNum
+		}
+		if note.TiF != tif {
+			t.Fatalf("limit note tif = %d, want %d", note.TiF, tif)
+		}
+	case *order.CancelOrder:
+		if !bytes.Equal(note.TargetID, ord.TargetOrderID[:]) {
+			t.Fatalf("cancel note target = %x, want %x", note.TargetID, ord.TargetOrderID)
+		}
+	}
+}
+
+func requireNoBookNoteFromLink(t *testing.T, link *TLink) {
+	t.Helper()
+	link.mtx.Lock()
+	defer link.mtx.Unlock()
+	if len(link.sends) != 0 {
+		t.Fatalf("unexpected book notification")
+	}
 }
 
 // bookStandingOrder locks a standing order's funding coins and inserts it

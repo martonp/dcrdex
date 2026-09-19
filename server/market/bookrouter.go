@@ -799,6 +799,19 @@ func (r *BookRouter) sendNote(route string, subs *subscribers, note any) {
 	}
 }
 
+// applyOrderAcceptedEvent applies an accepted-order event to the local book
+// projection and notifies local subscribers.
+func (r *BookRouter) applyOrderAcceptedEvent(book *msgBook, note *msgjson.EpochOrderNote, epochIdx int64) {
+	book.mtx.Lock()
+	if epochIdx > book.epochIdx {
+		book.epochIdx = epochIdx
+	}
+	book.mtx.Unlock()
+
+	note.Seq = book.subs.nextSeq()
+	r.sendNote(msgjson.EpochOrderRoute, book.subs, note)
+}
+
 // unbookOrder removes an order from the book projection and
 // notifies subscribers, doing nothing if the order was not in the projection.
 func (r *BookRouter) unbookOrder(book *msgBook, lo *order.LimitOrder) {
@@ -829,6 +842,29 @@ func cancelOrderToMsgOrder(o *order.CancelOrder, mkt string) *msgjson.BookOrderN
 			Time: uint64(o.ServerTime.UnixMilli()),
 		},
 	}
+}
+
+func epochOrderNote(ord order.Order, mkt string, epochIdx int64) *msgjson.EpochOrderNote {
+	epochNote := new(msgjson.EpochOrderNote)
+	switch o := ord.(type) {
+	case *order.LimitOrder:
+		epochNote.BookOrderNote = *limitOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.LimitOrderNum
+	case *order.MarketOrder:
+		epochNote.BookOrderNote = *marketOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.MarketOrderNum
+	case *order.CancelOrder:
+		epochNote.BookOrderNote = *cancelOrderToMsgOrder(o, mkt)
+		epochNote.OrderType = msgjson.CancelOrderNum
+		epochNote.TargetID = o.TargetOrderID[:]
+	default:
+		panic(fmt.Sprintf("unsupported epoch order type %T", ord))
+	}
+	epochNote.MarketID = mkt
+	epochNote.Epoch = uint64(epochIdx)
+	c := ord.Commitment()
+	epochNote.Commit = c[:]
+	return epochNote
 }
 
 // limitOrderToMsgOrder converts an *order.LimitOrder to a
