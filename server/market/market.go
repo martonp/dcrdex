@@ -556,6 +556,39 @@ func (m *Market) lockEpochOrderCoins(ords []order.Order) error {
 	return nil
 }
 
+func (m *Market) wakeLifecycleDriver() {
+	select {
+	case m.lifecycleWake <- struct{}{}:
+	default:
+	}
+}
+
+// applyMarketLifecycleRow updates the market's in-memory state from the stored
+// lifecycle. It initializes epoch queues when needed, updates whether orders
+// are accepted, and wakes the lifecycle driver.
+func (m *Market) applyMarketLifecycleRow(lifecycle *db.MarketLifecycle) {
+	if lifecycle == nil {
+		return
+	}
+	m.book.SetLotSize(lifecycle.RunParams.LotSize)
+
+	m.epochMtx.Lock()
+	m.projectMarketLifecycleLocked(lifecycle)
+
+	isRunning := lifecycle.State == db.MarketStateRunning
+	if isRunning && lifecycle.PendingAction == db.MarketPendingNone && m.currentEpoch == nil {
+		m.currentEpoch = NewEpoch(lifecycle.ActiveEpochIdx, lifecycle.StartEpochDur)
+		m.nextEpoch = NewEpoch(lifecycle.ActiveEpochIdx+1, lifecycle.StartEpochDur)
+		m.activeEpochIdx = lifecycle.ActiveEpochIdx
+	}
+
+	acceptOrders := isRunning && m.currentEpoch != nil
+	m.epochMtx.Unlock()
+
+	m.running.Store(acceptOrders)
+	m.wakeLifecycleDriver()
+}
+
 // SuspendASAP suspends requests the market to gracefully suspend epoch cycling
 // as soon as possible, always allowing an active epoch to close. See also
 // Suspend.
@@ -2237,6 +2270,27 @@ func (m *Market) sendRevokeOrderNote(oid order.OrderID, user account.AccountID) 
 		if err != nil {
 			log.Debugf("Failed to send %s notification to user %v: %v", route, user, err)
 		}
+	}
+}
+
+// noMatchMessage creates a nomatch notification for the specified order.
+func noMatchMessage(oid order.OrderID) (*msgjson.Message, error) {
+	return msgjson.NewNotification(msgjson.NoMatchRoute, &msgjson.NoMatch{
+		OrderID: oid[:],
+	})
+}
+
+// sendNoMatchNote sends a nomatch notification to the order owner if they
+// are connected to this node.
+func (m *Market) sendNoMatchNote(oid order.OrderID, user account.AccountID) {
+	msg, err := noMatchMessage(oid)
+	if err != nil {
+		log.Errorf("Failed to create nomatch notification for order %v: %v", oid, err)
+		return
+	}
+
+	if err := m.auth.SendIfLocal(user, msg); err != nil {
+		log.Debugf("Failed to send nomatch notification to user %v: %v", user, err)
 	}
 }
 

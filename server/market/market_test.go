@@ -28,8 +28,10 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/asset"
 	"decred.org/dcrdex/server/coinlock"
+	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
 )
@@ -45,7 +47,91 @@ type TArchivist struct {
 	epochInserted        chan struct{}
 	revoked              order.Order
 	epochOrders          []epochOrderWrite
+	marketStartedUpdates []*db.MarketStartedUpdate
 	lifecycle            *db.MarketLifecycle
+}
+
+func newMarketStartedEvent(marketName string, currentEpochIdx, epochDur int64, runParams meshevents.MarketRunParams,
+	revocationTime time.Time, bookedRevokes []*db.StartupOrderRevoke) mesh.EventEncoder {
+
+	return meshevents.NewMarketStartedEvent(marketName, currentEpochIdx, epochDur, runParams,
+		revocationTime, encodeStartupOrderRevokes(bookedRevokes), nil)
+}
+
+type marketEventRig struct {
+	mkt        *Market
+	storage    *TArchivist
+	auth       *TAuth
+	bookRouter *BookRouter
+	events     map[string]mesh.EventApplier
+	cleanup    func()
+}
+
+func newMarketEventRig(t *testing.T, opts ...any) *marketEventRig {
+	t.Helper()
+	mkt, storage, auth, cleanup, err := newTestMarket(opts...)
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	mktName := mkt.name
+	bookRouter := NewBookRouter(map[string]BookSource{
+		mktName: mkt,
+	}, &tFeeSource{}, func(string, comms.MsgHandler) {})
+	return &marketEventRig{
+		mkt:        mkt,
+		storage:    storage,
+		auth:       auth,
+		bookRouter: bookRouter,
+		events: Events(map[string]*Market{
+			mktName: mkt,
+		}, bookRouter, nil),
+		cleanup: cleanup,
+	}
+}
+
+func (rig *marketEventRig) apply(t *testing.T, event mesh.EventEncoder) *mesh.Event {
+	t.Helper()
+	entry, err := rig.applyResult(t, event)
+	if err != nil {
+		t.Fatalf("ApplyEvent(%q) error: %v", entry.Kind, err)
+	}
+	return entry
+}
+
+func (rig *marketEventRig) applyErr(t *testing.T, event mesh.EventEncoder) error {
+	t.Helper()
+	_, err := rig.applyResult(t, event)
+	return err
+}
+
+func (rig *marketEventRig) applyResult(t *testing.T, event mesh.EventEncoder) (*mesh.Event, error) {
+	t.Helper()
+	entry, err := mesh.NewEvent(event)
+	if err != nil {
+		t.Fatalf("event error: %v", err)
+	}
+	applier := rig.events[entry.Kind]
+	if applier == nil {
+		t.Fatalf("missing event applier for %q", entry.Kind)
+	}
+	_, err = applier(&mesh.EventApplyContext{Context: context.Background()}, entry)
+	return entry, err
+}
+
+func (rig *marketEventRig) submitMarketStarted(t *testing.T, currentEpochIdx int64) {
+	t.Helper()
+	rig.apply(t, newMarketStartedEvent(rig.mkt.name, currentEpochIdx, int64(rig.mkt.EpochDuration()),
+		rig.mkt.configuredParams.MarketRunParams, time.UnixMilli(1).UTC(), nil))
+}
+
+func (rig *marketEventRig) subscribeBook(t *testing.T) *TLink {
+	t.Helper()
+	link, sub := newSubscriber(mkt3)
+	if err := rig.bookRouter.handleOrderBook(link, sub); err != nil {
+		t.Fatalf("handleOrderBook: %v", err)
+	}
+	_ = link.getSend() // initial order book response
+	return link
 }
 
 type epochOrderWrite struct {
@@ -132,6 +218,21 @@ func (ta *TArchivist) EventLogFrontier(context.Context) (*db.EventLogPosition, e
 
 func (ta *TArchivist) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
 	return nil, nil
+}
+func (ta *TArchivist) ApplyMarketStartedEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketStartedUpdate) (*db.MarketStartedApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.marketStartedUpdates = append(ta.marketStartedUpdates, update)
+	// Epoch order status is not projected here: tests seed epochOrders for
+	// EpochOrders() reads and assert the recorded update.
+	next, changed, err := db.ProjectMarketStartedLifecycle(ta.lifecycle, update)
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		ta.lifecycle = next
+	}
+	return &db.MarketStartedApplyResult{Log: new(db.EventLogEntry), Lifecycle: next}, nil
 }
 func (ta *TArchivist) MarketLifecycle(string) (*db.MarketLifecycle, error) {
 	ta.mtx.Lock()
@@ -593,6 +694,9 @@ func TestMarket_LoadState_DuplicateBookedCoinLockRollbackAcrossAssets(t *testing
 	if quoteLocker.CoinLocked(sharedQuoteCoin) {
 		t.Fatalf("quote coin remains locked after quote-side restoration failure")
 	}
+	if len(storage.marketStartedUpdates) != 0 {
+		t.Fatalf("market started update count = %d, want 0", len(storage.marketStartedUpdates))
+	}
 }
 
 func TestLoadStateEpochs(t *testing.T) {
@@ -877,6 +981,14 @@ func epochStampedCO(t *testing.T, targetID order.OrderID, epochIdx, epochDur, of
 	return co
 }
 
+func setTestMarketLifecycle(mkt *Market, storage *TArchivist, lc *db.MarketLifecycle) {
+	cpy := *lc
+	storage.mtx.Lock()
+	storage.lifecycle = &cpy
+	storage.mtx.Unlock()
+	mkt.applyMarketLifecycleRow(&cpy)
+}
+
 func seedLifecycleRow(state db.MarketState, pending db.MarketPendingAction, epochIdx, epochDur int64) *db.MarketLifecycle {
 	persist := true
 	lc := &db.MarketLifecycle{
@@ -923,6 +1035,20 @@ func seedEpochOrder(storage *TArchivist, ord order.Order, epochIdx, epochDur int
 		epochDur: epochDur,
 	})
 	storage.mtx.Unlock()
+}
+
+// seedRunningLifecycle restores a running lifecycle row with the given epoch
+// cursor and seeds the market's epoch memory from the rig's storage mock,
+// mirroring what LoadState does at startup.
+func seedRunningLifecycle(t *testing.T, mkt *Market, activeEpochIdx, epochDur int64) {
+	t.Helper()
+	lc := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, activeEpochIdx, epochDur)
+	mkt.epochMtx.Lock()
+	mkt.projectMarketLifecycleLocked(lc)
+	mkt.epochMtx.Unlock()
+	if err := mkt.restoreEpochState(lc); err != nil {
+		t.Fatalf("restoreEpochState: %v", err)
+	}
 }
 
 func TestMarket_Book(t *testing.T) {
@@ -2937,5 +3063,216 @@ func TestMarket_lockOrderCoins(t *testing.T) {
 	co := makeCO(seller3, randomOrderID())
 	if !mkt.lockOrderCoins(co) {
 		t.Fatal("lockOrderCoins should always succeed for cancel orders")
+	}
+}
+
+func collectOwnerNotes(t *testing.T, auth *TAuth) (revokes, nomatches map[order.OrderID]bool) {
+	t.Helper()
+	revokes = make(map[order.OrderID]bool)
+	nomatches = make(map[order.OrderID]bool)
+	for msg := auth.getSend(); msg != nil; msg = auth.getSend() {
+		switch msg.Route {
+		case msgjson.RevokeOrderRoute:
+			var note msgjson.RevokeOrder
+			if err := json.Unmarshal(msg.Payload, &note); err != nil {
+				t.Fatalf("revoke note unmarshal: %v", err)
+			}
+			var oid order.OrderID
+			copy(oid[:], note.OrderID)
+			revokes[oid] = true
+		case msgjson.NoMatchRoute:
+			var note msgjson.NoMatch
+			if err := json.Unmarshal(msg.Payload, &note); err != nil {
+				t.Fatalf("nomatch note unmarshal: %v", err)
+			}
+			var oid order.OrderID
+			copy(oid[:], note.OrderID)
+			nomatches[oid] = true
+		case msgjson.PenaltyRoute:
+			t.Fatalf("unexpected penalty note")
+		}
+	}
+	return revokes, nomatches
+}
+
+func TestApplyMarketStartedEvent(t *testing.T) {
+	t.Run("revokes orders and resets epoch queues", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		mkt, storage, auth := rig.mkt, rig.storage, rig.auth
+		mktName := mkt.name
+		epochDur := int64(mkt.EpochDuration())
+		const seededEpochIdx int64 = 42
+		startedEpochIdx := seededEpochIdx + 100 // the restart jumps the epoch
+
+		// Warm state: a queued trade and cancel seeded from storage, plus a
+		// booked order in the market and router books.
+		epochCoin := order.CoinID{0xa4, 0xb5, 0xc6}
+		epochLO := epochStampedLO(t, seededEpochIdx, epochDur, 1, epochCoin)
+		epochCO := epochStampedCO(t, epochLO.ID(), seededEpochIdx, epochDur, 2)
+		seedEpochOrder(storage, epochLO, seededEpochIdx, epochDur)
+		seedEpochOrder(storage, epochCO, seededEpochIdx, epochDur)
+		seedRunningLifecycle(t, mkt, seededEpochIdx, epochDur)
+		mkt.epochMtx.RLock()
+		oldCurrent, oldNext := mkt.currentEpoch, mkt.nextEpoch
+		mkt.epochMtx.RUnlock()
+
+		bookedCoin := order.CoinID{0xa1, 0xb2, 0xc3}
+		booked := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		booked.Coins = []order.CoinID{bookedCoin}
+		bookStandingOrder(t, rig, booked)
+		book := rig.bookRouter.books[mktName]
+		rig.bookRouter.SeedBooks()
+		link := rig.subscribeBook(t)
+
+		revocationTime := time.UnixMilli(123456789).UTC()
+		startedEvent := meshevents.NewMarketStartedEvent(mktName, startedEpochIdx, epochDur,
+			mkt.configuredParams.MarketRunParams, revocationTime,
+			[]meshevents.StartupOrderRevokeRecord{
+				meshevents.NewStartupOrderRevokeRecord(booked, meshevents.StartupOrderRevokeReasonLotSizeIncompatible),
+			}, []meshevents.StartupOrderRevokeRecord{
+				meshevents.NewStartupOrderRevokeRecord(epochLO, meshevents.StartupOrderRevokeReasonEpochAbandoned),
+				meshevents.NewStartupOrderRevokeRecord(epochCO, meshevents.StartupOrderRevokeReasonEpochAbandoned),
+			})
+		rig.apply(t, startedEvent)
+
+		// The stored update mirrors the event.
+		if len(storage.marketStartedUpdates) != 1 {
+			t.Fatalf("market started updates = %d, want 1", len(storage.marketStartedUpdates))
+		}
+		update := storage.marketStartedUpdates[0]
+		if update.Market != mktName || update.RevocationTime != revocationTime {
+			t.Fatalf("update market/time = %q/%v, want %q/%v",
+				update.Market, update.RevocationTime, mktName, revocationTime)
+		}
+		if update.CurrentEpochIdx != startedEpochIdx || update.EpochDur != epochDur {
+			t.Fatalf("market started epoch = %d:%d, want %d:%d",
+				update.CurrentEpochIdx, update.EpochDur, startedEpochIdx, epochDur)
+		}
+		if len(update.BookedRevokes) != 1 || update.BookedRevokes[0].Order.ID() != booked.ID() ||
+			update.BookedRevokes[0].Reason != meshevents.StartupOrderRevokeReasonLotSizeIncompatible {
+			t.Fatalf("booked revokes mismatch: %+v", update.BookedRevokes)
+		}
+
+		// Every revoked order left the book with its coins unlocked. Storage
+		// epochOrders is a seed for EpochOrders() reads, not a projected table.
+		requireRevokedOrderGone(t, mkt, booked)
+		requireRevokedOrderGone(t, mkt, epochLO)
+
+		// Epoch memory replaced wholesale: fresh empty queues at the started
+		// epoch, old pointers not reused, indexes emptied, cursors moved.
+		mkt.epochMtx.RLock()
+		if mkt.currentEpoch == nil || mkt.currentEpoch.Epoch != startedEpochIdx ||
+			mkt.currentEpoch.Duration != epochDur || len(mkt.currentEpoch.Orders) != 0 {
+			t.Fatalf("current epoch = %v, want empty %d:%d", mkt.currentEpoch, startedEpochIdx, epochDur)
+		}
+		if mkt.nextEpoch == nil || mkt.nextEpoch.Epoch != startedEpochIdx+1 ||
+			mkt.nextEpoch.Duration != epochDur || len(mkt.nextEpoch.Orders) != 0 {
+			t.Fatalf("next epoch = %v, want empty %d:%d", mkt.nextEpoch, startedEpochIdx+1, epochDur)
+		}
+		if mkt.currentEpoch == oldCurrent || mkt.nextEpoch == oldNext {
+			t.Fatalf("market_started reused seeded epoch queues")
+		}
+		if len(mkt.epochOrders) != 0 || len(mkt.epochCommitments) != 0 {
+			t.Fatalf("queued orders survived market_started: orders=%d commitments=%d",
+				len(mkt.epochOrders), len(mkt.epochCommitments))
+		}
+		if mkt.startEpochIdx != startedEpochIdx || mkt.activeEpochIdx != startedEpochIdx {
+			t.Fatalf("epoch cursors = %d/%d, want %d", mkt.startEpochIdx, mkt.activeEpochIdx, startedEpochIdx)
+		}
+		mkt.epochMtx.RUnlock()
+		if bookEpoch, _, _ := mkt.Book(); bookEpoch != startedEpochIdx {
+			t.Fatalf("market book epoch = %d, want %d", bookEpoch, startedEpochIdx)
+		}
+		if routerEpoch := book.epoch(); routerEpoch != startedEpochIdx {
+			t.Fatalf("router book epoch = %d, want %d", routerEpoch, startedEpochIdx)
+		}
+
+		// Notes: an unbook for the booked order; revoke notes for the booked
+		// order and the epoch trade; a nomatch for the epoch cancel; no penalty.
+		unbookMsg := link.getSend()
+		if unbookMsg == nil || unbookMsg.Route != msgjson.UnbookOrderRoute {
+			t.Fatalf("unbook route = %v, want %q", unbookMsg, msgjson.UnbookOrderRoute)
+		}
+		var unbookNote msgjson.UnbookOrderNote
+		if err := json.Unmarshal(unbookMsg.Payload, &unbookNote); err != nil {
+			t.Fatalf("unbook note: %v", err)
+		}
+		bookedID := booked.ID()
+		if !bytes.Equal(unbookNote.OrderID, bookedID[:]) {
+			t.Fatalf("unbook order id = %x, want %x", unbookNote.OrderID, bookedID)
+		}
+		revokeIDs, nomatchIDs := collectOwnerNotes(t, auth)
+		if len(revokeIDs) != 2 || !revokeIDs[booked.ID()] || !revokeIDs[epochLO.ID()] {
+			t.Fatalf("revoke notes = %v, want %v and %v", revokeIDs, booked.ID(), epochLO.ID())
+		}
+		if len(nomatchIDs) != 1 || !nomatchIDs[epochCO.ID()] {
+			t.Fatalf("nomatch notes = %v, want %v", nomatchIDs, epochCO.ID())
+		}
+	})
+
+	t.Run("pending suspend start keeps the suspend and opens the final epoch", func(t *testing.T) {
+		rig := newMarketEventRig(t)
+		defer rig.cleanup()
+		mkt, storage := rig.mkt, rig.storage
+		epochDur := int64(mkt.EpochDuration())
+		finalEpochIdx := int64(42)
+		row := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingSuspend, finalEpochIdx, epochDur)
+		setTestMarketLifecycle(mkt, storage, row)
+		lo := epochStampedLO(t, finalEpochIdx, epochDur, 1, order.CoinID{0xa7, 0xb8})
+		seedEpochOrder(storage, lo, finalEpochIdx, epochDur)
+		if err := mkt.restoreEpochState(row); err != nil {
+			t.Fatalf("restoreEpochState: %v", err)
+		}
+		startedEvent := meshevents.NewMarketStartedEvent(mkt.name, finalEpochIdx, epochDur,
+			mkt.configuredParams.MarketRunParams, time.UnixMilli(123456789).UTC(), nil,
+			[]meshevents.StartupOrderRevokeRecord{
+				meshevents.NewStartupOrderRevokeRecord(lo, meshevents.StartupOrderRevokeReasonEpochAbandoned),
+			})
+		rig.apply(t, startedEvent)
+		mkt.epochMtx.RLock()
+		defer mkt.epochMtx.RUnlock()
+		if mkt.pendingLifecycleAction != db.MarketPendingSuspend {
+			t.Fatalf("pending action = %v, want %v", mkt.pendingLifecycleAction, db.MarketPendingSuspend)
+		}
+		if mkt.currentEpoch == nil || mkt.currentEpoch.Epoch != finalEpochIdx || len(mkt.currentEpoch.Orders) != 0 {
+			t.Fatalf("current epoch = %v, want empty %d", mkt.currentEpoch, finalEpochIdx)
+		}
+	})
+}
+
+// bookStandingOrder locks a standing order's funding coins and inserts it
+// into the market book and the router's book projection, as the router's
+// startup snapshot or booked-order apply would in production.
+func bookStandingOrder(t *testing.T, rig *marketEventRig, lo *order.LimitOrder) {
+	t.Helper()
+	mkt := rig.mkt
+	if !mkt.lockOrderCoins(lo) {
+		t.Fatalf("failed to lock book order coins")
+	}
+	mkt.bookMtx.Lock()
+	inserted := mkt.book.Insert(lo)
+	mkt.bookMtx.Unlock()
+	if !inserted {
+		t.Fatalf("failed to insert book order %v", lo.ID())
+	}
+	rig.bookRouter.books[mkt.name].insert(lo)
+}
+
+// requireRevokedOrderGone checks that a revoked order has left the market
+// book and that its funding coins are unlocked in the side-appropriate locker.
+func requireRevokedOrderGone(t *testing.T, mkt *Market, lo *order.LimitOrder) {
+	t.Helper()
+	if mkt.book.HaveOrder(lo.ID()) {
+		t.Fatalf("revoked order %v remains in market book", lo.ID())
+	}
+	assetID := mkt.Quote()
+	if lo.Sell {
+		assetID = mkt.Base()
+	}
+	for _, coin := range lo.Coins {
+		if mkt.CoinLocked(assetID, []byte(coin)) {
+			t.Fatalf("revoked order %v coin %x remains locked", lo.ID(), coin)
+		}
 	}
 }
