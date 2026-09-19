@@ -54,6 +54,7 @@ type cacheWithStoredTime struct {
 type DataAPI struct {
 	db             DBSource
 	epochDurations map[string]uint64
+	marketSources  map[string]MarketSource
 	bookSource     BookSource
 
 	spotsMtx sync.RWMutex
@@ -68,6 +69,7 @@ func NewDataAPI(dbSrc DBSource, registerHTTP func(route string, handler comms.HT
 	s := &DataAPI{
 		db:             dbSrc,
 		epochDurations: make(map[string]uint64),
+		marketSources:  make(map[string]MarketSource),
 		spots:          make(map[string]json.RawMessage),
 		marketCaches:   make(map[string]map[uint64]*cacheWithStoredTime),
 	}
@@ -80,14 +82,33 @@ func NewDataAPI(dbSrc DBSource, registerHTTP func(route string, handler comms.HT
 	return s
 }
 
-// AddMarketSource should be called before any markets are running.
+// AddMarketSource registers a market for candle cache loading.
+// Call it before LoadCaches.
 func (s *DataAPI) AddMarketSource(mkt MarketSource) error {
 	mktName, err := dex.MarketName(mkt.Base(), mkt.Quote())
 	if err != nil {
 		return err
 	}
+	s.marketSources[mktName] = mkt
+	return nil
+}
+
+// LoadCaches loads candle history for all registered markets.
+// Call it after market state restoration and before reporting epochs
+// or serving requests.
+func (s *DataAPI) LoadCaches() error {
+	for mktName, mkt := range s.marketSources {
+		if err := s.loadMarketCaches(mkt, mktName); err != nil {
+			return fmt.Errorf("market %s: %w", mktName, err)
+		}
+	}
+	return nil
+}
+
+// loadMarketCaches loads a market's candle history using its current
+// epoch duration.
+func (s *DataAPI) loadMarketCaches(mkt MarketSource, mktName string) error {
 	epochDur := mkt.EpochDuration()
-	s.epochDurations[mktName] = epochDur
 	binCaches := make(map[uint64]*cacheWithStoredTime, len(binSizes)+1)
 	cacheList := make([]*candles.Cache, 0, len(binSizes)+1)
 	for _, binSize := range append([]uint64{epochDur}, binSizes...) {
@@ -100,12 +121,13 @@ func (s *DataAPI) AddMarketSource(mkt MarketSource) error {
 		cacheList = append(cacheList, cache)
 		binCaches[binSize] = c
 	}
-	err = s.db.LoadEpochStats(mkt.Base(), mkt.Quote(), cacheList)
+	err := s.db.LoadEpochStats(mkt.Base(), mkt.Quote(), cacheList)
 	if err != nil {
 		return err
 	}
 	s.cacheMtx.Lock()
 	s.marketCaches[mktName] = binCaches
+	s.epochDurations[mktName] = epochDur
 	s.cacheMtx.Unlock()
 	return nil
 }

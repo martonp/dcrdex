@@ -5,6 +5,7 @@ package apidata
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -19,21 +20,26 @@ var dummyErr = fmt.Errorf("dummy error")
 
 type TMarketSource struct {
 	base, quote uint32
+	epochDur    uint64
 }
 
-func (m *TMarketSource) EpochDuration() uint64 { return 1000 }
+func (m *TMarketSource) EpochDuration() uint64 { return m.epochDur }
 func (m *TMarketSource) Base() uint32          { return m.base }
 func (m *TMarketSource) Quote() uint32         { return m.quote }
 
 type TDBSource struct {
-	loadEpochErr error
+	loadEpochErr    error
+	loadEpochCalls  int
+	lastCandleCalls int
 }
 
 func (db *TDBSource) LoadEpochStats(base, quote uint32, caches []*candles.Cache) error {
+	db.loadEpochCalls++
 	return db.loadEpochErr
 }
 
 func (db *TDBSource) LastCandleEndStamp(base, quote uint32, candleDur uint64) (uint64, error) {
+	db.lastCandleCalls++
 	return 0, nil
 }
 
@@ -64,36 +70,70 @@ func newTestRig() *testRig {
 
 func TestAddMarketSource(t *testing.T) {
 	rig := newTestRig()
-	// initial success
-	err := rig.api.AddMarketSource(&TMarketSource{42, 0})
-	if err != nil {
-		t.Fatalf("AddMarketSource error: %v", err)
+	mkt := &TMarketSource{base: 42, quote: 0, epochDur: 1000}
+	if err := rig.api.AddMarketSource(mkt); err != nil {
+		t.Fatal(err)
 	}
-	// unknown asset
-	err = rig.api.AddMarketSource(&TMarketSource{42, 54321})
-	if err == nil {
-		t.Fatalf("no error for unknown asset")
+	if err := rig.api.AddMarketSource(&TMarketSource{base: 42, quote: 54321, epochDur: 1000}); err == nil {
+		t.Fatal("no error for unknown asset")
 	}
-	// DB error
+	if len(rig.api.marketSources) != 1 || rig.api.marketSources["dcr_btc"] != mkt {
+		t.Fatal("expected only the valid market to be registered")
+	}
+	if rig.db.loadEpochCalls != 0 || rig.db.lastCandleCalls != 0 {
+		t.Fatal("market registration read from the database")
+	}
+}
+
+func TestLoadCaches(t *testing.T) {
+	rig := newTestRig()
+	mkt := &TMarketSource{base: 42, quote: 0, epochDur: 1000}
+	if err := rig.api.AddMarketSource(mkt); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restoring market state can change the duration after registration.
+	mkt.epochDur = 2000
 	rig.db.loadEpochErr = dummyErr
-	err = rig.api.AddMarketSource(&TMarketSource{42, 0})
-	if err == nil {
-		t.Fatalf("no error for DB error")
+	if err := rig.api.LoadCaches(); !errors.Is(err, dummyErr) {
+		t.Fatalf("LoadCaches error = %v, want %v", err, dummyErr)
 	}
+	if len(rig.api.marketCaches) != 0 || len(rig.api.epochDurations) != 0 {
+		t.Fatal("failed load published caches or epoch durations")
+	}
+
 	rig.db.loadEpochErr = nil
-	// success again
-	err = rig.api.AddMarketSource(&TMarketSource{42, 0})
-	if err != nil {
-		t.Fatalf("AddMarketSource error after: %v", err)
+	if err := rig.api.LoadCaches(); err != nil {
+		t.Fatal(err)
+	}
+	if rig.db.loadEpochCalls != 2 || rig.db.lastCandleCalls == 0 {
+		t.Fatalf("database reads: LoadEpochStats %d, LastCandleEndStamp %d",
+			rig.db.loadEpochCalls, rig.db.lastCandleCalls)
+	}
+	caches := rig.api.marketCaches["dcr_btc"]
+	if len(caches) != len(binSizes)+1 {
+		t.Fatalf("cache count = %d, want %d", len(caches), len(binSizes)+1)
+	}
+	if cache := caches[2000]; cache == nil || cache.BinSize != 2000 {
+		t.Fatal("missing cache for the restored epoch duration")
+	}
+	if _, found := caches[1000]; found {
+		t.Fatal("cache uses the duration from before restoration")
+	}
+	if dur := rig.api.epochDurations["dcr_btc"]; dur != 2000 {
+		t.Fatalf("epoch duration = %d, want 2000", dur)
 	}
 }
 
 func TestReportEpoch(t *testing.T) {
 	rig := newTestRig()
-	mktSrc := &TMarketSource{42, 0}
+	mktSrc := &TMarketSource{base: 42, quote: 0, epochDur: 1000}
 	err := rig.api.AddMarketSource(mktSrc)
 	if err != nil {
 		t.Fatalf("AddMarketSource error: %v", err)
+	}
+	if err := rig.api.LoadCaches(); err != nil {
+		t.Fatalf("LoadCaches error: %v", err)
 	}
 	epoch := uint64(time.Now().UnixMilli()) / mktSrc.EpochDuration()
 	epochsPerDay := uint64(time.Hour*24/time.Millisecond) / mktSrc.EpochDuration()
