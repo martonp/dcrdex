@@ -43,21 +43,20 @@ func (e Error) Error() string {
 }
 
 const (
-	ErrMarketNotRunning       = Error("market not running")
-	ErrInvalidOrder           = Error("order failed validation")
-	ErrInvalidRate            = Error("limit order rate too low")
-	ErrInvalidCommitment      = Error("order commitment invalid")
-	ErrEpochMissed            = Error("order unexpectedly missed its intended epoch")
-	ErrDuplicateOrder         = Error("order already in epoch") // maybe remove since this is ill defined
-	ErrQuantityTooHigh        = Error("order quantity exceeds user limit")
-	ErrDuplicateCancelOrder   = Error("equivalent cancel order already in epoch")
-	ErrTooManyCancelOrders    = Error("too many cancel orders in current epoch")
-	ErrCancelNotPermitted     = Error("cancel order account does not match targeted order account")
-	ErrTargetNotActive        = Error("target order not active on this market")
-	ErrTargetNotCancelable    = Error("targeted order is not a limit order with standing time-in-force")
-	ErrSuspendedAccount       = Error("suspended account")
-	ErrMalformedOrderResponse = Error("malformed order response")
-	ErrInternalServer         = Error("internal server error")
+	ErrMarketNotRunning     = Error("market not running")
+	ErrInvalidOrder         = Error("order failed validation")
+	ErrInvalidRate          = Error("limit order rate too low")
+	ErrInvalidCommitment    = Error("order commitment invalid")
+	ErrEpochMissed          = Error("order unexpectedly missed its intended epoch")
+	ErrDuplicateOrder       = Error("order already in epoch") // maybe remove since this is ill defined
+	ErrQuantityTooHigh      = Error("order quantity exceeds user limit")
+	ErrDuplicateCancelOrder = Error("equivalent cancel order already in epoch")
+	ErrTooManyCancelOrders  = Error("too many cancel orders in current epoch")
+	ErrCancelNotPermitted   = Error("cancel order account does not match targeted order account")
+	ErrTargetNotActive      = Error("target order not active on this market")
+	ErrTargetNotCancelable  = Error("targeted order is not a limit order with standing time-in-force")
+	ErrSuspendedAccount     = Error("suspended account")
+	ErrInternalServer       = Error("internal server error")
 )
 
 var errEpochOrderStorage = errors.New("epoch order storage failure")
@@ -754,63 +753,6 @@ func (m *Market) validateScheduleSuspendEvent(finalEpochIdx, finalEpochDur int64
 	return nil
 }
 
-// SuspendASAP suspends requests the market to gracefully suspend epoch cycling
-// as soon as possible, always allowing an active epoch to close. See also
-// Suspend.
-func (m *Market) SuspendASAP(persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	return m.Suspend(time.Now(), persistBook)
-}
-
-// Suspend requests the market to gracefully suspend epoch cycling as soon as
-// the given time, always allowing the epoch including that time to complete. If
-// the time is before the current epoch, the current epoch will be the last.
-func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	// epochMtx guards activeEpochIdx, startEpochIdx, suspendEpochIdx, and
-	// persistBook.
-	m.epochMtx.Lock()
-	defer m.epochMtx.Unlock()
-
-	dur := int64(m.EpochDuration())
-
-	epochEnd := func(idx int64) time.Time {
-		start := time.UnixMilli(idx * dur)
-		return start.Add(time.Duration(dur) * time.Millisecond)
-	}
-
-	// Determine which epoch includes asSoonAs, and compute its end time. If
-	// asSoonAs is in a past epoch, suspend at the end of the active epoch.
-
-	soonestFinalIdx := m.activeEpochIdx
-	if soonestFinalIdx == 0 {
-		// Cannot schedule a suspend if Run isn't running.
-		if m.startEpochIdx == 0 {
-			return -1, time.Time{}
-		}
-		// Not yet started. Soonest suspend idx is the start epoch idx - 1.
-		soonestFinalIdx = m.startEpochIdx - 1
-	}
-
-	if soonestEnd := epochEnd(soonestFinalIdx); asSoonAs.Before(soonestEnd) {
-		// Suspend at the end of the active epoch or the one prior to start.
-		finalEpochIdx = soonestFinalIdx
-		finalEpochEnd = soonestEnd
-	} else {
-		// Suspend at the end of the epoch that includes the target time.
-		ms := asSoonAs.UnixMilli()
-		finalEpochIdx = ms / dur
-		// Allow stopping at boundary, prior to the epoch starting at this time.
-		if ms%dur == 0 {
-			finalEpochIdx--
-		}
-		finalEpochEnd = epochEnd(finalEpochIdx)
-	}
-
-	m.suspendEpochIdx = finalEpochIdx
-	m.persistBook = persistBook
-
-	return
-}
-
 // buildScheduleResumeEvent builds an event scheduling resumption and returns
 // the scheduled starting epoch and its start time.
 // It fails if the market is already running.
@@ -874,29 +816,6 @@ func (m *Market) submitMarketResume(ctx context.Context, pendingEpochIdx, pendin
 	}
 	_, err = m.mesh.ApplyEvent(ctx, meshEvent)
 	return err
-}
-
-// SetStartEpochIdx sets the starting epoch index. This should generally be
-// called before Run, or Start used to specify the index at the same time.
-func (m *Market) SetStartEpochIdx(startEpochIdx int64) {
-	m.epochMtx.Lock()
-	m.startEpochIdx = startEpochIdx
-	m.epochMtx.Unlock()
-}
-
-// Start begins order processing with a starting epoch index. See also
-// SetStartEpochIdx and Run. Stop the Market by cancelling the context.
-func (m *Market) Start(ctx context.Context, startEpochIdx int64) {
-	m.SetStartEpochIdx(startEpochIdx)
-	m.Run(ctx)
-}
-
-// waitForEpochOpen waits until the start of epoch processing.
-func (m *Market) waitForEpochOpen() {
-	m.runMtx.RLock()
-	c := m.running // the field may be rewritten, but only after close
-	m.runMtx.RUnlock()
-	<-c
 }
 
 // Status describes the operation state of the Market.
@@ -1314,48 +1233,6 @@ func (m *Market) stampedSuspendedCancelEvent(rec *orderRecord) (*mesh.Event, *ms
 	return event, result, nil
 }
 
-// OrderFeed provides a new order book update channel. Channels provided before
-// the market starts and while a market is running are both valid. When the
-// market stops, channels are closed (invalidated), and new channels should be
-// requested if the market starts again.
-func (m *Market) OrderFeed() <-chan *updateSignal {
-	bookUpdates := make(chan *updateSignal, 1)
-	m.orderFeedMtx.Lock()
-	m.orderFeeds = append(m.orderFeeds, bookUpdates)
-	m.orderFeedMtx.Unlock()
-	return bookUpdates
-}
-
-// FeedDone informs the market that the caller is finished receiving from the
-// given channel, which should have been obtained from OrderFeed. If the channel
-// was a registered order feed channel from OrderFeed, it is closed and removed
-// so that no further signals will be send on the channel.
-func (m *Market) FeedDone(feed <-chan *updateSignal) bool {
-	m.orderFeedMtx.Lock()
-	defer m.orderFeedMtx.Unlock()
-	for i := range m.orderFeeds {
-		if m.orderFeeds[i] == feed {
-			close(m.orderFeeds[i])
-			// Order is not important to delete the channel without allocation.
-			m.orderFeeds[i] = m.orderFeeds[len(m.orderFeeds)-1]
-			m.orderFeeds[len(m.orderFeeds)-1] = nil // chan is a pointer
-			m.orderFeeds = m.orderFeeds[:len(m.orderFeeds)-1]
-			return true
-		}
-	}
-	return false
-}
-
-// sendToFeeds sends an *updateSignal to all order feed channels created with
-// OrderFeed().
-func (m *Market) sendToFeeds(sig *updateSignal) {
-	m.orderFeedMtx.RLock()
-	for _, s := range m.orderFeeds {
-		s <- sig
-	}
-	m.orderFeedMtx.RUnlock()
-}
-
 // sendSuspendedCancelMatchRequest signs and sends the maker and taker match
 // notifications for a cancellation to the locally connected order owner.
 func (m *Market) sendSuspendedCancelMatchRequest(user account.AccountID, match *order.Match, serverTime time.Time) {
@@ -1766,84 +1643,6 @@ func (m *Market) Book() (epoch int64, buys, sells []*order.LimitOrder) {
 	epoch = m.bookEpochIdx
 	m.bookMtx.Unlock()
 	return
-}
-
-// PurgeBook flushes all booked orders from the in-memory book and persistent
-// storage. In terms of storage, this means changing orders with status booked
-// to status revoked.
-func (m *Market) PurgeBook() {
-	// Clear booked orders from the DB and the in-memory book.
-	removed := m.purgeBook()
-
-	// Send individual revoke order notifications. These are not part of the
-	// orderbook subscription, so the users will receive them whether or not
-	// they are subscribed for book updates.
-	for oid, aid := range removed {
-		m.sendRevokeOrderNote(oid, aid)
-	}
-}
-
-func (m *Market) purgeBook() (removed map[order.OrderID]account.AccountID) {
-	m.bookMtx.Lock()
-	defer m.bookMtx.Unlock()
-
-	// Revoke all booked orders in the DB.
-	sellsCleared, buysCleared, err := m.storage.FlushBook(m.marketInfo.Base, m.marketInfo.Quote)
-	if err != nil {
-		log.Errorf("Failed to flush book for market %s: %v", m.marketInfo.Name, err)
-		return
-	}
-
-	// Clear the in-memory order book to match the DB.
-	buysRemoved, sellsRemoved := m.book.Clear()
-
-	log.Infof("Flushed %d sell orders and %d buy orders from market %q book",
-		len(sellsRemoved), len(buysRemoved), m.marketInfo.Name)
-	// Maybe the DB cleaned up orphaned orders. Log any discrepancies.
-	if len(sellsRemoved) != len(sellsCleared) {
-		log.Warnf("Removed %d sell orders from the book, but %d were updated in the DB.",
-			len(sellsRemoved), len(sellsCleared))
-	}
-	if len(buysRemoved) != len(buysCleared) {
-		log.Warnf("Removed %d buy orders from the book, but %d were updated in the DB.",
-			len(buysRemoved), len(buysCleared))
-	}
-
-	// Unlock coins for removed orders.
-
-	// TODO: only unlock previously booked order coins, do not include coins
-	// that might belong to orders still in epoch status. This won't matter if
-	// the market is suspended, but it does if PurgeBook is used while the
-	// market is still accepting new orders and processing epochs.
-
-	// Unlock base asset coins locked by sell orders.
-	if m.coinLockerBase != nil {
-		for i := range sellsRemoved {
-			m.coinLockerBase.UnlockOrderCoins(sellsRemoved[i].ID())
-		}
-	}
-
-	// Unlock quote asset coins locked by buy orders.
-	if m.coinLockerQuote != nil {
-		for i := range buysRemoved {
-			m.coinLockerQuote.UnlockOrderCoins(buysRemoved[i].ID())
-		}
-	}
-
-	removed = make(map[order.OrderID]account.AccountID, len(buysRemoved)+len(sellsRemoved))
-	for _, lo := range append(sellsRemoved, buysRemoved...) {
-		removed[lo.ID()] = lo.AccountID
-	}
-
-	return
-}
-
-func (m *Market) lazy(do func()) {
-	m.tasks.Add(1)
-	go func() {
-		defer m.tasks.Done()
-		do()
-	}()
 }
 
 // Run drives the market's epoch loop on the acting master. Call
@@ -2367,98 +2166,6 @@ func (m *Market) applyOrderRevokedMemory(lo *order.LimitOrder) bool {
 
 	m.sendRevokeOrderNote(oid, lo.User())
 	return true
-}
-
-// UnbookUserOrders unbooks all orders belonging to a user, unlocks the coins
-// that were used to fund the unbooked orders, changes the orders' statuses to
-// revoked in the DB, and notifies orderbook subscribers.
-func (m *Market) UnbookUserOrders(user account.AccountID) {
-	m.bookMtx.Lock()
-	removedBuys, removedSells := m.book.RemoveUserOrders(user)
-	// No order completion credit in SwapDone for revoked orders:
-	for _, lo := range removedSells {
-		delete(m.settling, lo.ID())
-	}
-	for _, lo := range removedBuys {
-		delete(m.settling, lo.ID())
-	}
-	m.bookMtx.Unlock()
-
-	total := len(removedBuys) + len(removedSells)
-	if total == 0 {
-		return
-	}
-
-	log.Infof("Unbooked %d orders (%d buys, %d sells) from market %v from user %v.",
-		total, len(removedBuys), len(removedSells), m.marketInfo.Name, user)
-
-	// Unlock the order funding coins, update order statuses in DB, and notify
-	// orderbook subscribers.
-	sellIDs := make([]order.OrderID, 0, len(removedSells))
-	for _, lo := range removedSells {
-		sellIDs = append(sellIDs, lo.ID())
-		m.unbookedOrder(lo)
-	}
-	if m.coinLockerBase != nil {
-		m.coinLockerBase.UnlockOrdersCoins(sellIDs)
-	}
-
-	buyIDs := make([]order.OrderID, 0, len(removedBuys))
-	for _, lo := range removedBuys {
-		buyIDs = append(buyIDs, lo.ID())
-		m.unbookedOrder(lo)
-	}
-	if m.coinLockerQuote != nil {
-		m.coinLockerQuote.UnlockOrdersCoins(buyIDs)
-	}
-}
-
-// Unbook allows the DEX manager to remove a booked order. This does: (1) remove
-// the order from the in-memory book, (2) unlock funding order coins, (3) set
-// the order's status in the DB to "revoked", (4) inform the auth manager of the
-// action for cancellation ratio accounting, and (5) send an 'unbook'
-// notification to subscribers of this market's order book. Note that this
-// presently treats the user as at-fault by counting the revocation in the
-// user's cancellation statistics.
-func (m *Market) Unbook(lo *order.LimitOrder) bool {
-	// Ensure we do not unbook during matching.
-	m.bookMtx.Lock()
-	_, removed := m.book.Remove(lo.ID())
-	delete(m.settling, lo.ID()) // no order completion credit in SwapDone for revoked orders
-	m.bookMtx.Unlock()
-
-	m.unlockOrderCoins(lo)
-
-	if removed {
-		// Update the order status in DB, and notify orderbook subscribers.
-		m.unbookedOrder(lo)
-	}
-	return removed
-}
-
-func (m *Market) unbookedOrder(lo *order.LimitOrder) {
-	// Create the server-generated cancel order, and register it with the
-	// AuthManager for cancellation rate computation if still connected.
-	oid, user := lo.ID(), lo.User()
-	coid, revTime, err := m.storage.RevokeOrder(lo)
-	if err == nil {
-		m.auth.RecordCancel(user, coid, oid, db.EpochGapNA, revTime)
-	} else {
-		log.Errorf("Failed to revoke order %v with a new cancel order: %v",
-			lo.UID(), err)
-	}
-
-	// Send revoke_order notification to order owner.
-	m.sendRevokeOrderNote(oid, user)
-
-	// Send "unbook" notification to order book subscribers.
-	m.sendToFeeds(&updateSignal{
-		action: unbookAction,
-		data: sigDataUnbookedOrder{
-			order:    lo,
-			epochIdx: -1, // NOTE: no epoch
-		},
-	})
 }
 
 // getFeeRate gets the fee rate for an asset.
@@ -3164,13 +2871,13 @@ func (m *Market) orderResult(rec *orderRecord) *msgjson.OrderResult {
 func (m *Market) SetFeeRateScale(assetID uint32, scale float64) {
 	m.feeScalesMtx.Lock()
 	switch assetID {
-	case m.marketInfo.Base:
+	case m.base:
 		m.feeScales.base = scale
-	case m.marketInfo.Quote:
+	case m.quote:
 		m.feeScales.quote = scale
 	default:
 		log.Errorf("Unknown asset ID %d for market %d-%d",
-			assetID, m.marketInfo.Base, m.marketInfo.Quote)
+			assetID, m.base, m.quote)
 	}
 	m.feeScalesMtx.Unlock()
 }
@@ -3184,7 +2891,7 @@ func (m *Market) ScaleFeeRate(assetID uint32, feeRate uint64) uint64 {
 	var feeScale float64
 	m.feeScalesMtx.RLock()
 	switch assetID {
-	case m.marketInfo.Base:
+	case m.base:
 		feeScale = m.feeScales.base
 	default:
 		feeScale = m.feeScales.quote
@@ -3206,10 +2913,10 @@ func (m *Market) SubscribeMMSnapshots(user account.AccountID, unsub bool) {
 	m.mmSnapshotMtx.Lock()
 	if unsub {
 		delete(m.mmSnapshotSubs, user)
-		log.Debugf("User %v unsubscribed from MM snapshots for %s", user, m.marketInfo.Name)
+		log.Debugf("User %v unsubscribed from MM snapshots for %s", user, m.name)
 	} else {
 		m.mmSnapshotSubs[user] = struct{}{}
-		log.Debugf("User %v subscribed to MM snapshots for %s", user, m.marketInfo.Name)
+		log.Debugf("User %v subscribed to MM snapshots for %s", user, m.name)
 	}
 	m.mmSnapshotMtx.Unlock()
 }

@@ -39,15 +39,14 @@ import (
 )
 
 type TArchivist struct {
-	mtx                           sync.Mutex
-	poisonEpochOrder              order.Order
 	orderWithKnownCommit          order.OrderID
 	commitForKnownOrder           order.Commitment
-	bookedOrders                  []*order.LimitOrder
 	canceledOrders                []*order.LimitOrder
 	archivedCancels               []*order.CancelOrder
-	epochInserted                 chan struct{}
 	revoked                       order.Order
+	mtx                           sync.Mutex
+	poisonEpochOrder              order.Order
+	bookedOrders                  []*order.LimitOrder
 	epochOrders                   []epochOrderWrite
 	orderAcceptedUpdates          []*db.OrderAcceptedUpdate
 	marketStartedUpdates          []*db.MarketStartedUpdate
@@ -60,6 +59,7 @@ type TArchivist struct {
 	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
+	epochInserted                 chan struct{}
 	suspendedCancels              []*db.SuspendedCancelUpdate
 	ordersRevokedUpdates          []*db.OrdersRevokedUpdate
 	commitOrders                  []db.OrderWithStatus
@@ -339,50 +339,11 @@ func (ta *TArchivist) EpochOrders(base, quote uint32) ([]order.Order, error) {
 func (ta *TArchivist) MarketMatches(base, quote uint32) ([]*db.MatchDataWithCoins, error) {
 	return nil, nil
 }
-func (ta *TArchivist) FlushBook(base, quote uint32) (sells, buys []order.OrderID, err error) {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	for _, lo := range ta.bookedOrders {
-		if lo.Sell {
-			sells = append(sells, lo.ID())
-		} else {
-			buys = append(buys, lo.ID())
-		}
-	}
-	ta.bookedOrders = nil
-	return
-}
-func (ta *TArchivist) NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error {
-	if ta.archivedCancels != nil {
-		ta.archivedCancels = append(ta.archivedCancels, ord)
-	}
-	return nil
-}
-func (ta *TArchivist) ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error) {
-	return make(map[order.OrderID][]order.CoinID), make(map[order.OrderID][]order.CoinID), nil
-}
-func (ta *TArchivist) UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error) {
-	return nil, nil, errors.New("boom")
-}
 func (ta *TArchivist) UserOrderStatuses(aid account.AccountID, base, quote uint32, oids []order.OrderID) ([]*db.OrderStatus, error) {
 	return nil, errors.New("boom")
 }
 func (ta *TArchivist) ActiveUserOrderStatuses(aid account.AccountID) ([]*db.OrderStatus, error) {
 	return nil, errors.New("boom")
-}
-func (ta *TArchivist) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	if commit == ta.commitForKnownOrder {
-		return true, ta.orderWithKnownCommit, nil
-	}
-	return
-}
-func (ta *TArchivist) CompletedUserOrders(aid account.AccountID, N int) (oids []order.OrderID, compTimes []int64, err error) {
-	return nil, nil, nil
-}
-func (ta *TArchivist) ExecutedCancelsForUser(aid account.AccountID, N int) ([]*db.CancelRecord, error) {
-	return nil, nil
 }
 func (ta *TArchivist) OrderStatus(order.Order) (order.OrderStatus, order.OrderType, int64, error) {
 	return order.OrderStatusUnknown, order.UnknownOrderType, -1, errors.New("boom")
@@ -501,15 +462,6 @@ func (ta *TArchivist) ApplyOrdersRevokedEvent(_ context.Context, _ *db.EventLogM
 	ta.ordersRevokedUpdates = append(ta.ordersRevokedUpdates, update)
 	return new(db.EventLogEntry), nil
 }
-func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	if ta.poisonEpochOrder != nil && ord.ID() == ta.poisonEpochOrder.ID() {
-		return errors.New("barf")
-	}
-	return nil
-}
-func (ta *TArchivist) StorePreimage(ord order.Order, pi order.Preimage) error { return nil }
 func (ta *TArchivist) failOnEpochOrder(ord order.Order) {
 	ta.mtx.Lock()
 	ta.poisonEpochOrder = ord
@@ -548,12 +500,6 @@ func (ta *TArchivist) ApplySuspendedCancelEvent(_ context.Context, _ *db.EventLo
 		Match:       update.Match,
 	}, nil
 }
-func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
-	if ta.epochInserted != nil { // the test wants to know
-		ta.epochInserted <- struct{}{}
-	}
-	return nil
-}
 func (ta *TArchivist) LastEpochRate(base, quote uint32) (rate uint64, err error) {
 	return 1, nil
 }
@@ -563,77 +509,20 @@ func (ta *TArchivist) BookOrder(lo *order.LimitOrder) error {
 	ta.bookedOrders = append(ta.bookedOrders, lo)
 	return nil
 }
-func (ta *TArchivist) ExecuteOrder(ord order.Order) error { return nil }
-func (ta *TArchivist) CancelOrder(lo *order.LimitOrder) error {
-	if ta.canceledOrders != nil {
-		ta.canceledOrders = append(ta.canceledOrders, lo)
-	}
-	return nil
-}
-func (ta *TArchivist) RevokeOrder(ord order.Order) (order.OrderID, time.Time, error) {
-	ta.revoked = ord
-	return ord.ID(), time.Now(), nil
-}
-func (ta *TArchivist) RevokeOrderUncounted(order.Order) (order.OrderID, time.Time, error) {
-	return order.OrderID{}, time.Now(), nil
-}
-func (ta *TArchivist) SetOrderCompleteTime(ord order.Order, compTime int64) error { return nil }
-func (ta *TArchivist) FailCancelOrder(*order.CancelOrder) error                   { return nil }
-func (ta *TArchivist) UpdateOrderFilled(*order.LimitOrder) error                  { return nil }
-func (ta *TArchivist) UpdateOrderStatus(order.Order, order.OrderStatus) error     { return nil }
 
 // SwapArchiver for Swapper
 func (ta *TArchivist) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
-func (ta *TArchivist) InsertMatch(match *order.Match) error     { return nil }
-func (ta *TArchivist) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
-	return nil, nil
-}
-func (ta *TArchivist) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
-	return nil, nil
-}
 func (ta *TArchivist) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {
 	return nil, nil
 }
-func (ta *TArchivist) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
-	return nil, nil
-}
-func (ta *TArchivist) ForgiveMatchFail(order.MatchID) (bool, error) { return false, nil }
 func (ta *TArchivist) AllActiveUserMatches(account.AccountID) ([]*db.MatchData, error) {
 	return nil, nil
 }
 func (ta *TArchivist) MatchStatuses(aid account.AccountID, base, quote uint32, matchIDs []order.MatchID) ([]*db.MatchStatus, error) {
 	return nil, nil
 }
-func (ta *TArchivist) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
-	return 0, nil, nil
-}
-func (ta *TArchivist) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ta *TArchivist) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ta *TArchivist) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error { return nil }
-func (ta *TArchivist) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error { return nil }
 
-// Contract data.
-func (ta *TArchivist) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error { return nil }
-func (ta *TArchivist) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
-
-// Redeem data.
-func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return nil
-}
-func (ta *TArchivist) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
-func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error     { return nil }
+func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}
 
@@ -1986,278 +1875,6 @@ func waitForOrderAdmission(t *testing.T, mkt *Market) {
 	t.Fatalf("timed out waiting for order admission")
 }
 
-func TestMarket_Suspend(t *testing.T) {
-	// Create the market.
-	mkt, _, _, cleanup, err := newTestMarket()
-	if err != nil {
-		t.Fatalf("newTestMarket failure: %v", err)
-		cleanup()
-		return
-	}
-	defer cleanup()
-	epochDurationMSec := int64(mkt.EpochDuration())
-
-	// Suspend before market start.
-	finalIdx, _ := mkt.Suspend(time.Now(), false)
-	if finalIdx != -1 {
-		t.Fatalf("not running market should not allow suspend")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	startEpochIdx := 2 + time.Now().UnixMilli()/epochDurationMSec
-	startEpochTime := time.UnixMilli(startEpochIdx * epochDurationMSec)
-	midPrevEpochTime := startEpochTime.Add(time.Duration(-epochDurationMSec/2) * time.Millisecond)
-
-	// ~----|-------|-------|-------|
-	// ^now ^prev   ^start  ^next
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mkt.Start(ctx, startEpochIdx)
-	}()
-
-	feed := mkt.OrderFeed()
-	go func() {
-		for range feed {
-		}
-	}()
-
-	// Wait until half way through the epoch prior to start, when we know Run is
-	// running but the market hasn't started yet.
-	<-time.After(time.Until(midPrevEpochTime))
-
-	// This tests the case where m.activeEpochIdx == 0 but start is scheduled.
-	// The suspend (final) epoch should be the one just prior to startEpochIdx.
-	persist := true
-	finalIdx, finalTime := mkt.Suspend(time.Now(), persist)
-	if finalIdx != startEpochIdx-1 {
-		t.Fatalf("finalIdx = %d, wanted %d", finalIdx, startEpochIdx-1)
-	}
-	if !startEpochTime.Equal(finalTime) {
-		t.Errorf("got finalTime = %v, wanted %v", finalTime, startEpochTime)
-	}
-
-	if mkt.suspendEpochIdx != finalIdx {
-		t.Errorf("got suspendEpochIdx = %d, wanted = %d", mkt.suspendEpochIdx, finalIdx)
-	}
-
-	// Set a new suspend time, in the future this time.
-	nextEpochIdx := startEpochIdx + 1
-	nextEpochTime := time.UnixMilli(nextEpochIdx * epochDurationMSec)
-
-	// Just before second epoch start.
-	finalIdx, finalTime = mkt.Suspend(nextEpochTime.Add(-1*time.Millisecond), persist)
-	if finalIdx != nextEpochIdx-1 {
-		t.Fatalf("finalIdx = %d, wanted %d", finalIdx, nextEpochIdx-1)
-	}
-	if !nextEpochTime.Equal(finalTime) {
-		t.Errorf("got finalTime = %v, wanted %v", finalTime, nextEpochTime)
-	}
-
-	if mkt.suspendEpochIdx != finalIdx {
-		t.Errorf("got suspendEpochIdx = %d, wanted = %d", mkt.suspendEpochIdx, finalIdx)
-	}
-
-	// Exactly at second epoch start, with same result.
-	finalIdx, finalTime = mkt.Suspend(nextEpochTime, persist)
-	if finalIdx != nextEpochIdx-1 {
-		t.Fatalf("finalIdx = %d, wanted %d", finalIdx, nextEpochIdx-1)
-	}
-	if !nextEpochTime.Equal(finalTime) {
-		t.Errorf("got finalTime = %v, wanted %v", finalTime, nextEpochTime)
-	}
-
-	if mkt.suspendEpochIdx != finalIdx {
-		t.Errorf("got suspendEpochIdx = %d, wanted = %d", mkt.suspendEpochIdx, finalIdx)
-	}
-
-	mkt.waitForEpochOpen()
-
-	// should be running
-	if !mkt.Running() {
-		t.Fatal("the market should have be running")
-	}
-
-	// Wait until after suspend time, and for Run to return.
-	<-time.After(time.Until(finalTime.Add(20 * time.Millisecond)))
-	wg.Wait()
-
-	// should be stopped
-	if mkt.Running() {
-		t.Fatal("the market should have been suspended")
-	}
-
-	mkt.FeedDone(feed)
-
-	// Start up again (consumer resumes the Market manually)
-	startEpochIdx = 1 + time.Now().UnixMilli()/epochDurationMSec
-	// startEpochTime = time.UnixMilli(startEpochIdx * epochDurationMSec)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mkt.Start(ctx, startEpochIdx)
-	}()
-
-	feed = mkt.OrderFeed()
-	go func() {
-		for range feed {
-		}
-	}()
-
-	mkt.waitForEpochOpen()
-
-	// should be running
-	if !mkt.Running() {
-		t.Fatal("the market should have be running")
-	}
-
-	// Suspend asap. Wait for Run to return.
-	_, finalTime = mkt.SuspendASAP(persist)
-	<-time.After(time.Until(finalTime.Add(40 * time.Millisecond)))
-	wg.Wait()
-
-	// Should be stopped
-	if mkt.Running() {
-		t.Fatal("the market should have been suspended")
-	}
-
-	cancel()
-	mkt.FeedDone(feed)
-}
-
-func TestMarket_Suspend_Persist(t *testing.T) {
-	// Create the market.
-	mkt, storage, _, cleanup, err := newTestMarket()
-	if err != nil {
-		t.Fatalf("newTestMarket failure: %v", err)
-		cleanup()
-		return
-	}
-	defer cleanup()
-	epochDurationMSec := int64(mkt.EpochDuration())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	startEpochIdx := 2 + time.Now().UnixMilli()/epochDurationMSec
-	//startEpochTime := time.UnixMilli(startEpochIdx * epochDurationMSec)
-
-	// ~----|-------|-------|-------|
-	// ^now ^prev   ^start  ^next
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mkt.Start(ctx, startEpochIdx)
-	}()
-
-	startFeedRecv := func(feed <-chan *updateSignal) {
-		go func() {
-			for range feed {
-			}
-		}()
-	}
-
-	// Wait until after original start time.
-	mkt.waitForEpochOpen()
-
-	if !mkt.Running() {
-		t.Fatal("the market should be running")
-	}
-
-	lo := makeLO(seller3, mkRate3(0.8, 1.0), randLots(10), order.StandingTiF)
-	ok := mkt.book.Insert(lo)
-	if !ok {
-		t.Fatalf("Failed to insert an order into Market's Book")
-	}
-	_ = storage.BookOrder(lo)
-
-	// Suspend asap with no resume.  The epoch with the limit order will be
-	// processed and then the market will suspend.
-	//wantClosedFeed = true // allow the feed receiver goroutine to return w/o error
-	persist := true
-	_, finalTime := mkt.SuspendASAP(persist)
-	<-time.After(time.Until(finalTime.Add(40 * time.Millisecond)))
-
-	// Wait for Run to return.
-	wg.Wait()
-
-	// Should be stopped
-	if mkt.Running() {
-		t.Fatal("the market should have been suspended")
-	}
-
-	// Verify the order is still there.
-	los, _ := storage.BookOrders(mkt.marketInfo.Base, mkt.marketInfo.Quote)
-	if len(los) == 0 {
-		t.Errorf("stored book orders were flushed")
-	}
-
-	_, buys, sells := mkt.Book()
-	if len(buys) != 0 {
-		t.Errorf("buy side of book not empty")
-	}
-	if len(sells) != 1 {
-		t.Errorf("sell side of book not equal to 1")
-	}
-
-	// Start it up again.
-	feed := mkt.OrderFeed()
-	startEpochIdx = 1 + time.Now().UnixMilli()/epochDurationMSec
-	//startEpochTime = time.UnixMilli(startEpochIdx * epochDurationMSec)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mkt.Start(ctx, startEpochIdx)
-	}()
-
-	startFeedRecv(feed)
-
-	mkt.waitForEpochOpen()
-
-	if !mkt.Running() {
-		t.Fatal("the market should be running")
-	}
-
-	persist = false
-	_, finalTime = mkt.SuspendASAP(persist)
-	<-time.After(time.Until(finalTime.Add(40 * time.Millisecond)))
-
-	// Wait for Run to return.
-	wg.Wait()
-	mkt.FeedDone(feed)
-
-	// Should be stopped
-	if mkt.Running() {
-		t.Fatal("the market should have been suspended")
-	}
-
-	// Verify the order is gone.
-	los, _ = storage.BookOrders(mkt.marketInfo.Base, mkt.marketInfo.Quote)
-	if len(los) != 0 {
-		t.Errorf("stored book orders were not flushed")
-	}
-
-	_, buys, sells = mkt.Book()
-	if len(buys) != 0 {
-		t.Errorf("buy side of book not empty")
-	}
-	if len(sells) != 0 {
-		t.Errorf("sell side of book not empty")
-	}
-
-	if t.Failed() {
-		cancel()
-		wg.Wait()
-	}
-}
-
 func TestMarket_Run(t *testing.T) {
 	// This test exercises the Market's main loop, which cycles the epochs and
 	// queues (or not) incoming orders.
@@ -2845,134 +2462,6 @@ func TestMarket_enqueueEpoch(t *testing.T) {
 	}
 }
 
-func TestMarket_Cancelable(t *testing.T) {
-	// Create the market.
-	mkt, storage, auth, cleanup, err := newTestMarket()
-	if err != nil {
-		t.Fatalf("newTestMarket failure: %v", err)
-		return
-	}
-	defer cleanup()
-	// This test wants to know when epoch order matching booking is done.
-	storage.epochInserted = make(chan struct{}, 1)
-	// and when handlePreimage is done.
-	auth.handlePreimageDone = make(chan struct{}, 1)
-
-	epochDurationMSec := int64(mkt.EpochDuration())
-	startEpochIdx := 1 + time.Now().UnixMilli()/epochDurationMSec
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		mkt.Start(ctx, startEpochIdx)
-	}()
-
-	// Make an order for the first epoch.
-	clientTimeMSec := startEpochIdx*epochDurationMSec + 10 // 10 ms after epoch start
-	lots := dex.PerTierBaseParcelLimit
-	qty := uint64(dcrLotSize * lots)
-	rate := uint64(1000) * dcrRateStep
-	aid := test.NextAccount()
-	pi := test.RandomPreimage()
-	commit := pi.Commit()
-	limitMsg := &msgjson.LimitOrder{
-		Prefix: msgjson.Prefix{
-			AccountID:  aid[:],
-			Base:       dcrID,
-			Quote:      btcID,
-			OrderType:  msgjson.LimitOrderNum,
-			ClientTime: uint64(clientTimeMSec),
-			Commit:     commit[:],
-		},
-		Trade: msgjson.Trade{
-			Side:     msgjson.SellOrderNum,
-			Quantity: qty,
-			Coins:    []*msgjson.Coin{},
-			Address:  btcAddr,
-		},
-		Rate: rate,
-		TiF:  msgjson.StandingOrderNum,
-	}
-
-	newLimit := func() *order.LimitOrder {
-		return &order.LimitOrder{
-			P: order.Prefix{
-				AccountID:  aid,
-				BaseAsset:  limitMsg.Base,
-				QuoteAsset: limitMsg.Quote,
-				OrderType:  order.LimitOrderType,
-				ClientTime: time.UnixMilli(clientTimeMSec),
-				Commit:     commit,
-			},
-			T: order.Trade{
-				Coins:    []order.CoinID{},
-				Sell:     true,
-				Quantity: limitMsg.Quantity,
-				Address:  limitMsg.Address,
-			},
-			Rate:  limitMsg.Rate,
-			Force: order.StandingTiF,
-		}
-	}
-	lo := newLimit()
-
-	oRecord := orderRecord{
-		msgID: 1,
-		req:   limitMsg,
-		order: lo,
-	}
-
-	auth.piMtx.Lock()
-	auth.preimagesByMsgID[oRecord.msgID] = pi
-	auth.piMtx.Unlock()
-
-	// Wait for the start of the epoch to submit the order.
-	mkt.waitForEpochOpen()
-
-	if mkt.Cancelable(order.OrderID{}) {
-		t.Errorf("Cancelable reported bogus order as is cancelable, " +
-			"but it wasn't even submitted.")
-	}
-
-	// Submit the standing limit order into the current epoch.
-	err = mkt.SubmitOrder(&oRecord)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !mkt.Cancelable(lo.ID()) {
-		t.Errorf("Cancelable failed to report order %v as cancelable, "+
-			"but it was in the epoch queue", lo)
-	}
-
-	// Let the epoch cycle and the fake client respond with its preimage
-	// (handlePreimageResp done)..
-	<-auth.handlePreimageDone
-	// and for matching to complete (in processReadyEpoch).
-	<-storage.epochInserted
-
-	if !mkt.Cancelable(lo.ID()) {
-		t.Errorf("Cancelable failed to report order %v as cancelable, "+
-			"but it should have been booked.", lo)
-	}
-
-	mkt.bookMtx.Lock()
-	_, ok := mkt.book.Remove(lo.ID())
-	mkt.bookMtx.Unlock()
-	if !ok {
-		t.Errorf("Failed to remove order %v from the book.", lo)
-	}
-
-	if mkt.Cancelable(lo.ID()) {
-		t.Errorf("Cancelable reported order %v as is cancelable, "+
-			"but it was removed from the Book.", lo)
-	}
-
-	cancel()
-	wg.Wait()
-}
-
 func TestMarket_handlePreimageResp(t *testing.T) {
 	randomCommit := func() (com order.Commitment) {
 		rnd.Read(com[:])
@@ -3185,146 +2674,6 @@ func TestMarket_MarketStartup_AccountBased(t *testing.T) {
 	t.Run("account-based base", func(t *testing.T) { testAccountAssets(t, true, false) })
 	t.Run("account-based quote", func(t *testing.T) { testAccountAssets(t, false, true) })
 	t.Run("both account-based", func(t *testing.T) { testAccountAssets(t, true, true) })
-}
-
-func TestMarket_CancelWhileSuspended(t *testing.T) {
-	mkt, storage, auth, cleanup, err := newTestMarket()
-	defer cleanup()
-	if err != nil {
-		t.Fatalf("newTestMarket failure: %v", err)
-		return
-	}
-
-	auth.handleMatchDone = make(chan *msgjson.Message, 1)
-	storage.archivedCancels = make([]*order.CancelOrder, 0, 1)
-	storage.canceledOrders = make([]*order.LimitOrder, 0, 1)
-
-	ctx := t.Context()
-
-	// Insert a limit order into the book before the market has started
-	lo := makeLO(buyer3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
-	if !mkt.book.Insert(lo) {
-		t.Fatalf("Failed to Insert order into book.")
-	}
-
-	// Start the market
-	epochDurationMSec := int64(mkt.EpochDuration())
-	startEpochIdx := 2 + time.Now().UnixMilli()/epochDurationMSec
-	startEpochTime := time.UnixMilli(startEpochIdx * epochDurationMSec)
-	go mkt.Start(ctx, startEpochIdx)
-	<-time.After(time.Until(startEpochTime.Add(50 * time.Millisecond)))
-	if !mkt.Running() {
-		t.Fatal("market should be running")
-	}
-
-	// Suspend the market, persisting the existing orders
-	_, finalTime := mkt.Suspend(time.Now(), true)
-	<-time.After(time.Until(finalTime.Add(50 * time.Millisecond)))
-	if mkt.Running() {
-		t.Fatal("market should not be running")
-	}
-
-	if mkt.book.BuyCount() != 1 {
-		t.Fatalf("There should be an order in the book.")
-	}
-
-	// Submit a valid cancel order.
-	loID := lo.ID()
-	piCo := test.RandomPreimage()
-	commit := piCo.Commit()
-	cancelTime := time.Now().UnixMilli()
-	aid := buyer3.Acct
-	cancelMsg := &msgjson.CancelOrder{
-		Prefix: msgjson.Prefix{
-			AccountID:  aid[:],
-			Base:       dcrID,
-			Quote:      btcID,
-			OrderType:  msgjson.CancelOrderNum,
-			ClientTime: uint64(cancelTime),
-			Commit:     commit[:],
-		},
-		TargetID: loID[:],
-	}
-	newCancel := func() *order.CancelOrder {
-		return &order.CancelOrder{
-			P: order.Prefix{
-				AccountID:  aid,
-				BaseAsset:  lo.Base(),
-				QuoteAsset: lo.Quote(),
-				OrderType:  order.CancelOrderType,
-				ClientTime: time.UnixMilli(cancelTime),
-				Commit:     commit,
-			},
-			TargetOrderID: loID,
-		}
-	}
-	co := newCancel()
-	coRecord := orderRecord{
-		msgID: 1,
-		req:   cancelMsg,
-		order: co,
-	}
-	err = mkt.SubmitOrder(&coRecord)
-	if err != nil {
-		t.Fatalf("Error submitting cancel order: %v", err)
-	}
-
-	if mkt.book.BuyCount() != 0 {
-		t.Fatalf("Did not remove order from book.")
-	}
-
-	// Make sure that the cancel order was archived, and the limit order was
-	// canceled.
-	if len(storage.archivedCancels) != 1 {
-		t.Fatalf("1 cancel order should be archived but there are %v", len(storage.archivedCancels))
-	}
-	if !bytes.Equal(storage.archivedCancels[0].ID().Bytes(), co.ID().Bytes()) {
-		t.Fatalf("Archived cancel order's ID does not match expected")
-	}
-	if len(storage.canceledOrders) != 1 {
-		t.Fatalf("1 cancel order should be archived but there are %v", len(storage.archivedCancels))
-	}
-	if !bytes.Equal(storage.canceledOrders[0].ID().Bytes(), lo.ID().Bytes()) {
-		t.Fatalf("Cacneled limit order's ID does not match expected")
-	}
-
-	// Make sure that we responded to the order request
-	if len(auth.sends) != 1 {
-		t.Fatalf("There should be 1 send, a response to the order request.")
-	}
-	msg := auth.sends[0]
-	response := new(msgjson.OrderResult)
-	msg.UnmarshalResult(response)
-	if !bytes.Equal(response.OrderID, co.ID().Bytes()) {
-		t.Fatalf("order response sent for the incorrect order ID")
-	}
-
-	// Make sure that we sent the match request to the client.
-	msg = <-auth.handleMatchDone
-	var matches []*msgjson.Match
-	err = json.Unmarshal(msg.Payload, &matches)
-	if err != nil {
-		t.Fatalf("failed to unmarshal match messages")
-	}
-	if len(matches) != 2 {
-		t.Fatalf("There should be 2 payloads, one for maker and taker match each: %v", len(matches))
-	}
-	var taker, maker bool
-	if matches[0].Side == uint8(order.Maker) || matches[1].Side == uint8(order.Maker) {
-		maker = true
-	}
-	if matches[0].Side == uint8(order.Taker) || matches[1].Side == uint8(order.Taker) {
-		taker = true
-	}
-	if !taker || !maker {
-		t.Fatalf("There should be 2 payloads, one for maker and taker match each")
-	}
-}
-
-func TestMarket_NewMarket_AccountBased(t *testing.T) {
-	testAccountAssets(t, true, false)
-	testAccountAssets(t, false, true)
-	testAccountAssets(t, true, true)
 }
 
 func testAccountAssets(t *testing.T, base, quote bool) {
@@ -6577,3 +5926,123 @@ func requireEpochRevokeSet(t *testing.T, update *db.MarketStartedUpdate, want []
 		}
 	}
 }
+
+func (ta *TArchivist) FlushBook(base, quote uint32) (sells, buys []order.OrderID, err error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	for _, lo := range ta.bookedOrders {
+		if lo.Sell {
+			sells = append(sells, lo.ID())
+		} else {
+			buys = append(buys, lo.ID())
+		}
+	}
+	ta.bookedOrders = nil
+	return
+}
+func (ta *TArchivist) NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error {
+	if ta.archivedCancels != nil {
+		ta.archivedCancels = append(ta.archivedCancels, ord)
+	}
+	return nil
+}
+func (ta *TArchivist) ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error) {
+	return make(map[order.OrderID][]order.CoinID), make(map[order.OrderID][]order.CoinID), nil
+}
+func (ta *TArchivist) UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error) {
+	return nil, nil, errors.New("boom")
+}
+
+func (ta *TArchivist) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if commit == ta.commitForKnownOrder {
+		return true, ta.orderWithKnownCommit, nil
+	}
+	return
+}
+func (ta *TArchivist) CompletedUserOrders(aid account.AccountID, N int) (oids []order.OrderID, compTimes []int64, err error) {
+	return nil, nil, nil
+}
+func (ta *TArchivist) ExecutedCancelsForUser(aid account.AccountID, N int) ([]*db.CancelRecord, error) {
+	return nil, nil
+}
+
+func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if ta.poisonEpochOrder != nil && ord.ID() == ta.poisonEpochOrder.ID() {
+		return errors.New("barf")
+	}
+	return nil
+}
+func (ta *TArchivist) StorePreimage(ord order.Order, pi order.Preimage) error { return nil }
+
+func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
+	if ta.epochInserted != nil { // the test wants to know
+		ta.epochInserted <- struct{}{}
+	}
+	return nil
+}
+
+func (ta *TArchivist) ExecuteOrder(ord order.Order) error { return nil }
+func (ta *TArchivist) CancelOrder(lo *order.LimitOrder) error {
+	if ta.canceledOrders != nil {
+		ta.canceledOrders = append(ta.canceledOrders, lo)
+	}
+	return nil
+}
+func (ta *TArchivist) RevokeOrder(ord order.Order) (order.OrderID, time.Time, error) {
+	ta.revoked = ord
+	return ord.ID(), time.Now(), nil
+}
+func (ta *TArchivist) RevokeOrderUncounted(order.Order) (order.OrderID, time.Time, error) {
+	return order.OrderID{}, time.Now(), nil
+}
+func (ta *TArchivist) SetOrderCompleteTime(ord order.Order, compTime int64) error { return nil }
+func (ta *TArchivist) FailCancelOrder(*order.CancelOrder) error                   { return nil }
+func (ta *TArchivist) UpdateOrderFilled(*order.LimitOrder) error                  { return nil }
+func (ta *TArchivist) UpdateOrderStatus(order.Order, order.OrderStatus) error     { return nil }
+
+func (ta *TArchivist) InsertMatch(match *order.Match) error { return nil }
+func (ta *TArchivist) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
+	return nil, nil
+}
+func (ta *TArchivist) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
+	return nil, nil
+}
+
+func (ta *TArchivist) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
+	return nil, nil
+}
+func (ta *TArchivist) ForgiveMatchFail(order.MatchID) (bool, error) { return false, nil }
+
+func (ta *TArchivist) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
+	return 0, nil, nil
+}
+func (ta *TArchivist) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error   { return nil }
+func (ta *TArchivist) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error   { return nil }
+func (ta *TArchivist) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error { return nil }
+func (ta *TArchivist) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error { return nil }
+
+// Contract data.
+func (ta *TArchivist) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error { return nil }
+func (ta *TArchivist) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
+
+// Redeem data.
+func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
+	return nil
+}
+func (ta *TArchivist) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }

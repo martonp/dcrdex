@@ -39,9 +39,6 @@ type AuthManager interface {
 	RequestIfLocal(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message), time.Duration, func()) error
 	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
-	PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID)
-	MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)
-	RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time)
 	UserReputationAt(user account.AccountID, asOf time.Time) (tier int64, score, maxScore int32, err error)
 }
 
@@ -84,10 +81,6 @@ type MarketTunnel interface {
 	// is a limit order with time-in-force standing either in the epoch queue or
 	// in the order book.
 	Cancelable(order.OrderID) bool
-
-	// Suspend suspends the market as soon as a given time, returning the final
-	// epoch index and and time at which that epoch closes.
-	Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time)
 
 	// Running indicates is the market is accepting new orders. This will return
 	// false when suspended, but false does not necessarily mean Run has stopped
@@ -938,44 +931,6 @@ func (r *OrderRouter) extractMarket(prefix *msgjson.Prefix) (MarketTunnel, *msgj
 type SuspendEpoch struct {
 	Idx int64
 	End time.Time
-}
-
-// SuspendMarket schedules a suspension of a given market, with the option to
-// persist the orders on the book (or purge the book automatically on market
-// shutdown). The scheduled final epoch and suspend time are returned. Note that
-// OrderRouter is a proxy for this request to the ultimate Market. This is done
-// because OrderRouter is the entry point for new orders into the market. TODO:
-// track running, suspended, and scheduled-suspended markets, appropriately
-// blocking order submission according to the schedule rather than just checking
-// Market.Running prior to submitting incoming orders to the Market.
-func (r *OrderRouter) SuspendMarket(mktName string, asSoonAs time.Time, persistBooks bool) *SuspendEpoch {
-	mkt, found := r.tunnels[mktName]
-	if !found {
-		return nil
-	}
-
-	idx, t := mkt.Suspend(asSoonAs, persistBooks)
-	return &SuspendEpoch{
-		Idx: idx,
-		End: t,
-	}
-}
-
-// Suspend is like SuspendMarket, but for all known markets.
-func (r *OrderRouter) Suspend(asSoonAs time.Time, persistBooks bool) map[string]*SuspendEpoch {
-
-	suspendTimes := make(map[string]*SuspendEpoch, len(r.tunnels))
-	for name, mkt := range r.tunnels {
-		idx, ts := mkt.Suspend(asSoonAs, persistBooks)
-		suspendTimes[name] = &SuspendEpoch{Idx: idx, End: ts}
-	}
-
-	// MarketTunnel.Running will return false when the market closes, and true
-	// when and if it opens again. Locking/blocking of the incoming order
-	// handlers is not necessary since any orders that sneak in to a Market will
-	// be rejected if there is no active epoch.
-
-	return suspendTimes
 }
 
 // extractMarketDetails finds the MarketTunnel, an assetSet, and market side for

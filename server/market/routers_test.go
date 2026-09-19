@@ -136,6 +136,8 @@ func nowMs() time.Time {
 // The AuthManager handles client-related actions, including authorization and
 // communications.
 type TAuth struct {
+	canceledOrder      order.OrderID
+	cancelOrder        order.OrderID
 	authErr            error
 	sendsMtx           sync.Mutex
 	sends              []*msgjson.Message
@@ -149,8 +151,6 @@ type TAuth struct {
 	handleMatchDone    chan *msgjson.Message
 	suspensions        map[account.AccountID]bool
 	onUserReputationAt func(time.Time)
-	canceledOrder      order.OrderID
-	cancelOrder        order.OrderID
 	rep                struct {
 		tier            int64
 		score, maxScore int32
@@ -286,31 +286,11 @@ func (a *TAuth) UserReputationAt(user account.AccountID, asOf time.Time) (tier i
 	}
 	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
 }
-func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-
-func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-
-func (a *TAuth) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
-}
-func (a *TAuth) Inaction(user account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-}
-func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
-	if a.rep.maxScore == 0 {
-		return 1, 30, 60, a.rep.err
-	}
-	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
-}
 func (a *TAuth) AcctStatus(user account.AccountID) (connected bool, tier int64) {
 	return true, 1
 }
 func (a *TAuth) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
 	return &db.ReputationOutcomePolicy{PreimageLimit: 40, OrderLimit: 100, FreeCancelThreshold: 2}
-}
-
-func (a *TAuth) RecordCompletedOrder(account.AccountID, order.OrderID, time.Time) {}
-func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epochGap int32, t time.Time) {
-	a.cancelOrder = coid
-	a.canceledOrder = oid
 }
 
 type TMarketTunnel struct {
@@ -407,11 +387,6 @@ func (m *TMarketTunnel) pop() *orderRecord {
 
 func (m *TMarketTunnel) Cancelable(order.OrderID) bool {
 	return m.cancelable
-}
-
-func (m *TMarketTunnel) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx int64, finalEpochEnd time.Time) {
-	// no suspension
-	return -1, time.Time{}
 }
 
 func (m *TMarketTunnel) Running() bool {
@@ -1642,7 +1617,6 @@ func (s *TBookSource) Quote() uint32 {
 
 func tNewBookSource(base, quote uint32) *TBookSource {
 	return &TBookSource{
-		feed:  make(chan *updateSignal, 16),
 		base:  base,
 		quote: quote,
 	}
@@ -1650,9 +1624,6 @@ func tNewBookSource(base, quote uint32) *TBookSource {
 
 func (s *TBookSource) Book() (eidx int64, buys []*order.LimitOrder, sells []*order.LimitOrder) {
 	return 13241324, s.buys, s.sells
-}
-func (s *TBookSource) OrderFeed() <-chan *updateSignal {
-	return s.feed
 }
 
 type TLink struct {
@@ -2423,4 +2394,28 @@ func TestParcelLimits(t *testing.T) {
 
 	lo.Quantity += lotSize
 	ensureErr()
+}
+
+func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
+
+func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID) {}
+
+func (a *TAuth) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
+}
+
+func (a *TAuth) Inaction(user account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
+}
+
+func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
+	if a.rep.maxScore == 0 {
+		return 1, 30, 60, a.rep.err
+	}
+	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
+}
+
+func (a *TAuth) RecordCompletedOrder(account.AccountID, order.OrderID, time.Time) {}
+
+func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epochGap int32, t time.Time) {
+	a.cancelOrder = coid
+	a.canceledOrder = oid
 }

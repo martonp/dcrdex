@@ -521,31 +521,6 @@ func newConfigResponse(cfg *DexConf, bondAssets map[string]*msgjson.BondAsset,
 	}, nil
 }
 
-func (cr *configResponse) setMktSuspend(name string, finalEpoch uint64, persist bool) {
-	for _, mkt := range cr.configMsg.Markets {
-		if mkt.Name == name {
-			mkt.MarketStatus.FinalEpoch = finalEpoch
-			mkt.MarketStatus.Persist = &persist
-			cr.remarshal()
-			return
-		}
-	}
-	log.Errorf("Failed to update MarketStatus for market %q", name)
-}
-
-func (cr *configResponse) setMktResume(name string, startEpoch uint64) (epochLen uint64) {
-	for _, mkt := range cr.configMsg.Markets {
-		if mkt.Name == name {
-			mkt.MarketStatus.StartEpoch = startEpoch
-			mkt.MarketStatus.FinalEpoch = 0
-			cr.remarshal()
-			return mkt.EpochLen
-		}
-	}
-	log.Errorf("Failed to update MarketStatus for market %q", name)
-	return 0
-}
-
 func (cr *configResponse) remarshal() {
 	encResult, err := json.Marshal(cr.configMsg)
 	if err != nil {
@@ -1309,15 +1284,6 @@ func (dm *DEX) SuspendMarket(name string, tSusp time.Time, persistBooks bool) (s
 		return
 	}
 	return market.ExecuteScheduleSuspend(context.Background(), dm.meshSvc, name, tSusp, persistBooks)
-}
-
-func (dm *DEX) findSubsys(name string) int {
-	for i := range dm.subsystems {
-		if dm.subsystems[i].name == name {
-			return i
-		}
-	}
-	return -1
 }
 
 // ResumeMarket schedules a market resumption.

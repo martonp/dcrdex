@@ -116,15 +116,8 @@ type OrderArchiver interface {
 	// EpochOrders returns all epoch orders for a market.
 	EpochOrders(base, quote uint32) ([]order.Order, error)
 
-	// FlushBook revokes all booked orders for a market.
-	FlushBook(base, quote uint32) (sellsRemoved, buysRemoved []order.OrderID, err error)
-
 	// ActiveOrderCoins retrieves a CoinID slice for each active order.
 	ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error)
-
-	// UserOrders retrieves all orders for the given account in the market
-	// specified by a base and quote asset.
-	UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error)
 
 	// UserOrderStatuses retrieves the statuses and filled amounts of the orders
 	// with the provided order IDs for the given account in the market specified
@@ -147,12 +140,6 @@ type OrderArchiver interface {
 	// for the user across all markets.
 	PreimageStats(user account.AccountID, lastN int) ([]*PreimageResult, error)
 
-	// ExecutedCancelsForUser retrieves up to N executed cancel orders for a
-	// given user. These may be user-initiated cancels, or cancels created by
-	// the server (revokes). Executed cancel orders from all markets are
-	// returned.
-	ExecutedCancelsForUser(aid account.AccountID, N int) ([]*CancelRecord, error)
-
 	// OrderWithCommit searches all markets' trade and cancel orders, both
 	// active and archived, for an order with the given Commitment.
 	OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error)
@@ -170,32 +157,15 @@ type OrderArchiver interface {
 	// StorePreimage stores the preimage associated with an existing order.
 	StorePreimage(ord order.Order, pi order.Preimage) error
 
-	// BookOrder books the given order. If the order was already stored (i.e.
-	// NewEpochOrder), it's status and filled amount are updated, otherwise it
-	// is inserted. See also UpdateOrderFilled.
-	BookOrder(*order.LimitOrder) error
-
-	// ExecuteOrder puts the order into the executed state, and sets the filled
-	// amount for market and limit orders. For unmatched cancel orders, use
-	// FailCancelOrder instead.
-	ExecuteOrder(ord order.Order) error
-
-	// CancelOrder puts a limit order into the canceled state. Market orders
-	// must use ExecuteOrder since they may not be canceled. Similarly, cancel
-	// orders must use ExecuteOrder or FailCancelOrder. Orders that are
-	// terminated by the DEX rather than via a cancel order are considered
-	// "revoked", and RevokeOrder should be used to set this status.
 	CancelOrder(*order.LimitOrder) error
 
 	// RevokeOrder puts an order into the revoked state, and generates a cancel
 	// order to record the action. Orders should be revoked by the DEX according
-	// to policy on failed orders. For canceling an order that was matched with
-	// a cancel order, use CancelOrder.
+	// to policy on failed orders.
 	RevokeOrder(order.Order) (cancelID order.OrderID, t time.Time, err error)
 
 	// RevokeOrderUncounted is like RevokeOrder except that the generated cancel
-	// order will not be counted against the user. i.e. ExecutedCancelsForUser
-	// should not return the cancel orders created this way.
+	// order will not be counted against the user.
 	RevokeOrderUncounted(order.Order) (cancelID order.OrderID, t time.Time, err error)
 
 	// NewArchivedCancel stores a cancel order directly in the executed state. This
@@ -203,13 +173,8 @@ type OrderArchiver interface {
 	// do not need to be matched.
 	NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error
 
-	// FailCancelOrder puts an unmatched cancel order into the executed state.
-	// For matched cancel orders, use ExecuteOrder.
-	FailCancelOrder(*order.CancelOrder) error
-
 	// UpdateOrderFilled updates the filled amount of the given order. This
-	// function applies only to limit orders, not cancel or market orders. The
-	// filled amount of a market order should be updated by ExecuteOrder.
+	// function applies only to limit orders, not cancel or market orders.
 	UpdateOrderFilled(*order.LimitOrder) error
 
 	// UpdateOrderStatus updates the status and filled amount of the given
