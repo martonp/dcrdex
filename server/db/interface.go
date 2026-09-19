@@ -844,3 +844,66 @@ type BondPostedResult struct {
 	Matches   []*MatchResult
 	Orders    []*OrderOutcome
 }
+
+// MarketState is a market's stored lifecycle state.
+type MarketState int16
+
+const (
+	MarketStateRunning MarketState = iota + 1
+	MarketStateSuspended
+	// MarketStateDraining means order intake has stopped while outstanding
+	// epochs finish processing before suspension.
+	MarketStateDraining
+)
+
+// MarketPendingAction is a scheduled market transition.
+type MarketPendingAction int16
+
+const (
+	MarketPendingNone MarketPendingAction = iota
+	MarketPendingSuspend
+	MarketPendingResume
+)
+
+// MarketLifecycle stores a market's state, scheduled transition,
+// epoch progress, and trading parameters. Epoch durations are in milliseconds.
+type MarketLifecycle struct {
+	Market string
+	State  MarketState
+	// StartEpochIdx is the first epoch of the current or scheduled market run.
+	StartEpochIdx int64
+	StartEpochDur int64
+	// FinalEpochIdx is the last trading epoch of a scheduled or completed
+	// suspension. It and FinalEpochDur are zero when no final epoch is recorded.
+	FinalEpochIdx int64
+	FinalEpochDur int64
+	PendingAction MarketPendingAction
+	// PendingEpochIdx and PendingEpochDur identify the epoch of the pending
+	// suspension or resumption. Both are zero when PendingAction is MarketPendingNone.
+	PendingEpochIdx int64
+	PendingEpochDur int64
+	// PersistBook records whether to retain booked orders on suspension.
+	// It is nil during normal trading, before a suspension is scheduled.
+	PersistBook *bool
+	// ActiveEpochIdx is the current trading epoch, or zero while draining
+	// or suspended.
+	ActiveEpochIdx int64
+	// ProcessedEpochIdx is the last processed epoch, or the last epoch skipped
+	// during startup or resume. The next epoch to process is ProcessedEpochIdx + 1.
+	ProcessedEpochIdx int64
+	// RunParams are the trading parameters for the current market run.
+	RunParams meshevents.MarketRunParams
+}
+
+// SuspendTime is the wall-clock end of the final trading epoch. It is only
+// meaningful when suspension is scheduled, the market is draining, or the
+// market is suspended with no resume scheduled.
+func (lc *MarketLifecycle) SuspendTime() time.Time {
+	return time.UnixMilli((lc.FinalEpochIdx + 1) * lc.FinalEpochDur).UTC()
+}
+
+// ResumeTime is the wall-clock start of the pending resume epoch. It is only
+// meaningful while PendingAction is MarketPendingResume.
+func (lc *MarketLifecycle) ResumeTime() time.Time {
+	return time.UnixMilli(lc.PendingEpochIdx * lc.PendingEpochDur).UTC()
+}
