@@ -3964,6 +3964,68 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 	})
 }
 
+// revokeBeforeApplyMesh changes book state after funding checks, before applying
+// their event, without relying on concurrent goroutine timing.
+type revokeBeforeApplyMesh struct {
+	*tMesh
+	beforeApply func()
+}
+
+func (m *revokeBeforeApplyMesh) ApplyEvent(ctx context.Context, event *mesh.Event) (any, error) {
+	m.beforeApply()
+	return m.tMesh.ApplyEvent(ctx, event)
+}
+
+type spentFundingSwapper struct{ epochProcessedTestSwapper }
+
+func (*spentFundingSwapper) CheckUnspent(context.Context, uint32, []byte) error {
+	return asset.CoinNotFoundError
+}
+
+func TestCheckUnfilledReturnsAppliedOrders(t *testing.T) {
+	rig := newMarketEventRig(t)
+	defer rig.cleanup()
+	mkt := rig.mkt
+	spent := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+	matchedBeforeApply := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+	for i, lo := range []*order.LimitOrder{spent, matchedBeforeApply} {
+		lo.Coins = []order.CoinID{{byte(i + 1)}}
+		bookStandingOrder(t, rig, lo)
+	}
+	rig.bookRouter.SeedBooks()
+	mkt.swapper = &spentFundingSwapper{}
+	meshStub := &tMesh{events: rig.events}
+	mkt.mesh = &revokeBeforeApplyMesh{
+		tMesh: meshStub,
+		beforeApply: func() {
+			// Matching occurs after funding checks but before revocation is applied.
+			matchedBeforeApply.AddFill(mkt.LotSize())
+		},
+	}
+	got := mkt.CheckUnfilled(mkt.base, spent.User())
+	if len(meshStub.entries) != 1 {
+		t.Fatalf("got %d events, want 1", len(meshStub.entries))
+	}
+	payload, err := meshevents.DecodeOrdersRevokedEvent(meshStub.entries[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventIDs []order.OrderID
+	for _, id := range payload.OrderIDs {
+		eventIDs = append(eventIDs, order.OrderID(id))
+	}
+	if len(eventIDs) != 2 || !slices.Contains(eventIDs, spent.ID()) || !slices.Contains(eventIDs, matchedBeforeApply.ID()) {
+		t.Fatalf("event targets = %v, want both orders", eventIDs)
+	}
+	if len(got) != 1 || got[0].ID() != spent.ID() {
+		t.Fatalf("CheckUnfilled returned %v, want only %v", got, spent.ID())
+	}
+	requireRevokedOrderGone(t, mkt, spent)
+	if !mkt.book.HaveOrder(matchedBeforeApply.ID()) || !mkt.CoinLocked(mkt.base, matchedBeforeApply.Coins[0]) {
+		t.Fatal("partially filled order lost its book entry or funding lock")
+	}
+}
+
 func TestApplyOrdersRevokedEvent(t *testing.T) {
 	type fixture struct {
 		*marketEventRig

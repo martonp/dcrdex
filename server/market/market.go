@@ -1274,45 +1274,6 @@ func (m *Market) CancelableBy(oid order.OrderID, aid account.AccountID) (bool, t
 	return true, lo.ServerTime, nil
 }
 
-func (m *Market) checkUnfilledOrders(assetID uint32, unfilled []*order.LimitOrder) (unbooked []*order.LimitOrder) {
-	checkUnspent := func(assetID uint32, coinID []byte) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		return m.swapper.CheckUnspent(ctx, assetID, coinID)
-	}
-
-orders:
-	for _, lo := range unfilled {
-		log.Tracef("Checking %d funding coins for order %v", len(lo.Coins), lo.ID())
-		for i := range lo.Coins {
-			err := checkUnspent(assetID, lo.Coins[i])
-			if err == nil {
-				continue // unspent, check next coin
-			}
-
-			if !errors.Is(err, asset.CoinNotFoundError) {
-				// other failure (timeout, coinID decode, RPC, etc.)
-				log.Errorf("Unexpected error checking coinID %v for order %v: %v",
-					lo.Coins[i], lo, err)
-				continue orders
-				// NOTE: This does not revoke orders from storage since this is
-				// likely to be a configuration or node issue.
-			}
-
-			// Final fill amount check in case it was matched after we pulled
-			// the list of unfilled orders from the book.
-			if lo.Filled() == 0 {
-				log.Warnf("Coin %s not unspent for unfilled order %v. "+
-					"Revoking the order.", fmtCoinID(assetID, lo.Coins[i]), lo)
-				m.Unbook(lo)
-				unbooked = append(unbooked, lo)
-			}
-			continue orders
-		}
-	}
-	return
-}
-
 // SwapDone updates an order's outstanding swap quantity. If faulted is true,
 // it stops tracking the order and releases any limit-order funding coins. It
 // also removes any booked remainder and notifies the owner of that removal.
@@ -1384,30 +1345,80 @@ func (m *Market) reduceSettling(ord order.Order, match *order.Match) {
 	delete(m.settling, oid)
 }
 
-// CheckUnfilled checks unfilled book orders belonging to a user and funded by
-// coins for a given asset to ensure that their funding coins are not spent. If
-// any of an order's funding coins are spent, the order is unbooked (removed
-// from the in-memory book, revoked in the DB, a cancellation marked against the
-// user, coins unlocked, and orderbook subscribers notified). See Unbook for
-// details.
-func (m *Market) CheckUnfilled(assetID uint32, user account.AccountID) (unbooked []*order.LimitOrder) {
-	base, quote := m.marketInfo.Base, m.marketInfo.Quote
-	if assetID != base && assetID != quote {
-		return
-	}
+// CheckUnfilled revokes a user's unfilled booked orders whose funding
+// coins are spent and returns the revoked orders.
+func (m *Market) CheckUnfilled(assetID uint32, user account.AccountID) []*order.LimitOrder {
 	var unfilled []*order.LimitOrder
 	switch assetID {
-	case base:
+	case m.base:
 		// Sell orders are funded by the base asset.
 		unfilled = m.book.UnfilledUserSells(user)
-	case quote:
+	case m.quote:
 		// Buy orders are funded by the quote asset.
 		unfilled = m.book.UnfilledUserBuys(user)
 	default:
-		return
+		return nil
 	}
 
-	return m.checkUnfilledOrders(assetID, unfilled)
+	spent := m.spentFundingOrders(assetID, unfilled)
+	if len(spent) == 0 {
+		return nil
+	}
+
+	oids := make([]order.OrderID, 0, len(spent))
+	for _, lo := range spent {
+		oids = append(oids, lo.ID())
+	}
+	event, err := mesh.NewEvent(meshevents.NewOrdersRevokedForOrdersEvent(m.name, oids,
+		meshevents.OrderRevokeReasonFundingSpent, time.Now().UTC()))
+	if err != nil {
+		log.Errorf("Failed to build orders_revoked event for %d spent-funding orders on market %s: %v",
+			len(spent), m.name, err)
+		return nil
+	}
+	result, err := m.mesh.ApplyEvent(context.Background(), event)
+	if err != nil {
+		log.Errorf("Failed to apply orders_revoked event for %d spent-funding orders on market %s: %v",
+			len(spent), m.name, err)
+		return nil
+	}
+	return result.([]*order.LimitOrder)
+}
+
+// spentFundingOrders returns the unfilled booked orders with spent funding coins.
+func (m *Market) spentFundingOrders(assetID uint32, unfilled []*order.LimitOrder) (spent []*order.LimitOrder) {
+	checkUnspent := func(coinID []byte) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return m.swapper.CheckUnspent(ctx, assetID, coinID)
+	}
+
+orders:
+	for _, lo := range unfilled {
+		log.Tracef("Checking %d funding coins for order %v", len(lo.Coins), lo.ID())
+		for _, coinID := range lo.Coins {
+			err := checkUnspent(coinID)
+			if err == nil {
+				continue // unspent, check next coin
+			}
+
+			if !errors.Is(err, asset.CoinNotFoundError) {
+				// Backend errors do not establish that funding was spent.
+				log.Errorf("Unexpected error checking coinID %v for order %v: %v",
+					coinID, lo.ID(), err)
+				continue orders
+			}
+
+			// An order matched during the funding checks may have spent its coins
+			// legitimately to fund a swap.
+			if lo.Filled() == 0 {
+				log.Warnf("Funding coin %s is spent for unfilled order %v", fmtCoinID(assetID, coinID), lo.ID())
+				spent = append(spent, lo)
+			}
+			continue orders
+		}
+	}
+	return
 }
 
 // AccountPending sums the orders quantities that pay to or from the specified
