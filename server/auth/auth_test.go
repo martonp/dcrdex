@@ -2918,6 +2918,10 @@ func TestAuth(t *testing.T) {
 		t.Fatalf("unexpected auth error: %v", err)
 	}
 
+	if err := rig.mgr.VerifyUserSig(user.acctID, msgBytes, sigBytes); err != nil {
+		t.Fatalf("VerifyUserSig for connected user: %v", err)
+	}
+
 	foreigner := tNewUser(t)
 	sigBytes = signMsg(user.privKey, msgBytes)
 	err = rig.mgr.Auth(foreigner.acctID, msgBytes, sigBytes)
@@ -2929,6 +2933,20 @@ func TestAuth(t *testing.T) {
 	err = rig.mgr.Auth(user.acctID, msgBytes, sigBytes)
 	if err == nil {
 		t.Fatalf("no error for wrong message")
+	}
+
+	// A user connected to the other mesh node has no local session.
+	storage := &TStorage{acctInfo: &db.Account{
+		AccountID: foreigner.acctID,
+		Pubkey:    foreigner.privKey.PubKey().SerializeCompressed(),
+	}}
+	auth := &AuthManager{storage: storage}
+	sigBytes = signMsg(foreigner.privKey, msgBytes)
+	if err := auth.VerifyUserSig(foreigner.acctID, msgBytes, sigBytes); err != nil {
+		t.Fatalf("VerifyUserSig with stored key: %v", err)
+	}
+	if err := auth.VerifyUserSig(foreigner.acctID, msgBytes, signMsg(user.privKey, msgBytes)); err == nil {
+		t.Fatal("VerifyUserSig accepted a signature from another key")
 	}
 }
 

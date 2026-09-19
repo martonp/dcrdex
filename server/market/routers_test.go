@@ -59,6 +59,16 @@ const (
 	clientPreimageDelay = 75 * time.Millisecond
 )
 
+type emptyEventLogReader struct{}
+
+func (emptyEventLogReader) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
+	return &db.EventLogPosition{}, nil
+}
+
+func (emptyEventLogReader) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
+	return nil, nil
+}
+
 var (
 	oRig       *tOrderRig
 	dummyError = fmt.Errorf("expected test error")
@@ -157,6 +167,9 @@ func (a *TAuth) Suspended(user account.AccountID) (found, suspended bool) {
 }
 func (a *TAuth) Auth(user account.AccountID, msg, sig []byte) error {
 	//log.Infof("Auth for user %v", user)
+	return a.authErr
+}
+func (a *TAuth) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
 	return a.authErr
 }
 func (a *TAuth) Sign(...msgjson.Signable) {}
@@ -270,9 +283,10 @@ func (a *TAuth) UserReputationAt(user account.AccountID, asOf time.Time) (tier i
 	}
 	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
 }
-
 func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)  {}
+
+func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID) {}
+
 func (a *TAuth) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
 }
 func (a *TAuth) Inaction(user account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
@@ -325,29 +339,28 @@ func tNewMarket(auth *TAuth) *TMarketTunnel {
 	}
 }
 
-func (m *TMarketTunnel) SubmitOrder(o *orderRecord) error {
-	// set the server time
+func (m *TMarketTunnel) AcceptOrderCommand(ctx context.Context, o *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
 	now := nowMs()
 	o.order.SetTime(now)
-
 	m.adds = append(m.adds, o)
 
-	// Send the order, but skip the signature
 	oid := o.order.ID()
-	resp, _ := msgjson.NewResponse(1, &msgjson.OrderResult{
+	result := &msgjson.OrderResult{
 		Sig:        msgjson.Bytes{},
 		OrderID:    oid[:],
 		ServerTime: uint64(now.UnixMilli()),
-	}, nil)
-	err := m.auth.Send(account.AccountID{}, resp)
-	if err != nil {
-		log.Debug("Send:", err)
 	}
-
+	event, err := mesh.NewEvent(meshevents.NewOrderAcceptedEvent(o.order))
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "new order accepted event error: %v", err)
+	}
+	err = completion.Emit(ctx, event, func() any { return result })
 	if m.added != nil {
 		m.added <- struct{}{}
 	}
-
+	if err != nil {
+		return marketOrderError(err)
+	}
 	return nil
 }
 
@@ -780,6 +793,20 @@ func TestMain(m *testing.M) {
 		DEXBalancer:  balancer,
 		MatchSwapper: swapper,
 	})
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands:       oRig.router.Commands(),
+		Events: map[string]mesh.EventApplier{
+			meshevents.EventKindOrderAccepted: func(*mesh.EventApplyContext, *mesh.Event) (*db.EventLogEntry, error) {
+				return new(db.EventLogEntry), nil
+			},
+		},
+	})
+	if err != nil {
+		panic("mesh.NewService error:" + err.Error())
+	}
+	oRig.router.SetMeshService(meshSvc)
 	rig = newTestRig()
 	src1 := rig.source1
 	src2 := rig.source2
@@ -817,7 +844,7 @@ func TestMain(m *testing.M) {
 			oRig.router.Run(testCtx)
 			wg.Done()
 		}()
-		time.Sleep(100 * time.Millisecond) // let the router actually start in runBook
+		time.Sleep(100 * time.Millisecond) // let the routers actually start
 		defer func() {
 			shutdown()
 			wg.Wait()
@@ -996,11 +1023,16 @@ func TestLimit(t *testing.T) {
 	if respMsg == nil {
 		t.Fatalf("no response from limit order")
 	}
-	resp, _ := respMsg.Response()
-	result := new(msgjson.OrderResult)
-	err := json.Unmarshal(resp.Result, result)
-	if err != nil {
-		t.Fatalf("unmarshal error: %v", err)
+	if respMsg.ID != reqID {
+		t.Fatalf("response request ID = %d, want %d", respMsg.ID, reqID)
+	}
+	var result msgjson.OrderResult
+	if err := respMsg.UnmarshalResult(&result); err != nil {
+		t.Fatalf("response result: %v", err)
+	}
+	oid := epochOrder.ID()
+	if !bytes.Equal(result.OrderID, oid[:]) {
+		t.Fatalf("response order ID = %x, want %v", result.OrderID, oid)
 	}
 	lo.ServerTime = time.UnixMilli(int64(result.ServerTime))
 
@@ -1051,6 +1083,71 @@ func TestLimit(t *testing.T) {
 	// None needed to redeem.
 	oRig.polygon.bal = 0
 	ensureSuccess("enough to redeem account-based quote")
+}
+
+func TestOrderHandlersSubmitCommand(t *testing.T) {
+	user := oRig.user
+	auth := new(TAuth)
+	router := &OrderRouter{auth: auth}
+
+	type handlerCase struct {
+		route  string
+		kind   string
+		handle func(account.AccountID, *msgjson.Message) *msgjson.Error
+	}
+
+	tests := []handlerCase{
+		{
+			route:  msgjson.LimitRoute,
+			kind:   commandKindLimit,
+			handle: router.handleLimit,
+		},
+		{
+			route:  msgjson.MarketRoute,
+			kind:   commandKindMarket,
+			handle: router.handleMarket,
+		},
+		{
+			route:  msgjson.CancelRoute,
+			kind:   commandKindCancel,
+			handle: router.handleCancel,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			meshReq := &tMesh{}
+			router.SetMeshService(meshReq)
+			auth.sends = nil
+
+			reqID := uint64(55 + i)
+			msg, err := msgjson.NewRequest(reqID, tt.route, nil)
+			if err != nil {
+				t.Fatalf("NewRequest(%q): %v", tt.route, err)
+			}
+			if rpcErr := tt.handle(user.acct, msg); rpcErr != nil {
+				t.Fatalf("handler error: %v", rpcErr)
+			}
+			if meshReq.calls != 1 {
+				t.Fatalf("mesh request calls = %d, want 1", meshReq.calls)
+			}
+			if meshReq.req.Kind != tt.kind {
+				t.Fatalf("wrong command kind. got %q, want %q", meshReq.req.Kind, tt.kind)
+			}
+			if meshReq.user != user.acct {
+				t.Fatalf("mesh request user = %v, want %v", meshReq.user, user.acct)
+			}
+			if meshReq.msg != msg {
+				t.Fatal("mesh request msg pointer mismatch")
+			}
+			if meshReq.req.Respond == nil {
+				t.Fatal("mesh request missing response callback")
+			}
+			if len(auth.sends) != 0 {
+				t.Fatalf("unexpected immediate local responses: %d", len(auth.sends))
+			}
+		})
+	}
 }
 
 func TestMarketStartProcessStop(t *testing.T) {
@@ -1213,11 +1310,16 @@ func TestMarketStartProcessStop(t *testing.T) {
 	if respMsg == nil {
 		t.Fatalf("no response from market order")
 	}
-	resp, _ := respMsg.Response()
-	result := new(msgjson.OrderResult)
-	err := json.Unmarshal(resp.Result, result)
-	if err != nil {
-		t.Fatalf("unmarshal error: %v", err)
+	if respMsg.ID != reqID {
+		t.Fatalf("response request ID = %d, want %d", respMsg.ID, reqID)
+	}
+	var result msgjson.OrderResult
+	if err := respMsg.UnmarshalResult(&result); err != nil {
+		t.Fatalf("response result: %v", err)
+	}
+	oid := epochOrder.ID()
+	if !bytes.Equal(result.OrderID, oid[:]) {
+		t.Fatalf("response order ID = %x, want %v", result.OrderID, oid)
 	}
 	mo.ServerTime = time.UnixMilli(int64(result.ServerTime))
 
@@ -1331,13 +1433,18 @@ func TestCancel(t *testing.T) {
 	// Get the server time from the response.
 	respMsg := oRig.auth.getSend()
 	if respMsg == nil {
-		t.Fatalf("no response from market order")
+		t.Fatalf("no response from cancel order")
 	}
-	resp, _ := respMsg.Response()
-	result := new(msgjson.OrderResult)
-	err := json.Unmarshal(resp.Result, result)
-	if err != nil {
-		t.Fatalf("unmarshal error: %v", err)
+	if respMsg.ID != reqID {
+		t.Fatalf("response request ID = %d, want %d", respMsg.ID, reqID)
+	}
+	var result msgjson.OrderResult
+	if err := respMsg.UnmarshalResult(&result); err != nil {
+		t.Fatalf("response result: %v", err)
+	}
+	oid := epochOrder.ID()
+	if !bytes.Equal(result.OrderID, oid[:]) {
+		t.Fatalf("response order ID = %x, want %v", result.OrderID, oid)
 	}
 	co.ServerTime = time.UnixMilli(int64(result.ServerTime))
 

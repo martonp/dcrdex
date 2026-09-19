@@ -29,6 +29,7 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 )
 
@@ -799,6 +800,105 @@ func (m *Market) Quote() uint32 {
 	return m.quote
 }
 
+// marketOrderError maps an order submission error to a client RPC error,
+// preserving the underlying cause.
+func marketOrderError(err error) *msgjson.Error {
+	code := msgjson.UnknownMarketError
+	switch {
+	case errors.Is(err, ErrInternalServer), errors.Is(err, errEpochOrderStorage):
+		code = msgjson.RPCInternalError
+		log.Errorf("Market order submission failed: %v", err)
+	case errors.Is(err, ErrMarketNotRunning):
+		code = msgjson.MarketNotRunningError
+	case errors.Is(err, ErrQuantityTooHigh):
+		code = msgjson.OrderQuantityTooHigh
+	case errors.Is(err, ErrInvalidRate), errors.Is(err, ErrInvalidCommitment), errors.Is(err, ErrInvalidOrder):
+		code = msgjson.OrderParameterError
+	default:
+		log.Debugf("Market order submission failed: %v", err)
+	}
+	return mesh.ClientError(err, code, "%v", err)
+}
+
+// stampedOrderAcceptedEvent sets the order's server time, checks its eligibility,
+// and builds the order_accepted event and client result.
+func (m *Market) stampedOrderAcceptedEvent(rec *orderRecord) (*mesh.Event, *msgjson.OrderResult, *msgjson.Error) {
+	sTime := time.Now().Truncate(time.Millisecond).UTC()
+	rec.order.SetTime(sTime)
+	log.Tracef("Received order %v at %v", rec.order, sTime)
+
+	if err := m.checkOrderEligibility(rec.order); err != nil {
+		return nil, nil, marketOrderError(err)
+	}
+
+	result := m.orderResult(rec)
+	event, err := mesh.NewEvent(meshevents.NewOrderAcceptedEvent(rec.order))
+	if err != nil {
+		return nil, nil, msgjson.NewError(msgjson.RPCInternalError, "failed to build accepted order event: %v", err)
+	}
+	return event, result, nil
+}
+
+// checkOrderEligibility checks the account tier and parcel limit for a new
+// order. Cancel orders bypass these checks.
+func (m *Market) checkOrderEligibility(ord order.Order) error {
+	if ord.Type() == order.CancelOrderType {
+		return nil
+	}
+	oid := ord.ID()
+	if _, tier := m.auth.AcctStatus(ord.User()); tier < 1 {
+		log.Debugf("Account %v with tier %d not allowed to submit order %v", ord.User(), tier, oid)
+		return ErrSuspendedAccount
+	}
+	return m.validateOrderAcceptedParcelLimit(ord)
+}
+
+// AcceptOrderCommand submits an order_accepted event, restamping the order
+// if its epoch closed before the event could be applied.
+func (m *Market) AcceptOrderCommand(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
+	if err := m.validateOrder(rec.order); err != nil {
+		log.Debugf("AcceptOrderCommand: Invalid order received from user %v with commitment %v: %v",
+			rec.order.User(), rec.order.Commitment(), err)
+		return marketOrderError(err)
+	}
+
+	if !m.Running() {
+		return msgjson.NewError(msgjson.MarketNotRunningError, "%v", ErrMarketNotRunning)
+	}
+
+	commit := rec.order.Commitment()
+	m.epochMtx.RLock()
+	otherOID, found := m.epochCommitments[commit]
+	m.epochMtx.RUnlock()
+	if found {
+		log.Debugf("Received order with commitment %x also used in previous order %v!",
+			commit, otherOID)
+		return marketOrderError(ErrInvalidCommitment)
+	}
+
+	// If the epoch closes before the event is applied, restamp and retry once.
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		event, result, rpcErr := m.stampedOrderAcceptedEvent(rec)
+		if rpcErr != nil {
+			return rpcErr
+		}
+		err = completion.Emit(ctx, event, func() any { return result })
+		if err == nil {
+			return nil
+		}
+		if attempt != 0 || !errors.Is(err, ErrEpochMissed) {
+			break
+		}
+		log.Debugf("Restamping order %v after missed epoch during event apply", rec.order.ID())
+	}
+
+	if db.IsErrReusedCommit(err) {
+		return marketOrderError(ErrInvalidCommitment)
+	}
+	return marketOrderError(err)
+}
+
 // OrderFeed provides a new order book update channel. Channels provided before
 // the market starts and while a market is running are both valid. When the
 // market stops, channels are closed (invalidated), and new channels should be
@@ -841,21 +941,6 @@ func (m *Market) sendToFeeds(sig *updateSignal) {
 	m.orderFeedMtx.RUnlock()
 }
 
-type orderUpdateSignal struct {
-	rec     *orderRecord
-	errChan chan error // should be buffered
-}
-
-func newOrderUpdateSignal(ord *orderRecord) *orderUpdateSignal {
-	return &orderUpdateSignal{ord, make(chan error, 1)}
-}
-
-// SubmitOrder submits a new order for inclusion into the current epoch. This is
-// the synchronous version of SubmitOrderAsync.
-func (m *Market) SubmitOrder(rec *orderRecord) error {
-	return <-m.SubmitOrderAsync(rec)
-}
-
 // processCancelOrderWhileSuspended is called when cancelling an order while
 // the market is suspended and Run is not running. The error sent on errChan
 // is returned to the client.
@@ -895,7 +980,7 @@ func (m *Market) processCancelOrderWhileSuspended(rec *orderRecord, errChan chan
 
 	// Create the client response here, but don't send it until the order has been
 	// committed to the storage.
-	respMsg, err := m.orderResponse(rec)
+	respMsg, err := msgjson.NewResponse(rec.msgID, m.orderResult(rec), nil)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create order response: %w", err)
 		return
@@ -1011,51 +1096,6 @@ func (m *Market) processMatchAcksForCancel(user account.AccountID, msg *msgjson.
 		return
 	}
 	log.Debugf("processMatchAcksForCancel: 'match' ack received from %v", user)
-}
-
-// SubmitOrderAsync submits a new order for inclusion into the current epoch.
-// When submission is completed, an error value will be sent on the channel.
-// This is the asynchronous version of SubmitOrder.
-func (m *Market) SubmitOrderAsync(rec *orderRecord) <-chan error {
-	sendErr := func(err error) <-chan error {
-		errChan := make(chan error, 1)
-		errChan <- err // i.e. ErrInvalidOrder, ErrInvalidCommitment
-		return errChan
-	}
-
-	// Validate the order. The order router must do it's own validation, but do
-	// a second validation for (1) this Market and (2) epoch status, before
-	// putting it on the queue.
-	if err := m.validateOrder(rec.order); err != nil {
-		// Order ID cannot be computed since ServerTime has not been set.
-		log.Debugf("SubmitOrderAsync: Invalid order received from user %v with commitment %v: %v",
-			rec.order.User(), rec.order.Commitment(), err)
-		return sendErr(err)
-	}
-
-	// Only submit orders while market is running.
-	m.runMtx.RLock()
-	defer m.runMtx.RUnlock()
-
-	select {
-	case <-m.running:
-	default:
-		if rec.order.Type() == order.CancelOrderType {
-			errChan := make(chan error, 1)
-			go m.processCancelOrderWhileSuspended(rec, errChan)
-			return errChan
-		}
-		// m.orderRouter is closed
-		log.Infof("SubmitOrderAsync: Market stopped with an order in submission (commitment %v).",
-			rec.order.Commitment()) // The order is not time stamped, so no OrderID.
-		return sendErr(ErrMarketNotRunning)
-	}
-
-	sig := newOrderUpdateSignal(rec)
-	// The lock is still held, so there is a receiver: either Run's main loop or
-	// the drain in Run's defer that runs until m.running starts blocking.
-	m.orderRouter <- sig
-	return sig.errChan
 }
 
 // MidGap returns the mid-gap market rate, which is ths rate halfway between the
@@ -2844,26 +2884,19 @@ func (m *Market) validateOrder(ord order.Order) error {
 	return nil
 }
 
-// orderResponse signs the order data and prepares the OrderResult to be sent to
-// the client.
-func (m *Market) orderResponse(oRecord *orderRecord) (*msgjson.Message, error) {
-	// Add the server timestamp.
-	stamp := uint64(oRecord.order.Time())
-	oRecord.req.Stamp(stamp)
+// orderResult signs the stamped order request and returns its signature,
+// order ID, and server time.
+func (m *Market) orderResult(rec *orderRecord) *msgjson.OrderResult {
+	stamp := uint64(rec.order.Time())
+	rec.req.Stamp(stamp)
+	m.auth.Sign(rec.req)
 
-	// Sign the serialized order request.
-	m.auth.Sign(oRecord.req)
-
-	// Prepare the OrderResult, including the server signature and time stamp.
-	oid := oRecord.order.ID()
-	res := &msgjson.OrderResult{
-		Sig:        oRecord.req.SigBytes(),
+	oid := rec.order.ID()
+	return &msgjson.OrderResult{
+		Sig:        rec.req.SigBytes(),
 		OrderID:    oid[:],
 		ServerTime: stamp,
 	}
-
-	// Encode the order response as a message for the client.
-	return msgjson.NewResponse(oRecord.msgID, res, nil)
 }
 
 // SetFeeRateScale sets a swap fee scale factor for the given asset.
