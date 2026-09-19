@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"decred.org/dcrdex/dex"
@@ -38,7 +39,7 @@ type AuthManager interface {
 	MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)
 	RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time)
 	RecordCompletedOrder(user account.AccountID, oid order.OrderID, t time.Time)
-	UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error)
+	UserReputationAt(user account.AccountID, asOf time.Time) (tier int64, score, maxScore int32, err error)
 }
 
 const (
@@ -697,15 +698,15 @@ func calcParcelLimit(tier int64, score, maxScore int32) uint32 {
 // calculate the number of parcels from that market when quantity from settling
 // matches is taken into consideration. CheckParcelLimit checks the global
 // parcel limit, based on the users tier and score and active orders for ALL
-// markets.
-func (r *OrderRouter) CheckParcelLimit(user account.AccountID, targetMarketName string, calcParcels MarketParcelCalculator) bool {
-	tier, score, maxScore, err := r.auth.UserReputation(user)
+// markets. The tier is evaluated at asOf (the order's server time). A returned
+// error is a reputation-load failure, not a limit verdict.
+func (r *OrderRouter) CheckParcelLimit(user account.AccountID, targetMarketName string, asOf time.Time, calcParcels MarketParcelCalculator) (bool, error) {
+	tier, score, maxScore, err := r.auth.UserReputationAt(user, asOf)
 	if err != nil {
-		log.Errorf("error getting user score for parcel limit check: %w", err)
-		return false
+		return false, fmt.Errorf("loading reputation for parcel limit check: %w", err)
 	}
 	if tier <= 0 {
-		return false
+		return false, nil
 	}
 
 	roundParcels := func(parcels float64) uint32 {
@@ -725,22 +726,31 @@ func (r *OrderRouter) CheckParcelLimit(user account.AccountID, targetMarketName 
 		settlingQuantities[mktName] += qty
 	}
 
+	// Accumulate in sorted market order: float addition is not associative,
+	// and this verdict re-runs on every node, so map-iteration order must
+	// not be able to flip a boundary case between nodes.
+	mktNames := make([]string, 0, len(r.tunnels))
+	for mktName := range r.tunnels {
+		mktNames = append(mktNames, mktName)
+	}
+	sort.Strings(mktNames)
+
 	var otherMarketParcels float64
 	var settlingQty uint64
-	for mktName, mkt := range r.tunnels {
+	for _, mktName := range mktNames {
 		if mktName == targetMarketName {
 			settlingQty = settlingQuantities[mktName]
 			continue
 		}
 
-		otherMarketParcels += mkt.Parcels(user, settlingQuantities[mktName])
+		otherMarketParcels += r.tunnels[mktName].Parcels(user, settlingQuantities[mktName])
 		if roundParcels(otherMarketParcels) > parcelLimit {
-			return false
+			return false, nil
 		}
 	}
 	targetMarketParcels := calcParcels(settlingQty)
 
-	return roundParcels(otherMarketParcels+targetMarketParcels) <= parcelLimit
+	return roundParcels(otherMarketParcels+targetMarketParcels) <= parcelLimit, nil
 }
 
 func (r *OrderRouter) submitOrderToMarket(tunnel MarketTunnel, oRecord *orderRecord) *msgjson.Error {

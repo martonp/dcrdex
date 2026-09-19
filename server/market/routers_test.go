@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -25,6 +26,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -135,6 +138,7 @@ type TAuth struct {
 	handlePreimageDone chan struct{}
 	handleMatchDone    chan *msgjson.Message
 	suspensions        map[account.AccountID]bool
+	onUserReputationAt func(time.Time)
 	canceledOrder      order.OrderID
 	cancelOrder        order.OrderID
 	rep                struct {
@@ -255,6 +259,16 @@ func (a *TAuth) RequestWithTimeout(user account.AccountID, msg *msgjson.Message,
 		}
 	}
 	return nil
+}
+
+func (a *TAuth) UserReputationAt(user account.AccountID, asOf time.Time) (tier int64, score, maxScore int32, err error) {
+	if a.onUserReputationAt != nil {
+		a.onUserReputationAt(asOf)
+	}
+	if a.rep.maxScore == 0 {
+		return 1, 30, 60, a.rep.err
+	}
+	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
 }
 
 func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
@@ -791,6 +805,7 @@ func TestMain(m *testing.M) {
 		var shutdown context.CancelFunc
 		testCtx, shutdown = context.WithCancel(context.Background())
 		rig.router = NewBookRouter(rig.sources(), &tFeeSource{}, func(route string, handler comms.MsgHandler) {})
+		rig.router.SeedBooks()
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
@@ -1522,7 +1537,7 @@ func tNewLink() *TLink {
 		ip:          dex.NewIPKey("[1:800:dead:cafe::]"),
 		addr:        "testaddr",
 		sends:       make([]*msgjson.Message, 0),
-		sendTrigger: make(chan struct{}, 1),
+		sendTrigger: make(chan struct{}, 32),
 	}
 }
 
@@ -1818,17 +1833,10 @@ func TestRouter(t *testing.T) {
 	orders = checkResponse("second link, market 1", mktName1, sub.ID, link2)
 	checkBook(src1, msgjson.StandingOrderNum, "second link, market 1", orders...)
 
-	// An epoch notification sent on market 1's channel should arrive at both
-	// clients.
+	// An accepted order should notify both subscribers and update the book epoch.
 	lo := makeLO(buyer1, mkRate1(0.8, 1.0), randLots(10), order.ImmediateTiF)
-	sig := &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    lo,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	epochIdx := router.books[mktName1].epoch() + 1
+	router.applyOrderAcceptedEvent(router.books[mktName1], epochOrderNote(lo, mktName1, epochIdx), epochIdx)
 
 	epochNote := getEpochNoteFromLink(t, link1)
 	compareLO(&epochNote.BookOrderNote, lo, msgjson.ImmediateOrderNum, "epoch notification, link1")
@@ -1839,10 +1847,17 @@ func TestRouter(t *testing.T) {
 	epochNote = getEpochNoteFromLink(t, link2)
 	compareLO(&epochNote.BookOrderNote, lo, msgjson.ImmediateOrderNum, "epoch notification, link2")
 
-	// just for kicks, checks the epoch is as expected.
-	wantIdx := sig.data.(sigDataEpochOrder).epochIdx
-	if epochNote.Epoch != uint64(wantIdx) {
-		t.Fatalf("wrong epoch. wanted %d, got %d", wantIdx, epochNote.Epoch)
+	if epochNote.Epoch != uint64(epochIdx) {
+		t.Fatalf("wrong epoch. wanted %d, got %d", epochIdx, epochNote.Epoch)
+	}
+	if epochNote.Seq == 0 {
+		t.Fatal("expected non-zero epoch note sequence")
+	}
+	if epochNote.OrderType != msgjson.LimitOrderNum {
+		t.Fatalf("epoch note order type = %d, want %d", epochNote.OrderType, msgjson.LimitOrderNum)
+	}
+	if got := router.books[mktName1].epoch(); got != epochIdx {
+		t.Fatalf("book epoch = %d, want %d", got, epochIdx)
 	}
 
 	// Have both subscribers subscribe to market 2.
@@ -1860,14 +1875,7 @@ func TestRouter(t *testing.T) {
 
 	// Send an epoch update for a market order.
 	mo := makeMO(buyer2, randLots(10))
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    mo,
-			epochIdx: 12345678,
-		},
-	}
-	src2.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName2], epochOrderNote(mo, mktName2, epochIdx), epochIdx)
 
 	epochNote = getEpochNoteFromLink(t, link1)
 	compareTrade(&epochNote.BookOrderNote, mo, "link 1 market 2 epoch update (market order)")
@@ -1881,7 +1889,7 @@ func TestRouter(t *testing.T) {
 	lo = makeLO(seller2, mkRate2(1.0, 1.2), randLots(10)+1, order.StandingTiF)
 	lo.FillAmt = mkt2.LotSize
 
-	sig = &updateSignal{
+	sig := &updateSignal{
 		action: bookAction,
 		data: sigDataBookedOrder{
 			order:    lo,
@@ -1979,14 +1987,7 @@ func TestRouter(t *testing.T) {
 	}
 
 	mo = makeMO(seller1, randLots(10))
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    mo,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName1], epochOrderNote(mo, mktName1, epochIdx), epochIdx)
 
 	if link2.getSend() == nil {
 		t.Fatalf("client 2 didn't receive an update after client 1 unsubbed")
@@ -2002,14 +2003,8 @@ func TestRouter(t *testing.T) {
 	// Now epoch a cancel order to client 2.
 	targetID := src1.buys[0].ID()
 	co := makeCO(buyer1, targetID)
-	sig = &updateSignal{
-		action: epochAction,
-		data: sigDataEpochOrder{
-			order:    co,
-			epochIdx: 12345678,
-		},
-	}
-	src1.feed <- sig
+	coNote := epochOrderNote(co, mktName1, epochIdx)
+	router.applyOrderAcceptedEvent(router.books[mktName1], coNote, epochIdx)
 
 	epochNote = getEpochNoteFromLink(t, link2)
 	if epochNote.OrderType != msgjson.CancelOrderNum {
@@ -2024,7 +2019,7 @@ func TestRouter(t *testing.T) {
 
 	// Send another, but err on the send. Check for unsubscribed
 	link2.sendRawErr = dummyError
-	src1.feed <- sig
+	router.applyOrderAcceptedEvent(router.books[mktName1], coNote, epochIdx)
 
 	// Wait for (*BookRouter).sendNote to remove the erroring link from the
 	// subscription conns map.
@@ -2225,17 +2220,25 @@ func TestParcelLimits(t *testing.T) {
 		return calc.Parcels(settlingWeight+lo.Quantity, 0, lotSize, 1)
 	}
 
+	asOf := time.UnixMilli(123456789)
+	oRig.auth.onUserReputationAt = func(got time.Time) {
+		if !got.Equal(asOf) {
+			t.Fatalf("reputation lookup time = %v, want %v", got, asOf)
+		}
+	}
+	t.Cleanup(func() { oRig.auth.onUserReputationAt = nil })
+
 	ensureSuccess := func() {
 		t.Helper()
 		// Single lot should definitely be ok.
-		if ok := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", calcParcels); !ok {
-			t.Fatalf("not ok")
+		if ok, err := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", asOf, calcParcels); err != nil || !ok {
+			t.Fatalf("not ok (err = %v)", err)
 		}
 	}
 
 	ensureErr := func() {
 		t.Helper()
-		if ok := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", calcParcels); ok {
+		if ok, _ := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", asOf, calcParcels); ok {
 			t.Fatalf("not error")
 		}
 	}
@@ -2249,6 +2252,13 @@ func TestParcelLimits(t *testing.T) {
 	rep.tier = 0
 	ensureErr()
 	rep.tier = 1
+
+	// A reputation load failure propagates as an error, never as a verdict.
+	rep.err = errors.New("db down")
+	if ok, err := oRig.router.CheckParcelLimit(oRecord.order.User(), "dcr_btc", asOf, calcParcels); err == nil || ok {
+		t.Fatalf("reputation load failure: ok=%v err=%v, want propagated error", ok, err)
+	}
+	rep.err = nil
 
 	var maxParcels uint64 = dex.PerTierBaseParcelLimit // based on score of 0
 	maxMakerQty := lotSize * maxParcels
