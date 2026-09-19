@@ -14,7 +14,20 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/meshevents"
 )
+
+// epochReport carries the per-epoch statistics published to book subscribers
+// and price feeders after an epoch_processed event.
+type epochReport struct {
+	epochIdx     int64
+	epochDur     int64
+	stats        *matcher.MatchCycleStats
+	spot         *msgjson.Spot
+	baseFeeRate  uint64
+	quoteFeeRate uint64
+	matches      [][2]int64
+}
 
 // A updateAction classifies updates into how they affect the book or epoch
 // queue.
@@ -812,6 +825,66 @@ func (r *BookRouter) applyOrderAcceptedEvent(book *msgBook, note *msgjson.EpochO
 	r.sendNote(msgjson.EpochOrderRoute, book.subs, note)
 }
 
+// applyBookedOrder applies a newly booked limit order to the local book
+// projection and notifies local subscribers.
+func (r *BookRouter) applyBookedOrder(book *msgBook, lo *order.LimitOrder) {
+	note := book.insert(lo)
+	note.Seq = book.subs.nextSeq()
+	r.sendNote(msgjson.BookOrderRoute, book.subs, note)
+}
+
+// applyEpochProcessedEvent applies the order book projection and notifications
+// produced by an epoch_processed event.
+func (r *BookRouter) applyEpochProcessedEvent(book *msgBook, event *meshevents.EpochProcessedEvent, result *epochProcessedResult) {
+	r.sendMatchProof(book, event, result)
+
+	for _, ord := range result.booked {
+		lo, ok := ord.Order.(*order.LimitOrder)
+		if !ok {
+			log.Errorf("non-limit order %T received in booked orders", ord.Order)
+			continue
+		}
+		r.applyBookedOrder(book, lo)
+	}
+
+	for _, lo := range result.updates.TradesPartial {
+		r.updateRemaining(book, lo)
+	}
+	for _, lo := range result.unbooked {
+		r.unbookOrder(book, lo)
+	}
+}
+
+func (r *BookRouter) sendMatchProof(book *msgBook, event *meshevents.EpochProcessedEvent, result *epochProcessedResult) {
+	misses := make([]msgjson.Bytes, 0, len(result.misses))
+	for _, ord := range result.misses {
+		oid := ord.ID()
+		misses = append(misses, oid[:])
+	}
+	preimages := make([]msgjson.Bytes, 0, len(result.revealed))
+	for _, revealed := range result.revealed {
+		preimages = append(preimages, revealed.Preimage[:])
+	}
+	r.sendNote(msgjson.MatchProofRoute, book.subs, &msgjson.MatchProofNote{
+		MarketID:  book.name,
+		Epoch:     uint64(event.EpochIdx),
+		Preimages: preimages,
+		Misses:    misses,
+		CSum:      event.CSum,
+		Seed:      result.seed,
+	})
+}
+
+func (r *BookRouter) updateRemaining(book *msgBook, lo *order.LimitOrder) {
+	bookNote := book.update(lo)
+	note := &msgjson.UpdateRemainingNote{
+		OrderNote: bookNote.OrderNote,
+		Remaining: lo.Remaining(),
+	}
+	note.Seq = book.subs.nextSeq()
+	r.sendNote(msgjson.UpdateRemainingRoute, book.subs, note)
+}
+
 // unbookOrder removes an order from the book projection and
 // notifies subscribers, doing nothing if the order was not in the projection.
 func (r *BookRouter) unbookOrder(book *msgBook, lo *order.LimitOrder) {
@@ -825,6 +898,44 @@ func (r *BookRouter) unbookOrder(book *msgBook, lo *order.LimitOrder) {
 		OrderID:  oid[:],
 	}
 	r.sendNote(msgjson.UnbookOrderRoute, book.subs, note)
+}
+
+// publishEpochReport updates recent matches and sends the epoch report to book
+// subscribers and the latest price update to price subscribers.
+func (r *BookRouter) publishEpochReport(book *msgBook, report *epochReport) {
+	startStamp := report.epochIdx * report.epochDur
+	endStamp := startStamp + report.epochDur
+	stats := report.stats
+
+	matchesWithTimestamp := make([][3]int64, 0, len(report.matches))
+	for _, match := range report.matches {
+		matchesWithTimestamp = append(matchesWithTimestamp, [3]int64{
+			match[0],
+			match[1],
+			endStamp})
+	}
+	book.addRecentMatches(matchesWithTimestamp)
+
+	r.sendNote(msgjson.EpochReportRoute, book.subs, &msgjson.EpochReportNote{
+		MarketID:     book.name,
+		Epoch:        uint64(report.epochIdx),
+		BaseFeeRate:  report.baseFeeRate,
+		QuoteFeeRate: report.quoteFeeRate,
+		Candle: msgjson.Candle{
+			StartStamp:  uint64(startStamp),
+			EndStamp:    uint64(endStamp),
+			MatchVolume: stats.MatchVolume,
+			QuoteVolume: stats.QuoteVolume,
+			HighRate:    stats.HighRate,
+			LowRate:     stats.LowRate,
+			StartRate:   stats.StartRate,
+			EndRate:     stats.EndRate,
+		},
+		MatchSummary: report.matches,
+	})
+	if report.spot != nil {
+		r.sendNote(msgjson.PriceUpdateRoute, r.priceFeeders, report.spot)
+	}
 }
 
 // cancelOrderToMsgOrder converts an *order.CancelOrder to a

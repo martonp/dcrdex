@@ -21,6 +21,7 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/asset"
 	"decred.org/dcrdex/server/comms"
+	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
 	"decred.org/dcrdex/server/mesh"
 )
@@ -36,6 +37,7 @@ type AuthManager interface {
 	SendIfLocal(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message), time.Duration, func()) error
+	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
 	PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID)
 	MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)
 	RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time)

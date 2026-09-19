@@ -1841,3 +1841,13 @@ func coinIDString(assetID uint32, coinID []byte) string {
 	}
 	return s
 }
+
+// ReputationOutcomePolicy returns the reputation policy used when storage
+// derives outcome updates from event facts.
+func (auth *AuthManager) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
+	return &db.ReputationOutcomePolicy{
+		PreimageLimit:       scoringOrderLimit,
+		OrderLimit:          cancelThreshWindow,
+		FreeCancelThreshold: freeCancelThreshold,
+	}
+}
