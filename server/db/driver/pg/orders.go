@@ -17,6 +17,7 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/lib/pq"
 )
 
@@ -179,6 +180,76 @@ func (status pgOrderStatus) active() bool {
 	default:
 		panic("unknown order status!") // programmer error
 	}
+}
+
+// ApplyOrderAcceptedEvent stores an accepted order with epoch status and
+// appends its event log entry in the same transaction.
+func (a *Archiver) ApplyOrderAcceptedEvent(ctx context.Context, meta *db.EventLogMeta, update *db.OrderAcceptedUpdate) (*db.EventLogEntry, error) {
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	ord := update.Order
+	marketSchema, err := a.marketSchema(ord.Base(), ord.Quote())
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyEventTx(ctx, meta, meshevents.EventKindOrderAccepted, txData, func(tx *sql.Tx) error {
+		commit := ord.Commitment()
+		for schema := range a.markets {
+			found, previousID, err := orderForCommit(ctx, tx, a.dbName, schema, commit)
+			if err != nil {
+				return err
+			}
+			if !found {
+				continue
+			}
+			if previousID == ord.ID() {
+				// Skip inserting the existing order, but still append the event log entry.
+				return nil
+			}
+			return db.ArchiveError{
+				Code: db.ErrReusedCommit,
+				Detail: fmt.Sprintf("order %v reuses commit %v from previous order %v",
+					ord.UID(), commit, previousID),
+			}
+		}
+
+		mkt := a.markets[marketSchema]
+		if mkt == nil {
+			return fmt.Errorf("unknown market schema %s", marketSchema)
+		}
+		if err := a.checkOrderAcceptanceTx(tx, mkt.Name, update.EpochIdx, update.EpochDur, ord.Time()); err != nil {
+			return err
+		}
+
+		var rowsAffected int64
+		var storeErr error
+		switch ord := ord.(type) {
+		case *order.CancelOrder:
+			tableName := fullCancelOrderTableName(a.dbName, marketSchema, true)
+			rowsAffected, storeErr = storeCancelOrder(tx, tableName, ord, orderStatusEpoch, update.EpochIdx, update.EpochDur, update.EpochGap)
+		case *order.MarketOrder:
+			tableName := fullOrderTableName(a.dbName, marketSchema, true)
+			rowsAffected, storeErr = storeMarketOrder(tx, tableName, ord, orderStatusEpoch, update.EpochIdx, update.EpochDur)
+		case *order.LimitOrder:
+			tableName := fullOrderTableName(a.dbName, marketSchema, true)
+			rowsAffected, storeErr = storeLimitOrder(tx, tableName, ord, orderStatusEpoch, update.EpochIdx, update.EpochDur)
+		default:
+			return fmt.Errorf("unsupported accepted order type %T", ord)
+		}
+		if storeErr != nil {
+			if ctx.Err() == nil {
+				a.fatalBackendErr(storeErr)
+			}
+			return fmt.Errorf("failed to store accepted order %v: %w", ord.UID(), storeErr)
+		}
+		if rowsAffected != 1 {
+			return fmt.Errorf("failed to store order %v: %d rows affected, expected 1", ord.UID(), rowsAffected)
+		}
+		return nil
+	})
 }
 
 // NewEpochOrder stores the given order with epoch status. This is equivalent to
@@ -573,17 +644,8 @@ func (a *Archiver) storeOrder(dbe sqlQueryExecutor, ord order.Order, epochIdx, e
 		}
 	}
 
-	// Check for order commitment duplicates. This also covers order ID since
-	// commitment is part of order serialization. Note that it checks ALL
-	// markets, so this may be excessive. This check may be more appropriate in
-	// the caller, or may be removed in favor of a different check depending on
-	// where preimages are stored. If we allow reused commitments if the
-	// preimages are only revealed once, then the unique constraint on the
-	// commit column in the orders tables would need to be removed.
-
-	// IDEA: Do not apply this constraint to server-generated cancel orders,
-	// which we may wish to have a zero value commitment and status revoked.
-	// if _, isCancel := ord.(*order.CancelOrder); !isCancel || status != orderStatusRevoked {
+	// Reject commitments already present in active orders.
+	// Commitments from archived orders may be reused.
 	commit := ord.Commitment()
 	found, prevOid, err := a.orderWithCommit(a.ctx, dbe, commit) // no query timeouts in storeOrder, only explicit cancellation
 	if err != nil {
@@ -1210,13 +1272,13 @@ func (a *Archiver) userOrderStatusesFromTable(fullTable string, aid account.Acco
 	return statuses, nil
 }
 
-// OrderWithCommit searches all markets' trade and cancel orders, both active
-// and archived, for an order with the given Commitment.
+// OrderWithCommit searches all markets' active trade and cancel orders for
+// the given commitment.
 func (a *Archiver) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
 	return a.orderWithCommit(ctx, a.db, commit)
 }
 
-// orderWithCommit searches all markets' trade and cancel orders for
+// orderWithCommit searches all markets' active trade and cancel orders for
 // the given Commitment.
 func (a *Archiver) orderWithCommit(ctx context.Context, dbe sqlQueryer, commit order.Commitment) (found bool, oid order.OrderID, err error) {
 	// Check all markets.
@@ -1627,47 +1689,22 @@ func userOrdersFromTable(ctx context.Context, dbe *sql.DB, fullTable string, bas
 }
 
 func orderForCommit(ctx context.Context, dbe sqlQueryer, dbName, marketSchema string, commit order.Commitment) (bool, order.OrderID, error) {
-	var zeroOrderID order.OrderID
-
-	execCheckOrderStmt := func(stmt string) (bool, order.OrderID, error) {
+	for _, tableName := range []string{
+		fullOrderTableName(dbName, marketSchema, true),
+		fullCancelOrderTableName(dbName, marketSchema, true),
+	} {
+		stmt := fmt.Sprintf(internal.SelectOrderByCommit, tableName)
 		var oid order.OrderID
 		err := dbe.QueryRowContext(ctx, stmt, commit).Scan(&oid)
-		if err == nil {
-			return true, oid, nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return false, zeroOrderID, err
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
 		}
-		// sql.ErrNoRows
-		return false, zeroOrderID, nil
-	}
-
-	checkTradeOrders := func(active bool) (bool, order.OrderID, error) {
-		fullTable := fullOrderTableName(dbName, marketSchema, active)
-		stmt := fmt.Sprintf(internal.SelectOrderByCommit, fullTable)
-		return execCheckOrderStmt(stmt)
-	}
-
-	checkCancelOrders := func(active bool) (bool, order.OrderID, error) {
-		fullTable := fullCancelOrderTableName(dbName, marketSchema, active)
-		stmt := fmt.Sprintf(internal.SelectOrderByCommit, fullTable)
-		return execCheckOrderStmt(stmt)
-	}
-
-	// Check active then archived cancel and trade orders.
-	for _, active := range []bool{true, false} {
-		// Trade orders.
-		found, oid, err := checkTradeOrders(active)
-		if found || err != nil {
-			return found, oid, err
+		if err != nil {
+			return false, order.OrderID{}, err
 		}
-
-		// Cancel orders.
-		found, oid, err = checkCancelOrders(active)
-		if found || err != nil {
-			return found, oid, err
-		}
+		return true, oid, nil
 	}
-	return false, zeroOrderID, nil
+	return false, order.OrderID{}, nil
 }
 
 func storeLimitOrder(dbe sqlExecutor, tableName string, lo *order.LimitOrder, status pgOrderStatus, epochIdx, epochDur int64) (int64, error) {

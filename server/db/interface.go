@@ -221,6 +221,7 @@ type OrderArchiver interface {
 	// that is not on the book.
 	SetOrderCompleteTime(ord order.Order, compTimeMs int64) error
 
+	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 }
 
@@ -845,6 +846,16 @@ type BondPostedResult struct {
 	Preimages []*PreimageOutcome
 	Matches   []*MatchResult
 	Orders    []*OrderOutcome
+}
+
+// OrderAcceptedUpdate contains an accepted order and the epoch information
+// needed to store it. Unlike meshevents.OrderAcceptedEvent, it includes the
+// epoch index, duration, and cancel epoch gap calculated by the market.
+type OrderAcceptedUpdate struct {
+	Order    order.Order
+	EpochIdx int64
+	EpochDur int64
+	EpochGap int32
 }
 
 // MarketState is a market's stored lifecycle state.
