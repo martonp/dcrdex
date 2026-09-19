@@ -656,7 +656,9 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	}
 	mkt.SetMeshService(newTMesh(mkt, authMgr))
 
-	swapDone = mkt.SwapDone
+	swapDone = func(ord order.Order, match *order.Match, fail bool) {
+		mkt.SwapDone(ord, match, fail)
+	}
 
 	ssw := dex.NewStartStopWaiter(swapper)
 	ssw.Start(testCtx)
@@ -1297,6 +1299,146 @@ func TestMarket_Book(t *testing.T) {
 		t.Errorf("failed to unbook order")
 	}
 
+}
+
+func TestSwapDone(t *testing.T) {
+	matchQty := uint64(dcrLotSize)
+	newOrderAndMatch := func(force order.TimeInForce) (*order.LimitOrder, *order.Match) {
+		ord := makeLO(seller3, mkRate3(1.0, 1.2), 2, force)
+		maker := makeLO(buyer3, ord.Rate, 2, order.StandingTiF)
+		return ord, &order.Match{
+			Maker:    maker,
+			Taker:    ord,
+			Quantity: matchQty,
+			Rate:     maker.Rate,
+		}
+	}
+
+	for _, tt := range []struct {
+		name              string
+		force             order.TimeInForce
+		initial           uint64
+		hasSettling       bool
+		booked            bool
+		wantSettling      uint64
+		wantSettlingFound bool
+	}{
+		{
+			name:              "remaining swaps keep settling entry",
+			force:             order.ImmediateTiF,
+			initial:           matchQty * 2,
+			hasSettling:       true,
+			wantSettling:      matchQty,
+			wantSettlingFound: true,
+		},
+		{
+			name:        "last swap clears unbooked order",
+			force:       order.ImmediateTiF,
+			initial:     matchQty,
+			hasSettling: true,
+		},
+		{
+			name:              "booked order keeps zero settling entry",
+			force:             order.StandingTiF,
+			initial:           matchQty,
+			hasSettling:       true,
+			booked:            true,
+			wantSettlingFound: true,
+		},
+		{
+			name:  "missing settling entry is ignored",
+			force: order.ImmediateTiF,
+		},
+		{
+			name:        "insufficient settling quantity does not underflow",
+			force:       order.ImmediateTiF,
+			initial:     matchQty - 1,
+			hasSettling: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ord, match := newOrderAndMatch(tt.force)
+			mkt := &Market{
+				settling: make(map[order.OrderID]uint64),
+				book:     book.New(dcrLotSize, 0),
+			}
+			if tt.hasSettling {
+				mkt.settling[ord.ID()] = tt.initial
+			}
+			if tt.booked && !mkt.book.Insert(ord) {
+				t.Fatal("failed to book order")
+			}
+
+			if removed := mkt.SwapDone(ord, match, false); removed != nil {
+				t.Fatalf("nonfaulted order was removed: %v", removed.ID())
+			}
+			got, found := mkt.settling[ord.ID()]
+			if found != tt.wantSettlingFound || got != tt.wantSettling {
+				t.Fatalf("settling = %d (found %t), want %d (found %t)",
+					got, found, tt.wantSettling, tt.wantSettlingFound)
+			}
+			if onBook := mkt.book.HaveOrder(ord.ID()); onBook != tt.booked {
+				t.Fatalf("order on book = %t, want %t", onBook, tt.booked)
+			}
+		})
+	}
+
+	t.Run("faulted booked order is revoked", func(t *testing.T) {
+		ord, match := newOrderAndMatch(order.StandingTiF)
+		ord.Coins = []order.CoinID{{0x01, 0x02}}
+		auth := &TAuth{}
+		locker := coinlock.NewAssetCoinLocker()
+		mkt := &Market{
+			settling:       map[order.OrderID]uint64{ord.ID(): matchQty},
+			book:           book.New(dcrLotSize, 0),
+			auth:           auth,
+			coinLockerBase: locker,
+		}
+		if !mkt.book.Insert(ord) || !mkt.lockOrderCoins(ord) {
+			t.Fatal("failed to book and lock order")
+		}
+		if !locker.CoinLocked(ord.Coins[0]) {
+			t.Fatal("order funding was not locked")
+		}
+
+		removed := mkt.SwapDone(ord, match, true)
+		if removed == nil || removed.ID() != ord.ID() {
+			t.Fatalf("removed order = %v, want %v", removed, ord.ID())
+		}
+		if _, found := mkt.settling[ord.ID()]; found || mkt.book.HaveOrder(ord.ID()) {
+			t.Fatal("faulted order is still tracked or booked")
+		}
+		if locker.CoinLocked(ord.Coins[0]) {
+			t.Fatal("faulted order funding remains locked")
+		}
+		msg := auth.getSend()
+		if msg == nil || msg.Route != msgjson.RevokeOrderRoute {
+			t.Fatalf("notification = %v, want revoke_order", msg)
+		}
+		var note msgjson.RevokeOrder
+		if err := msg.Unmarshal(&note); err != nil {
+			t.Fatal(err)
+		}
+		oid := ord.ID()
+		if !bytes.Equal(note.OrderID, oid[:]) {
+			t.Fatalf("revoked order = %x, want %v", note.OrderID, oid)
+		}
+		if auth.getSend() != nil {
+			t.Fatal("unexpected extra notification")
+		}
+	})
+
+	t.Run("faulted missing settling entry is ignored", func(t *testing.T) {
+		ord, match := newOrderAndMatch(order.ImmediateTiF)
+		auth := &TAuth{}
+		mkt := &Market{settling: make(map[order.OrderID]uint64), auth: auth}
+		if removed := mkt.SwapDone(ord, match, true); removed != nil {
+			t.Fatalf("untracked order was removed: %v", removed.ID())
+		}
+		if len(mkt.settling) != 0 || auth.getSend() != nil {
+			t.Fatal("untracked order changed settling or sent a notification")
+		}
+	})
 }
 
 func TestMarket_Suspend(t *testing.T) {

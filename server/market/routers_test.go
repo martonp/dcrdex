@@ -2064,15 +2064,8 @@ func TestRouter(t *testing.T) {
 	// clear the send from client 1
 	link1.getSend()
 
-	// Now unbook the order.
-	sig := &updateSignal{
-		action: unbookAction,
-		data: sigDataUnbookedOrder{
-			order:    lo,
-			epochIdx: 12345678,
-		},
-	}
-	src2.feed <- sig
+	// Now unbook the order and notify subscribers.
+	router.UnbookOrder(mktName2, lo)
 
 	unbookNote := getUnbookNoteFromLink(t, link1)
 	if lo.ID().String() != unbookNote.OrderID.String() {

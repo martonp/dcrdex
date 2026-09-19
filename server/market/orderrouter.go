@@ -41,7 +41,6 @@ type AuthManager interface {
 	PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID)
 	MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID)
 	RecordCancel(user account.AccountID, oid, target order.OrderID, epochGap int32, t time.Time)
-	RecordCompletedOrder(user account.AccountID, oid order.OrderID, t time.Time)
 	UserReputationAt(user account.AccountID, asOf time.Time) (tier int64, score, maxScore int32, err error)
 }
 

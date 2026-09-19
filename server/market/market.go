@@ -1313,22 +1313,57 @@ orders:
 	return
 }
 
-// SwapDone registers a match for a given order as being finished. Whether the
-// match was a successful or failed swap is indicated by fail. This is used to
-// (1) register completed orders for cancellation rate purposes, and (2) to
-// unbook at-fault limit orders.
-//
-// Implementation note: Orders that have failed a swap or were canceled (see
-// processReadyEpoch) are removed from the settling map regardless of any amount
-// still setting for such orders.
-func (m *Market) SwapDone(ord order.Order, match *order.Match, fail bool) {
+// SwapDone updates an order's outstanding swap quantity. If faulted is true,
+// it stops tracking the order and releases any limit-order funding coins. It
+// also removes any booked remainder and notifies the owner of that removal.
+// It returns the removed order, or nil. Orders no longer tracked for settlement
+// are ignored.
+func (m *Market) SwapDone(ord order.Order, match *order.Match, faulted bool) *order.LimitOrder {
+	if !faulted {
+		m.reduceSettling(ord, match)
+		return nil
+	}
+
+	oid := ord.ID()
+	m.bookMtx.Lock()
+	settling, found := m.settling[oid]
+	if !found {
+		m.bookMtx.Unlock()
+		return nil
+	}
+	if settling < match.Quantity {
+		log.Errorf("Finished swap %v (qty %d) for order %v larger than current settling (%d) amount.",
+			match.ID(), match.Quantity, oid, settling)
+	}
+
+	lo, limit := ord.(*order.LimitOrder)
+	delete(m.settling, oid)
+	var removed bool
+	if limit {
+		_, removed = m.book.Remove(oid)
+	}
+	m.bookMtx.Unlock()
+	if !limit {
+		return nil
+	}
+
+	m.unlockOrderCoins(lo)
+	if removed {
+		m.sendRevokeOrderNote(oid, lo.User())
+		return lo
+	}
+	return nil
+}
+
+// reduceSettling subtracts a finished match from the order's outstanding swap
+// quantity, retaining the entry while swaps remain or the order is still booked.
+func (m *Market) reduceSettling(ord order.Order, match *order.Match) {
 	oid := ord.ID()
 	m.bookMtx.Lock()
 	defer m.bookMtx.Unlock()
+
 	settling, found := m.settling[oid]
 	if !found {
-		// Order was canceled, revoked, or already had failed swap, and was
-		// removed from the map. No more settling amount tracking needed.
 		return
 	}
 	if settling < match.Quantity {
@@ -1339,47 +1374,14 @@ func (m *Market) SwapDone(ord order.Order, match *order.Match, fail bool) {
 		settling -= match.Quantity
 	}
 
-	// Limit orders may need to be unbooked, or considered for further matches.
+	// Check the market's book because the supplied order may have an outdated
+	// filled amount. A booked order can still make more matches.
 	lo, limit := ord.(*order.LimitOrder)
-
-	// For a failed swap, remove the map entry, and unbook/revoke the order.
-	if fail {
-		delete(m.settling, oid)
-		if limit {
-			// Try to unbook and revoke failed limit orders.
-			_, removed := m.book.Remove(oid)
-			m.unlockOrderCoins(lo)
-			if removed {
-				// Lazily update DB and auth, and notify orderbook subscribers.
-				m.lazy(func() { m.unbookedOrder(lo) })
-			}
-		}
-		return
-	}
-
-	// Continue tracking if there are swaps settling or it is booked (more
-	// matches can be made). We check Book.HaveOrder instead of Remaining since
-	// the provided Order instance may not belong to Market and may thus be out
-	// of sync with respect to filled amount.
 	if settling > 0 || (limit && lo.Force == order.StandingTiF && m.book.HaveOrder(oid)) {
 		m.settling[oid] = settling
 		return
 	}
-
-	// The order can no longer be matched and nothing is settling.
 	delete(m.settling, oid)
-
-	// Register the order as successfully completed in the auth manager.
-	compTime := time.Now().UTC()
-	m.auth.RecordCompletedOrder(ord.User(), oid, compTime)
-	// Record the successful completion time.
-	if err := m.storage.SetOrderCompleteTime(ord, compTime.UnixMilli()); err != nil {
-		if db.IsErrGeneralFailure(err) {
-			log.Errorf("fatal error with SetOrderCompleteTime for order %v: %v", ord, err)
-			return
-		}
-		log.Errorf("SetOrderCompleteTime for %v: %v", ord, err)
-	}
 }
 
 // CheckUnfilled checks unfilled book orders belonging to a user and funded by
