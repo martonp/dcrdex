@@ -4,14 +4,23 @@
 package market
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 )
+
+// MeshService is the part of mesh.Service this package calls:
+// ExecuteCommand for client requests, ApplyEvent for replicated state.
+type MeshService interface {
+	ExecuteCommand(context.Context, mesh.CommandRequest) *msgjson.Error
+	ApplyEvent(context.Context, *mesh.Event) (any, error)
+}
 
 // LifecycleTransition identifies a change to a market's trading lifecycle.
 type LifecycleTransition uint8
