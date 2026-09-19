@@ -2294,8 +2294,7 @@ func (m *Market) sendRevokeOrderNote(oid order.OrderID, user account.AccountID) 
 	if err != nil {
 		log.Errorf("Failed to create %s notification for order %v: %v", route, oid, err)
 	} else {
-		err = m.auth.Send(user, revNtfn)
-		if err != nil {
+		if err = m.auth.SendIfLocal(user, revNtfn); err != nil {
 			log.Debugf("Failed to send %s notification to user %v: %v", route, user, err)
 		}
 	}
@@ -2320,6 +2319,49 @@ func (m *Market) sendNoMatchNote(oid order.OrderID, user account.AccountID) {
 	if err := m.auth.SendIfLocal(user, msg); err != nil {
 		log.Debugf("Failed to send nomatch notification to user %v: %v", user, err)
 	}
+}
+
+// sendPenaltyNote notifies a locally connected user that their trading tier
+// is too low.
+func (m *Market) sendPenaltyNote(user account.AccountID, penaltyTime time.Time) {
+	penaltyNote := &msgjson.PenaltyNote{
+		Penalty: &msgjson.Penalty{
+			Rule: account.NoRule,
+			Time: uint64(penaltyTime.UnixMilli()),
+			Details: "Ordering has been suspended for this account. " +
+				"Post additional bond to offset violations.",
+		},
+	}
+	m.auth.Sign(penaltyNote)
+	note, err := msgjson.NewNotification(msgjson.PenaltyRoute, penaltyNote)
+	if err != nil {
+		log.Errorf("Failed to create penalty notification for user %v: %v", user, err)
+		return
+	}
+	if err := m.auth.SendIfLocal(user, note); err != nil {
+		log.Debugf("Failed to send penalty notification to user %v: %v", user, err)
+	}
+}
+
+// applyOrderRevokedMemory removes a revoked order from the book and settling
+// map, unlocks its funding coins, and notifies its owner. It reports whether
+// the order was removed from the book.
+func (m *Market) applyOrderRevokedMemory(lo *order.LimitOrder) bool {
+	oid := lo.ID()
+	m.bookMtx.Lock()
+	_, removed := m.book.Remove(oid)
+	delete(m.settling, oid)
+	m.bookMtx.Unlock()
+
+	m.unlockOrderCoins(lo)
+
+	if !removed {
+		log.Errorf("orders_revoked target %v was not on the %s book", oid, m.name)
+		return false
+	}
+
+	m.sendRevokeOrderNote(oid, lo.User())
+	return true
 }
 
 // UnbookUserOrders unbooks all orders belonging to a user, unlocks the coins

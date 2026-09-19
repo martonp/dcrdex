@@ -54,6 +54,7 @@ type TArchivist struct {
 	lifecycle            *db.MarketLifecycle
 	poisonEpochProcessed bool
 	epochProcessed       []*db.EpochProcessedUpdate
+	ordersRevokedUpdates []*db.OrdersRevokedUpdate
 	commitOrders         []db.OrderWithStatus
 	commitOrdersErr      error
 }
@@ -365,6 +366,12 @@ func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMe
 		}
 		ta.lifecycle = next
 	}
+	return new(db.EventLogEntry), nil
+}
+func (ta *TArchivist) ApplyOrdersRevokedEvent(_ context.Context, _ *db.EventLogMeta, _ *db.ReputationOutcomePolicy, update *db.OrdersRevokedUpdate) (*db.EventLogEntry, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.ordersRevokedUpdates = append(ta.ordersRevokedUpdates, update)
 	return new(db.EventLogEntry), nil
 }
 func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
@@ -1208,7 +1215,7 @@ func seedRunningLifecycle(t *testing.T, mkt *Market, activeEpochIdx, epochDur in
 }
 
 func TestMarket_Book(t *testing.T) {
-	mkt, storage, auth, cleanup, err := newTestMarket()
+	mkt, _, _, cleanup, err := newTestMarket()
 	if err != nil {
 		t.Fatalf("newTestMarket failure: %v", err)
 	}
@@ -1216,21 +1223,15 @@ func TestMarket_Book(t *testing.T) {
 
 	rnd.Seed(0)
 
-	// Fill the book.
 	for i := 0; i < 8; i++ {
-		// Buys
 		lo := makeLO(buyer3, mkRate3(0.8, 1.0), randLots(10), order.StandingTiF)
 		if !mkt.book.Insert(lo) {
 			t.Fatalf("Failed to Insert order into book.")
 		}
-		//t.Logf("Inserted buy order  (rate=%10d, quantity=%d) onto book.", lo.Rate, lo.Quantity)
-
-		// Sells
 		lo = makeLO(seller3, mkRate3(1.0, 1.2), randLots(10), order.StandingTiF)
 		if !mkt.book.Insert(lo) {
 			t.Fatalf("Failed to Insert order into book.")
 		}
-		//t.Logf("Inserted sell order (rate=%10d, quantity=%d) onto book.", lo.Rate, lo.Quantity)
 	}
 
 	bestBuy, bestSell := mkt.book.Best()
@@ -1238,7 +1239,7 @@ func TestMarket_Book(t *testing.T) {
 	marketRate := mkt.MidGap()
 	mktRateWant := (bestBuy.Rate + bestSell.Rate) / 2
 	if marketRate != mktRateWant {
-		t.Errorf("Market rate expected %d, got %d", mktRateWant, mktRateWant)
+		t.Errorf("Market rate expected %d, got %d", mktRateWant, marketRate)
 	}
 
 	_, buys, sells := mkt.Book()
@@ -1250,55 +1251,6 @@ func TestMarket_Book(t *testing.T) {
 		t.Errorf("Incorrect best sell order. Got %v, expected %v",
 			sells[0], bestSell)
 	}
-
-	// unbook something not on the book
-	if mkt.Unbook(makeLO(buyer3, 100, 1, order.StandingTiF)) {
-		t.Fatalf("unbooked and order that was not on the book")
-	}
-
-	// unbook the best buy order
-	feed := mkt.OrderFeed()
-
-	if !mkt.Unbook(bestBuy) {
-		t.Fatalf("Failed to unbook order")
-	}
-
-	sig := <-feed
-	if sig.action != unbookAction {
-		t.Fatalf("did not receive unbookAction signal")
-	}
-	sigData, ok := sig.data.(sigDataUnbookedOrder)
-	if !ok {
-		t.Fatalf("incorrect sigdata type")
-	}
-	if sigData.epochIdx != -1 {
-		t.Fatalf("expected epoch index -1, got %d", sigData.epochIdx)
-	}
-	loUnbooked, ok := sigData.order.(*order.LimitOrder)
-	if !ok {
-		t.Fatalf("incorrect unbooked order type")
-	}
-	if loUnbooked.ID() != bestBuy.ID() {
-		t.Errorf("unbooked order %v, wanted %v", loUnbooked.ID(), bestBuy.ID())
-	}
-
-	if auth.canceledOrder != bestBuy.ID() {
-		t.Errorf("revoke not recorded with auth manager")
-	}
-
-	if storage.revoked.ID() != bestBuy.ID() {
-		t.Errorf("revoke not recorded in storage")
-	}
-
-	if lockedCoins, _ := mkt.coinsLocked(bestBuy); lockedCoins != nil {
-		t.Errorf("unbooked order still has locked coins: %v", lockedCoins)
-	}
-
-	bestBuy2, _ := mkt.book.Best()
-	if bestBuy2 == bestBuy {
-		t.Errorf("failed to unbook order")
-	}
-
 }
 
 func TestSwapDone(t *testing.T) {
@@ -3835,6 +3787,8 @@ func TestMarket_SwapLockedCoinsRejectOrders(t *testing.T) {
 	}
 }
 
+// collectOwnerNotes drains the auth feed and collects revoke_order and
+// nomatch notes by order ID, failing on any penalty note.
 func collectOwnerNotes(t *testing.T, auth *TAuth) (revokes, nomatches map[order.OrderID]bool) {
 	t.Helper()
 	revokes = make(map[order.OrderID]bool)
@@ -4007,6 +3961,213 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 		if mkt.currentEpoch == nil || mkt.currentEpoch.Epoch != finalEpochIdx || len(mkt.currentEpoch.Orders) != 0 {
 			t.Fatalf("current epoch = %v, want empty %d", mkt.currentEpoch, finalEpochIdx)
 		}
+	})
+}
+
+func TestApplyOrdersRevokedEvent(t *testing.T) {
+	type fixture struct {
+		*marketEventRig
+		second  *Market
+		markets map[string]*Market
+		links   map[string]*TLink
+	}
+	newFixture := func(t *testing.T) *fixture {
+		t.Helper()
+		rig := newMarketEventRig(t)
+		t.Cleanup(rig.cleanup)
+		second, _, _, cleanup, err := newTestMarket(rig.storage, [2]*asset.BackedAsset{assetBTC, assetDCR})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cleanup)
+		second.auth = rig.auth
+		markets := map[string]*Market{rig.mkt.name: rig.mkt, second.name: second}
+		rig.bookRouter = NewBookRouter(map[string]BookSource{rig.mkt.name: rig.mkt, second.name: second},
+			&tFeeSource{}, func(string, comms.MsgHandler) {})
+		rig.events = Events(markets, rig.bookRouter, rig.auth.SendIfLocal, nil)
+		return &fixture{marketEventRig: rig, second: second, markets: markets, links: make(map[string]*TLink)}
+	}
+	newOrder := func(mkt *Market, user account.AccountID, sell bool, coin byte) *order.LimitOrder {
+		lo := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		lo.AccountID, lo.BaseAsset, lo.QuoteAsset = user, mkt.base, mkt.quote
+		lo.Sell = sell
+		lo.Coins = []order.CoinID{{coin}}
+		return lo
+	}
+	bookOrders := func(t *testing.T, mkt *Market, orders ...*order.LimitOrder) {
+		t.Helper()
+		for _, lo := range orders {
+			if !mkt.book.Insert(lo) || !mkt.lockOrderCoins(lo) {
+				t.Fatalf("failed to book and lock order %v", lo.ID())
+			}
+			mkt.settling[lo.ID()] = mkt.LotSize()
+		}
+	}
+	subscribeBooks := func(t *testing.T, f *fixture) {
+		t.Helper()
+		f.bookRouter.SeedBooks()
+		for name, mkt := range f.markets {
+			link, sub := newSubscriber(&test.Market{Base: mkt.base, Quote: mkt.quote})
+			if err := f.bookRouter.handleOrderBook(link, sub); err != nil {
+				t.Fatal(err)
+			}
+			link.getSend() // initial book response
+			f.links[name] = link
+		}
+	}
+	requireUpdate := func(t *testing.T, f *fixture, event *meshevents.OrdersRevokedEvent, result any, want ...*order.LimitOrder) {
+		t.Helper()
+		if len(f.storage.ordersRevokedUpdates) != 1 {
+			t.Fatalf("got %d DB updates, want 1", len(f.storage.ordersRevokedUpdates))
+		}
+		update := f.storage.ordersRevokedUpdates[0]
+		if update.Reason != event.Reason || !update.RevokeTime.Equal(time.UnixMilli(event.RevokeTime)) {
+			t.Fatalf("unexpected revocation metadata: %+v", update)
+		}
+		var wantIDs []order.OrderID
+		for _, lo := range want {
+			wantIDs = append(wantIDs, lo.ID())
+		}
+		slices.SortFunc(wantIDs, func(a, b order.OrderID) int { return bytes.Compare(a[:], b[:]) })
+		for name, orders := range map[string][]*order.LimitOrder{"DB targets": update.Orders, "result": result.([]*order.LimitOrder)} {
+			var ids []order.OrderID
+			for _, lo := range orders {
+				ids = append(ids, lo.ID())
+			}
+			if !slices.Equal(ids, wantIDs) {
+				t.Fatalf("%s = %v, want %v", name, ids, wantIDs)
+			}
+		}
+	}
+	requireRemoved := func(t *testing.T, f *fixture, lo *order.LimitOrder) {
+		t.Helper()
+		name, _ := dex.MarketName(lo.Base(), lo.Quote())
+		mkt := f.markets[name]
+		requireRevokedOrderGone(t, mkt, lo)
+		if _, found := mkt.settling[lo.ID()]; found {
+			t.Fatal("revoked order remains in settling map")
+		}
+		if _, found := f.bookRouter.books[name].orders[lo.ID()]; found {
+			t.Fatal("revoked order remains in router book")
+		}
+		msg := f.auth.getSend()
+		if msg == nil || msg.Route != msgjson.RevokeOrderRoute {
+			t.Fatalf("expected revoke notification, got %v", msg)
+		}
+		var note msgjson.RevokeOrder
+		if err := json.Unmarshal(msg.Payload, &note); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(note.OrderID, lo.ID().Bytes()) {
+			t.Fatalf("owner notification ID = %x, want %v", note.OrderID, lo.ID())
+		}
+		unbook := getUnbookNoteFromLink(t, f.links[name])
+		if !bytes.Equal(unbook.OrderID, lo.ID().Bytes()) || unbook.MarketID != name {
+			t.Fatalf("unexpected unbook notification: %+v", unbook)
+		}
+	}
+	requireRetained := func(t *testing.T, f *fixture, mkt *Market, orders ...*order.LimitOrder) {
+		t.Helper()
+		for _, lo := range orders {
+			_, inRouter := f.bookRouter.books[mkt.name].orders[lo.ID()]
+			if !inRouter || !mkt.book.HaveOrder(lo.ID()) {
+				t.Fatalf("retained order %v missing from market or router book", lo.ID())
+			}
+			assetID := mkt.quote
+			if lo.Sell {
+				assetID = mkt.base
+			}
+			if !mkt.CoinLocked(assetID, lo.Coins[0]) || mkt.settling[lo.ID()] != mkt.LotSize() {
+				t.Fatalf("retained order %v lost funding lock or settling entry", lo.ID())
+			}
+		}
+	}
+	requireNoMoreNotifications := func(t *testing.T, f *fixture) {
+		t.Helper()
+		if extra := f.auth.getSend(); extra != nil {
+			t.Fatalf("unexpected owner notification: %v", extra)
+		}
+		for _, link := range f.links {
+			requireNoBookNoteFromLink(t, link)
+		}
+	}
+	revokeTime := time.UnixMilli(123456789).UTC()
+
+	t.Run("explicit order IDs", func(t *testing.T) {
+		f := newFixture(t)
+		buy := newOrder(f.mkt, seller3.Acct, false, 1)
+		sell := newOrder(f.mkt, seller3.Acct, true, 2)
+		partial := newOrder(f.mkt, seller3.Acct, true, 3)
+		partial.AddFill(f.mkt.LotSize())
+		unlisted := newOrder(f.mkt, seller3.Acct, true, 4)
+		otherMarket := newOrder(f.second, seller3.Acct, true, 5)
+		bookOrders(t, f.mkt, buy, sell, partial, unlisted)
+		bookOrders(t, f.second, otherMarket)
+		subscribeBooks(t, f)
+
+		// The missing order, partial fill, and duplicate must not add revocations.
+		ids := []order.OrderID{sell.ID(), buy.ID(), {}, partial.ID(), sell.ID()}
+		payload := meshevents.NewOrdersRevokedForOrdersEvent(f.mkt.name, ids, meshevents.OrderRevokeReasonFundingSpent, revokeTime)
+		event, err := mesh.NewEvent(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := (&tMesh{events: f.events}).ApplyEvent(context.Background(), event)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		requireUpdate(t, f, payload, result, buy, sell)
+		// Notifications follow the sorted database targets.
+		for _, lo := range f.storage.ordersRevokedUpdates[0].Orders {
+			requireRemoved(t, f, lo)
+		}
+		requireRetained(t, f, f.mkt, partial, unlisted)
+		requireRetained(t, f, f.second, otherMarket)
+		requireNoMoreNotifications(t, f)
+	})
+
+	t.Run("account orders across markets", func(t *testing.T) {
+		f := newFixture(t)
+		buy := newOrder(f.mkt, seller3.Acct, false, 1)
+		sell := newOrder(f.mkt, seller3.Acct, true, 2)
+		partial := newOrder(f.mkt, seller3.Acct, true, 3)
+		partial.AddFill(f.mkt.LotSize())
+		otherUser := newOrder(f.mkt, buyer3.Acct, true, 4)
+		otherMarket := newOrder(f.second, seller3.Acct, true, 5)
+		bookOrders(t, f.mkt, buy, sell, partial, otherUser)
+		bookOrders(t, f.second, otherMarket)
+		subscribeBooks(t, f)
+
+		payload := meshevents.NewOrdersRevokedForUserEvent(seller3.Acct, meshevents.OrderRevokeReasonPenalty, revokeTime)
+		event, err := mesh.NewEvent(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := (&tMesh{events: f.events}).ApplyEvent(context.Background(), event)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		requireUpdate(t, f, payload, result, buy, sell, partial, otherMarket)
+		for _, lo := range f.storage.ordersRevokedUpdates[0].Orders {
+			requireRemoved(t, f, lo)
+		}
+		requireRetained(t, f, f.mkt, otherUser)
+
+		// One account penalty is sent, regardless of the number of revoked orders.
+		msg := f.auth.getSend()
+		if msg == nil || msg.Route != msgjson.PenaltyRoute {
+			t.Fatalf("expected one penalty notification, got %v", msg)
+		}
+		var note msgjson.PenaltyNote
+		if err := json.Unmarshal(msg.Payload, &note); err != nil {
+			t.Fatal(err)
+		}
+		if note.Penalty.Time != uint64(revokeTime.UnixMilli()) {
+			t.Fatalf("penalty time = %d, want %d", note.Penalty.Time, revokeTime.UnixMilli())
+		}
+		requireNoMoreNotifications(t, f)
 	})
 }
 
