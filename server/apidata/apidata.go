@@ -6,6 +6,7 @@ package apidata
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,7 +154,20 @@ func (s *DataAPI) ReportEpoch(base, quote uint32, epochIdx uint64, stats *matche
 		if mktCaches == nil {
 			return 0, 0, 0, 0, fmt.Errorf("unknown market %q", mktName)
 		}
-		epochDur := s.epochDurations[mktName]
+		epochDur := s.marketSources[mktName].EpochDuration()
+		if previousDur := s.epochDurations[mktName]; previousDur != epochDur {
+			// Replace the old epoch cache, but retain it if it also serves
+			// one of the standard candle intervals.
+			if !slices.Contains(binSizes, previousDur) {
+				delete(mktCaches, previousDur)
+			}
+			if _, exists := mktCaches[epochDur]; !exists {
+				mktCaches[epochDur] = &cacheWithStoredTime{
+					Cache: candles.NewCache(candles.CacheSize, epochDur),
+				}
+			}
+			s.epochDurations[mktName] = epochDur
+		}
 		startStamp := epochIdx * epochDur
 		endStamp := startStamp + epochDur
 		var cache5min *cacheWithStoredTime
@@ -174,9 +188,8 @@ func (s *DataAPI) ReportEpoch(base, quote uint32, epochIdx uint64, stats *matche
 			}
 			cache.Add(candle)
 
-			// Check if any candles need to be inserted.
-			// Don't insert epoch candles.
-			if cache.BinSize == epochDur {
+			// Persist standard intervals even when they also serve as the epoch cache.
+			if !slices.Contains(binSizes, dur) {
 				continue
 			}
 

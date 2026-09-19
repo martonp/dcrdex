@@ -169,7 +169,7 @@ func (a *Archiver) LoadEpochStats(base, quote uint32, caches []*candles.Cache) e
 			EndRate:     uint64(endRate),
 		}
 		for since, cache := range sinceCaches {
-			if uint64(endStamp) > since {
+			if uint64(endStamp) >= since {
 				cache.Add(candle)
 			}
 		}
