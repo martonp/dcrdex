@@ -226,6 +226,7 @@ type OrderArchiver interface {
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
+	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
 }
 
 // Account holds data returned by Accounts.
@@ -952,6 +953,15 @@ type MarketStartedUpdate struct {
 	// EpochRevokes lists the abandoned epoch orders. It must include every
 	// active epoch order exactly once.
 	EpochRevokes []*StartupOrderRevoke
+}
+
+// OrdersRevokedUpdate contains the booked orders selected for revocation.
+// Unlike meshevents.OrdersRevokedEvent, it contains the resolved orders
+// rather than an account or a list of order IDs.
+type OrdersRevokedUpdate struct {
+	Reason     meshevents.OrderRevokeReason
+	RevokeTime time.Time
+	Orders     []*order.LimitOrder
 }
 
 // ReputationOutcomePolicy sets how many outcomes of each class are retained

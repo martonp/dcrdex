@@ -231,6 +231,64 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 	})
 }
 
+func TestApplyOrdersRevokedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	ctx := context.Background()
+	revokeTime := time.Now().Truncate(time.Millisecond).UTC()
+	booked := newLimitOrder(false, 5_000_000, 1, order.StandingTiF, 0)
+	booked.ClientTime = revokeTime.Add(-time.Minute)
+	booked.SetTime(booked.ClientTime)
+	epochIdx := booked.ServerTime.UnixMilli() / int64(EpochDuration)
+	if err := storeOrderForTest(archie, booked, epochIdx, int64(EpochDuration), order.OrderStatusBooked); err != nil {
+		t.Fatalf("store booked order: %v", err)
+	}
+	update := &db.OrdersRevokedUpdate{
+		Reason:     meshevents.OrderRevokeReasonPenalty,
+		RevokeTime: revokeTime,
+		Orders:     []*order.LimitOrder{booked},
+	}
+	policy := &db.ReputationOutcomePolicy{OrderLimit: 10, FreeCancelThreshold: 2}
+	event := []byte("orders-revoked-event")
+	logEntry, err := archie.ApplyOrdersRevokedEvent(ctx, &db.EventLogMeta{Event: event}, policy, update)
+	if err != nil {
+		t.Fatalf("ApplyOrdersRevokedEvent: %v", err)
+	}
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindOrdersRevoked, event, update)
+	requireEventApplyLog(t, logEntry, 1, meshevents.EventKindOrdersRevoked, event, tip, update)
+	assertEventLogFrontier(t, ctx, 1, tip)
+
+	if _, status, err := archie.Order(booked.ID(), booked.Base(), booked.Quote()); err != nil || status != order.OrderStatusRevoked {
+		t.Fatalf("revoked order: status %v, error %v", status, err)
+	}
+	// Even revocation for a penalty is not counted as a user cancellation.
+	_, _, outcomes, err := archie.GetUserReputationData(ctx, booked.User(), 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData: %v", err)
+	}
+	if len(outcomes) != 1 {
+		t.Fatalf("got %d order outcomes, want 1", len(outcomes))
+	}
+	if outcomes[0].Canceled {
+		t.Fatal("server revocation counted as a user cancellation")
+	}
+	stored, status, err := archie.Order(outcomes[0].OrderID, booked.Base(), booked.Quote())
+	if err != nil {
+		t.Fatalf("generated cancel: %v", err)
+	}
+	cancel, ok := stored.(*order.CancelOrder)
+	if !ok {
+		t.Fatalf("generated order type = %T, want *order.CancelOrder", stored)
+	}
+	if status != order.OrderStatusRevoked || cancel.TargetOrderID != booked.ID() || cancel.User() != booked.User() {
+		t.Fatalf("unexpected generated cancel: status %v, order %+v", status, cancel)
+	}
+	if !cancel.ClientTime.Equal(revokeTime) || !cancel.ServerTime.Equal(revokeTime) {
+		t.Fatalf("cancel times = %v/%v, want %v", cancel.ClientTime, cancel.ServerTime, revokeTime)
+	}
+}
+
 func TestApplyEpochProcessedEvent(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
