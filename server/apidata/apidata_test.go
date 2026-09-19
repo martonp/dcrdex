@@ -31,6 +31,9 @@ type TDBSource struct {
 	loadEpochErr    error
 	loadEpochCalls  int
 	lastCandleCalls int
+	lastCandleStamp uint64
+	insertErr       error
+	insertedCandles map[uint64][]candles.Candle
 }
 
 func (db *TDBSource) LoadEpochStats(base, quote uint32, caches []*candles.Cache) error {
@@ -40,10 +43,19 @@ func (db *TDBSource) LoadEpochStats(base, quote uint32, caches []*candles.Cache)
 
 func (db *TDBSource) LastCandleEndStamp(base, quote uint32, candleDur uint64) (uint64, error) {
 	db.lastCandleCalls++
-	return 0, nil
+	return db.lastCandleStamp, nil
 }
 
 func (db *TDBSource) InsertCandles(base, quote uint32, dur uint64, cs []*candles.Candle) error {
+	if db.insertErr != nil {
+		return db.insertErr
+	}
+	if db.insertedCandles == nil {
+		db.insertedCandles = make(map[uint64][]candles.Candle)
+	}
+	for _, candle := range cs {
+		db.insertedCandles[dur] = append(db.insertedCandles[dur], *candle)
+	}
 	return nil
 }
 
@@ -213,6 +225,106 @@ func TestReportEpoch(t *testing.T) {
 	}
 	if len(wireCandles.StartRates) != 3 {
 		t.Fatalf("wrong number of candles. expected 3, got %d", len(wireCandles.StartRates))
+	}
+}
+
+func TestReportEpochDurationChange(t *testing.T) {
+	const fiveMinutes = uint64(5 * time.Minute / time.Millisecond)
+	for _, tc := range []struct {
+		name           string
+		oldDur, newDur uint64
+		keepOldCache   bool
+		insertErr      error
+	}{
+		{name: "new epoch interval", oldDur: 5000, newDur: 10000},
+		{name: "retain old standard interval", oldDur: fiveMinutes, newDur: 10000, keepOldCache: true},
+		{name: "reuse new standard interval", oldDur: 10000, newDur: fiveMinutes},
+		{name: "unchanged duration", oldDur: 10000, newDur: 10000, keepOldCache: true},
+		{name: "storage failure after changing duration", oldDur: 10000, newDur: fiveMinutes, insertErr: dummyErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Keep the reports in separate bins for every standard interval.
+			boundary := uint64(time.Now().UTC().Truncate(24 * time.Hour).UnixMilli())
+			rig := newTestRig()
+			rig.db.lastCandleStamp = boundary - uint64(48*time.Hour/time.Millisecond)
+			mkt := &TMarketSource{base: 42, quote: 0, epochDur: tc.oldDur}
+			if err := rig.api.AddMarketSource(mkt); err != nil {
+				t.Fatal(err)
+			}
+			if err := rig.api.LoadCaches(); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := rig.api.ReportEpoch(42, 0, boundary/tc.oldDur-2,
+				&matcher.MatchCycleStats{MatchVolume: 7, EndRate: 100}); err != nil {
+				t.Fatal(err)
+			}
+			caches := rig.api.marketCaches["dcr_btc"]
+			oldEpochCache := caches[tc.oldDur]
+			standardCaches := make(map[uint64]*cacheWithStoredTime, len(binSizes))
+			for _, dur := range binSizes {
+				standardCaches[dur] = caches[dur]
+			}
+
+			mkt.epochDur = tc.newDur
+			rig.db.insertErr = tc.insertErr
+			_, err := rig.api.ReportEpoch(42, 0, boundary/tc.newDur,
+				&matcher.MatchCycleStats{MatchVolume: 13, EndRate: 200})
+			if !errors.Is(err, tc.insertErr) {
+				t.Fatalf("ReportEpoch error = %v, want %v", err, tc.insertErr)
+			}
+			if tc.insertErr != nil {
+				for dur, cache := range standardCaches {
+					if cache.lastStoredEndStamp != rig.db.lastCandleStamp {
+						t.Fatalf("failed insert advanced stored timestamp for interval %d", dur)
+					}
+				}
+				return
+			}
+			if dur := rig.api.epochDurations["dcr_btc"]; dur != tc.newDur {
+				t.Fatalf("cached epoch duration = %d, want %d", dur, tc.newDur)
+			}
+			if tc.keepOldCache {
+				if caches[tc.oldDur] != oldEpochCache {
+					t.Fatal("old cache was replaced")
+				}
+			} else if _, found := caches[tc.oldDur]; found {
+				t.Fatal("old epoch cache was not removed")
+			}
+			newCache := caches[tc.newDur]
+			if newCache == nil || newCache.BinSize != tc.newDur || len(newCache.Candles) == 0 {
+				t.Fatal("missing candle for the current epoch duration")
+			}
+			if tc.oldDur == tc.newDur && (len(newCache.Candles) != 2 || newCache.Candles[0].MatchVolume != 7) {
+				t.Fatal("unchanged epoch cache lost its history")
+			}
+			last := newCache.Last()
+			if last.StartStamp != boundary || last.EndStamp != boundary+tc.newDur || last.MatchVolume != 13 {
+				t.Fatalf("new epoch candle = %+v, want stamps %d/%d and volume 13",
+					last, boundary, boundary+tc.newDur)
+			}
+			if len(rig.db.insertedCandles) != len(binSizes) {
+				t.Fatalf("stored %d candle intervals, want %d", len(rig.db.insertedCandles), len(binSizes))
+			}
+			for dur, original := range standardCaches {
+				cache := caches[dur]
+				if cache != original {
+					t.Fatalf("standard cache %d was replaced", dur)
+				}
+				stored := rig.db.insertedCandles[dur]
+				if len(stored) != 1 || stored[0].MatchVolume != 7 || stored[0].EndStamp != boundary-tc.oldDur {
+					t.Fatalf("completed candles stored for interval %d = %+v", dur, stored)
+				}
+				if cache.lastStoredEndStamp != stored[0].EndStamp {
+					t.Fatalf("stored timestamp for interval %d = %d, want %d", dur,
+						cache.lastStoredEndStamp, stored[0].EndStamp)
+				}
+				cs := cache.CandlesCopy()
+				if len(cs) != 2 || cs[0].MatchVolume != 7 || cs[1].MatchVolume != 13 {
+					t.Fatalf("standard cache %d lost candle history: %+v", dur, cs)
+				}
+			}
+		})
 	}
 }
 
