@@ -6,7 +6,6 @@ package market
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,7 +35,6 @@ import (
 	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
-	"runtime"
 )
 
 type TArchivist struct {
@@ -1994,273 +1992,139 @@ func TestMarket_Run(t *testing.T) {
 }
 
 func TestMarket_enqueueEpoch(t *testing.T) {
-	// This tests processing of a closed epoch by prepEpoch (for preimage
-	// collection) and processReadyEpoch (for sending the expected book and
-	// unbook messages to book subscribers registered via OrderFeed) via
-	// enqueueEpoch and the epochPump.
+	trade, tradePI := makeLORevealed(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	cancelOrder, cancelPI := makeCORevealed(buyer3, randomOrderID())
+	missed, _ := makeLORevealed(seller3, mkRate3(1.0, 1.2), 1, order.ImmediateTiF)
 
-	mkt, _, auth, cleanup, err := newTestMarket()
-	if err != nil {
-		t.Fatalf("Failed to create test market: %v", err)
-		return
-	}
-	defer cleanup()
-
-	rnd.Seed(0) // deterministic random data
-
-	// Fill the book. Preimages not needed for these.
-	for i := 0; i < 8; i++ {
-		// Buys
-		lo := makeLO(buyer3, mkRate3(0.8, 1.0), randLots(10), order.StandingTiF)
-		if !mkt.book.Insert(lo) {
-			t.Fatalf("Failed to Insert order into book.")
-		}
-		//t.Logf("Inserted buy order (rate=%10d, quantity=%d) onto book.", lo.Rate, lo.Quantity)
-
-		// Sells
-		lo = makeLO(seller3, mkRate3(1.0, 1.2), randLots(10), order.StandingTiF)
-		if !mkt.book.Insert(lo) {
-			t.Fatalf("Failed to Insert order into book.")
-		}
-		//t.Logf("Inserted sell order (rate=%10d, quantity=%d) onto book.", lo.Rate, lo.Quantity)
-	}
-
-	bestBuy, bestSell := mkt.book.Best()
-	bestBuyRate := bestBuy.Rate
-	bestBuyQuant := bestBuy.Quantity * 3 // tweak for new shuffle seed without changing csum
-	bestSellID := bestSell.ID()
-
-	var epochIdx, epochDur int64 = 123413513, int64(mkt.marketInfo.EpochDuration)
-	eq := NewEpoch(epochIdx, epochDur)
-	eID := order.EpochID{Idx: uint64(epochIdx), Dur: uint64(epochDur)}
-	lo, loPI := makeLORevealed(seller3, bestBuyRate-dcrRateStep, bestBuyQuant, order.StandingTiF)
-	co, coPI := makeCORevealed(buyer3, bestSellID)
-	eq.Insert(lo)
-	eq.Insert(co)
-
-	cSum, _ := hex.DecodeString("4859aa186630c2b135074037a8db42f240bbbe81c1361d8783aa605ed3f0cf90")
-	seed, _ := hex.DecodeString("e061777b09170c80ce7049439bef0d69649f361ed16b500b5e53b80920813c54")
-	mp := &order.MatchProof{
-		Epoch:     eID,
-		Preimages: []order.Preimage{loPI, coPI},
-		Misses:    nil,
-		CSum:      cSum,
-		Seed:      seed,
-	}
-
-	// Test with a missed preimage.
-	eq2 := NewEpoch(epochIdx, epochDur)
-	co2, co2PI := makeCORevealed(buyer3, randomOrderID())
-	lo2, _ := makeLORevealed(seller3, bestBuyRate-dcrRateStep, bestBuyQuant, order.ImmediateTiF)
-	eq2.Insert(co2)
-	eq2.Insert(lo2) // lo2 will not be in preimage map (miss)
-
-	cSum2, _ := hex.DecodeString("a64ee6372a49f9465910ca0b556818dbc765f3c7fa21d5f40ab25bf4b73f45ed") // includes both commitments, including the miss
-	seed2, _ := hex.DecodeString("aba75140b1f6edf26955a97e1b09d7b17abdc9c0b099fc73d9729501652fbf66") // includes only the provided preimage
-	mp2 := &order.MatchProof{
-		Epoch:     eID,
-		Preimages: []order.Preimage{co2PI},
-		Misses:    []order.Order{lo2},
-		CSum:      cSum2,
-		Seed:      seed2,
-	}
-
-	auth.piMtx.Lock()
-	auth.preimagesByOrdID[lo.UID()] = loPI
-	auth.preimagesByOrdID[co.UID()] = coPI
-	auth.preimagesByOrdID[co2.UID()] = co2PI
-	// No lo2 (miss)
-	auth.piMtx.Unlock()
-
-	var bookSignals []*updateSignal
-	var mtx sync.Mutex
-	// intercept what would go to an OrderFeed() chan of Run were running.
-	notifyChan := make(chan *updateSignal, 32)
-	defer close(notifyChan) // quit bookSignals receiver, but not necessary
-	go func() {
-		for up := range notifyChan {
-			//fmt.Println("received signal", up.action)
-			mtx.Lock()
-			bookSignals = append(bookSignals, up)
-			mtx.Unlock()
-		}
-	}()
-
-	var wg sync.WaitGroup
-	defer wg.Wait() // wait for the following epoch pipeline goroutines
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // stop the following epoch pipeline goroutines
-
-	// This test does not start the entire market, so manually start the epoch
-	// queue pump, and a goroutine to receive ready (preimage collection
-	// completed) epochs and start matching, etc.
-	ePump := newEpochPump()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ePump.Run(ctx)
-	}()
-
-	goForIt := make(chan struct{}, 1)
-
-	wg.Add(1)
-	go func() {
-		defer close(goForIt)
-		defer wg.Done()
-		for ep := range ePump.ready {
-			t.Logf("processReadyEpoch: %d orders revealed\n", len(ep.ordersRevealed))
-
-			// prepEpoch has completed preimage collection.
-			mkt.processReadyEpoch(ep, notifyChan) // notify is async!
-			goForIt <- struct{}{}
-		}
-	}()
-
-	// MatchProof for empty epoch queue.
-	mp0 := &order.MatchProof{
-		Epoch: eID,
-		// everything else is nil
-	}
-
-	tests := []struct {
-		name                string
-		epoch               *EpochQueue
-		expectedBookSignals []*updateSignal
+	for _, tt := range []struct {
+		name     string
+		revealed []*matcher.OrderRevealed
+		missed   []order.Order
 	}{
 		{
-			"ok book unbook",
-			eq,
-			[]*updateSignal{
-				{matchProofAction, sigDataMatchProof{mp}},
-				{bookAction, sigDataBookedOrder{lo, epochIdx}},
-				{unbookAction, sigDataUnbookedOrder{bestBuy, epochIdx}},
-				{unbookAction, sigDataUnbookedOrder{bestSell, epochIdx}},
-				{epochReportAction, sigDataEpochReport{epochIdx, epochDur, nil, nil, 10, 10, nil}},
+			name: "all preimages revealed",
+			revealed: []*matcher.OrderRevealed{
+				{Order: trade, Preimage: tradePI},
+				{Order: cancelOrder, Preimage: cancelPI},
 			},
 		},
 		{
-			"ok no matches or book updates, one miss",
-			eq2,
-			[]*updateSignal{
-				{matchProofAction, sigDataMatchProof{mp2}},
-				{epochReportAction, sigDataEpochReport{epochIdx, epochDur, nil, nil, 10, 10, nil}},
-			},
+			name:     "missing preimage",
+			revealed: []*matcher.OrderRevealed{{Order: cancelOrder, Preimage: cancelPI}},
+			missed:   []order.Order{missed},
 		},
-		{
-			"ok empty queue",
-			NewEpoch(epochIdx, epochDur),
-			[]*updateSignal{
-				{matchProofAction, sigDataMatchProof{mp0}},
-				{epochReportAction, sigDataEpochReport{epochIdx, epochDur, nil, nil, 10, 10, nil}},
-			},
-		},
-	}
-	for _, tt := range tests {
+		{name: "empty epoch"},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			mkt.enqueueEpoch(ePump, tt.epoch)
-			// Wait for processReadyEpoch, which sends on buffered (async) book
-			// order feed channels.
-			<-goForIt
-			// Preimage collection has completed, but notifications are asynchronous.
-			runtime.Gosched()                  // defer to the notify goroutine in (*Market).Run, somewhat redundant with the following sleep
-			time.Sleep(250 * time.Millisecond) // let the test goroutine receive the signals on notifyChan, updating bookSignals
-			// TODO: if this sleep becomes a problem, a receive(expectedNotes int) function might be needed
-			mtx.Lock()
-			defer mtx.Unlock() // inside this closure
-			defer func() { bookSignals = []*updateSignal{} }()
-			if len(bookSignals) != len(tt.expectedBookSignals) {
-				t.Fatalf("expected %d book update signals, got %d",
-					len(tt.expectedBookSignals), len(bookSignals))
+			mkt, storage, auth, cleanup, err := newTestMarket()
+			if err != nil {
+				t.Fatal(err)
 			}
-			for i, s := range bookSignals {
-				exp := tt.expectedBookSignals[i]
-				if exp.action != s.action {
-					t.Errorf("Book signal #%d has action %d, expected %d",
-						i, s.action, exp.action)
+			defer cleanup()
+
+			const epochIdx int64 = 1234
+			epochDur := int64(mkt.EpochDuration())
+			epoch := NewEpoch(epochIdx, epochDur)
+			for _, revealed := range tt.revealed {
+				revealed.Order.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+				epoch.Insert(revealed.Order)
+				auth.preimagesByOrdID[revealed.Order.UID()] = revealed.Preimage
+			}
+			for _, ord := range tt.missed {
+				ord.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+				epoch.Insert(ord)
+			}
+			wantCSum := matcher.CSum(epoch.OrderSlice())
+			// The epoch is closed and is next in line for processing.
+			storage.lifecycle = seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, epochIdx+1, epochDur)
+			storage.lifecycle.ProcessedEpochIdx = epochIdx - 1
+
+			ctx, cancel := context.WithCancel(context.Background())
+			pump := newEpochPump()
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pump.Run(ctx)
+			}()
+			defer wg.Wait()
+			defer cancel()
+
+			if !mkt.enqueueEpoch(pump, epoch) {
+				t.Fatal("enqueueEpoch returned false")
+			}
+			var ready *readyEpoch
+			select {
+			case ready = <-pump.ready:
+				if ready == nil {
+					t.Fatal("epoch pump closed before emitting the epoch")
 				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("epoch pump blocked waiting for preimage collection")
+			}
+			select {
+			case <-ready.ready:
+			default:
+				t.Fatal("ready epoch channel was not closed")
+			}
+			if ready.missRevokeTime.IsZero() {
+				t.Fatal("ready epoch has no miss revoke time")
+			}
+			meshSvc := mkt.mesh.(*tMesh)
+			if len(meshSvc.entries) != 0 {
+				t.Fatal("preimage collection published a mesh event")
+			}
 
-				switch sigData := s.data.(type) {
-				case sigDataMatchProof:
-					mp := sigData.matchProof
-					wantMp := exp.data.(sigDataMatchProof).matchProof
-					if !bytes.Equal(wantMp.CSum, mp.CSum) {
-						t.Errorf("Book signal #%d (action %v), has CSum %x, expected %x",
-							i, s.action, mp.CSum, wantMp.CSum)
-					}
-					if !bytes.Equal(wantMp.Seed, mp.Seed) {
-						t.Errorf("Book signal #%d (action %v), has Seed %x, expected %x",
-							i, s.action, mp.Seed, wantMp.Seed)
-					}
-					if wantMp.Epoch.Idx != mp.Epoch.Idx {
-						t.Errorf("Book signal #%d (action %v), has Epoch Idx %d, expected %d",
-							i, s.action, mp.Epoch.Idx, wantMp.Epoch.Idx)
-					}
-					if wantMp.Epoch.Dur != mp.Epoch.Dur {
-						t.Errorf("Book signal #%d (action %v), has Epoch Dur %d, expected %d",
-							i, s.action, mp.Epoch.Dur, wantMp.Epoch.Dur)
-					}
-					if len(wantMp.Preimages) != len(mp.Preimages) {
-						t.Errorf("Book signal #%d (action %v), has %d Preimages, expected %d",
-							i, s.action, len(mp.Preimages), len(wantMp.Preimages))
-						continue
-					}
-					for ii := range wantMp.Preimages {
-						if wantMp.Preimages[ii] != mp.Preimages[ii] {
-							t.Errorf("Book signal #%d (action %v), has #%d Preimage %x, expected %x",
-								i, s.action, ii, mp.Preimages[ii], wantMp.Preimages[ii])
-						}
-					}
-					if len(wantMp.Misses) != len(mp.Misses) {
-						t.Errorf("Book signal #%d (action %v), has %d Misses, expected %d",
-							i, s.action, len(mp.Misses), len(wantMp.Misses))
-						continue
-					}
-					for ii := range wantMp.Misses {
-						if wantMp.Misses[ii].ID() != mp.Misses[ii].ID() {
-							t.Errorf("Book signal #%d (action %v), has #%d missed Order %v, expected %v",
-								i, s.action, ii, mp.Misses[ii].ID(), wantMp.Misses[ii].ID())
-						}
-					}
-
-				case sigDataBookedOrder:
-					wantOrd := exp.data.(sigDataBookedOrder).order
-					if wantOrd.ID() != sigData.order.ID() {
-						t.Errorf("Book signal #%d (action %v) has order %v, expected %v",
-							i, s.action, sigData.order.ID(), wantOrd.ID())
-					}
-
-				case sigDataUnbookedOrder:
-					wantOrd := exp.data.(sigDataUnbookedOrder).order
-					if wantOrd.ID() != sigData.order.ID() {
-						t.Errorf("Unbook signal #%d (action %v) has order %v, expected %v",
-							i, s.action, sigData.order.ID(), wantOrd.ID())
-					}
-
-				case sigDataNewEpoch:
-					wantIdx := exp.data.(sigDataNewEpoch).idx
-					if wantIdx != sigData.idx {
-						t.Errorf("new epoch signal #%d (action %v) has epoch index %d, expected %d",
-							i, s.action, sigData.idx, wantIdx)
-					}
-
-				case sigDataEpochReport:
-					expSig := exp.data.(sigDataEpochReport)
-					if expSig.epochIdx != sigData.epochIdx {
-						t.Errorf("epoch report signal #%d (action %v) has epoch index %d, expected %d",
-							i, s.action, sigData.epochIdx, expSig.epochIdx)
-					}
-					if expSig.epochDur != sigData.epochDur {
-						t.Errorf("epoch report signal #%d (action %v) has epoch duration %d, expected %d",
-							i, s.action, sigData.epochDur, expSig.epochDur)
-					}
+			if err := mkt.processReadyEpoch(ctx, ready); err != nil {
+				t.Fatalf("processReadyEpoch: %v", err)
+			}
+			if len(meshSvc.entries) != 1 || meshSvc.entries[0].Kind != meshevents.EventKindEpochProcessed {
+				t.Fatalf("published events = %v, want one epoch_processed event", meshSvc.entries)
+			}
+			processed, err := meshevents.DecodeEpochProcessedEvent(meshSvc.entries[0].Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if processed.Market != mkt.name || processed.EpochIdx != epochIdx || processed.EpochDur != epochDur {
+				t.Fatalf("processed market/epoch = %s/%d:%d, want %s/%d:%d",
+					processed.Market, processed.EpochIdx, processed.EpochDur, mkt.name, epochIdx, epochDur)
+			}
+			if !bytes.Equal(processed.CSum, wantCSum) {
+				t.Fatalf("processed checksum = %x, want %x", processed.CSum, wantCSum)
+			}
+			if processed.MissRevokeTime != ready.missRevokeTime.UnixMilli() {
+				t.Fatal("event did not preserve the collected miss revocation time")
+			}
+			revealed, err := processed.OrdersRevealed()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(revealed) != len(tt.revealed) {
+				t.Fatalf("revealed orders = %d, want %d", len(revealed), len(tt.revealed))
+			}
+			preimages := make(map[order.OrderID]order.Preimage, len(revealed))
+			for _, reveal := range revealed {
+				preimages[reveal.Order.ID()] = reveal.Preimage
+			}
+			for _, want := range tt.revealed {
+				if pi, found := preimages[want.Order.ID()]; !found || pi != want.Preimage {
+					t.Fatalf("incorrect or missing preimage for %v", want.Order.ID())
 				}
-
+			}
+			missed, err := processed.MissedOrders()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(missed) != len(tt.missed) {
+				t.Fatalf("missed orders = %d, want %d", len(missed), len(tt.missed))
+			}
+			for i, want := range tt.missed {
+				if missed[i].ID() != want.ID() {
+					t.Fatalf("missed order %d = %v, want %v", i, missed[i].ID(), want.ID())
+				}
 			}
 		})
 	}
-
-	cancel()
 }
 
 func TestMarket_Cancelable(t *testing.T) {
