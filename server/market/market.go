@@ -2213,6 +2213,88 @@ func (m *Market) enqueueEpoch(eq *epochPump, epoch *EpochQueue) bool {
 	return true
 }
 
+// validateAdvanceEpochState checks the transition against the current
+// epoch queues and returns the orders in the epoch being closed.
+func (m *Market) validateAdvanceEpochState(event *meshevents.AdvanceEpochEvent) ([]order.Order, error) {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+
+	if m.currentEpoch == nil {
+		return nil, fmt.Errorf("advance_epoch with no active epoch on market %s", m.name)
+	}
+	if m.currentEpoch.Epoch != event.ClosedEpochIdx {
+		return nil, fmt.Errorf("advance_epoch closed epoch %d does not match current epoch %d",
+			event.ClosedEpochIdx, m.currentEpoch.Epoch)
+	}
+	if event.OpenedEpochIdx == 0 {
+		if m.pendingLifecycleAction != db.MarketPendingSuspend ||
+			m.pendingLifecycleEpochIdx != event.ClosedEpochIdx ||
+			m.pendingLifecycleEpochDur != event.EpochDur {
+			return nil, fmt.Errorf("advance_epoch final close without matching pending suspend")
+		}
+	} else if m.nextEpoch != nil && m.nextEpoch.Epoch != event.OpenedEpochIdx {
+		return nil, fmt.Errorf("advance_epoch opened epoch %d does not match next epoch %d",
+			event.OpenedEpochIdx, m.nextEpoch.Epoch)
+	}
+	closedOrders := m.currentEpoch.OrderSlice()
+	for _, ord := range closedOrders {
+		oid := ord.ID()
+		if _, found := m.epochOrders[oid]; !found {
+			return nil, fmt.Errorf("advance_epoch closed order %v is not in epoch memory", oid)
+		}
+	}
+	return closedOrders, nil
+}
+
+// applyAdvanceEpochEvent advances epoch memory after an advance_epoch event.
+func (m *Market) applyAdvanceEpochEvent(event *meshevents.AdvanceEpochEvent, closedOrders []order.Order) {
+	if event.OpenedEpochIdx > 0 {
+		m.bookMtx.Lock()
+		if event.OpenedEpochIdx <= m.bookEpochIdx {
+			log.Errorf("market %s advance_epoch opened %d but book epoch is already %d",
+				m.name, event.OpenedEpochIdx, m.bookEpochIdx)
+		} else {
+			m.bookEpochIdx = event.OpenedEpochIdx
+		}
+		m.bookMtx.Unlock()
+	}
+
+	m.epochMtx.Lock()
+	// Remove closed orders from the epoch maps, retaining their funding locks
+	// until epoch processing or startup recovery releases them.
+	for _, ord := range closedOrders {
+		oid := ord.ID()
+		delete(m.epochOrders, oid)
+		delete(m.epochCommitments, ord.Commitment())
+	}
+
+	if event.OpenedEpochIdx == 0 {
+		m.currentEpoch = nil
+		m.nextEpoch = nil
+		m.activeEpochIdx = 0
+		m.lifecycleState = db.MarketStateDraining
+		m.pendingLifecycleAction = db.MarketPendingNone
+		m.pendingLifecycleEpochIdx = 0
+		m.pendingLifecycleEpochDur = 0
+		m.epochMtx.Unlock()
+		m.running.Store(false)
+		m.wakeLifecycleDriver()
+		return
+	}
+	if m.nextEpoch != nil {
+		m.currentEpoch = m.nextEpoch
+	} else {
+		m.currentEpoch = NewEpoch(event.OpenedEpochIdx, event.EpochDur)
+	}
+	m.nextEpoch = NewEpoch(event.OpenedEpochIdx+1, event.EpochDur)
+	m.activeEpochIdx = event.OpenedEpochIdx
+	acceptOrders := m.lifecycleState == db.MarketStateRunning
+	m.epochMtx.Unlock()
+	if acceptOrders {
+		m.running.Store(true)
+	}
+}
+
 func (m *Market) sendRevokeOrderNote(oid order.OrderID, user account.AccountID) {
 	// Send revoke_order notification to order owner.
 	route := msgjson.RevokeOrderRoute

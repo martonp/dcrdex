@@ -51,6 +51,7 @@ type TArchivist struct {
 	epochOrders          []epochOrderWrite
 	orderAcceptedUpdates []*db.OrderAcceptedUpdate
 	marketStartedUpdates []*db.MarketStartedUpdate
+	advanceEpochEvents   []*meshevents.AdvanceEpochEvent
 	lifecycle            *db.MarketLifecycle
 	commitOrders         []db.OrderWithStatus
 	commitOrdersErr      error
@@ -328,6 +329,22 @@ func (ta *TArchivist) MarketLifecycle(string) (*db.MarketLifecycle, error) {
 	return &cpy, nil
 }
 
+func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.advanceEpochEvents = append(ta.advanceEpochEvents, event)
+	// Mirror the real applier's lifecycle projection (including the pending
+	// suspend final-close transition to MarketStateDraining), but only
+	// when a test has seeded a lifecycle row.
+	if ta.lifecycle != nil {
+		next, err := db.ProjectAdvanceEpochLifecycle(ta.lifecycle, event)
+		if err != nil {
+			return nil, err
+		}
+		ta.lifecycle = next
+	}
+	return new(db.EventLogEntry), nil
+}
 func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
 	ta.mtx.Lock()
 	defer ta.mtx.Unlock()
@@ -3939,6 +3956,150 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 			t.Fatalf("current epoch = %v, want empty %d", mkt.currentEpoch, finalEpochIdx)
 		}
 	})
+}
+
+func TestApplyAdvanceEpochEvent(t *testing.T) {
+	const closedEpochIdx int64 = 10
+	const nextEpochIdx = closedEpochIdx + 1
+
+	type fixture struct {
+		*marketEventRig
+		book   *msgBook
+		closed []order.Order
+		next   []order.Order
+		event  *meshevents.AdvanceEpochEvent
+	}
+	newFixture := func(t *testing.T, pending db.MarketPendingAction) *fixture {
+		t.Helper()
+		rig := newMarketEventRig(t)
+		t.Cleanup(rig.cleanup)
+		mkt := rig.mkt
+		epochDur := int64(mkt.EpochDuration())
+		f := &fixture{
+			marketEventRig: rig,
+			book:           rig.bookRouter.books[mkt.name],
+			closed: []order.Order{
+				epochStampedLO(t, closedEpochIdx, epochDur, 1, order.CoinID{0x11}),
+				epochStampedLO(t, closedEpochIdx, epochDur, 2, order.CoinID{0x12}),
+			},
+			event: meshevents.NewAdvanceEpochEvent(mkt.name, closedEpochIdx, nextEpochIdx, epochDur),
+		}
+		if pending == db.MarketPendingSuspend {
+			f.event.OpenedEpochIdx = 0
+		} else {
+			f.next = []order.Order{epochStampedLO(t, nextEpochIdx, epochDur, 1, order.CoinID{0x21})}
+		}
+		for _, ord := range f.closed {
+			seedEpochOrder(rig.storage, ord, closedEpochIdx, epochDur)
+		}
+		for _, ord := range f.next {
+			seedEpochOrder(rig.storage, ord, nextEpochIdx, epochDur)
+		}
+		lc := seedLifecycleRow(db.MarketStateRunning, pending, closedEpochIdx, epochDur)
+		rig.storage.lifecycle = lc
+		mkt.epochMtx.Lock()
+		mkt.projectMarketLifecycleLocked(lc)
+		mkt.epochMtx.Unlock()
+		if err := mkt.restoreEpochState(lc); err != nil {
+			t.Fatalf("restoreEpochState: %v", err)
+		}
+		mkt.running.Store(true)
+		f.book.setEpoch(closedEpochIdx)
+		return f
+	}
+
+	// Check the queues, funding locks, book epochs, and cancelability.
+	requireEpochState := func(t *testing.T, f *fixture, activeEpoch, bookEpoch int64, queued, dequeued []order.Order) {
+		t.Helper()
+		requireSeededState(t, f.mkt, activeEpoch, queued, dequeued)
+		if got := f.book.epoch(); got != bookEpoch {
+			t.Fatalf("bookrouter epoch = %d, want %d", got, bookEpoch)
+		}
+		if got := f.mkt.bookEpochIdx; got != bookEpoch {
+			t.Fatalf("market book epoch = %d, want %d", got, bookEpoch)
+		}
+		for _, ord := range queued {
+			if !f.mkt.Cancelable(ord.ID()) {
+				t.Fatalf("queued order %v should be cancelable", ord.ID())
+			}
+		}
+		for _, ord := range dequeued {
+			if f.mkt.Cancelable(ord.ID()) {
+				t.Fatalf("dequeued order %v unexpectedly cancelable", ord.ID())
+			}
+		}
+	}
+	requireStoredEvent := func(t *testing.T, f *fixture) {
+		t.Helper()
+		if got := len(f.storage.advanceEpochEvents); got != 1 {
+			t.Fatalf("advance epoch events = %d, want 1", got)
+		}
+		if got := f.storage.advanceEpochEvents[0]; *got != *f.event {
+			t.Fatalf("stored advance epoch event = %+v, want %+v", got, f.event)
+		}
+	}
+
+	t.Run("opens next epoch", func(t *testing.T) {
+		f := newFixture(t, db.MarketPendingNone)
+		f.apply(t, f.event)
+
+		requireStoredEvent(t, f)
+		requireEpochState(t, f, nextEpochIdx, nextEpochIdx, f.next, f.closed)
+		if !f.mkt.running.Load() {
+			t.Fatal("advancement stopped order intake")
+		}
+	})
+
+	t.Run("closes final epoch", func(t *testing.T) {
+		f := newFixture(t, db.MarketPendingSuspend)
+		f.apply(t, f.event)
+
+		requireStoredEvent(t, f)
+		requireEpochState(t, f, 0, closedEpochIdx, nil, f.closed)
+		mkt := f.mkt
+		if mkt.lifecycleState != db.MarketStateDraining || mkt.running.Load() ||
+			mkt.pendingLifecycleAction != db.MarketPendingNone ||
+			mkt.pendingLifecycleEpochIdx != 0 || mkt.pendingLifecycleEpochDur != 0 {
+			t.Fatal("final close did not stop intake and clear the pending suspension")
+		}
+	})
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(*fixture)
+	}{
+		{
+			name: "wrong current epoch",
+			mutate: func(f *fixture) {
+				f.event.ClosedEpochIdx++
+				f.event.OpenedEpochIdx++
+			},
+		},
+		{
+			name: "final close without scheduled suspension",
+			mutate: func(f *fixture) {
+				f.event.OpenedEpochIdx = 0
+			},
+		},
+		{
+			name: "missing book",
+			mutate: func(f *fixture) {
+				delete(f.bookRouter.books, f.event.Market)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, db.MarketPendingNone)
+			tt.mutate(f)
+			if err := f.applyErr(t, f.event); err == nil {
+				t.Fatal("expected validation error")
+			}
+			if len(f.storage.advanceEpochEvents) != 0 {
+				t.Fatal("invalid event reached storage")
+			}
+			requireEpochState(t, f, closedEpochIdx, closedEpochIdx, append(f.closed, f.next...), nil)
+		})
+	}
 }
 
 func requireEpochNoteFromLink(t *testing.T, link *TLink, mkt *Market, ord order.Order, epochIdx int64, wantOrderType uint8) {
