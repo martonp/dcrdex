@@ -30,6 +30,38 @@ func orderIDListTxData(ids []order.OrderID) []byte {
 	return b
 }
 
+// orderIDsTxData encodes the IDs of the supplied orders.
+func orderIDsTxData[T interface {
+	comparable
+	order.Order
+}](ords []T) ([]byte, error) {
+	var zero T
+	b := encode.BuildyBytes{0}
+	for i, ord := range ords {
+		if ord == zero {
+			return nil, fmt.Errorf("nil order at index %d", i)
+		}
+		oid := ord.ID()
+		b = b.AddData(oid[:])
+	}
+	return b, nil
+}
+
+// orderFillsTxData encodes each order's ID and total filled amount.
+func orderFillsTxData(ords []*order.LimitOrder) ([]byte, error) {
+	b := encode.BuildyBytes{0}
+	for _, ord := range ords {
+		if ord == nil {
+			return nil, fmt.Errorf("nil partial fill order")
+		}
+		oid := ord.ID()
+		b = b.AddData(encode.BuildyBytes{0}.
+			AddData(oid[:]).
+			AddData(encode.Uint64Bytes(ord.Trade().Filled())))
+	}
+	return b, nil
+}
+
 func startupOrderRevokesTxData(ords []*StartupOrderRevoke) ([]byte, error) {
 	b := encode.BuildyBytes{0}
 	for _, revoke := range ords {
@@ -55,6 +87,19 @@ func startupOrderRevokesTxData(ords []*StartupOrderRevoke) ([]byte, error) {
 	if len(b) > encode.MaxDataLen {
 		return nil, fmt.Errorf("startup revocation data size %d exceeds maximum %d",
 			len(b), encode.MaxDataLen)
+	}
+	return b, nil
+}
+
+// matchIDsTxData encodes the IDs of the supplied matches.
+func matchIDsTxData(matches []*order.Match) ([]byte, error) {
+	b := encode.BuildyBytes{0}
+	for _, match := range matches {
+		if match == nil {
+			return nil, fmt.Errorf("nil match")
+		}
+		id := match.ID()
+		b = b.AddData(id[:])
 	}
 	return b, nil
 }
@@ -98,4 +143,159 @@ func (u *MarketStartedUpdate) EventTxData() ([]byte, error) {
 		AddData(int64Bytes(u.RevocationTime.UnixMilli())).
 		AddData(bookedRevokes).
 		AddData(epochRevokes), nil
+}
+
+// encodeEventTxData encodes versioned fields, rejecting oversized fields
+// instead of letting BuildyBytes.AddData panic.
+func encodeEventTxData(fields ...[]byte) ([]byte, error) {
+	b := encode.BuildyBytes{0}
+	for i, field := range fields {
+		if len(field) > encode.MaxDataLen {
+			return nil, fmt.Errorf("transaction data field %d size %d exceeds maximum %d", i, len(field), encode.MaxDataLen)
+		}
+		b = b.AddData(field)
+	}
+	return b, nil
+}
+
+func preimageMissesTxData(misses []*PreimageMissUpdate) ([]byte, error) {
+	b := encode.BuildyBytes{0}
+	for _, miss := range misses {
+		if miss == nil {
+			return nil, fmt.Errorf("nil preimage miss update")
+		}
+		if miss.Order == nil {
+			return nil, fmt.Errorf("nil preimage miss order")
+		}
+		data, err := encodeEventTxData(
+			miss.Order.Serialize(),
+			int64Bytes(miss.RevokeTime.UnixMilli()),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > encode.MaxDataLen {
+			return nil, fmt.Errorf("preimage miss data size %d exceeds maximum %d", len(data), encode.MaxDataLen)
+		}
+		b = b.AddData(data)
+	}
+	return b, nil
+}
+
+func preimageRevealsTxData(reveals []*PreimageRevealUpdate) ([]byte, error) {
+	b := encode.BuildyBytes{0}
+	for _, reveal := range reveals {
+		if reveal == nil {
+			return nil, fmt.Errorf("nil preimage reveal update")
+		}
+		if reveal.Order == nil {
+			return nil, fmt.Errorf("nil preimage reveal order")
+		}
+		data, err := encodeEventTxData(
+			reveal.Order.Serialize(),
+			reveal.Preimage[:],
+		)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > encode.MaxDataLen {
+			return nil, fmt.Errorf("preimage reveal data size %d exceeds maximum %d", len(data), encode.MaxDataLen)
+		}
+		b = b.AddData(data)
+	}
+	return b, nil
+}
+
+func epochResultsTxData(epoch *EpochResults) ([]byte, error) {
+	return encodeEventTxData(
+		encode.Uint32Bytes(epoch.MktBase),
+		encode.Uint32Bytes(epoch.MktQuote),
+		int64Bytes(epoch.Idx),
+		int64Bytes(epoch.Dur),
+		int64Bytes(epoch.MatchTime),
+		epoch.CSum,
+		epoch.Seed,
+		orderIDListTxData(epoch.OrdersRevealed),
+		orderIDListTxData(epoch.OrdersMissed),
+		encode.Uint64Bytes(epoch.MatchVolume),
+		encode.Uint64Bytes(epoch.QuoteVolume),
+		encode.Uint64Bytes(epoch.BookBuys),
+		encode.Uint64Bytes(epoch.BookBuys5),
+		encode.Uint64Bytes(epoch.BookBuys25),
+		encode.Uint64Bytes(epoch.BookSells),
+		encode.Uint64Bytes(epoch.BookSells5),
+		encode.Uint64Bytes(epoch.BookSells25),
+		encode.Uint64Bytes(epoch.HighRate),
+		encode.Uint64Bytes(epoch.LowRate),
+		encode.Uint64Bytes(epoch.StartRate),
+		encode.Uint64Bytes(epoch.EndRate),
+	)
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for an epoch_processed event.
+func (u *EpochProcessedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil epoch processed update")
+	}
+	if u.Epoch == nil {
+		return nil, fmt.Errorf("nil epoch results")
+	}
+	epoch, err := epochResultsTxData(u.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	misses, err := preimageMissesTxData(u.Misses)
+	if err != nil {
+		return nil, err
+	}
+	reveals, err := preimageRevealsTxData(u.Reveals)
+	if err != nil {
+		return nil, err
+	}
+	tradesBooked, err := orderIDsTxData(u.TradesBooked)
+	if err != nil {
+		return nil, err
+	}
+	tradesPartial, err := orderFillsTxData(u.TradesPartial)
+	if err != nil {
+		return nil, err
+	}
+	tradesCompleted, err := orderIDsTxData(u.TradesCompleted)
+	if err != nil {
+		return nil, err
+	}
+	tradesCanceled, err := orderIDsTxData(u.TradesCanceled)
+	if err != nil {
+		return nil, err
+	}
+	tradesFailed, err := orderIDsTxData(u.TradesFailed)
+	if err != nil {
+		return nil, err
+	}
+	cancelsFailed, err := orderIDsTxData(u.CancelsFailed)
+	if err != nil {
+		return nil, err
+	}
+	cancelsExecuted, err := orderIDsTxData(u.CancelsExecuted)
+	if err != nil {
+		return nil, err
+	}
+	matches, err := matchIDsTxData(u.Matches)
+	if err != nil {
+		return nil, err
+	}
+	return encodeEventTxData(
+		epoch,
+		misses,
+		reveals,
+		tradesBooked,
+		tradesPartial,
+		tradesCompleted,
+		tradesCanceled,
+		tradesFailed,
+		cancelsFailed,
+		cancelsExecuted,
+		matches,
+	)
 }

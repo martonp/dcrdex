@@ -144,6 +144,49 @@ func ProjectAdvanceEpochLifecycle(prev *MarketLifecycle, event *meshevents.Advan
 	return &next, nil
 }
 
+// ProjectEpochProcessedLifecycle returns the lifecycle state after processing
+// an epoch. The epoch must immediately follow the last processed epoch and
+// must already be closed.
+func ProjectEpochProcessedLifecycle(prev *MarketLifecycle, market string, epochIdx, epochDur int64) (*MarketLifecycle, error) {
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", market)
+	}
+	var lastClosed int64
+	switch prev.State {
+	case MarketStateRunning:
+		if prev.PendingAction != MarketPendingNone && prev.PendingAction != MarketPendingSuspend {
+			return nil, fmt.Errorf("epoch_processed rejected for market %s lifecycle pending action %d",
+				prev.Market, prev.PendingAction)
+		}
+		lastClosed = prev.ActiveEpochIdx - 1
+	case MarketStateDraining:
+		lastClosed = prev.FinalEpochIdx
+	default:
+		return nil, fmt.Errorf("epoch_processed for inactive market %s", market)
+	}
+	if epochDur != prev.StartEpochDur {
+		return nil, fmt.Errorf("epoch_processed duration %d mismatches run duration %d for market %s",
+			epochDur, prev.StartEpochDur, market)
+	}
+	if epochIdx != prev.ProcessedEpochIdx+1 {
+		return nil, fmt.Errorf("epoch_processed epoch %d does not follow last processed epoch %d for market %s",
+			epochIdx, prev.ProcessedEpochIdx, market)
+	}
+	if epochIdx > lastClosed {
+		return nil, fmt.Errorf("epoch_processed epoch %d is not closed (last closed epoch %d) for market %s",
+			epochIdx, lastClosed, market)
+	}
+	if prev.State == MarketStateDraining &&
+		epochIdx == prev.FinalEpochIdx &&
+		epochDur != prev.FinalEpochDur {
+		return nil, fmt.Errorf("epoch_processed duration %d mismatches final epoch duration %d for market %s",
+			epochDur, prev.FinalEpochDur, market)
+	}
+	next := *prev
+	next.ProcessedEpochIdx = epochIdx
+	return &next, nil
+}
+
 func newRunningMarketLifecycle(update *MarketStartedUpdate) *MarketLifecycle {
 	return &MarketLifecycle{
 		Market:            update.Market,

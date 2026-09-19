@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 
+	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/meshevents"
@@ -77,6 +78,143 @@ func (a *Archiver) applyMarketStartedEpochRevokesTx(tx *sql.Tx, update *db.Marke
 		if _, err := a.revokeOrder(tx, ord, true, update.RevocationTime); err != nil {
 			return fmt.Errorf("startup epoch revoke %v: %w", oid, err)
 		}
+	}
+	return nil
+}
+
+// ApplyEpochProcessedEvent records an epoch's preimage results, order changes,
+// matches, and reputation outcomes, and advances the last processed epoch.
+func (a *Archiver) ApplyEpochProcessedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, update *db.EpochProcessedUpdate) (*db.EventLogEntry, error) {
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	marketName, err := dex.MarketName(update.Epoch.MktBase, update.Epoch.MktQuote)
+	if err != nil {
+		return nil, err
+	}
+	return a.applyRepEventTx(ctx, meta, meshevents.EventKindEpochProcessed, txData, policy, func(tx *sql.Tx, repUpdates *reputationOutcomeBatch) error {
+		if err := a.applyEpochProcessedLifecycleTx(tx, marketName, update.Epoch.Idx, update.Epoch.Dur); err != nil {
+			return err
+		}
+		if err := a.applyEpochPreimagesTx(tx, update, repUpdates); err != nil {
+			return err
+		}
+		if err := a.insertEpoch(tx, update.Epoch); err != nil {
+			return err
+		}
+		if err := a.applyEpochOrderUpdatesTx(tx, update, policy, repUpdates); err != nil {
+			return err
+		}
+
+		for _, match := range update.Matches {
+			matchesTableName, err := a.matchTableName(match)
+			if err != nil {
+				return err
+			}
+			n, err := upsertMatch(tx, matchesTableName, match)
+			if err != nil {
+				a.fatalBackendErr(err)
+				return err
+			}
+			if n != 1 {
+				return fmt.Errorf("upsertMatch: updated %d rows, expected 1", n)
+			}
+		}
+
+		// Make sure no orders from the epoch were left in epoch status.
+		stranded, err := a.unprocessedEpochOrderIDsTx(tx, update.Epoch.MktBase, update.Epoch.MktQuote,
+			update.Epoch.Idx, update.Epoch.Dur)
+		if err != nil {
+			return err
+		}
+		if n := len(stranded); n > 0 {
+			return fmt.Errorf("epoch_processed for epoch %d leaves %d orders in epoch status",
+				update.Epoch.Idx, n)
+		}
+
+		return nil
+	})
+}
+
+// applyEpochPreimagesTx stores revealed preimages and revokes orders with missing
+// preimages, collecting the corresponding reputation outcomes.
+func (a *Archiver) applyEpochPreimagesTx(tx *sql.Tx, update *db.EpochProcessedUpdate, repUpdates *reputationOutcomeBatch) error {
+	for _, miss := range update.Misses {
+		cancelID, err := a.revokeOrder(tx, miss.Order, false, miss.RevokeTime)
+		if err != nil {
+			return err
+		}
+		repUpdates.orders = append(repUpdates.orders, &reputationOrderOutcome{
+			user: miss.Order.User(),
+			oid:  cancelID,
+		})
+		repUpdates.preimages = append(repUpdates.preimages, &reputationPreimageOutcome{
+			user: miss.Order.User(),
+			oid:  miss.Order.ID(),
+			miss: true,
+		})
+	}
+	for _, reveal := range update.Reveals {
+		if err := a.storePreimage(tx, reveal.Order, reveal.Preimage); err != nil {
+			return err
+		}
+		repUpdates.preimages = append(repUpdates.preimages, &reputationPreimageOutcome{
+			user: reveal.Order.User(),
+			oid:  reveal.Order.ID(),
+		})
+	}
+	return nil
+}
+
+// applyEpochOrderUpdatesTx records order statuses and fills after matching,
+// collecting reputation outcomes for successful cancellations.
+func (a *Archiver) applyEpochOrderUpdatesTx(tx *sql.Tx, update *db.EpochProcessedUpdate, policy *db.ReputationOutcomePolicy, repUpdates *reputationOutcomeBatch) error {
+	for _, lo := range update.TradesBooked {
+		if err := a.updateOrderStatus(tx, lo, orderStatusBooked); err != nil {
+			return err
+		}
+	}
+	for _, lo := range update.TradesPartial {
+		if err := a.updateOrderFilledByID(tx, lo.ID(), lo.Base(), lo.Quote(), int64(lo.Trade().Filled())); err != nil {
+			return err
+		}
+	}
+	for _, ord := range update.TradesCompleted {
+		if err := a.updateOrderStatus(tx, ord, orderStatusExecuted); err != nil {
+			return err
+		}
+	}
+	for _, lo := range update.TradesCanceled {
+		if err := a.updateOrderStatus(tx, lo, orderStatusCanceled); err != nil {
+			return err
+		}
+	}
+	for _, ord := range update.TradesFailed {
+		if err := a.updateOrderStatus(tx, ord, orderStatusExecuted); err != nil {
+			return err
+		}
+	}
+	for _, co := range update.CancelsFailed {
+		if err := a.updateOrderStatus(tx, co, orderStatusFailed); err != nil {
+			return err
+		}
+	}
+	for _, co := range update.CancelsExecuted {
+		epochGap, err := a.cancelOrderEpochGap(tx, co.ID(), co.Base(), co.Quote())
+		if err != nil {
+			return err
+		}
+		if err := a.updateOrderStatus(tx, co, orderStatusExecuted); err != nil {
+			return err
+		}
+		penalizedCancel := policy != nil && epochGap >= 0 && epochGap < policy.FreeCancelThreshold
+		repUpdates.orders = append(repUpdates.orders, &reputationOrderOutcome{
+			user:            co.User(),
+			oid:             co.ID(),
+			penalizedCancel: penalizedCancel,
+		})
 	}
 	return nil
 }

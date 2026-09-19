@@ -88,6 +88,9 @@ const (
 		commit, coins, quantity, rate, force, filled
 	FROM %s WHERE status = $1;`
 
+	SelectOrderIDsByStatusAndEpoch = `SELECT oid FROM %s
+		WHERE status = $1 AND epoch_idx = $2 AND epoch_dur = $3;`
+
 	PreimageResultsLastN = `SELECT oid, (preimage IS NULL AND status=$3) AS preimageMiss, 
 		(epoch_idx+1) * epoch_dur as epochCloseTime   -- when preimages are requested
 	FROM %s -- e.g. dcr_btc.orders_archived
@@ -284,6 +287,8 @@ const (
 
 	// CancelOrderStatus retrieves an order's status
 	CancelOrderStatus = `SELECT status FROM %s WHERE oid = $1;`
+
+	SelectCancelOrderEpochGap = `SELECT epoch_gap FROM %s WHERE oid = $1;`
 
 	// MoveCancelOrder, like MoveOrder, moves an order row from one table to
 	// another. However, for a cancel order, only status column is updated.

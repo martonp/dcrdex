@@ -713,7 +713,11 @@ func (a *Archiver) storeOrder(dbe sqlQueryExecutor, ord order.Order, epochIdx, e
 }
 
 func (a *Archiver) orderTableName(ord order.Order) (string, pgOrderStatus, error) {
-	status, orderType, _, err := a.orderStatus(a.db, ord)
+	return a.orderTableNameWithExecutor(a.db, ord)
+}
+
+func (a *Archiver) orderTableNameWithExecutor(dbe sqlQueryer, ord order.Order) (string, pgOrderStatus, error) {
+	status, orderType, _, err := a.orderStatus(dbe, ord)
 	if err != nil {
 		return "", status, err
 	}
@@ -748,9 +752,8 @@ func (a *Archiver) OrderPreimage(ord order.Order) (order.Preimage, error) {
 	return pi, err
 }
 
-// StorePreimage stores the preimage associated with an existing order.
-func (a *Archiver) StorePreimage(ord order.Order, pi order.Preimage) error {
-	tableName, status, err := a.orderTableName(ord)
+func (a *Archiver) storePreimage(dbe sqlQueryExecutor, ord order.Order, pi order.Preimage) error {
+	tableName, status, err := a.orderTableNameWithExecutor(dbe, ord)
 	if err != nil {
 		return err
 	}
@@ -763,7 +766,7 @@ func (a *Archiver) StorePreimage(ord order.Order, pi order.Preimage) error {
 	}
 
 	stmt := fmt.Sprintf(internal.SetOrderPreimage, tableName)
-	N, err := sqlExec(a.db, stmt, pi, ord.ID())
+	N, err := sqlExec(dbe, stmt, pi, ord.ID())
 	if err != nil {
 		a.fatalBackendErr(err)
 		return err
@@ -772,6 +775,11 @@ func (a *Archiver) StorePreimage(ord order.Order, pi order.Preimage) error {
 		return fmt.Errorf("failed to update 1 order's preimage, updated %d", N)
 	}
 	return nil
+}
+
+// StorePreimage stores the preimage associated with an existing order.
+func (a *Archiver) StorePreimage(ord order.Order, pi order.Preimage) error {
+	return a.storePreimage(a.db, ord, pi)
 }
 
 // SetOrderCompleteTime sets the successful swap completion time for an existing
@@ -1104,16 +1112,14 @@ func (a *Archiver) moveCancelOrder(dbe sqlExecutor, oid order.OrderID, srcTableN
 	return nil
 }
 
-// UpdateOrderFilledByID updates the filled amount of the order with the given
-// OrderID in the market specified by a base and quote asset. This function
-// applies only to market and limit orders, not cancel orders. OrderStatusByID
-// is used to locate the existing order. If the order is not found, the error
-// value is ErrUnknownOrder, and the type is order.OrderStatusUnknown. See also
-// UpdateOrderFilled. To also update the order status, use UpdateOrderStatusByID
-// or UpdateOrderStatus.
-func (a *Archiver) UpdateOrderFilledByID(oid order.OrderID, base, quote uint32, filled int64) error {
+// updateOrderFilledByID updates the filled amount of the order
+// with the given OrderID in the market specified by a base and quote asset.
+// This function applies only to market and limit orders, not cancel orders.
+// The order's status is used to locate the existing order. If the order is not
+// found, the error value is ErrUnknownOrder.
+func (a *Archiver) updateOrderFilledByID(dbe sqlQueryExecutor, oid order.OrderID, base, quote uint32, filled int64) error {
 	// Locate the order.
-	status, orderType, initFilled, err := a.orderStatusByID(a.db, oid, base, quote)
+	status, orderType, initFilled, err := a.orderStatusByID(dbe, oid, base, quote)
 	if err != nil {
 		return err
 	}
@@ -1133,11 +1139,22 @@ func (a *Archiver) UpdateOrderFilledByID(oid order.OrderID, base, quote uint32, 
 		return err // should be caught already by a.OrderStatusByID
 	}
 	tableName := fullOrderTableName(a.dbName, marketSchema, status.active())
-	err = updateOrderFilledAmt(a.db, tableName, oid, uint64(filled))
+	err = updateOrderFilledAmt(dbe, tableName, oid, uint64(filled))
 	if err != nil {
 		a.fatalBackendErr(err) // TODO: it could have changed tables since this function is not atomic
 	}
 	return err
+}
+
+// UpdateOrderFilledByID updates the filled amount of the order with the given
+// OrderID in the market specified by a base and quote asset. This function
+// applies only to market and limit orders, not cancel orders. OrderStatusByID
+// is used to locate the existing order. If the order is not found, the error
+// value is ErrUnknownOrder, and the type is order.OrderStatusUnknown. See also
+// UpdateOrderFilled. To also update the order status, use UpdateOrderStatusByID
+// or UpdateOrderStatus.
+func (a *Archiver) UpdateOrderFilledByID(oid order.OrderID, base, quote uint32, filled int64) error {
+	return a.updateOrderFilledByID(a.db, oid, base, quote, filled)
 }
 
 // UpdateOrderFilled updates the filled amount of the given order. Both the
@@ -1904,6 +1921,29 @@ func cancelOrderStatus(dbe sqlQueryer, oid order.OrderID, dbName, marketSchema s
 
 	// Order not found in either orders table.
 	return orderStatusUnknown, db.ArchiveError{Code: db.ErrUnknownOrder}
+}
+
+// cancelOrderEpochGap returns the number of epochs between a cancel order and
+// its target order. Server-generated revocations use db.EpochGapNA.
+func (a *Archiver) cancelOrderEpochGap(dbe sqlQueryer, oid order.OrderID, base, quote uint32) (int32, error) {
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return db.EpochGapNA, err
+	}
+	for _, active := range []bool{true, false} {
+		table := fullCancelOrderTableName(a.dbName, marketSchema, active)
+		stmt := fmt.Sprintf(internal.SelectCancelOrderEpochGap, table)
+		var gap int32
+		err := dbe.QueryRow(stmt, oid).Scan(&gap)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return db.EpochGapNA, err
+		}
+		return gap, nil
+	}
+	return db.EpochGapNA, db.ArchiveError{Code: db.ErrUnknownOrder}
 }
 
 func findCancelOrder(dbe sqlQueryer, oid order.OrderID, dbName, marketSchema string, active bool) (bool, pgOrderStatus, error) {
