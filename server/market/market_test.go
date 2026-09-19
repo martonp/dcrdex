@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"decred.org/dcrdex/dex/order/test"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/asset"
+	"decred.org/dcrdex/server/book"
 	"decred.org/dcrdex/server/coinlock"
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
@@ -49,6 +51,56 @@ type TArchivist struct {
 	epochOrders          []epochOrderWrite
 	marketStartedUpdates []*db.MarketStartedUpdate
 	lifecycle            *db.MarketLifecycle
+}
+
+type tMesh struct {
+	err        *msgjson.Error
+	publishErr error
+
+	calls int
+	req   mesh.CommandRequest
+	user  account.AccountID
+	msg   *msgjson.Message
+
+	entries []*mesh.Event
+	events  map[string]mesh.EventApplier
+}
+
+func (t *tMesh) ExecuteCommand(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
+	t.calls++
+	t.req = req
+	t.user = req.User
+	t.msg = req.Msg
+	return t.err
+}
+
+func (t *tMesh) ApplyEvent(ctx context.Context, event *mesh.Event) (any, error) {
+	if t.publishErr != nil {
+		return nil, t.publishErr
+	}
+	if event == nil || t.events == nil {
+		return nil, nil
+	}
+	t.entries = append(t.entries, event)
+	applier := t.events[event.Kind]
+	if applier == nil {
+		return nil, fmt.Errorf("unsupported test mesh event %q", event.Kind)
+	}
+	applyCtx := &mesh.EventApplyContext{Context: ctx}
+	_, err := applier(applyCtx, event)
+	return applyCtx.Result(), err
+}
+
+func newTMesh(mkt *Market, authMgr *TAuth) *tMesh {
+	mktName := mkt.name
+	bookRouter := NewBookRouter(map[string]BookSource{
+		mktName: mkt,
+	}, &tFeeSource{}, func(string, comms.MsgHandler) {})
+	return &tMesh{
+		events: Events(map[string]*Market{
+			mktName: mkt,
+		}, bookRouter, nil),
+	}
 }
 
 func newMarketStartedEvent(marketName string, currentEpochIdx, epochDur int64, runParams meshevents.MarketRunParams,
@@ -380,11 +432,12 @@ func (f *tFeeFetcher) SwapFeeRate(context.Context) uint64 {
 }
 
 type tBalancer struct {
-	reqs map[string]int
+	reqs          map[string]int
+	checkReserved func(string, uint32) bool
 }
 
 func newTBalancer() *tBalancer {
-	return &tBalancer{make(map[string]int)}
+	return &tBalancer{reqs: make(map[string]int)}
 }
 
 func (b *tBalancer) CheckBalance(acctAddr string, assetID, redeemAssetID uint32, qty, lots uint64, redeems int) bool {
@@ -393,7 +446,11 @@ func (b *tBalancer) CheckBalance(acctAddr string, assetID, redeemAssetID uint32,
 }
 
 func (b *tBalancer) CheckReserved(acctAddr string, assetID uint32) bool {
-	return b.CheckBalance(acctAddr, assetID, assetID, 0, 0, 0)
+	b.reqs[acctAddr]++
+	if b.checkReserved != nil {
+		return b.checkReserved(acctAddr, assetID)
+	}
+	return true
 }
 
 func randomOrderID() order.OrderID {
@@ -501,6 +558,7 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	if err := mkt.LoadState(); err != nil {
 		return nil, nil, nil, func() {}, fmt.Errorf("Failed to load test market state: %w", err)
 	}
+	mkt.SetMeshService(newTMesh(mkt, authMgr))
 
 	swapDone = mkt.SwapDone
 
@@ -2443,6 +2501,12 @@ func TestMarket_handlePreimageResp(t *testing.T) {
 	}
 }
 
+func TestMarket_MarketStartup_AccountBased(t *testing.T) {
+	t.Run("account-based base", func(t *testing.T) { testAccountAssets(t, true, false) })
+	t.Run("account-based quote", func(t *testing.T) { testAccountAssets(t, false, true) })
+	t.Run("both account-based", func(t *testing.T) { testAccountAssets(t, true, true) })
+}
+
 func TestMarket_CancelWhileSuspended(t *testing.T) {
 	mkt, storage, auth, cleanup, err := newTestMarket()
 	defer cleanup()
@@ -2584,10 +2648,11 @@ func TestMarket_NewMarket_AccountBased(t *testing.T) {
 }
 
 func testAccountAssets(t *testing.T, base, quote bool) {
+	t.Helper()
 	storage := &TArchivist{}
 	balancer := newTBalancer()
-	const numPerSide = 10
-	ords := make([]*order.LimitOrder, 0, numPerSide*2)
+	var ords []*order.LimitOrder
+	var partialSell *order.LimitOrder
 
 	baseAsset, quoteAsset := assetDCR, assetBTC
 	if base {
@@ -2597,28 +2662,60 @@ func testAccountAssets(t *testing.T, base, quote bool) {
 		quoteAsset = assetMATIC
 	}
 
-	for i := 0; i < numPerSide*2; i++ {
+	for _, spec := range []struct {
+		sell    bool
+		partial bool
+	}{
+		{sell: true},
+		{sell: false},
+		{sell: true, partial: true},
+		{sell: false, partial: true},
+	} {
 		writer := test.RandomWriter()
 		writer.Market = &test.Market{
 			Base:    baseAsset.ID,
 			Quote:   quoteAsset.ID,
 			LotSize: dcrLotSize,
 		}
-		writer.Sell = i%2 == 0
-		ord := makeLO(writer, mkRate3(0.8, 1.0), randLots(10), order.StandingTiF)
-		if (ord.Sell && base) || (!ord.Sell && quote) { // eth-funded order needs a account address coin.
+		writer.Sell = spec.sell
+		ord := makeLO(writer, mkRate3(0.8, 1.0), 2, order.StandingTiF)
+		if (ord.Sell && base) || (!ord.Sell && quote) { // Account-funded orders use an account address as their coin.
 			ord.Coins = []order.CoinID{[]byte(test.RandomAddress())}
+		}
+		if spec.partial {
+			ord.FillAmt = dcrLotSize
+			if spec.sell {
+				partialSell = ord
+			}
 		}
 		ords = append(ords, ord)
 		storage.BookOrder(ord)
 	}
 
-	_, _, _, cleanup, err := newTestMarket(storage, balancer, [2]*asset.BackedAsset{baseAsset, quoteAsset})
+	mkt, storage, _, cleanup, err := newTestMarket(storage, balancer, [2]*asset.BackedAsset{baseAsset, quoteAsset})
 	if err != nil {
 		t.Fatalf("newTestMarket failure: %v", err)
 	}
 	defer cleanup()
 
+	for _, lo := range ords {
+		if base && balancer.reqs[lo.BaseAccount()] != 0 {
+			t.Fatalf("constructor requested base balance for order")
+		}
+		if quote && balancer.reqs[lo.QuoteAccount()] != 0 {
+			t.Fatalf("constructor requested quote balance for order")
+		}
+	}
+
+	if _, err := mkt.submitMarketStarted(context.Background()); err != nil {
+		t.Fatalf("submitMarketStarted error: %v", err)
+	}
+	if len(storage.marketStartedUpdates) != 1 {
+		t.Fatalf("market started update count = %d, want 1", len(storage.marketStartedUpdates))
+	}
+	if len(storage.marketStartedUpdates[0].BookedRevokes) != 0 {
+		t.Fatalf("startup cleanup unexpectedly revoked %d orders", len(storage.marketStartedUpdates[0].BookedRevokes))
+	}
 	for _, lo := range ords {
 		if base && balancer.reqs[lo.BaseAccount()] == 0 {
 			t.Fatalf("base balance not requested for order")
@@ -2626,6 +2723,26 @@ func testAccountAssets(t *testing.T, base, quote bool) {
 		if quote && balancer.reqs[lo.QuoteAccount()] == 0 {
 			t.Fatalf("quote balance not requested for order")
 		}
+	}
+
+	// A partially filled order still needs an account balance check.
+	failedAddr, failedAsset := partialSell.QuoteAccount(), quoteAsset.ID
+	if base {
+		failedAddr, failedAsset = partialSell.BaseAccount(), baseAsset.ID
+	}
+	balancer.checkReserved = func(addr string, assetID uint32) bool {
+		return addr != failedAddr || assetID != failedAsset
+	}
+	if _, err := mkt.submitMarketStarted(context.Background()); err != nil {
+		t.Fatalf("submitMarketStarted with low balance: %v", err)
+	}
+	if len(storage.marketStartedUpdates) != 2 {
+		t.Fatalf("market started updates = %d, want 2", len(storage.marketStartedUpdates))
+	}
+	revokes := storage.marketStartedUpdates[1].BookedRevokes
+	if len(revokes) != 1 || revokes[0].Order.ID() != partialSell.ID() ||
+		revokes[0].Reason != meshevents.StartupOrderRevokeReasonAccountLowBalance {
+		t.Fatalf("expected the partially filled order to be revoked for low balance, got %v", revokes)
 	}
 }
 
@@ -3273,6 +3390,188 @@ func requireRevokedOrderGone(t *testing.T, mkt *Market, lo *order.LimitOrder) {
 	for _, coin := range lo.Coins {
 		if mkt.CoinLocked(assetID, []byte(coin)) {
 			t.Fatalf("revoked order %v coin %x remains locked", lo.ID(), coin)
+		}
+	}
+}
+
+// useApplierMesh routes the market's own event submissions through the rig's
+// appliers, so they run the same projection every node applies.
+func (rig *marketEventRig) useApplierMesh() {
+	rig.mkt.SetMeshService(&tMesh{events: rig.events})
+}
+
+func TestSubmitMarketStarted(t *testing.T) {
+	type leftoverEpochOrderSpec struct {
+		offset int64 // epochs relative to the current clock epoch
+		cancel bool  // targets the previously seeded trade
+		coin   order.CoinID
+	}
+	cases := []struct {
+		name           string
+		state          db.MarketState // zero means no stored lifecycle
+		pendingAction  db.MarketPendingAction
+		suspendOffset  int64
+		leftoverOrders []leftoverEpochOrderSpec
+		wantOpenEpoch  bool
+	}{
+		{
+			name: "first start revokes all leftover epoch orders and opens an epoch",
+			leftoverOrders: []leftoverEpochOrderSpec{
+				{offset: -900, coin: order.CoinID{0x11, 0x12}},
+				{offset: -900, coin: order.CoinID{0x13, 0x14}},
+				{offset: -900, cancel: true},
+				{offset: 0, coin: order.CoinID{0x31, 0x32}},
+			},
+			wantOpenEpoch: true,
+		},
+		{
+			name:           "pending suspend past the final epoch finalizes without opening an epoch",
+			state:          db.MarketStateRunning,
+			pendingAction:  db.MarketPendingSuspend,
+			suspendOffset:  -5,
+			leftoverOrders: []leftoverEpochOrderSpec{{offset: -5, coin: order.CoinID{0x51, 0x52}}},
+		},
+		{
+			name:           "draining restart repairs leftover orders without opening an epoch",
+			state:          db.MarketStateDraining,
+			suspendOffset:  -5,
+			leftoverOrders: []leftoverEpochOrderSpec{{offset: -5, coin: order.CoinID{0x61, 0x62}}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newMarketEventRig(t)
+			defer rig.cleanup()
+			rig.useApplierMesh()
+			mkt, storage := rig.mkt, rig.storage
+			epochDur := int64(mkt.EpochDuration())
+			referenceEpoch := currentMarketEpochIdx(epochDur)
+
+			if tc.state != 0 {
+				finalIdx := referenceEpoch + tc.suspendOffset
+				setTestMarketLifecycle(mkt, storage, seedLifecycleRow(tc.state, tc.pendingAction, finalIdx, epochDur))
+			}
+
+			var leftover []order.Order
+			var lastTrade *order.LimitOrder
+			for i, spec := range tc.leftoverOrders {
+				idx := referenceEpoch + spec.offset
+				var ord order.Order
+				if spec.cancel {
+					ord = epochStampedCO(t, lastTrade.ID(), idx, epochDur, int64(i+1))
+				} else {
+					lastTrade = epochStampedLO(t, idx, epochDur, int64(i+1), spec.coin)
+					ord = lastTrade
+				}
+				seedEpochOrder(storage, ord, idx, epochDur)
+				leftover = append(leftover, ord)
+			}
+
+			startupEpoch, err := mkt.submitMarketStarted(context.Background())
+			if err != nil {
+				t.Fatalf("submitMarketStarted error: %v", err)
+			}
+			if tc.wantOpenEpoch && startupEpoch == 0 {
+				t.Fatalf("startup epoch = 0, want nonzero")
+			}
+			if len(storage.marketStartedUpdates) != 1 {
+				t.Fatalf("market started updates = %d, want 1", len(storage.marketStartedUpdates))
+			}
+			requireEpochRevokeSet(t, storage.marketStartedUpdates[0], leftover)
+
+			mkt.epochMtx.RLock()
+			currentEpoch := mkt.currentEpoch
+			mkt.epochMtx.RUnlock()
+			if (currentEpoch != nil) != tc.wantOpenEpoch {
+				t.Fatalf("current epoch = %v, want opened %t", currentEpoch, tc.wantOpenEpoch)
+			}
+			if got := mkt.isDraining(); got != !tc.wantOpenEpoch {
+				t.Fatalf("finalizing suspend = %t, want %t", got, !tc.wantOpenEpoch)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		state   db.MarketState
+		pending db.MarketPendingAction
+	}{
+		{"due suspension keeps stored parameters", db.MarketStateRunning, db.MarketPendingSuspend},
+		{"draining keeps stored parameters", db.MarketStateDraining, db.MarketPendingNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := &TArchivist{}
+			balancer := newTBalancer()
+			writer := test.RandomWriter()
+			writer.Market = &test.Market{Base: assetETH.ID, Quote: assetBTC.ID, LotSize: dcrLotSize}
+			writer.Sell = true
+			addr := test.RandomAddress()
+			for lots := uint64(1); lots <= 2; lots++ {
+				lo := makeLO(writer, btcRateStep, lots, order.StandingTiF)
+				lo.Coins = []order.CoinID{[]byte(addr)}
+				storage.BookOrder(lo)
+			}
+			rig := newMarketEventRig(t, storage, balancer, [2]*asset.BackedAsset{assetETH, assetBTC})
+			defer rig.cleanup()
+			rig.useApplierMesh()
+			mkt := rig.mkt
+			live := *mkt.liveParams.Load()
+			finalEpoch := currentMarketEpochIdx(live.epochDur) - 5
+			row := seedLifecycleRow(tc.state, tc.pending, finalEpoch, live.epochDur)
+			row.Market = mkt.name
+			row.RunParams = live.MarketRunParams
+			setTestMarketLifecycle(mkt, storage, row)
+			mkt.configuredParams.LotSize *= 2
+			if tc.state == db.MarketStateDraining {
+				mkt.configuredParams.epochDur *= 2
+			}
+			if got := mkt.startParams(time.Now()); got != live {
+				t.Fatal("startup did not select the stored trading parameters")
+			}
+
+			if _, err := mkt.submitMarketStarted(context.Background()); err != nil {
+				t.Fatalf("submitMarketStarted: %v", err)
+			}
+			if len(storage.marketStartedUpdates) != 1 {
+				t.Fatalf("startup updates = %d, want 1", len(storage.marketStartedUpdates))
+			}
+			update := storage.marketStartedUpdates[0]
+			if update.RunParams != live.MarketRunParams || update.EpochDur != live.epochDur {
+				t.Fatal("startup did not keep the stored trading parameters")
+			}
+			_, buys, sells := mkt.Book()
+			if len(update.BookedRevokes) != 0 || len(buys)+len(sells) != 2 {
+				t.Fatal("startup revoked orders using the configured lot size")
+			}
+			if mkt.lifecycleState != db.MarketStateDraining || mkt.currentEpoch != nil {
+				t.Fatal("startup reopened trading while completing suspension")
+			}
+		})
+	}
+}
+
+// requireEpochRevokeSet checks that the event's epoch revokes cover exactly
+// the given orders, sorted by ID, all with the penalty-free reason.
+func requireEpochRevokeSet(t *testing.T, update *db.MarketStartedUpdate, want []order.Order) {
+	t.Helper()
+	if len(update.EpochRevokes) != len(want) {
+		t.Fatalf("epoch revokes = %d, want %d", len(update.EpochRevokes), len(want))
+	}
+	wantIDs := make([]order.OrderID, len(want))
+	for i, ord := range want {
+		wantIDs[i] = ord.ID()
+	}
+	sort.Slice(wantIDs, func(i, j int) bool {
+		return bytes.Compare(wantIDs[i][:], wantIDs[j][:]) < 0
+	})
+	for i, revoke := range update.EpochRevokes {
+		if revoke.Order.ID() != wantIDs[i] {
+			t.Fatalf("epoch revoke %d ID = %v, want %v", i, revoke.Order.ID(), wantIDs[i])
+		}
+		if revoke.Reason != meshevents.StartupOrderRevokeReasonEpochAbandoned {
+			t.Fatalf("epoch revoke %d reason = %d, want %d", i,
+				revoke.Reason, meshevents.StartupOrderRevokeReasonEpochAbandoned)
 		}
 	}
 }

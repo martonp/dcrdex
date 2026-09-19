@@ -186,6 +186,8 @@ type Market struct {
 
 	mmSnapshotMtx  sync.RWMutex
 	mmSnapshotSubs map[account.AccountID]struct{}
+
+	mesh MeshService
 }
 
 // Storage is the DB interface required by Market.
@@ -554,6 +556,12 @@ func (m *Market) lockEpochOrderCoins(ords []order.Order) error {
 		locked = append(locked, ord)
 	}
 	return nil
+}
+
+// SetMeshService sets the mesh service used to submit commands and events.
+// Call it before starting market workers or serving requests.
+func (m *Market) SetMeshService(mesh MeshService) {
+	m.mesh = mesh
 }
 
 func (m *Market) wakeLifecycleDriver() {
@@ -2888,24 +2896,6 @@ func (m *Market) ScaleFeeRate(assetID uint32, feeRate uint64) uint64 {
 	}
 	// It started non-zero, so don't allow it to go to zero.
 	return uint64(math.Max(1.0, math.Round(float64(feeRate)*feeScale)))
-}
-
-type accountStats struct {
-	qty, lots uint64
-	redeems   int
-}
-
-type accountCounter map[string]*accountStats
-
-func (a accountCounter) add(addr string, qty, lots uint64, redeems int) {
-	stats, found := a[addr]
-	if !found {
-		stats = new(accountStats)
-		a[addr] = stats
-	}
-	stats.qty += qty
-	stats.lots += lots
-	stats.redeems += redeems
 }
 
 // SubscribeMMSnapshots subscribes or unsubscribes a user from per-epoch market
