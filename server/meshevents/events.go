@@ -27,5 +27,6 @@ func decodeEvent[T any, PT interface {
 const (
 	EventKindBondPosted          = "bond_posted"
 	EventKindPrepaidBondsCreated = "prepaid_bonds_created"
+	EventKindMarketStarted       = "market_started"
 	EventKindReputationForgiven  = "reputation_forgiven"
 )

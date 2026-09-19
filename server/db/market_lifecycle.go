@@ -1,0 +1,95 @@
+// This code is available on the terms of the project LICENSE.md file,
+// also available online at https://blueoakcouncil.org/license/1.0.0.
+
+package db
+
+import "fmt"
+
+// ProjectMarketStartedLifecycle returns the lifecycle state after startup
+// recovery. It performs no storage I/O. changed is false when no update is needed.
+func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedUpdate) (next *MarketLifecycle, changed bool, err error) {
+	if update == nil {
+		return nil, false, fmt.Errorf("nil market started update")
+	}
+
+	// A market's first start creates its lifecycle state.
+	if prev == nil {
+		return newRunningMarketLifecycle(update), true, nil
+	}
+
+	// Startup repair revokes leftover epoch orders, so a draining market can
+	// finish suspension without processing those abandoned epochs.
+	if prev.State == MarketStateDraining {
+		// Trading remains stopped, so keep the existing trading parameters.
+		if update.EpochDur != prev.StartEpochDur || update.RunParams != prev.RunParams {
+			return nil, false, fmt.Errorf("market_started must carry the run's pinned parameters while market %s drains", update.Market)
+		}
+		if prev.ProcessedEpochIdx == prev.FinalEpochIdx {
+			return prev, false, nil
+		}
+		next := *prev
+		next.ProcessedEpochIdx = prev.FinalEpochIdx
+		return &next, true, nil
+	}
+
+	// If the state is not running or draining, it means it is stopped. This
+	// state requires a market resume rather than a market started event.
+	if prev.State != MarketStateRunning {
+		return nil, false, fmt.Errorf("market_started for market %s in state %d", update.Market, prev.State)
+	}
+
+	// Startup revokes leftover epoch orders. Set ProcessedEpochIdx to the epoch
+	// before trading restarts, or to the final epoch if suspension is due.
+	switch prev.PendingAction {
+	case MarketPendingNone:
+		return newRunningMarketLifecycle(update), true, nil
+	case MarketPendingSuspend:
+		// Keep the epoch duration used to schedule the suspension.
+		if update.EpochDur != prev.PendingEpochDur {
+			return nil, false, fmt.Errorf("market_started duration %d mismatches pending suspend duration %d for market %s; "+
+				"the epoch duration cannot change while a suspend is pending",
+				update.EpochDur, prev.PendingEpochDur, update.Market)
+		}
+
+		if update.CurrentEpochIdx > prev.PendingEpochIdx {
+			// The final trading epoch passed while the server was down.
+			// Enter draining without reopening trading or changing parameters.
+			if update.RunParams != prev.RunParams {
+				return nil, false, fmt.Errorf("market_started must carry the run's pinned parameters while market %s completes its suspend", update.Market)
+			}
+			next := *prev
+			next.State = MarketStateDraining
+			next.PendingAction = MarketPendingNone
+			next.PendingEpochIdx = 0
+			next.PendingEpochDur = 0
+			next.ActiveEpochIdx = 0
+			next.ProcessedEpochIdx = prev.FinalEpochIdx
+			return &next, true, nil
+		}
+
+		// Restart trading at the current epoch and keep the scheduled suspension.
+		next := *prev
+		next.ActiveEpochIdx = update.CurrentEpochIdx
+		next.ProcessedEpochIdx = update.CurrentEpochIdx - 1
+		next.RunParams = update.RunParams
+		return &next, true, nil
+	default:
+		// If the pending action is resume, it means the market was in stopped state,
+		// and we would have errored above already.
+		return nil, false, fmt.Errorf("market %s lifecycle row has invalid state/action %d/%d",
+			update.Market, prev.State, prev.PendingAction)
+	}
+}
+
+func newRunningMarketLifecycle(update *MarketStartedUpdate) *MarketLifecycle {
+	return &MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateRunning,
+		StartEpochIdx:     update.CurrentEpochIdx,
+		StartEpochDur:     update.EpochDur,
+		PendingAction:     MarketPendingNone,
+		ActiveEpochIdx:    update.CurrentEpochIdx,
+		ProcessedEpochIdx: update.CurrentEpochIdx - 1,
+		RunParams:         update.RunParams,
+	}
+}
