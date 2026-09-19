@@ -51,6 +51,8 @@ type TMarket struct {
 	resumeEpoch int64
 	resumeTime  time.Time
 	persist     bool
+	persistSet  bool
+	lifecycle   market.LifecyclePhase
 }
 
 type TCore struct {
@@ -113,13 +115,18 @@ func (c *TCore) MarketStatus(mktName string) *market.Status {
 	if mkt.suspend != nil {
 		suspendEpoch = mkt.suspend.Idx
 	}
+	var persist *bool
+	if mkt.suspend != nil || mkt.persistSet {
+		persistLocal := mkt.persist
+		persist = &persistLocal
+	}
 	return &market.Status{
 		Running:       mkt.running,
 		EpochDuration: mkt.dur,
 		ActiveEpoch:   mkt.activeEpoch,
 		StartEpoch:    mkt.startEpoch,
 		SuspendEpoch:  suspendEpoch,
-		PersistBook:   mkt.persist,
+		PersistBook:   persist,
 	}
 }
 
@@ -154,24 +161,35 @@ func (c *TCore) MarketStatuses() map[string]*market.Status {
 		if mkt.suspend != nil {
 			suspendEpoch = mkt.suspend.Idx
 		}
+		var persist *bool
+		if mkt.suspend != nil || mkt.persistSet {
+			persistLocal := mkt.persist
+			persist = &persistLocal
+		}
 		mktStatuses[name] = &market.Status{
 			Running:       mkt.running,
 			EpochDuration: mkt.dur,
 			ActiveEpoch:   mkt.activeEpoch,
 			StartEpoch:    mkt.startEpoch,
 			SuspendEpoch:  suspendEpoch,
-			PersistBook:   mkt.persist,
+			PersistBook:   persist,
 		}
 	}
 	return mktStatuses
 }
 
-func (c *TCore) MarketRunning(mktName string) (found, running bool) {
+func (c *TCore) MarketLifecyclePhase(mktName string) (found bool, phase market.LifecyclePhase) {
 	mkt := c.market(mktName)
 	if mkt == nil {
-		return
+		return false, market.LifecyclePhaseUnknown
 	}
-	return true, mkt.running
+	if mkt.lifecycle != market.LifecyclePhaseUnknown {
+		return true, mkt.lifecycle
+	}
+	if mkt.running {
+		return true, market.LifecyclePhaseRunning
+	}
+	return true, market.LifecyclePhaseSuspended
 }
 
 func (c *TCore) EnableDataAPI(yes bool) {
@@ -401,6 +419,40 @@ func TestMarkets(t *testing.T) {
 			log.Errorf("incorrect market status. got %v, expected %v", stat, wantStat)
 		}
 	}
+
+	// Pending resume has no final epoch, but still exposes the preserved
+	// persist flag.
+	tMkt.running = false
+	tMkt.startEpoch = 12350
+	tMkt.persist = true
+	tMkt.persistSet = true
+	w = httptest.NewRecorder()
+	r, _ = http.NewRequest(http.MethodGet, "https://localhost/markets", nil)
+	r.RemoteAddr = "localhost"
+
+	mux.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("apiMarkets returned code %d, expected %d", w.Code, http.StatusOK)
+	}
+
+	exp = `{
+    "dcr_btc": {
+        "running": false,
+        "epochlen": 1234,
+        "activeepoch": 12343,
+        "startepoch": 12350,
+        "persistbook": true
+    }
+}
+`
+	if exp != w.Body.String() {
+		t.Errorf("unexpected response %q, wanted %q", w.Body.String(), exp)
+	}
+
+	tMkt.running = true
+	tMkt.startEpoch = 12340
+	tMkt.persistSet = false
 
 	// Set suspend data.
 	tMkt.suspend = &market.SuspendEpoch{Idx: 12345, End: time.UnixMilli(int64(dur) * idx)}

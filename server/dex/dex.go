@@ -463,6 +463,7 @@ func (ss *subsystem) stop() {
 // DEX is the DEX manager, which creates and controls the lifetime of all
 // components of the DEX.
 type DEX struct {
+	meshSvc     *mesh.Service
 	network     dex.Network
 	markets     map[string]*market.Market
 	assets      map[uint32]*swap.SwapperAsset
@@ -1244,14 +1245,14 @@ func (dm *DEX) ConfigMsg() json.RawMessage {
 	return dm.configResp.configEnc
 }
 
-// TODO: for just market running status, the DEX manager should use its
-// knowledge of Market subsystem state.
-func (dm *DEX) MarketRunning(mktName string) (found, running bool) {
+// MarketLifecyclePhase reports the named market's suspend/resume control
+// phase. found is false when the market is unknown.
+func (dm *DEX) MarketLifecyclePhase(mktName string) (found bool, phase market.LifecyclePhase) {
 	mkt := dm.markets[mktName]
 	if mkt == nil {
-		return
+		return false, market.LifecyclePhaseUnknown
 	}
-	return true, mkt.Running()
+	return true, mkt.LifecyclePhase()
 }
 
 // MarketStatus returns the market.Status for the named market. If the market is
@@ -1274,52 +1275,14 @@ func (dm *DEX) MarketStatuses() map[string]*market.Status {
 	return statuses
 }
 
-// SuspendMarket schedules a suspension of a given market, with the option to
-// persist the orders on the book (or purge the book automatically on market
-// shutdown). The scheduled final epoch and suspend time are returned. This is a
-// passthrough to the OrderRouter. A TradeSuspension notification is broadcasted
-// to all connected clients.
+// SuspendMarket schedules a market suspension.
 func (dm *DEX) SuspendMarket(name string, tSusp time.Time, persistBooks bool) (suspEpoch *market.SuspendEpoch, err error) {
 	name = strings.ToLower(name)
-
-	// Locate the (running) subsystem for this market.
-	i := dm.findSubsys(marketSubSysName(name))
-	if i == -1 {
-		err = fmt.Errorf("market subsystem %s not found", name)
+	if dm.markets[name] == nil {
+		err = fmt.Errorf("unknown market %s", name)
 		return
 	}
-	if !dm.subsystems[i].ssw.On() {
-		err = fmt.Errorf("market subsystem %s is not running", name)
-		return
-	}
-
-	// Go through the order router since OrderRouter is likely to have market
-	// status tracking built into it to facilitate resume.
-	suspEpoch = dm.orderRouter.SuspendMarket(name, tSusp, persistBooks)
-	if suspEpoch == nil {
-		err = fmt.Errorf("unable to locate market %s", name)
-		return
-	}
-
-	// Update config message with suspend schedule.
-	dm.configRespMtx.Lock()
-	dm.configResp.setMktSuspend(name, uint64(suspEpoch.Idx), persistBooks)
-	dm.configRespMtx.Unlock()
-
-	// Broadcast a TradeSuspension notification to all connected clients.
-	note, errMsg := msgjson.NewNotification(msgjson.SuspensionRoute, msgjson.TradeSuspension{
-		MarketID:    name,
-		FinalEpoch:  uint64(suspEpoch.Idx),
-		SuspendTime: uint64(suspEpoch.End.UnixMilli()),
-		Persist:     persistBooks,
-	})
-	if errMsg != nil {
-		log.Errorf("Failed to create suspend notification: %v", errMsg)
-		// Notification or not, the market is resuming, so do not return error.
-	} else {
-		dm.server.Broadcast(note)
-	}
-	return
+	return market.ExecuteScheduleSuspend(context.Background(), dm.meshSvc, name, tSusp, persistBooks)
 }
 
 func (dm *DEX) findSubsys(name string) int {
@@ -1331,9 +1294,7 @@ func (dm *DEX) findSubsys(name string) int {
 	return -1
 }
 
-// ResumeMarket launches a stopped market subsystem as early as the given time.
-// The actual time the market will resume depends on the configure epoch
-// duration, as the market only starts at the beginning of an epoch.
+// ResumeMarket schedules a market resumption.
 func (dm *DEX) ResumeMarket(name string, asSoonAs time.Time) (startEpoch int64, startTime time.Time, err error) {
 	name = strings.ToLower(name)
 	mkt := dm.markets[name]
@@ -1341,58 +1302,7 @@ func (dm *DEX) ResumeMarket(name string, asSoonAs time.Time) (startEpoch int64, 
 		err = fmt.Errorf("unknown market %s", name)
 		return
 	}
-
-	// Get the next available start epoch given the earliest allowed time.
-	// Requires the market to be stopped already.
-	startEpoch = mkt.ResumeEpoch(asSoonAs)
-	if startEpoch == 0 {
-		err = fmt.Errorf("unable to resume market %s at time %v", name, asSoonAs)
-		return
-	}
-
-	// Locate the (stopped) subsystem for this market.
-	i := dm.findSubsys(marketSubSysName(name))
-	if i == -1 {
-		err = fmt.Errorf("market subsystem %s not found", name)
-		return
-	}
-	if dm.subsystems[i].ssw.On() {
-		err = fmt.Errorf("market subsystem %s not stopped", name)
-		return
-	}
-
-	// Update config message with resume schedule.
-	dm.configRespMtx.Lock()
-	epochLen := dm.configResp.setMktResume(name, uint64(startEpoch))
-	dm.configRespMtx.Unlock()
-	if epochLen == 0 {
-		return // couldn't set the new start epoch
-	}
-
-	// Configure the start epoch with the Market.
-	startTimeMS := int64(epochLen) * startEpoch
-	startTime = time.UnixMilli(startTimeMS)
-	mkt.SetStartEpochIdx(startEpoch)
-
-	// Relaunch the market.
-	ssw := dex.NewStartStopWaiter(mkt)
-	dm.subsystems[i].ssw = ssw
-	ssw.Start(context.Background())
-
-	// Broadcast a TradeResumption notification to all connected clients.
-	note, errMsg := msgjson.NewNotification(msgjson.ResumptionRoute, msgjson.TradeResumption{
-		MarketID:   name,
-		ResumeTime: uint64(startTimeMS),
-		StartEpoch: uint64(startEpoch),
-	})
-	if errMsg != nil {
-		log.Errorf("Failed to create resume notification: %v", errMsg)
-		// Notification or not, the market is resuming, so do not return error.
-	} else {
-		dm.server.Broadcast(note)
-	}
-
-	return
+	return market.ExecuteScheduleResume(context.Background(), dm.meshSvc, name, asSoonAs)
 }
 
 // AccountInfo returns data for an account.
@@ -1623,4 +1533,74 @@ func parseBaseQuoteIDs(r *http.Request) (baseID, quoteID uint32, errMsg string) 
 		return 0, 0, "unknown quote"
 	}
 	return
+}
+
+// setMktLifecycle projects a market's durable lifecycle row into the served
+// market status.
+func (cr *configResponse) setMktLifecycle(lc *db.MarketLifecycle) {
+	if lc == nil {
+		return
+	}
+	for _, mkt := range cr.configMsg.Markets {
+		if mkt.Name == lc.Market {
+			mkt.MarketStatus.StartEpoch = uint64(lc.StartEpochIdx)
+			mkt.MarketStatus.FinalEpoch = uint64(lc.FinalEpochIdx)
+			mkt.MarketStatus.Persist = lc.PersistBook
+			if lc.RunParams.LotSize != 0 {
+				mkt.LotSize = lc.RunParams.LotSize
+				mkt.RateStep = lc.RunParams.RateStep
+				mkt.ParcelSize = lc.RunParams.ParcelSize
+				mkt.EpochLen = uint64(lc.StartEpochDur)
+			}
+			cr.remarshal()
+			return
+		}
+	}
+	log.Errorf("Failed to update MarketStatus for market %q", lc.Market)
+}
+
+func (dm *DEX) updateConfigMarketLifecycle(lc *db.MarketLifecycle) {
+	dm.configRespMtx.Lock()
+	defer dm.configRespMtx.Unlock()
+	dm.configResp.setMktLifecycle(lc)
+}
+
+// broadcastLifecycleNote sends a suspend/resume schedule note to clients.
+func (dm *DEX) broadcastLifecycleNote(kind, route string, payload any) {
+	note, err := msgjson.NewNotification(route, payload)
+	if err != nil {
+		log.Errorf("Failed to create %s notification: %v", kind, err)
+		return
+	}
+	dm.server.Broadcast(note)
+}
+
+// newLifecycleUpdated keeps served market config current and notifies clients
+// of scheduled suspend/resume. getDEX may be nil during NewDEX construction.
+func newLifecycleUpdated(getDEX func() *DEX) market.LifecycleUpdated {
+	return func(transition market.LifecycleTransition, lc *db.MarketLifecycle) {
+		dexMgr := getDEX()
+		if dexMgr == nil || lc == nil {
+			return
+		}
+		dexMgr.updateConfigMarketLifecycle(lc)
+		switch transition {
+		case market.LifecycleTransitionScheduleSuspend:
+			if lc.PersistBook == nil {
+				return
+			}
+			dexMgr.broadcastLifecycleNote("suspend", msgjson.SuspensionRoute, msgjson.TradeSuspension{
+				MarketID:    lc.Market,
+				FinalEpoch:  uint64(lc.FinalEpochIdx),
+				SuspendTime: uint64(lc.SuspendTime().UnixMilli()),
+				Persist:     *lc.PersistBook,
+			})
+		case market.LifecycleTransitionScheduleResume:
+			dexMgr.broadcastLifecycleNote("resume", msgjson.ResumptionRoute, msgjson.TradeResumption{
+				MarketID:   lc.Market,
+				ResumeTime: uint64(lc.ResumeTime().UnixMilli()),
+				StartEpoch: uint64(lc.PendingEpochIdx),
+			})
+		}
+	}
 }

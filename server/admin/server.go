@@ -65,7 +65,7 @@ type SvrCore interface {
 	Asset(id uint32) (*asset.BackedAsset, error)
 	SetFeeRateScale(assetID uint32, scale float64)
 	ScaleFeeRate(assetID uint32, rate uint64) uint64
-	MarketRunning(mktName string) (found, running bool)
+	MarketLifecyclePhase(mktName string) (found bool, phase market.LifecyclePhase)
 	MarketStatus(mktName string) *market.Status
 	MarketStatuses() map[string]*market.Status
 	SuspendMarket(name string, tSusp time.Time, persistBooks bool) (*market.SuspendEpoch, error)

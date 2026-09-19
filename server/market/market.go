@@ -811,18 +811,6 @@ func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx in
 	return
 }
 
-// ResumeEpoch returns the first epoch starting after both asSoonAs and the
-// current time, using the current run's epoch duration. It returns zero if
-// the market is already running.
-func (m *Market) ResumeEpoch(asSoonAs time.Time) int64 {
-	if m.Running() {
-		return 0
-	}
-
-	dur := m.liveParams.Load().epochDur
-	return 1 + max(asSoonAs.UnixMilli(), time.Now().UnixMilli())/dur
-}
-
 // buildScheduleResumeEvent builds an event scheduling resumption and returns
 // the scheduled starting epoch and its start time.
 // It fails if the market is already running.
@@ -927,6 +915,16 @@ type Status struct {
 	ParcelSize  uint32
 }
 
+// LifecyclePhase is the market's suspend/resume control phase.
+type LifecyclePhase uint8
+
+const (
+	LifecyclePhaseUnknown    LifecyclePhase = iota
+	LifecyclePhaseRunning                   // live; suspend may be scheduled
+	LifecyclePhaseSuspended                 // parked; resume may be scheduled
+	LifecyclePhaseSuspending                // final epoch closed; suspend event pending
+)
+
 // persistBookForStatusLocked reports whether PersistBook should appear in
 // Status: only once a suspend/resume decision exists. Caller holds epochMtx.
 func (m *Market) persistBookForStatusLocked() *bool {
@@ -958,6 +956,26 @@ func (m *Market) Status() *Status {
 		PersistBook:   m.persistBookForStatusLocked(),
 		Base:          m.base,
 		Quote:         m.quote,
+	}
+}
+
+// LifecyclePhase reports this market's suspend/resume control phase.
+func (m *Market) LifecyclePhase() LifecyclePhase {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	liveEpoch := m.currentEpoch != nil || m.activeEpochIdx > 0
+	switch {
+	case m.lifecycleState == db.MarketStateRunning &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingSuspend) &&
+		liveEpoch:
+		return LifecyclePhaseRunning
+	case m.lifecycleState == db.MarketStateDraining:
+		return LifecyclePhaseSuspending
+	case m.lifecycleState == db.MarketStateSuspended &&
+		(m.pendingLifecycleAction == db.MarketPendingNone || m.pendingLifecycleAction == db.MarketPendingResume):
+		return LifecyclePhaseSuspended
+	default:
+		return LifecyclePhaseUnknown
 	}
 }
 

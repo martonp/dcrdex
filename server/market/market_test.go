@@ -5235,8 +5235,8 @@ func TestApplyAdvanceEpochEvent(t *testing.T) {
 			mkt.pendingLifecycleEpochIdx != 0 || mkt.pendingLifecycleEpochDur != 0 {
 			t.Fatal("final close did not stop intake and clear the pending suspension")
 		}
-		if mkt.currentEpoch != nil || mkt.nextEpoch != nil {
-			t.Fatal("draining market still has epoch queues")
+		if mkt.currentEpoch != nil || mkt.nextEpoch != nil || mkt.LifecyclePhase() != LifecyclePhaseSuspending {
+			t.Fatal("draining market still has epoch queues or the wrong phase")
 		}
 		epochDur := f.event.EpochDur
 		if err := mkt.validateScheduleSuspendEvent(closedEpochIdx+1, epochDur); err == nil {
