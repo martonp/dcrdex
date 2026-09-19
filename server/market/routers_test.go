@@ -202,6 +202,10 @@ func (a *TAuth) Send(user account.AccountID, msg *msgjson.Message) error {
 
 	return nil
 }
+func (a *TAuth) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
+	return a.Send(user, msg)
+}
+
 func (a *TAuth) getSend() *msgjson.Message {
 	a.sendsMtx.Lock()
 	defer a.sendsMtx.Unlock()

@@ -375,6 +375,13 @@ func (r *BookRouter) seedBook(book *msgBook) {
 	book.running = true
 }
 
+func (r *BookRouter) applyMarketStartedEvent(book *msgBook, epochIdx int64, removed []*order.LimitOrder) {
+	book.setEpoch(epochIdx)
+	for _, lo := range removed {
+		r.unbookOrder(book, lo)
+	}
+}
+
 // runBook is a monitoring loop for an order book.
 func (r *BookRouter) runBook(ctx context.Context, book *msgBook) {
 	// Get the initial book.

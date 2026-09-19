@@ -31,6 +31,7 @@ type AuthManager interface {
 	AcctStatus(user account.AccountID) (connected bool, tier int64)
 	Sign(...msgjson.Signable)
 	Send(account.AccountID, *msgjson.Message) error
+	SendIfLocal(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message), time.Duration, func()) error
 	PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID)

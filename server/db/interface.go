@@ -220,6 +220,8 @@ type OrderArchiver interface {
 	// order. This will follow the final step in swap negotiation, for an order
 	// that is not on the book.
 	SetOrderCompleteTime(ord order.Order, compTimeMs int64) error
+
+	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 }
 
 // Account holds data returned by Accounts.
