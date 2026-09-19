@@ -139,6 +139,20 @@ func (a *Archiver) applyAdvanceEpochLifecycleTx(tx *sql.Tx, event *meshevents.Ad
 	return a.updateMarketLifecycleTx(tx, next)
 }
 
+// applyEpochProcessedLifecycleTx locks the lifecycle row, checks that the epoch
+// is next to be processed, and advances ProcessedEpochIdx.
+func (a *Archiver) applyEpochProcessedLifecycleTx(tx *sql.Tx, market string, epochIdx, epochDur int64) error {
+	lc, err := a.marketLifecycleForUpdate(tx, market)
+	if err != nil {
+		return err
+	}
+	next, err := db.ProjectEpochProcessedLifecycle(lc, market, epochIdx, epochDur)
+	if err != nil {
+		return err
+	}
+	return a.updateMarketLifecycleTx(tx, next)
+}
+
 // checkOrderAcceptanceTx locks the market's lifecycle row and checks
 // that the current lifecycle permits accepting the order into its epoch.
 func (a *Archiver) checkOrderAcceptanceTx(tx *sql.Tx, market string, epochIdx, epochDur, orderTimeMs int64) error {
@@ -180,6 +194,10 @@ func selectOrderIDsByStatus(dbe sqlQueryer, tableName string, status pgOrderStat
 	return scanOrderIDRows(dbe.Query(fmt.Sprintf(internal.SelectOrderIDsByStatus, tableName), status))
 }
 
+func selectOrderIDsByStatusAndEpoch(dbe sqlQueryer, tableName string, status pgOrderStatus, epochIdx, epochDur int64) ([]order.OrderID, error) {
+	return scanOrderIDRows(dbe.Query(fmt.Sprintf(internal.SelectOrderIDsByStatusAndEpoch, tableName), status, epochIdx, epochDur))
+}
+
 func scanOrderIDRows(rows *sql.Rows, err error) ([]order.OrderID, error) {
 	if err != nil {
 		return nil, err
@@ -211,6 +229,26 @@ func (a *Archiver) activeEpochOrderIDsTx(tx *sql.Tx, base, quote uint32) ([]orde
 	}
 	cancelsActive := fullCancelOrderTableName(a.dbName, marketSchema, orderStatusEpoch.active())
 	cancelIDs, err := selectOrderIDsByStatus(tx, cancelsActive, orderStatusEpoch)
+	if err != nil {
+		return nil, err
+	}
+	return append(tradeIDs, cancelIDs...), nil
+}
+
+// unprocessedEpochOrderIDsTx returns trade and cancel order IDs still in epoch
+// status for the specified market and epoch.
+func (a *Archiver) unprocessedEpochOrderIDsTx(tx *sql.Tx, base, quote uint32, epochIdx, epochDur int64) ([]order.OrderID, error) {
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return nil, err
+	}
+	tradesActive := fullOrderTableName(a.dbName, marketSchema, orderStatusEpoch.active())
+	tradeIDs, err := selectOrderIDsByStatusAndEpoch(tx, tradesActive, orderStatusEpoch, epochIdx, epochDur)
+	if err != nil {
+		return nil, err
+	}
+	cancelsActive := fullCancelOrderTableName(a.dbName, marketSchema, orderStatusEpoch.active())
+	cancelIDs, err := selectOrderIDsByStatusAndEpoch(tx, cancelsActive, orderStatusEpoch, epochIdx, epochDur)
 	if err != nil {
 		return nil, err
 	}

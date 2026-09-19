@@ -30,5 +30,6 @@ const (
 	EventKindOrderAccepted       = "order_accepted"
 	EventKindMarketStarted       = "market_started"
 	EventKindAdvanceEpoch        = "advance_epoch"
+	EventKindEpochProcessed      = "epoch_processed"
 	EventKindReputationForgiven  = "reputation_forgiven"
 )

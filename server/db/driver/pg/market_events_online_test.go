@@ -6,6 +6,7 @@ import (
 	"context"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -228,4 +229,321 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 			PersistBook:       &persistBook, RunParams: lifecycle.RunParams,
 		})
 	})
+}
+
+func TestApplyEpochProcessedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const epochIdx, epochDur int64 = 13245678, 6000
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		RunParams:     testMarketRunParams(),
+		Market:        "dcr_btc",
+		State:         db.MarketStateRunning,
+		StartEpochIdx: epochIdx,
+		StartEpochDur: epochDur,
+		PendingAction: db.MarketPendingNone,
+		// The epoch is closed but has not been processed.
+		ActiveEpochIdx:    epochIdx + 1,
+		ProcessedEpochIdx: epochIdx - 1,
+	})
+
+	storeEpochOrder := func(label string, ord order.Order, idx int64, status order.OrderStatus) {
+		t.Helper()
+
+		if err := storeOrderForTest(archie, ord, idx, epochDur, status); err != nil {
+			t.Fatalf("StoreOrder %s %v error: %v", label, ord.ID(), err)
+		}
+	}
+
+	storeEpochCancel := func(label string, cancel *order.CancelOrder, idx int64, gap int32) {
+		t.Helper()
+
+		if err := archie.storeOrder(archie.db, cancel, idx, epochDur, gap, orderStatusEpoch); err != nil {
+			t.Fatalf("storeOrder (epoch) %s error: %v", label, err)
+		}
+	}
+
+	booked := newLimitOrder(false, 5_000_000, 1, order.StandingTiF, 10)
+	storeEpochOrder("booked", booked, epochIdx, order.OrderStatusEpoch)
+	partial := newLimitOrder(false, 5_050_000, 3, order.StandingTiF, 13)
+	storeEpochOrder("partial", partial, epochIdx, order.OrderStatusBooked)
+	partial.Trade().SetFill(LotSize)
+	cancelTarget := newLimitOrder(false, 5_025_000, 1, order.StandingTiF, 14)
+	storeEpochOrder("cancel target", cancelTarget, epochIdx, order.OrderStatusBooked)
+	fastCancel := newCancelOrder(booked.ID(), AssetDCR, AssetBTC, 11)
+	storeEpochCancel("fast cancel", fastCancel, epochIdx, 1)
+	freeCancel := newCancelOrder(booked.ID(), AssetDCR, AssetBTC, 12)
+	storeEpochCancel("free cancel", freeCancel, epochIdx, 2)
+	matchedCancel := newCancelOrder(cancelTarget.ID(), AssetDCR, AssetBTC, 15)
+	storeEpochCancel("matched cancel", matchedCancel, epochIdx, 1)
+	maker := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 20)
+	taker := newLimitOrder(true, 4_800_000, 1, order.ImmediateTiF, 21)
+	for _, ord := range []order.Order{maker, taker} {
+		storeEpochOrder("match", ord, epochIdx, order.OrderStatusExecuted)
+	}
+	match := newMatch(maker, taker, taker.Quantity, order.EpochID{
+		Idx: uint64(epochIdx),
+		Dur: uint64(epochDur),
+	})
+	cancelMatch := newMatch(cancelTarget, matchedCancel, 0, order.EpochID{
+		Idx: uint64(epochIdx),
+		Dur: uint64(epochDur),
+	})
+	update := &db.EpochProcessedUpdate{
+		Epoch: &db.EpochResults{
+			MktBase:        AssetDCR,
+			MktQuote:       AssetBTC,
+			Idx:            epochIdx,
+			Dur:            epochDur,
+			MatchTime:      (epochIdx + 1) * epochDur,
+			CSum:           []byte{0x01, 0x02},
+			Seed:           []byte{0x03, 0x04},
+			OrdersRevealed: []order.OrderID{booked.ID()},
+			MatchVolume:    match.Quantity,
+			QuoteVolume:    match.Quantity * match.Rate,
+			HighRate:       5_000_000,
+			LowRate:        4_800_000,
+			StartRate:      4_900_000,
+			EndRate:        4_950_000,
+		},
+		TradesBooked:    []*order.LimitOrder{booked},
+		TradesPartial:   []*order.LimitOrder{partial},
+		TradesCanceled:  []*order.LimitOrder{cancelTarget},
+		CancelsExecuted: []*order.CancelOrder{fastCancel, freeCancel, matchedCancel},
+		Matches:         []*order.Match{match, cancelMatch},
+	}
+
+	// Apply the order and match changes together with the event-log entry.
+	event := []byte("epoch-processed-event")
+	policy := &db.ReputationOutcomePolicy{OrderLimit: 10, FreeCancelThreshold: 2}
+	logEntry, err := archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{Event: event}, policy, update)
+	if err != nil {
+		t.Fatalf("ApplyEpochProcessedEvent error: %v", err)
+	}
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindEpochProcessed, event, update)
+	requireEventApplyLog(t, logEntry, 1, meshevents.EventKindEpochProcessed, event, tip, update)
+	assertEventLogFrontier(t, ctx, 1, tip)
+
+	for _, want := range []struct {
+		name   string
+		ord    order.Order
+		status order.OrderStatus
+		filled int64
+	}{
+		{"booked", booked, order.OrderStatusBooked, 0},
+		{"partial", partial, order.OrderStatusBooked, int64(LotSize)},
+		{"cancel target", cancelTarget, order.OrderStatusCanceled, 0},
+		{"fast cancel", fastCancel, order.OrderStatusExecuted, -1},
+		{"free cancel", freeCancel, order.OrderStatusExecuted, -1},
+		{"matched cancel", matchedCancel, order.OrderStatusExecuted, -1},
+	} {
+		status, _, filled, err := archie.OrderStatus(want.ord)
+		if err != nil {
+			t.Fatalf("%s OrderStatus: %v", want.name, err)
+		}
+		if status != want.status || filled != want.filled {
+			t.Errorf("%s status/filled = %v/%d, want %v/%d", want.name, status, filled, want.status, want.filled)
+		}
+	}
+
+	for _, want := range []struct {
+		name   string
+		match  *order.Match
+		status order.MatchStatus
+		active bool
+	}{
+		{"trade", match, order.NewlyMatched, true},
+		{"cancel", cancelMatch, order.MatchComplete, false},
+	} {
+		stored, err := archie.MatchByID(want.match.ID(), AssetDCR, AssetBTC)
+		if err != nil {
+			t.Fatalf("%s MatchByID: %v", want.name, err)
+		}
+		if stored.Status != want.status || stored.Active != want.active {
+			t.Errorf("%s match status/active = %v/%v, want %v/%v", want.name, stored.Status, stored.Active, want.status, want.active)
+		}
+	}
+
+	for _, want := range []struct {
+		name      string
+		cancel    *order.CancelOrder
+		penalized bool
+	}{
+		{"fast cancel", fastCancel, true},
+		{"free cancel", freeCancel, false},
+		{"matched cancel", matchedCancel, true},
+	} {
+		_, _, outcomes, err := archie.GetUserReputationData(ctx, want.cancel.User(), 10, 10, 10)
+		if err != nil {
+			t.Fatalf("%s GetUserReputationData: %v", want.name, err)
+		}
+		if len(outcomes) != 1 || outcomes[0].OrderID != want.cancel.ID() || outcomes[0].Canceled != want.penalized {
+			t.Errorf("%s outcomes = %+v, want one outcome for %v with canceled=%t", want.name, outcomes, want.cancel.ID(), want.penalized)
+		}
+	}
+
+	rate, err := archie.LastEpochRate(AssetDCR, AssetBTC)
+	if err != nil {
+		t.Fatalf("LastEpochRate: %v", err)
+	}
+	if rate != update.Epoch.EndRate {
+		t.Errorf("last rate = %d, want %d", rate, update.Epoch.EndRate)
+	}
+	requireProcessedEpoch(t, epochIdx)
+}
+
+// TestApplyEpochProcessedPreimageOutcomes checks preimage storage and reputation
+// updates while a draining market finishes processing its closed epochs.
+func TestApplyEpochProcessedPreimageOutcomes(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const epochIdx, epochDur int64 = 13245678, 6000
+	persist := true
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		RunParams:     testMarketRunParams(),
+		Market:        "dcr_btc",
+		State:         db.MarketStateDraining,
+		StartEpochIdx: epochIdx,
+		StartEpochDur: epochDur,
+		FinalEpochIdx: epochIdx + 1,
+		FinalEpochDur: epochDur,
+		PendingAction: db.MarketPendingNone,
+		PersistBook:   &persist,
+		// Both closed epochs still need to be processed.
+		ProcessedEpochIdx: epochIdx - 1,
+	})
+	revealed, pi := newLimitOrderRevealed(false, 4_900_000, 1, order.StandingTiF, 0)
+	missed, _ := newLimitOrderRevealed(true, 4_800_000, 1, order.StandingTiF, 10)
+	for _, ord := range []order.Order{revealed, missed} {
+		if err := storeOrderForTest(archie, ord, epochIdx, epochDur, order.OrderStatusEpoch); err != nil {
+			t.Fatalf("StoreOrder %v error: %v", ord.ID(), err)
+		}
+	}
+
+	epochEnd := time.UnixMilli((epochIdx + 1) * epochDur).UTC()
+	revokeTime := epochEnd.Add(500 * time.Millisecond)
+	update := &db.EpochProcessedUpdate{
+		Epoch: &db.EpochResults{
+			MktBase:   AssetDCR,
+			MktQuote:  AssetBTC,
+			Idx:       epochIdx,
+			Dur:       epochDur,
+			MatchTime: epochEnd.UnixMilli(),
+			CSum:      []byte{0x0c},
+			Seed:      []byte{0x5e},
+		},
+		Misses: []*db.PreimageMissUpdate{{
+			Order:      missed,
+			RevokeTime: revokeTime,
+		}},
+		Reveals: []*db.PreimageRevealUpdate{{
+			Order:    revealed,
+			Preimage: pi,
+		}},
+		// Every processed order must leave epoch status.
+		TradesBooked: []*order.LimitOrder{revealed},
+	}
+
+	// Apply one event and verify its durable DB effects.
+	event := []byte("epoch-processed-event")
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, OrderLimit: 1}
+	logEntry, err := archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{Event: event}, policy, update)
+	if err != nil {
+		t.Fatalf("ApplyEpochProcessedEvent error: %v", err)
+	}
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindEpochProcessed, event, update)
+	requireEventApplyLog(t, logEntry, 1, meshevents.EventKindEpochProcessed, event, tip, update)
+	assertEventLogFrontier(t, ctx, 1, tip)
+	requireProcessedEpoch(t, epochIdx)
+
+	// Reveals store preimages; misses revoke the order.
+	gotPI, err := archie.OrderPreimage(revealed)
+	if err != nil {
+		t.Fatalf("OrderPreimage error: %v", err)
+	}
+	if gotPI != pi {
+		t.Fatalf("stored preimage = %x, want %x", gotPI, pi)
+	}
+	if _, status, err := archie.Order(missed.ID(), missed.Base(), missed.Quote()); err != nil || status != order.OrderStatusRevoked {
+		t.Fatalf("missed order status = %v, err = %v, want revoked", status, err)
+	}
+
+	// The event facts are translated into reputation outcomes by the DB layer.
+	missedPimgs, _, missedOrds, err := archie.GetUserReputationData(ctx, missed.User(), 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData missed user error: %v", err)
+	}
+	if len(missedPimgs) != 1 || !missedPimgs[0].Miss || len(missedOrds) != 1 || missedOrds[0].Canceled {
+		t.Fatalf("missed user reputation data pimgs=%+v ords=%+v, want miss and non-canceled revoke", missedPimgs, missedOrds)
+	}
+	revealPimgs, _, revealOrds, err := archie.GetUserReputationData(ctx, revealed.User(), 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData revealed user error: %v", err)
+	}
+	if len(revealPimgs) != 1 || revealPimgs[0].Miss || len(revealOrds) != 0 {
+		t.Fatalf("revealed user reputation data pimgs=%+v ords=%+v, want one success preimage only", revealPimgs, revealOrds)
+	}
+}
+
+func TestApplyEpochProcessedRejectsUnprocessedOrders(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	ctx := context.Background()
+	const epochIdx, epochDur int64 = 13245678, 6000
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		RunParams:         testMarketRunParams(),
+		Market:            "dcr_btc",
+		State:             db.MarketStateRunning,
+		StartEpochIdx:     epochIdx,
+		StartEpochDur:     epochDur,
+		ActiveEpochIdx:    epochIdx + 1,
+		ProcessedEpochIdx: epochIdx - 1,
+	})
+	included := newLimitOrder(false, 5_100_000, 1, order.StandingTiF, 30)
+	omitted := newLimitOrder(true, 5_200_000, 1, order.StandingTiF, 40)
+	for _, ord := range []order.Order{included, omitted} {
+		if err := storeOrderForTest(archie, ord, epochIdx, epochDur, order.OrderStatusEpoch); err != nil {
+			t.Fatalf("StoreOrder %v: %v", ord.ID(), err)
+		}
+	}
+	// Booking only one order leaves the other in epoch status.
+	update := &db.EpochProcessedUpdate{
+		Epoch: &db.EpochResults{
+			MktBase:   AssetDCR,
+			MktQuote:  AssetBTC,
+			Idx:       epochIdx,
+			Dur:       epochDur,
+			MatchTime: (epochIdx + 1) * epochDur,
+			CSum:      []byte{0x0c},
+			Seed:      []byte{0x5e},
+		},
+		TradesBooked: []*order.LimitOrder{included},
+	}
+	_, err := archie.ApplyEpochProcessedEvent(ctx, &db.EventLogMeta{Event: []byte("epoch-processed-incomplete")}, nil, update)
+	if err == nil || !strings.Contains(err.Error(), "leaves 1 orders in epoch status") {
+		t.Fatalf("incomplete processing error = %v, want epoch-status rejection", err)
+	}
+	if status, _, _, err := archie.OrderStatus(included); err != nil || status != order.OrderStatusEpoch {
+		t.Fatalf("included order status = %v, err = %v, want unchanged epoch status", status, err)
+	}
+	assertEventLogFrontier(t, ctx, 0, nil)
+	requireProcessedEpoch(t, epochIdx-1)
+}
+
+func requireProcessedEpoch(t *testing.T, want int64) {
+	t.Helper()
+	lifecycle, err := archie.MarketLifecycle("dcr_btc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lifecycle == nil || lifecycle.ProcessedEpochIdx != want {
+		t.Fatalf("lifecycle = %+v, want last processed epoch %d", lifecycle, want)
+	}
 }

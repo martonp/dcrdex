@@ -203,3 +203,107 @@ func TestProjectAdvanceEpochLifecycle(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectEpochProcessedLifecycle(t *testing.T) {
+	persist := true
+	const market = "dcr_btc"
+	const dur int64 = 10_000
+
+	row := func(active, processed int64, pending MarketPendingAction) *MarketLifecycle {
+		lc := &MarketLifecycle{
+			Market:            market,
+			State:             MarketStateRunning,
+			StartEpochIdx:     10,
+			StartEpochDur:     dur,
+			PendingAction:     pending,
+			ActiveEpochIdx:    active,
+			ProcessedEpochIdx: processed,
+		}
+		if pending == MarketPendingSuspend {
+			lc.FinalEpochIdx, lc.FinalEpochDur = 20, dur
+			lc.PendingEpochIdx, lc.PendingEpochDur = 20, dur
+			lc.PersistBook = &persist
+		}
+		return lc
+	}
+
+	draining := func(processed int64) *MarketLifecycle {
+		lc := row(0, processed, MarketPendingNone)
+		lc.State = MarketStateDraining
+		lc.FinalEpochIdx, lc.FinalEpochDur = 20, dur
+		lc.PersistBook = &persist
+		return lc
+	}
+
+	tests := []struct {
+		name          string
+		prev          *MarketLifecycle
+		epochIdx      int64
+		epochDur      int64
+		wantProcessed int64
+		wantErr       bool
+	}{
+		{
+			name: "processes the newest closed epoch",
+			prev: row(16, 14, MarketPendingNone), epochIdx: 15, epochDur: dur,
+			wantProcessed: 15,
+		}, {
+			name: "rejects skipping an epoch",
+			prev: row(16, 13, MarketPendingNone), epochIdx: 15, epochDur: dur,
+			wantErr: true,
+		}, {
+			name: "rejects the still-open epoch",
+			prev: row(16, 15, MarketPendingNone), epochIdx: 16, epochDur: dur,
+			wantErr: true,
+		}, {
+			name: "pending suspend allows processing before the final epoch",
+			prev: row(19, 17, MarketPendingSuspend), epochIdx: 18, epochDur: dur,
+			wantProcessed: 18,
+		}, {
+			name: "draining allows processing before the final epoch",
+			prev: draining(18), epochIdx: 19, epochDur: dur,
+			wantProcessed: 19,
+		}, {
+			name: "draining allows processing the final epoch",
+			prev: draining(19), epochIdx: 20, epochDur: dur,
+			wantProcessed: 20,
+		}, {
+			name: "draining rejects a duration mismatch",
+			prev: draining(19), epochIdx: 20, epochDur: dur + 1,
+			wantErr: true,
+		}, {
+			name: "drain rejects past the final epoch",
+			prev: draining(20), epochIdx: 21, epochDur: dur,
+			wantErr: true,
+		}, {
+			name: "rejects a suspended market",
+			prev: func() *MarketLifecycle {
+				lc := row(16, 15, MarketPendingNone)
+				lc.State = MarketStateSuspended
+				return lc
+			}(), epochIdx: 16, epochDur: dur,
+			wantErr: true,
+		}, {
+			name:    "rejects a missing row",
+			prev:    nil,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			next, err := ProjectEpochProcessedLifecycle(tt.prev, market, tt.epochIdx, tt.epochDur)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected projection error, got %+v", next)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProjectEpochProcessedLifecycle: %v", err)
+			}
+			if next.ProcessedEpochIdx != tt.wantProcessed {
+				t.Fatalf("last processed epoch = %d, want %d", next.ProcessedEpochIdx, tt.wantProcessed)
+			}
+		})
+	}
+}

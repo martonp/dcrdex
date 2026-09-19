@@ -225,6 +225,7 @@ type OrderArchiver interface {
 	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
+	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 }
 
 // Account holds data returned by Accounts.
@@ -962,6 +963,39 @@ type ReputationOutcomePolicy struct {
 	// Successful cancellations with a nonnegative epoch gap below this
 	// threshold are penalized.
 	FreeCancelThreshold int32
+}
+
+// PreimageMissUpdate identifies an order to revoke for a missing preimage and
+// the time to record for its revocation.
+type PreimageMissUpdate struct {
+	Order      order.Order
+	RevokeTime time.Time
+}
+
+// PreimageRevealUpdate contains an order and its revealed preimage.
+type PreimageRevealUpdate struct {
+	Order    order.Order
+	Preimage order.Preimage
+}
+
+// EpochProcessedUpdate contains the database changes resulting from matching
+// an epoch, including preimage results, order changes, and matches.
+type EpochProcessedUpdate struct {
+	Epoch           *EpochResults
+	Misses          []*PreimageMissUpdate
+	Reveals         []*PreimageRevealUpdate
+	TradesBooked    []*order.LimitOrder
+	TradesPartial   []*order.LimitOrder
+	TradesCompleted []order.Order
+	TradesCanceled  []*order.LimitOrder
+
+	// TradesFailed contains orders that did not match and will not enter the
+	// book, such as market orders and immediate limit orders. They are archived
+	// with executed status.
+	TradesFailed    []order.Order
+	CancelsFailed   []*order.CancelOrder
+	CancelsExecuted []*order.CancelOrder
+	Matches         []*order.Match
 }
 
 // StartupOrderRevoke contains an order and its startup revocation reason.

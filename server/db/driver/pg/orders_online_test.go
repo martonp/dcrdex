@@ -1501,7 +1501,7 @@ func TestStorePreimage(t *testing.T) {
 
 	err = archie.StorePreimage(lo, pi)
 	if err != nil {
-		t.Fatalf("StoreOrder failed: %v", err)
+		t.Fatalf("StorePreimage failed: %v", err)
 	}
 
 	piOut, err := archie.OrderPreimage(lo)
