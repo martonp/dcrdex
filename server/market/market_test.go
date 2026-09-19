@@ -13,6 +13,7 @@ import (
 	"math"
 	"math/rand"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -4183,6 +4184,164 @@ func requireRevokedOrderGone(t *testing.T, mkt *Market, lo *order.LimitOrder) {
 		if mkt.CoinLocked(assetID, []byte(coin)) {
 			t.Fatalf("revoked order %v coin %x remains locked", lo.ID(), coin)
 		}
+	}
+}
+
+func TestBuildEpochProcessedUpdate(t *testing.T) {
+	const epochIdx, epochDur int64 = 4321, 6000
+	const lastRate uint64 = 2 * dcrRateStep
+	matchTime := time.UnixMilli(epochIdx*epochDur + 100)
+	missRevokeTime := matchTime.Add(time.Second)
+
+	type updateCounts struct {
+		booked, partial, completed, canceled int
+		failed, cancelsFailed, cancelsDone   int
+		matches                              int
+	}
+	tests := []struct {
+		name string
+		kind string
+		want updateCounts
+	}{
+		{"unmatched standing order and missed preimage", "standing", updateCounts{booked: 1}},
+		{"partial maker fill and completed taker", "trade", updateCounts{partial: 1, completed: 1, matches: 1}},
+		{"canceled maker and executed cancel", "cancel", updateCounts{canceled: 1, cancelsDone: 1, matches: 1}},
+		{"empty epoch retains the previous rate", "empty", updateCounts{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mkt := &Market{name: mktName3, base: mkt3.Base, quote: mkt3.Quote,
+				book: book.New(dcrLotSize, 0), matcher: matcher.New()}
+			mkt.liveParams.Store(&marketRun{MarketRunParams: meshevents.MarketRunParams{LotSize: dcrLotSize}, epochDur: epochDur})
+
+			var maker *order.LimitOrder
+			if tt.kind == "trade" || tt.kind == "cancel" {
+				maker = makeLO(buyer3, mkRate3(1.0, 1.2), 3, order.StandingTiF)
+				maker.SetTime(time.UnixMilli(epochIdx*epochDur - 1))
+				maker.AddFill(dcrLotSize)
+				if !mkt.book.Insert(maker) {
+					t.Fatal("insert maker")
+				}
+			}
+			var epochOrder order.Order
+			var preimage order.Preimage
+			switch tt.kind {
+			case "standing":
+				epochOrder, preimage = makeLORevealed(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+			case "trade":
+				epochOrder, preimage = makeLORevealed(seller3, maker.Rate-dcrRateStep, 1, order.ImmediateTiF)
+			case "cancel":
+				epochOrder, preimage = makeCORevealed(buyer3, maker.ID())
+			}
+			var revealed []*matcher.OrderRevealed
+			var epochOrders, misses []order.Order
+			var revealedIDs, missedIDs []order.OrderID
+			if epochOrder != nil {
+				epochOrder.SetTime(time.UnixMilli(epochIdx*epochDur + 1))
+				revealed = []*matcher.OrderRevealed{{Order: epochOrder, Preimage: preimage}}
+				epochOrders = append(epochOrders, epochOrder)
+				revealedIDs = append(revealedIDs, epochOrder.ID())
+			}
+			if tt.kind == "standing" {
+				missed := makeLO(seller3, mkRate3(1.2, 1.4), 1, order.StandingTiF)
+				misses = []order.Order{missed}
+				epochOrders = append(epochOrders, missed)
+				missedIDs = []order.OrderID{missed.ID()}
+			}
+			cSum := matcher.CSum(epochOrders)
+			event := meshevents.NewEpochProcessedEvent(mkt.name, epochIdx, epochDur,
+				matchTime, 11, 22, lastRate, cSum, revealed, misses, missRevokeTime)
+			mkt.bookMtx.Lock()
+			result, err := mkt.buildEpochProcessedUpdate(event)
+			mkt.bookMtx.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			update := result.dbUpdate
+			got := updateCounts{
+				booked: len(update.TradesBooked), partial: len(update.TradesPartial),
+				completed: len(update.TradesCompleted), canceled: len(update.TradesCanceled),
+				failed: len(update.TradesFailed), cancelsFailed: len(update.CancelsFailed),
+				cancelsDone: len(update.CancelsExecuted), matches: len(update.Matches),
+			}
+			if got != tt.want {
+				t.Fatalf("updates = %+v, want %+v", got, tt.want)
+			}
+			epoch := update.Epoch
+			if epoch == nil || epoch.MktBase != mkt.base || epoch.MktQuote != mkt.quote ||
+				epoch.Idx != epochIdx || epoch.Dur != epochDur || epoch.MatchTime != matchTime.UnixMilli() || !bytes.Equal(epoch.CSum, cSum) {
+				t.Fatalf("unexpected epoch results: %+v", epoch)
+			}
+			if !slices.Equal(epoch.OrdersRevealed, revealedIDs) || !slices.Equal(epoch.OrdersMissed, missedIDs) {
+				t.Fatalf("revealed/missed IDs = %v/%v, want %v/%v", epoch.OrdersRevealed, epoch.OrdersMissed, revealedIDs, missedIDs)
+			}
+			if len(update.Reveals) != len(revealed) || len(update.Misses) != len(misses) {
+				t.Fatalf("reveals/misses = %d/%d, want %d/%d", len(update.Reveals), len(update.Misses), len(revealed), len(misses))
+			}
+			if len(revealed) != 0 && (update.Reveals[0].Order.ID() != epochOrder.ID() || update.Reveals[0].Preimage != preimage) {
+				t.Fatalf("unexpected reveal: %+v", update.Reveals[0])
+			}
+			if len(misses) != 0 && (update.Misses[0].Order.ID() != misses[0].ID() || !update.Misses[0].RevokeTime.Equal(missRevokeTime)) {
+				t.Fatalf("unexpected miss: %+v", update.Misses[0])
+			}
+
+			if tt.want.booked != 0 && update.TradesBooked[0].ID() != epochOrder.ID() {
+				t.Fatal("wrong booked order")
+			}
+			if tt.want.partial != 0 && (update.TradesPartial[0].ID() != maker.ID() || update.TradesPartial[0].Filled() != 2*dcrLotSize) {
+				t.Fatal("wrong partially filled maker or fill amount")
+			}
+			if tt.want.completed != 0 && (update.TradesCompleted[0].ID() != epochOrder.ID() || update.TradesCompleted[0].Trade().Filled() != dcrLotSize) {
+				t.Fatal("wrong completed taker or fill amount")
+			}
+			if tt.want.canceled != 0 && (update.TradesCanceled[0].ID() != maker.ID() || update.CancelsExecuted[0].ID() != epochOrder.ID()) {
+				t.Fatal("wrong canceled maker or executed cancel")
+			}
+			if tt.want.matches != 0 {
+				match := update.Matches[0]
+				wantQty := uint64(dcrLotSize)
+				if tt.kind == "cancel" {
+					wantQty = 2 * dcrLotSize
+				}
+				if match.Maker.ID() != maker.ID() || match.Taker.ID() != epochOrder.ID() || match.Quantity != wantQty || match.Rate != maker.Rate ||
+					match.Epoch.Idx != uint64(epochIdx) || match.Epoch.Dur != uint64(epochDur) || match.FeeRateBase != 11 || match.FeeRateQuote != 22 {
+					t.Fatalf("unexpected match: %+v", match)
+				}
+			}
+			wantRate := lastRate
+			var wantReport [][2]int64
+			if tt.kind == "trade" {
+				wantRate = maker.Rate
+				wantReport = [][2]int64{{int64(maker.Rate), int64(dcrLotSize)}}
+			}
+			if epoch.StartRate != wantRate || epoch.EndRate != wantRate || epoch.HighRate != wantRate || epoch.LowRate != wantRate {
+				t.Fatalf("epoch rates = %d/%d/%d/%d, want %d", epoch.StartRate, epoch.EndRate, epoch.HighRate, epoch.LowRate, wantRate)
+			}
+			if !slices.Equal(result.matchReport, wantReport) {
+				t.Fatalf("match report = %v, want %v", result.matchReport, wantReport)
+			}
+
+			// Planning must neither alter the live book nor consume the revealed
+			// orders' fills before they are matched against it after commit.
+			wantBookSize := 0
+			if maker != nil {
+				wantBookSize = 1
+				if !mkt.book.HaveOrder(maker.ID()) || maker.Filled() != dcrLotSize {
+					t.Fatal("builder removed or changed the live maker")
+				}
+			}
+			if mkt.book.BuyCount()+mkt.book.SellCount() != wantBookSize {
+				t.Fatal("builder changed live book membership")
+			}
+			if len(result.revealed) != len(revealed) {
+				t.Fatalf("preserved reveals = %d, want %d", len(result.revealed), len(revealed))
+			}
+			for _, preserved := range result.revealed {
+				if trade := preserved.Order.Trade(); trade != nil && trade.Filled() != 0 {
+					t.Fatal("builder changed the preserved revealed order's fill")
+				}
+			}
+		})
 	}
 }
 

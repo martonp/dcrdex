@@ -2485,6 +2485,27 @@ func (m *Market) getFeeRate(assetID uint32, f FeeFetcher) uint64 {
 	return rate
 }
 
+// epochProcessedResult contains the match results and database changes for a
+// processed epoch.
+type epochProcessedResult struct {
+	seed        []byte
+	matches     []*order.MatchSet
+	revealed    []*matcher.OrderRevealed
+	misses      []order.Order
+	failed      []*matcher.OrderRevealed
+	doneOK      []*matcher.OrderRevealed
+	partial     []*matcher.OrderRevealed
+	booked      []*matcher.OrderRevealed
+	nomatched   []*matcher.OrderRevealed
+	unbooked    []*order.LimitOrder
+	updates     *matcher.OrdersUpdated
+	stats       *matcher.MatchCycleStats
+	matchReport [][2]int64
+
+	dbUpdate       *db.EpochProcessedUpdate
+	updateLastRate bool
+}
+
 // processReadyEpoch performs the following operations for a closed epoch that
 // has finished preimage collection via collectPreimages:
 //  1. Perform matching with the order book.
@@ -2844,6 +2865,244 @@ func (m *Market) processReadyEpoch(epoch *readyEpoch, notifyChan chan<- *updateS
 			epoch.Epoch, epoch.Duration)
 		m.swapper.Negotiate(matches)
 	}
+}
+
+func cloneOrderForMatching(ord order.Order) (order.Order, error) {
+	switch o := ord.(type) {
+	case *order.LimitOrder:
+		return cloneLimitOrderForMatching(o), nil
+	case *order.MarketOrder:
+		return &order.MarketOrder{
+			P: o.P,
+			T: *o.T.Copy(),
+		}, nil
+	case *order.CancelOrder:
+		return &order.CancelOrder{
+			P:             o.P,
+			TargetOrderID: o.TargetOrderID,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported order type %T", ord)
+	}
+}
+
+func cloneLimitOrderForMatching(ord *order.LimitOrder) *order.LimitOrder {
+	return &order.LimitOrder{
+		P:     ord.P,
+		T:     *ord.T.Copy(),
+		Rate:  ord.Rate,
+		Force: ord.Force,
+	}
+}
+
+func cloneRevealedOrdersForMatching(revealed []*matcher.OrderRevealed) ([]*matcher.OrderRevealed, error) {
+	copies := make([]*matcher.OrderRevealed, 0, len(revealed))
+	for _, revealedOrder := range revealed {
+		if revealedOrder == nil {
+			return nil, fmt.Errorf("nil revealed order")
+		}
+		ord, err := cloneOrderForMatching(revealedOrder.Order)
+		if err != nil {
+			return nil, err
+		}
+		copies = append(copies, &matcher.OrderRevealed{
+			Order:    ord,
+			Preimage: revealedOrder.Preimage,
+		})
+	}
+	return copies, nil
+}
+
+// matchingBookSnapshotLocked copies the book for matching without changing live
+// state. The orders must also be copied because matching changes their filled
+// quantities. The caller must hold bookMtx.
+func (m *Market) matchingBookSnapshotLocked() (*book.Book, error) {
+	bookCopy := book.New(m.LotSize(), 0)
+	for _, side := range [][]*order.LimitOrder{m.book.BuyOrders(), m.book.SellOrders()} {
+		for _, ord := range side {
+			orderCopy := cloneLimitOrderForMatching(ord)
+			if !bookCopy.Insert(orderCopy) {
+				return nil, fmt.Errorf("failed to insert cloned book order %v", ord.ID())
+			}
+		}
+	}
+	return bookCopy, nil
+}
+
+func stampEpochMatchSets(event *meshevents.EpochProcessedEvent, matches []*order.MatchSet) {
+	for _, ms := range matches {
+		ms.Epoch.Idx = uint64(event.EpochIdx)
+		ms.Epoch.Dur = uint64(event.EpochDur)
+		ms.FeeRateBase = event.FeeRateBase
+		ms.FeeRateQuote = event.FeeRateQuote
+	}
+}
+
+// applyEpochStatsLastRate carries the previous trade rate forward when the epoch
+// contains no trade matches, including epochs with only cancellations.
+func applyEpochStatsLastRate(stats *matcher.MatchCycleStats, lastRate uint64) {
+	if stats.EndRate != 0 {
+		return
+	}
+	stats.EndRate = lastRate
+	stats.StartRate = lastRate
+	stats.HighRate = lastRate
+	stats.LowRate = lastRate
+}
+
+// epochMatchReport groups consecutive trade matches with the same rate and taker
+// side into [rate, signed quantity] pairs. Sell quantities are positive and buy
+// quantities are negative. Cancel matches are excluded.
+func epochMatchReport(matches []*order.MatchSet) [][2]int64 {
+	matchReport := make([][2]int64, 0, len(matches))
+	var lastRate uint64
+	var lastSell bool
+	for _, matchSet := range matches {
+		for _, match := range matchSet.Matches() {
+			trade := match.Taker.Trade()
+			if trade == nil {
+				continue
+			}
+			if len(matchReport) == 0 || match.Rate != lastRate || trade.Sell != lastSell {
+				matchReport = append(matchReport, [2]int64{int64(match.Rate), 0})
+				lastRate, lastSell = match.Rate, trade.Sell
+			}
+			if trade.Sell {
+				matchReport[len(matchReport)-1][1] += int64(match.Quantity)
+			} else {
+				matchReport[len(matchReport)-1][1] -= int64(match.Quantity)
+			}
+		}
+	}
+	return matchReport
+}
+
+// buildEpochProcessedUpdate runs the matcher on copies of the book and revealed
+// orders and builds the database update without changing market state.
+// The caller must hold bookMtx.
+func (m *Market) buildEpochProcessedUpdate(event *meshevents.EpochProcessedEvent) (*epochProcessedResult, error) {
+	ordersRevealed, err := event.OrdersRevealed()
+	if err != nil {
+		return nil, err
+	}
+	misses, err := event.MissedOrders()
+	if err != nil {
+		return nil, err
+	}
+
+	// Matching changes fills in both the book orders and the revealed orders.
+	// Run it on copies first so a failed database update leaves live state
+	// unchanged. After the update commits, matching runs again on the live book
+	// with the original revealed orders and their initial fills.
+	matchingOrders, err := cloneRevealedOrdersForMatching(ordersRevealed)
+	if err != nil {
+		return nil, err
+	}
+	bookCopy, err := m.matchingBookSnapshotLocked()
+	if err != nil {
+		return nil, err
+	}
+	seed, matches, _, failed, doneOK, partial, booked, nomatched, unbooked, updates, stats := m.matcher.Match(bookCopy, matchingOrders)
+	stampEpochMatchSets(event, matches)
+
+	if len(ordersRevealed) > 0 {
+		log.Infof("Matching complete for market %v epoch %d:"+
+			" %d matches (%d partial fills), %d completed OK (not booked),"+
+			" %d booked, %d unbooked, %d failed",
+			m.name, event.EpochIdx,
+			len(matches), len(partial), len(doneOK),
+			len(booked), len(unbooked), len(failed),
+		)
+	}
+
+	// Build the epoch results and order updates to be stored together.
+	oidsRevealed := make([]order.OrderID, 0, len(matchingOrders))
+	for _, revealedOrder := range matchingOrders {
+		oidsRevealed = append(oidsRevealed, revealedOrder.Order.ID())
+	}
+	oidsMissed := make([]order.OrderID, 0, len(misses))
+	for _, missedOrder := range misses {
+		oidsMissed = append(oidsMissed, missedOrder.ID())
+	}
+
+	applyEpochStatsLastRate(stats, event.LastRate)
+
+	epochResults := &db.EpochResults{
+		MktBase:        m.base,
+		MktQuote:       m.quote,
+		Idx:            event.EpochIdx,
+		Dur:            event.EpochDur,
+		MatchTime:      event.MatchTime,
+		CSum:           event.CSum,
+		Seed:           seed,
+		OrdersRevealed: oidsRevealed,
+		OrdersMissed:   oidsMissed,
+		MatchVolume:    stats.MatchVolume,
+		QuoteVolume:    stats.QuoteVolume,
+		BookBuys:       stats.BookBuys,
+		BookBuys5:      stats.BookBuys5,
+		BookBuys25:     stats.BookBuys25,
+		BookSells:      stats.BookSells,
+		BookSells5:     stats.BookSells5,
+		BookSells25:    stats.BookSells25,
+		HighRate:       stats.HighRate,
+		LowRate:        stats.LowRate,
+		StartRate:      stats.StartRate,
+		EndRate:        stats.EndRate,
+	}
+
+	dbMatches := make([]*order.Match, 0)
+	for _, matchSet := range matches {
+		dbMatches = append(dbMatches, matchSet.Matches()...)
+	}
+
+	missRevokeTime := time.UnixMilli(event.MissRevokeTime)
+	missUpdates := make([]*db.PreimageMissUpdate, 0, len(misses))
+	for _, ord := range misses {
+		missUpdates = append(missUpdates, &db.PreimageMissUpdate{
+			Order:      ord,
+			RevokeTime: missRevokeTime,
+		})
+	}
+	revealUpdates := make([]*db.PreimageRevealUpdate, 0, len(ordersRevealed))
+	for _, revealedOrder := range ordersRevealed {
+		revealUpdates = append(revealUpdates, &db.PreimageRevealUpdate{
+			Order:    revealedOrder.Order,
+			Preimage: revealedOrder.Preimage,
+		})
+	}
+
+	dbUpdate := &db.EpochProcessedUpdate{
+		Epoch:           epochResults,
+		Misses:          missUpdates,
+		Reveals:         revealUpdates,
+		TradesBooked:    updates.TradesBooked,
+		TradesPartial:   updates.TradesPartial,
+		TradesCompleted: updates.TradesCompleted,
+		TradesCanceled:  updates.TradesCanceled,
+		TradesFailed:    updates.TradesFailed,
+		CancelsFailed:   updates.CancelsFailed,
+		CancelsExecuted: updates.CancelsExecuted,
+		Matches:         dbMatches,
+	}
+
+	return &epochProcessedResult{
+		seed:           seed,
+		matches:        matches,
+		revealed:       ordersRevealed,
+		misses:         misses,
+		failed:         failed,
+		doneOK:         doneOK,
+		partial:        partial,
+		booked:         booked,
+		nomatched:      nomatched,
+		unbooked:       unbooked,
+		updates:        updates,
+		stats:          stats,
+		matchReport:    epochMatchReport(matches),
+		dbUpdate:       dbUpdate,
+		updateLastRate: stats.EndRate != event.LastRate || len(matches) > 0,
+	}, nil
 }
 
 func (m *Market) validateOrderAcceptedEvent(ord order.Order, book *msgBook) (*validatedOrderAcceptedEvent, error) {
