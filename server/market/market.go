@@ -2088,15 +2088,16 @@ func (m *Market) handlePreimageResp(msg *msgjson.Message, reqData *piData) {
 // collectPreimages solicits preimages from the owners of each of the orders in
 // the provided queue with a 'preimage' ntfn/request via AuthManager.Request,
 // and returns the preimages contained in the client responses. This function
-// can block for up to 20 seconds (piTimeout) to allow clients time to respond.
-// Clients that fail to respond, or respond with invalid data (see
-// handlePreimageResp), are counted as misses.
+// can block for up to the preimage deadline (piTimeout below) to allow clients
+// time to respond. Clients that fail to respond, or respond with invalid data
+// (see handlePreimageResp), are counted as misses.
 func (m *Market) collectPreimages(orders []order.Order) (cSum []byte, ordersRevealed []*matcher.OrderRevealed, misses []order.Order) {
 	// Compute the commitment checksum for the order queue.
 	cSum = matcher.CSum(orders)
 
-	// Request preimages from the clients.
-	piTimeout := 20 * time.Second
+	// Two-thirds of an epoch, capped at 20s, so one unresponsive owner cannot
+	// delay the close by a full epoch.
+	piTimeout := min(20*time.Second, 2*time.Duration(m.EpochDuration())*time.Millisecond/3)
 	preimages := make(map[order.Order]chan *order.Preimage, len(orders))
 	for _, ord := range orders {
 		// Make the 'preimage' request.
