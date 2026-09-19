@@ -4,9 +4,12 @@ package pg
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/order"
@@ -224,4 +227,142 @@ func requireMatchForgiven(t *testing.T, ctx context.Context, mid db.MarketMatchI
 	if forgiven != want {
 		t.Fatalf("match forgiven = %v, want %v", forgiven, want)
 	}
+}
+
+func TestApplyRepEventTx(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	ctx := context.Background()
+	calls := captureRepListener(t)
+	userA, userB := randomAccountID(), randomAccountID()
+	userBPreimage, userBOrder := randomReputationOrderID(), randomReputationOrderID()
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, OrderLimit: 1}
+
+	// A failed callback must not record the batch or notify listeners.
+	applyErr := errors.New("apply failed")
+	_, err := archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-fail")},
+		"test_reputation", []byte("rep-listener-fail-tx"), policy,
+		func(_ *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.orders = []*reputationOrderOutcome{{user: userA, oid: randomReputationOrderID()}}
+			return applyErr
+		})
+	if !errors.Is(err, applyErr) {
+		t.Fatalf("applyRepEventTx error = %v, want %v", err, applyErr)
+	}
+	requireRepListenerCall(t, *calls, 0)
+
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-commit")},
+		"test_reputation", []byte("rep-listener-commit-tx"), policy,
+		func(_ *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.preimages = []*reputationPreimageOutcome{
+				{user: userA, oid: randomReputationOrderID(), miss: true},
+				{user: userB, oid: userBPreimage},
+			}
+			batch.orders = []*reputationOrderOutcome{
+				{user: userA, oid: randomReputationOrderID()},
+				{user: userB, oid: userBOrder},
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("applyRepEventTx error: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 1, userA, userB)
+
+	preimages, matches, orders, err := archie.GetUserReputationData(ctx, userA, 10, 10, 10)
+	if err != nil {
+		t.Fatalf("GetUserReputationData error: %v", err)
+	}
+	if len(preimages) != 1 || len(orders) != 1 || len(matches) != 0 {
+		t.Fatalf("userA outcomes preimages=%d orders=%d matches=%d, want 1/1/0", len(preimages), len(orders), len(matches))
+	}
+
+	// Retain the newest outcomes for userA without pruning userB's outcomes.
+	keepPreimage, keepOrder := randomReputationOrderID(), randomReputationOrderID()
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-prune")},
+		"test_reputation", []byte("rep-prune-tx"), policy,
+		func(_ *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.preimages = []*reputationPreimageOutcome{
+				{user: userA, oid: randomReputationOrderID(), miss: true},
+				{user: userA, oid: keepPreimage},
+			}
+			batch.orders = []*reputationOrderOutcome{
+				{user: userA, oid: randomReputationOrderID(), penalizedCancel: true},
+				{user: userA, oid: keepOrder},
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("applyRepEventTx prune: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 2, userA)
+	for _, want := range []struct {
+		user                     account.AccountID
+		preimageOrderID, orderID order.OrderID
+	}{
+		{userA, keepPreimage, keepOrder},
+		{userB, userBPreimage, userBOrder},
+	} {
+		// Request more than the retention limit so read-side trimming cannot hide a failure to prune.
+		preimages, _, orders, err := archie.GetUserReputationData(ctx, want.user, 10, 10, 10)
+		if err != nil {
+			t.Fatalf("GetUserReputationData: %v", err)
+		}
+		if len(preimages) != 1 || preimages[0].OrderID != want.preimageOrderID || preimages[0].Miss {
+			t.Fatalf("user %v preimages = %+v, want success %v", want.user, preimages, want.preimageOrderID)
+		}
+		if len(orders) != 1 || orders[0].OrderID != want.orderID || orders[0].Canceled {
+			t.Fatalf("user %v orders = %+v, want completion %v", want.user, orders, want.orderID)
+		}
+	}
+
+	// Empty batch: committed, no notify.
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-listener-empty")},
+		"test_reputation", []byte("rep-listener-empty-tx"), policy,
+		func(_ *sql.Tx, batch *reputationOutcomeBatch) error { return nil })
+	if err != nil {
+		t.Fatalf("applyRepEventTx empty error: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 2, userA)
+}
+
+// TestApplyRepEventTxCancellation checks that canceling a blocked reputation
+// insert returns a cancellation error without marking the database backend as
+// failed, committing an event-log entry, or notifying reputation listeners.
+func TestApplyRepEventTxCancellation(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+	calls := captureRepListener(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Hold the points table lock so insertion waits until cancellation.
+	lockTx, err := archie.db.Begin()
+	if err != nil {
+		t.Fatalf("begin blocking transaction: %v", err)
+	}
+	defer lockTx.Rollback()
+	if _, err := lockTx.Exec(fmt.Sprintf("LOCK TABLE %s IN ACCESS EXCLUSIVE MODE", archie.tables.points)); err != nil {
+		t.Fatalf("lock points table: %v", err)
+	}
+
+	user := randomAccountID()
+	_, err = archie.applyRepEventTx(ctx, &db.EventLogMeta{Event: []byte("rep-canceled")},
+		"test_reputation", []byte("rep-canceled-tx"), &db.ReputationOutcomePolicy{OrderLimit: 1},
+		func(_ *sql.Tx, batch *reputationOutcomeBatch) error {
+			batch.orders = []*reputationOrderOutcome{{user: user, oid: randomReputationOrderID()}}
+			timer := time.AfterFunc(100*time.Millisecond, cancel)
+			t.Cleanup(func() { timer.Stop() })
+			return nil
+		})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyRepEventTx error = %v, want context.Canceled", err)
+	}
+	if err := archie.LastErr(); err != nil {
+		t.Fatalf("cancellation marked backend failed: %v", err)
+	}
+	requireRepListenerCall(t, *calls, 0)
+	assertEventLogFrontier(t, context.Background(), 0, nil)
 }
