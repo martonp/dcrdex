@@ -368,6 +368,42 @@ func TestRevokeOrder(t *testing.T) {
 		t.Errorf("generated cancel order did not have NULL/zero-value commitment")
 	}
 
+	t.Run("rollback", func(t *testing.T) {
+		lo := newLimitOrder(false, 4800000, 2, order.StandingTiF, 1)
+		lo.FillAmt = LotSize
+		if err := archie.StoreOrder(lo, epochIdx, epochDur, order.OrderStatusBooked); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := archie.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		cancelID, err := archie.revokeBookedOrderByID(tx, lo.ID(), lo.User(), lo.Base(), lo.Quote(), false, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, oid := range []order.OrderID{lo.ID(), cancelID} {
+			status, _, filled, err := archie.orderStatusByID(tx, oid, lo.Base(), lo.Quote())
+			if err != nil || status != orderStatusRevoked {
+				t.Fatalf("order %v within transaction: status %v, error %v", oid, status, err)
+			}
+			if oid == lo.ID() && filled != int64(lo.Filled()) {
+				t.Fatalf("revocation changed filled amount: got %v, want %v", filled, lo.Filled())
+			}
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		status, _, filled, err := archie.OrderStatusByID(lo.ID(), lo.Base(), lo.Quote())
+		if err != nil || status != order.OrderStatusBooked || filled != int64(lo.Filled()) {
+			t.Fatalf("order after rollback: status %v, filled %v, error %v", status, filled, err)
+		}
+		if _, _, err := archie.Order(cancelID, lo.Base(), lo.Quote()); !db.IsErrOrderUnknown(err) {
+			t.Fatalf("cancel order after rollback: expected unknown order, got %v", err)
+		}
+	})
+
 	// Revoke an order not in the tables yet
 	lo2 := newLimitOrder(true, 4600000, 1, order.StandingTiF, 0)
 	_, _, err = archie.RevokeOrder(lo2)
