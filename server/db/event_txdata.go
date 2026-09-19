@@ -14,6 +14,10 @@ func int64Bytes(v int64) []byte {
 	return encode.Uint64Bytes(uint64(v))
 }
 
+func int32Bytes(v int32) []byte {
+	return encode.Uint32Bytes(uint32(v))
+}
+
 func orderTypeBytes(t order.OrderType) []byte {
 	return []byte{byte(t)}
 }
@@ -45,6 +49,22 @@ func startupOrderRevokesTxData(ords []*StartupOrderRevoke) ([]byte, error) {
 			len(b), encode.MaxDataLen)
 	}
 	return b, nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for an order_accepted event.
+func (u *OrderAcceptedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil order accepted update")
+	}
+	if u.Order == nil {
+		return nil, fmt.Errorf("nil accepted order")
+	}
+	return encode.BuildyBytes{0}.
+		AddData(u.Order.Serialize()).
+		AddData(int64Bytes(u.EpochIdx)).
+		AddData(int64Bytes(u.EpochDur)).
+		AddData(int32Bytes(u.EpochGap)), nil
 }
 
 // EventTxData returns the versioned transaction data recorded in the event log

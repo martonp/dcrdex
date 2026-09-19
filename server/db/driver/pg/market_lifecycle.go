@@ -126,6 +126,43 @@ func (a *Archiver) validateLifecycleMarket(market string, base, quote uint32) er
 	return nil
 }
 
+// checkOrderAcceptanceTx locks the market's lifecycle row and checks
+// that the current lifecycle permits accepting the order into its epoch.
+func (a *Archiver) checkOrderAcceptanceTx(tx *sql.Tx, market string, epochIdx, epochDur, orderTimeMs int64) error {
+	lifecycle, err := a.marketLifecycleForUpdate(tx, market)
+	if err != nil {
+		return err
+	}
+	if lifecycle == nil {
+		return fmt.Errorf("missing lifecycle row for market %s", market)
+	}
+	if lifecycle.State != db.MarketStateRunning {
+		return fmt.Errorf("order_accepted for non-running market %s", market)
+	}
+	if lifecycle.PendingAction == db.MarketPendingNone {
+		return nil
+	}
+	if lifecycle.PendingAction != db.MarketPendingSuspend {
+		return fmt.Errorf("order_accepted rejected for market %s lifecycle pending action %d",
+			market, lifecycle.PendingAction)
+	}
+
+	if epochDur != lifecycle.PendingEpochDur {
+		return fmt.Errorf("order_accepted epoch duration %d mismatches pending suspend duration %d for market %s",
+			epochDur, lifecycle.PendingEpochDur, market)
+	}
+	suspendBoundary := (lifecycle.PendingEpochIdx + 1) * lifecycle.PendingEpochDur
+	if orderTimeMs >= suspendBoundary {
+		return fmt.Errorf("order_accepted time %d at/after pending suspend boundary %d for market %s",
+			orderTimeMs, suspendBoundary, market)
+	}
+	if epochIdx > lifecycle.PendingEpochIdx {
+		return fmt.Errorf("order_accepted epoch %d after pending suspend final epoch %d for market %s",
+			epochIdx, lifecycle.PendingEpochIdx, market)
+	}
+	return nil
+}
+
 func selectOrderIDsByStatus(dbe sqlQueryer, tableName string, status pgOrderStatus) ([]order.OrderID, error) {
 	return scanOrderIDRows(dbe.Query(fmt.Sprintf(internal.SelectOrderIDsByStatus, tableName), status))
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/davecgh/go-spew/spew"
 )
 
@@ -101,8 +103,7 @@ func TestStoreOrder(t *testing.T) {
 				ord:    limitA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in orders_archived: primary key
 		},
 		{
 			name: "limit duplicate by commit only",
@@ -110,8 +111,7 @@ func TestStoreOrder(t *testing.T) {
 				ord:    limitAx,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: false, // new OID, commit only in archive
 		},
 		{
 			name: "limit bad quantity (lot size)",
@@ -171,13 +171,12 @@ func TestStoreOrder(t *testing.T) {
 				ord:    marketSellA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in orders_archived: primary key
 		},
 		{
 			name: "market sell - duplicate archived order",
 			args: args{
-				ord:    marketSellB, // dd64e2ae2845d281ba55a6d46eceb9297b2bdec5c5bada78f9ae9e373164df0d
+				ord:    marketSellB, // still live in orders_active from the epoch insert
 				status: order.OrderStatusExecuted,
 			},
 			wantErr:     true,
@@ -197,8 +196,7 @@ func TestStoreOrder(t *testing.T) {
 				ord:    cancelA,
 				status: order.OrderStatusExecuted,
 			},
-			wantErr:     true,
-			wantErrType: db.ArchiveError{Code: db.ErrReusedCommit},
+			wantErr: true, // same OID already in cancels_archived: primary key
 		},
 	}
 	for _, tt := range tests {
@@ -209,8 +207,189 @@ func TestStoreOrder(t *testing.T) {
 			}
 			if err != nil {
 				t.Logf("%s: %v", tt.name, err)
-				if !db.SameErrorTypes(err, tt.wantErrType) {
+				if tt.wantErrType != nil && !db.SameErrorTypes(err, tt.wantErrType) {
 					t.Errorf("Wrong error. Got %v, expected %v", err, tt.wantErrType)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyOrderAcceptedEvent(t *testing.T) {
+	ctx := context.Background()
+	const epochDur int64 = 6000
+	limit, preimage := newLimitOrderRevealed(false, 4_900_000, 1, order.StandingTiF, 0)
+	reuse := &order.LimitOrder{
+		P: limit.P, T: *limit.T.Copy(), Rate: limit.Rate, Force: limit.Force,
+	}
+	reuse.SetTime(limit.ServerTime.Add(time.Millisecond))
+	boundary := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	finalEpoch := limit.Time() / epochDur
+	boundary.SetTime(time.UnixMilli((finalEpoch + 1) * epochDur))
+	beforeBoundary := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	beforeBoundary.SetTime(boundary.ServerTime.Add(-time.Millisecond))
+	cancel := newCancelOrder(limit.ID(), limit.Base(), limit.Quote(), 0)
+	cancel.Commit = limit.Commit
+	otherMarket := newLimitOrderWithAssets(false, 4_900_000, 1, order.StandingTiF, 0, AssetBTC, AssetLTC)
+	otherMarket.Commit = limit.Commit
+
+	tests := []struct {
+		name           string
+		ord            order.Order
+		existing       order.Order
+		existingStatus order.OrderStatus
+		suspendEpoch   int64
+		draining       bool
+		wantErr        string
+	}{
+		{name: "limit order", ord: limit},
+		{name: "draining market", ord: limit, suspendEpoch: finalEpoch, draining: true, wantErr: "non-running market"},
+		{name: "market order", ord: newMarketSellOrder(1, 0)},
+		{name: "cancel order", ord: newCancelOrder(limit.ID(), limit.Base(), limit.Quote(), 0)},
+		{name: "existing order", ord: limit, existing: limit, existingStatus: order.OrderStatusEpoch},
+		{name: "active commitment", ord: reuse, existing: limit, existingStatus: order.OrderStatusEpoch, wantErr: "reuses commit"},
+		{name: "trade commitment reused by cancel", ord: cancel, existing: limit, existingStatus: order.OrderStatusEpoch, wantErr: "reuses commit"},
+		{name: "cancel commitment reused by trade", ord: reuse, existing: cancel, existingStatus: order.OrderStatusEpoch, wantErr: "reuses commit"},
+		{name: "commitment in another market", ord: reuse, existing: otherMarket, existingStatus: order.OrderStatusEpoch, wantErr: "reuses commit"},
+		{name: "archived commitment", ord: reuse, existing: limit, existingStatus: order.OrderStatusExecuted},
+		{name: "before suspension boundary", ord: beforeBoundary, suspendEpoch: finalEpoch},
+		{name: "suspension boundary", ord: boundary, suspendEpoch: finalEpoch, wantErr: "at/after pending suspend boundary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			ord := tt.ord
+			update := &db.OrderAcceptedUpdate{
+				Order:    ord,
+				EpochIdx: ord.Time() / epochDur,
+				EpochDur: epochDur,
+				EpochGap: db.EpochGapNA,
+			}
+			if ord.Type() == order.CancelOrderType {
+				update.EpochGap = 2
+			}
+			lifecycle := &db.MarketLifecycle{
+				RunParams:     testMarketRunParams(),
+				Market:        "dcr_btc",
+				State:         db.MarketStateRunning,
+				StartEpochIdx: update.EpochIdx,
+				StartEpochDur: epochDur,
+			}
+			if tt.suspendEpoch != 0 {
+				// Keep the epoch within the suspension cutoff to isolate the timestamp check.
+				update.EpochIdx = tt.suspendEpoch
+				lifecycle.StartEpochIdx = update.EpochIdx
+				lifecycle.FinalEpochIdx, lifecycle.FinalEpochDur = update.EpochIdx, epochDur
+				lifecycle.PendingAction = db.MarketPendingSuspend
+				lifecycle.PendingEpochIdx, lifecycle.PendingEpochDur = update.EpochIdx, epochDur
+				persistBook := true
+				lifecycle.PersistBook = &persistBook
+			}
+			if tt.draining {
+				lifecycle.State = db.MarketStateDraining
+				lifecycle.PendingAction = db.MarketPendingNone
+				lifecycle.PendingEpochIdx, lifecycle.PendingEpochDur = 0, 0
+				lifecycle.ProcessedEpochIdx = finalEpoch
+			}
+			seedMarketLifecycle(t, lifecycle)
+
+			if tt.existing != nil {
+				if tt.existingStatus == order.OrderStatusEpoch {
+					if tt.existing.Base() != ord.Base() || tt.existing.Quote() != ord.Quote() {
+						otherLifecycle := *lifecycle
+						otherLifecycle.Market = mktInfo2.Name
+						seedMarketLifecycle(t, &otherLifecycle)
+					}
+					seedUpdate := *update
+					seedUpdate.Order = tt.existing
+					seedUpdate.EpochIdx = tt.existing.Time() / epochDur
+					if _, err := archie.ApplyOrderAcceptedEvent(ctx, &db.EventLogMeta{Event: []byte("original order")}, &seedUpdate); err != nil {
+						t.Fatalf("seed active order: %v", err)
+					}
+				} else if err := storeOrderForTest(archie, tt.existing, tt.existing.Time()/epochDur, epochDur, tt.existingStatus); err != nil {
+					t.Fatalf("seed archived order: %v", err)
+				}
+			}
+
+			before, err := archie.EventLogFrontier(ctx)
+			if err != nil {
+				t.Fatalf("EventLogFrontier before apply: %v", err)
+			}
+			event := []byte(tt.name)
+			seq := before.Seq + 1
+			tip := testEventApplyTip(t, before.TipHash, seq, meshevents.EventKindOrderAccepted, event, update)
+			entry, applyErr := archie.ApplyOrderAcceptedEvent(ctx, &db.EventLogMeta{
+				Seq: seq, Event: event, ExpectedTipHash: tip,
+			}, update)
+			after, err := archie.EventLogFrontier(ctx)
+			if err != nil {
+				t.Fatalf("EventLogFrontier after apply: %v", err)
+			}
+			if tt.wantErr != "" {
+				if applyErr == nil || !strings.Contains(applyErr.Error(), tt.wantErr) {
+					t.Fatalf("apply error = %v, want %q", applyErr, tt.wantErr)
+				}
+				if tt.existing != nil && !db.IsErrReusedCommit(applyErr) {
+					t.Fatalf("apply error = %v, want ErrReusedCommit", applyErr)
+				}
+				if _, status, err := archie.Order(ord.ID(), ord.Base(), ord.Quote()); err == nil || status != order.OrderStatusUnknown {
+					t.Fatalf("rejected order status = %v, err = %v, want unknown order", status, err)
+				}
+				if after.Seq != before.Seq || !bytes.Equal(after.TipHash, before.TipHash) {
+					t.Fatalf("rejected event changed frontier from %v to %v", before, after)
+				}
+				return
+			}
+			if applyErr != nil {
+				t.Fatalf("ApplyOrderAcceptedEvent: %v", applyErr)
+			}
+			requireEventApplyLog(t, entry, seq, meshevents.EventKindOrderAccepted, event, tip, update)
+			if after.Seq != seq || !bytes.Equal(after.TipHash, tip) {
+				t.Fatalf("frontier = (%d, %x), want (%d, %x)", after.Seq, after.TipHash, seq, tip)
+			}
+			stored, status, err := archie.Order(ord.ID(), ord.Base(), ord.Quote())
+			if err != nil {
+				t.Fatalf("Order: %v", err)
+			}
+			if status != order.OrderStatusEpoch || !bytes.Equal(order.EncodeOrder(stored), order.EncodeOrder(ord)) {
+				t.Fatalf("stored order differs from accepted epoch order (status %v)", status)
+			}
+			table := fullOrderTableName(archie.dbName, "dcr_btc", true)
+			if ord.Type() == order.CancelOrderType {
+				table = fullCancelOrderTableName(archie.dbName, "dcr_btc", true)
+				var gap int32
+				err := archie.db.QueryRow(fmt.Sprintf("SELECT epoch_gap FROM %s WHERE oid = $1", table), ord.ID()).Scan(&gap)
+				if err != nil || gap != update.EpochGap {
+					t.Fatalf("stored epoch gap = %d, err = %v, want %d", gap, err, update.EpochGap)
+				}
+			}
+			var epochIdx, storedEpochDur int64
+			err = archie.db.QueryRow(fmt.Sprintf("SELECT epoch_idx, epoch_dur FROM %s WHERE oid = $1", table), ord.ID()).Scan(&epochIdx, &storedEpochDur)
+			if err != nil || epochIdx != update.EpochIdx || storedEpochDur != epochDur {
+				t.Fatalf("stored epoch = (%d, %d), err = %v, want (%d, %d)", epochIdx, storedEpochDur, err, update.EpochIdx, epochDur)
+			}
+
+			if tt.existingStatus == order.OrderStatusExecuted {
+				// Archiving the new order must preserve the reused commitment and preimage.
+				archivedTable := fullOrderTableName(archie.dbName, "dcr_btc", false)
+				if _, err := archie.db.Exec(fmt.Sprintf("UPDATE %s SET preimage = $1 WHERE oid = $2", archivedTable), preimage, tt.existing.ID()); err != nil {
+					t.Fatalf("set archived preimage: %v", err)
+				}
+				if err := archie.StorePreimage(ord, preimage); err != nil {
+					t.Fatalf("set active preimage: %v", err)
+				}
+				if err := archie.updateOrderStatus(archie.db, ord, orderStatusExecuted); err != nil {
+					t.Fatalf("archive reused-commit order: %v", err)
+				}
+				stored, status, err := archie.Order(ord.ID(), ord.Base(), ord.Quote())
+				if err != nil || status != order.OrderStatusExecuted || stored.Commitment() != ord.Commitment() {
+					t.Fatalf("archived reused-commit order status = %v, err = %v", status, err)
+				}
+				storedPreimage, err := archie.OrderPreimage(ord)
+				if err != nil || storedPreimage != preimage {
+					t.Fatalf("archived preimage = %x, err = %v, want %x", storedPreimage, err, preimage)
 				}
 			}
 		})
