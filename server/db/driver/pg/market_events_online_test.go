@@ -4,6 +4,7 @@ package pg
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/db/driver/pg/internal"
 	"decred.org/dcrdex/server/meshevents"
 )
 
@@ -168,7 +170,9 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 			if _, status, err := archie.Order(revocation.ID(), AssetDCR, AssetBTC); err != nil || status != order.OrderStatusRevoked {
 				t.Fatalf("revocation cancel for %v: status %v, error %v", ord.ID(), status, err)
 			}
-			counted, err := archie.ExecutedCancelsForUser(ord.User(), 10)
+			cancelTable := fullCancelOrderTableName(archie.dbName, mktInfo.Name, false)
+			stmt := fmt.Sprintf(internal.SelectRevokeCancels, cancelTable)
+			counted, err := revokeGeneratedCancelsForUser(ctx, archie.db, stmt, ord.User(), 10)
 			if err != nil || len(counted) != 0 {
 				t.Fatalf("counted cancels for %v: %v, error %v", ord.ID(), counted, err)
 			}

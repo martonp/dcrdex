@@ -43,18 +43,6 @@ func New(lotSize uint64, acctTracking AccountTracking) *Book {
 	}
 }
 
-// Clear reset the order book with configured capacity.
-func (b *Book) Clear() (removedBuys, removedSells []*order.LimitOrder) {
-	b.mtx.Lock()
-	removedBuys, removedSells = b.buys.Orders(), b.sells.Orders()
-	b.buys, b.sells = nil, nil
-	b.buys = NewMaxOrderPQ(initBookHalfCapacity)
-	b.sells = NewMinOrderPQ(initBookHalfCapacity)
-	b.acctTracker = newAccountTracker(b.acctTracking)
-	b.mtx.Unlock()
-	return
-}
-
 // LotSize returns the Book's configured lot size in atoms of the base asset.
 func (b *Book) LotSize() uint64 {
 	b.mtx.RLock()
@@ -169,20 +157,6 @@ func (b *Book) Remove(oid order.OrderID) (*order.LimitOrder, bool) {
 		return removed, true
 	}
 	return nil, false
-}
-
-// RemoveUserOrders removes all orders from the book that belong to a user. The
-// removed buy and sell orders are returned.
-func (b *Book) RemoveUserOrders(user account.AccountID) (removedBuys, removedSells []*order.LimitOrder) {
-	removedBuys = b.buys.RemoveUserOrders(user)
-	for _, lo := range removedBuys {
-		b.acctTracker.remove(lo)
-	}
-	removedSells = b.sells.RemoveUserOrders(user)
-	for _, lo := range removedSells {
-		b.acctTracker.remove(lo)
-	}
-	return
 }
 
 // HaveOrder checks if an order is in either the buy or sell side of the book.

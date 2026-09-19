@@ -39,15 +39,14 @@ import (
 )
 
 type TArchivist struct {
-	mtx                           sync.Mutex
-	poisonEpochOrder              order.Order
 	orderWithKnownCommit          order.OrderID
 	commitForKnownOrder           order.Commitment
-	bookedOrders                  []*order.LimitOrder
 	canceledOrders                []*order.LimitOrder
 	archivedCancels               []*order.CancelOrder
-	epochInserted                 chan struct{}
 	revoked                       order.Order
+	mtx                           sync.Mutex
+	poisonEpochOrder              order.Order
+	bookedOrders                  []*order.LimitOrder
 	epochOrders                   []epochOrderWrite
 	orderAcceptedUpdates          []*db.OrderAcceptedUpdate
 	marketStartedUpdates          []*db.MarketStartedUpdate
@@ -60,6 +59,7 @@ type TArchivist struct {
 	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
+	epochInserted                 chan struct{}
 	suspendedCancels              []*db.SuspendedCancelUpdate
 	ordersRevokedUpdates          []*db.OrdersRevokedUpdate
 	commitOrders                  []db.OrderWithStatus
@@ -317,50 +317,11 @@ func (ta *TArchivist) EpochOrders(base, quote uint32) ([]order.Order, error) {
 func (ta *TArchivist) MarketMatches(base, quote uint32) ([]*db.MatchDataWithCoins, error) {
 	return nil, nil
 }
-func (ta *TArchivist) FlushBook(base, quote uint32) (sells, buys []order.OrderID, err error) {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	for _, lo := range ta.bookedOrders {
-		if lo.Sell {
-			sells = append(sells, lo.ID())
-		} else {
-			buys = append(buys, lo.ID())
-		}
-	}
-	ta.bookedOrders = nil
-	return
-}
-func (ta *TArchivist) NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error {
-	if ta.archivedCancels != nil {
-		ta.archivedCancels = append(ta.archivedCancels, ord)
-	}
-	return nil
-}
-func (ta *TArchivist) ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error) {
-	return make(map[order.OrderID][]order.CoinID), make(map[order.OrderID][]order.CoinID), nil
-}
-func (ta *TArchivist) UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error) {
-	return nil, nil, errors.New("boom")
-}
 func (ta *TArchivist) UserOrderStatuses(aid account.AccountID, base, quote uint32, oids []order.OrderID) ([]*db.OrderStatus, error) {
 	return nil, errors.New("boom")
 }
 func (ta *TArchivist) ActiveUserOrderStatuses(aid account.AccountID) ([]*db.OrderStatus, error) {
 	return nil, errors.New("boom")
-}
-func (ta *TArchivist) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	if commit == ta.commitForKnownOrder {
-		return true, ta.orderWithKnownCommit, nil
-	}
-	return
-}
-func (ta *TArchivist) CompletedUserOrders(aid account.AccountID, N int) (oids []order.OrderID, compTimes []int64, err error) {
-	return nil, nil, nil
-}
-func (ta *TArchivist) ExecutedCancelsForUser(aid account.AccountID, N int) ([]*db.CancelRecord, error) {
-	return nil, nil
 }
 func (ta *TArchivist) OrderStatus(order.Order) (order.OrderStatus, order.OrderType, int64, error) {
 	return order.OrderStatusUnknown, order.UnknownOrderType, -1, errors.New("boom")
@@ -479,15 +440,6 @@ func (ta *TArchivist) ApplyOrdersRevokedEvent(_ context.Context, _ *db.EventLogM
 	ta.ordersRevokedUpdates = append(ta.ordersRevokedUpdates, update)
 	return new(db.EventLogEntry), nil
 }
-func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
-	ta.mtx.Lock()
-	defer ta.mtx.Unlock()
-	if ta.poisonEpochOrder != nil && ord.ID() == ta.poisonEpochOrder.ID() {
-		return errors.New("barf")
-	}
-	return nil
-}
-func (ta *TArchivist) StorePreimage(ord order.Order, pi order.Preimage) error { return nil }
 func (ta *TArchivist) failOnEpochOrder(ord order.Order) {
 	ta.mtx.Lock()
 	ta.poisonEpochOrder = ord
@@ -526,12 +478,6 @@ func (ta *TArchivist) ApplySuspendedCancelEvent(_ context.Context, _ *db.EventLo
 		Match:       update.Match,
 	}, nil
 }
-func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
-	if ta.epochInserted != nil { // the test wants to know
-		ta.epochInserted <- struct{}{}
-	}
-	return nil
-}
 func (ta *TArchivist) LastEpochRate(base, quote uint32) (rate uint64, err error) {
 	return 1, nil
 }
@@ -541,77 +487,20 @@ func (ta *TArchivist) BookOrder(lo *order.LimitOrder) error {
 	ta.bookedOrders = append(ta.bookedOrders, lo)
 	return nil
 }
-func (ta *TArchivist) ExecuteOrder(ord order.Order) error { return nil }
-func (ta *TArchivist) CancelOrder(lo *order.LimitOrder) error {
-	if ta.canceledOrders != nil {
-		ta.canceledOrders = append(ta.canceledOrders, lo)
-	}
-	return nil
-}
-func (ta *TArchivist) RevokeOrder(ord order.Order) (order.OrderID, time.Time, error) {
-	ta.revoked = ord
-	return ord.ID(), time.Now(), nil
-}
-func (ta *TArchivist) RevokeOrderUncounted(order.Order) (order.OrderID, time.Time, error) {
-	return order.OrderID{}, time.Now(), nil
-}
-func (ta *TArchivist) SetOrderCompleteTime(ord order.Order, compTime int64) error { return nil }
-func (ta *TArchivist) FailCancelOrder(*order.CancelOrder) error                   { return nil }
-func (ta *TArchivist) UpdateOrderFilled(*order.LimitOrder) error                  { return nil }
-func (ta *TArchivist) UpdateOrderStatus(order.Order, order.OrderStatus) error     { return nil }
 
 // SwapArchiver for Swapper
 func (ta *TArchivist) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
-func (ta *TArchivist) InsertMatch(match *order.Match) error     { return nil }
-func (ta *TArchivist) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
-	return nil, nil
-}
-func (ta *TArchivist) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
-	return nil, nil
-}
 func (ta *TArchivist) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {
 	return nil, nil
 }
-func (ta *TArchivist) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
-	return nil, nil
-}
-func (ta *TArchivist) ForgiveMatchFail(order.MatchID) (bool, error) { return false, nil }
 func (ta *TArchivist) AllActiveUserMatches(account.AccountID) ([]*db.MatchData, error) {
 	return nil, nil
 }
 func (ta *TArchivist) MatchStatuses(aid account.AccountID, base, quote uint32, matchIDs []order.MatchID) ([]*db.MatchStatus, error) {
 	return nil, nil
 }
-func (ta *TArchivist) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
-	return 0, nil, nil
-}
-func (ta *TArchivist) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ta *TArchivist) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ta *TArchivist) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error { return nil }
-func (ta *TArchivist) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error { return nil }
 
-// Contract data.
-func (ta *TArchivist) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error { return nil }
-func (ta *TArchivist) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
-
-// Redeem data.
-func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return nil
-}
-func (ta *TArchivist) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ta *TArchivist) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
-func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error     { return nil }
+func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}
 
@@ -2843,12 +2732,6 @@ func TestMarket_MarketStartup_AccountBased(t *testing.T) {
 	t.Run("account-based base", func(t *testing.T) { testAccountAssets(t, true, false) })
 	t.Run("account-based quote", func(t *testing.T) { testAccountAssets(t, false, true) })
 	t.Run("both account-based", func(t *testing.T) { testAccountAssets(t, true, true) })
-}
-
-func TestMarket_NewMarket_AccountBased(t *testing.T) {
-	testAccountAssets(t, true, false)
-	testAccountAssets(t, false, true)
-	testAccountAssets(t, true, true)
 }
 
 func testAccountAssets(t *testing.T, base, quote bool) {
@@ -6135,3 +6018,123 @@ func requireEpochRevokeSet(t *testing.T, update *db.MarketStartedUpdate, want []
 		}
 	}
 }
+
+func (ta *TArchivist) FlushBook(base, quote uint32) (sells, buys []order.OrderID, err error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	for _, lo := range ta.bookedOrders {
+		if lo.Sell {
+			sells = append(sells, lo.ID())
+		} else {
+			buys = append(buys, lo.ID())
+		}
+	}
+	ta.bookedOrders = nil
+	return
+}
+func (ta *TArchivist) NewArchivedCancel(ord *order.CancelOrder, epochID, epochDur int64) error {
+	if ta.archivedCancels != nil {
+		ta.archivedCancels = append(ta.archivedCancels, ord)
+	}
+	return nil
+}
+func (ta *TArchivist) ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins map[order.OrderID][]order.CoinID, err error) {
+	return make(map[order.OrderID][]order.CoinID), make(map[order.OrderID][]order.CoinID), nil
+}
+func (ta *TArchivist) UserOrders(ctx context.Context, aid account.AccountID, base, quote uint32) ([]order.Order, []order.OrderStatus, error) {
+	return nil, nil, errors.New("boom")
+}
+
+func (ta *TArchivist) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if commit == ta.commitForKnownOrder {
+		return true, ta.orderWithKnownCommit, nil
+	}
+	return
+}
+func (ta *TArchivist) CompletedUserOrders(aid account.AccountID, N int) (oids []order.OrderID, compTimes []int64, err error) {
+	return nil, nil, nil
+}
+func (ta *TArchivist) ExecutedCancelsForUser(aid account.AccountID, N int) ([]*db.CancelRecord, error) {
+	return nil, nil
+}
+
+func (ta *TArchivist) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	if ta.poisonEpochOrder != nil && ord.ID() == ta.poisonEpochOrder.ID() {
+		return errors.New("barf")
+	}
+	return nil
+}
+func (ta *TArchivist) StorePreimage(ord order.Order, pi order.Preimage) error { return nil }
+
+func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
+	if ta.epochInserted != nil { // the test wants to know
+		ta.epochInserted <- struct{}{}
+	}
+	return nil
+}
+
+func (ta *TArchivist) ExecuteOrder(ord order.Order) error { return nil }
+func (ta *TArchivist) CancelOrder(lo *order.LimitOrder) error {
+	if ta.canceledOrders != nil {
+		ta.canceledOrders = append(ta.canceledOrders, lo)
+	}
+	return nil
+}
+func (ta *TArchivist) RevokeOrder(ord order.Order) (order.OrderID, time.Time, error) {
+	ta.revoked = ord
+	return ord.ID(), time.Now(), nil
+}
+func (ta *TArchivist) RevokeOrderUncounted(order.Order) (order.OrderID, time.Time, error) {
+	return order.OrderID{}, time.Now(), nil
+}
+func (ta *TArchivist) SetOrderCompleteTime(ord order.Order, compTime int64) error { return nil }
+func (ta *TArchivist) FailCancelOrder(*order.CancelOrder) error                   { return nil }
+func (ta *TArchivist) UpdateOrderFilled(*order.LimitOrder) error                  { return nil }
+func (ta *TArchivist) UpdateOrderStatus(order.Order, order.OrderStatus) error     { return nil }
+
+func (ta *TArchivist) InsertMatch(match *order.Match) error { return nil }
+func (ta *TArchivist) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
+	return nil, nil
+}
+func (ta *TArchivist) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
+	return nil, nil
+}
+
+func (ta *TArchivist) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
+	return nil, nil
+}
+func (ta *TArchivist) ForgiveMatchFail(order.MatchID) (bool, error) { return false, nil }
+
+func (ta *TArchivist) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
+	return 0, nil, nil
+}
+func (ta *TArchivist) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error   { return nil }
+func (ta *TArchivist) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error   { return nil }
+func (ta *TArchivist) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error { return nil }
+func (ta *TArchivist) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error { return nil }
+
+// Contract data.
+func (ta *TArchivist) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error { return nil }
+func (ta *TArchivist) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
+
+// Redeem data.
+func (ta *TArchivist) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
+	return nil
+}
+func (ta *TArchivist) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
+	return nil
+}
+func (ta *TArchivist) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
