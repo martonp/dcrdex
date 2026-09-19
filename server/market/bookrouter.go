@@ -388,6 +388,12 @@ func (r *BookRouter) seedBook(book *msgBook) {
 	book.running = true
 }
 
+// UnbookOrder removes an order from a configured market's cached book and
+// notifies subscribers. It does nothing if the order is already absent.
+func (r *BookRouter) UnbookOrder(mktName string, lo *order.LimitOrder) {
+	r.unbookOrder(r.books[mktName], lo)
+}
+
 func (r *BookRouter) applyMarketStartedEvent(book *msgBook, epochIdx int64, removed []*order.LimitOrder) {
 	book.setEpoch(epochIdx)
 	for _, lo := range removed {

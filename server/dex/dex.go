@@ -970,6 +970,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	log.Infof("Penalty threshold is %v", cfg.PenaltyThreshold)
 
+	var bookRouter *market.BookRouter
+
 	// Create a swapDone dispatcher for the Swapper.
 	swapDone := func(ord order.Order, match *order.Match, fail bool) {
 		name, err := dex.MarketName(ord.Base(), ord.Quote())
@@ -984,7 +986,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			log.Warnf("swapDone: no market %q for order %v (match may have been revoked during initialization)", name, ord.ID())
 			return
 		}
-		mkt.SwapDone(ord, match, fail)
+		if removed := mkt.SwapDone(ord, match, fail); removed != nil {
+			bookRouter.UnbookOrder(name, removed)
+		}
 	}
 
 	// Create the swapper.
@@ -1072,10 +1076,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	dexBalancer.SetMarkets(pendingAccounters)
 
-	// Start the AuthManager and Swapper subsystems.
-	startSubSys("Auth manager", authMgr)
-	startSubSys("Swapper", swapper)
-
 	// Set start epoch index for each market. Also create BookSources for the
 	// BookRouter, and MarketTunnels for the OrderRouter.
 	now := time.Now().UnixMilli()
@@ -1101,7 +1101,10 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 
 	// Book router
-	bookRouter := market.NewBookRouter(bookSources, feeMgr, server.Route)
+	bookRouter = market.NewBookRouter(bookSources, feeMgr, server.Route)
+	// The swapper may report order removals as soon as it starts.
+	startSubSys("Auth manager", authMgr)
+	startSubSys("Swapper", swapper)
 	startSubSys("BookRouter", bookRouter)
 
 	// Register the MM snapshot subscription handler once for all markets.
