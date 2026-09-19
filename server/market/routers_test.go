@@ -307,22 +307,23 @@ func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epo
 }
 
 type TMarketTunnel struct {
-	adds        []*orderRecord
-	added       chan struct{}
-	auth        *TAuth
-	midGap      uint64
-	lotSize     uint64
-	rateStep    uint64
-	mbBuffer    float64
-	epochIdx    uint64
-	epochDur    uint64
-	locked      bool
-	cancelable  bool
-	acctQty     uint64
-	acctLots    uint64
-	acctRedeems int
-	base, quote uint32
-	parcels     float64
+	adds          []*orderRecord
+	added         chan struct{}
+	auth          *TAuth
+	midGap        uint64
+	lotSize       uint64
+	rateStep      uint64
+	mbBuffer      float64
+	epochIdx      uint64
+	epochDur      uint64
+	locked        bool
+	cancelable    bool
+	resendHandled bool
+	acctQty       uint64
+	acctLots      uint64
+	acctRedeems   int
+	base, quote   uint32
+	parcels       float64
 }
 
 func tNewMarket(auth *TAuth) *TMarketTunnel {
@@ -337,6 +338,10 @@ func tNewMarket(auth *TAuth) *TMarketTunnel {
 		epochIdx:   1573773894,
 		epochDur:   60_000,
 	}
+}
+
+func (m *TMarketTunnel) HandleOrderResubmission(_ context.Context, _ *orderRecord, _ *mesh.CommandCompletion) (bool, *msgjson.Error) {
+	return m.resendHandled, nil
 }
 
 func (m *TMarketTunnel) AcceptOrderCommand(ctx context.Context, o *orderRecord, completion *mesh.CommandCompletion) *msgjson.Error {
@@ -950,6 +955,28 @@ func TestLimit(t *testing.T) {
 	testPrefixTrade(&limit.Prefix, &limit.Trade, oRig.dcr.TBackend, oRig.btc.TBackend,
 		func(tag string, code int) { t.Helper(); ensureErr(tag, sendLimit(), code) },
 	)
+
+	// Recognized resubmissions bypass the age and current rate-step checks.
+	ogTime, ogRateStep := limit.ClientTime, oRig.market.rateStep
+	for _, test := range []struct {
+		name   string
+		change func()
+		code   int
+	}{
+		{"old client time", func() { limit.ClientTime = ogTime - maxClockOffset - 1 }, msgjson.ClockRangeError},
+		{"changed rate step", func() { oRig.market.rateStep = limit.Rate + 1 }, msgjson.OrderParameterError},
+	} {
+		test.change()
+		oRig.market.resendHandled = true
+		msg, err := msgjson.NewRequest(reqID, msgjson.LimitRoute, limit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ensureErr("resubmission with "+test.name, oRig.router.handleLimit(user.acct, msg), -1)
+		oRig.market.resendHandled = false
+		ensureErr("new request with "+test.name, sendLimit(), test.code)
+		limit.ClientTime, oRig.market.rateStep = ogTime, ogRateStep
+	}
 
 	// Zero-conf fails fee rate validation.
 	oRig.dcr.confsMinus2 = -2

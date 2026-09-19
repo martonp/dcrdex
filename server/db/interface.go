@@ -221,6 +221,7 @@ type OrderArchiver interface {
 	// that is not on the book.
 	SetOrderCompleteTime(ord order.Order, compTimeMs int64) error
 
+	OrdersWithCommit(ctx context.Context, base, quote uint32, commit order.Commitment, archivedCutoff time.Time) ([]OrderWithStatus, error)
 	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 }
@@ -846,6 +847,12 @@ type BondPostedResult struct {
 	Preimages []*PreimageOutcome
 	Matches   []*MatchResult
 	Orders    []*OrderOutcome
+}
+
+// OrderWithStatus contains an order and its stored status.
+type OrderWithStatus struct {
+	Order  order.Order
+	Status order.OrderStatus
 }
 
 // OrderAcceptedUpdate contains an accepted order and the epoch information

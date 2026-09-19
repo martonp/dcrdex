@@ -84,6 +84,10 @@ var _ db.OrderArchiver = (*Archiver)(nil)
 // error value is ErrUnknownOrder, and the type is order.OrderStatusUnknown. The
 // only recognized order types are market, limit, and cancel.
 func (a *Archiver) Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error) {
+	return a.order(context.Background(), oid, base, quote)
+}
+
+func (a *Archiver) order(ctx context.Context, oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error) {
 	marketSchema, err := a.marketSchema(base, quote)
 	if err != nil {
 		return nil, order.OrderStatusUnknown, err
@@ -94,14 +98,14 @@ func (a *Archiver) Order(oid order.OrderID, base, quote uint32) (order.Order, or
 	// - if found, coerce into the correct order type and return
 	// - if not found, try loading a cancel order with this oid
 	var errA db.ArchiveError
-	ord, status, err := loadTrade(a.db, a.dbName, marketSchema, oid)
+	ord, status, err := loadTrade(ctx, a.db, a.dbName, marketSchema, oid)
 	if errors.As(err, &errA) {
 		if errA.Code != db.ErrUnknownOrder {
 			return nil, order.OrderStatusUnknown, err
 		}
 		// Try the cancel orders.
 		var co *order.CancelOrder
-		co, status, err = loadCancelOrder(a.db, a.dbName, marketSchema, oid)
+		co, status, err = loadCancelOrder(ctx, a.db, a.dbName, marketSchema, oid)
 		if err != nil {
 			return nil, order.OrderStatusUnknown, err // includes ErrUnknownOrder
 		}
@@ -1272,6 +1276,63 @@ func (a *Archiver) userOrderStatusesFromTable(fullTable string, aid account.Acco
 	return statuses, nil
 }
 
+// OrdersWithCommit returns orders with the given commitment in one market.
+// It includes all active orders and archived orders accepted at or after
+// archivedCutoff.
+func (a *Archiver) OrdersWithCommit(ctx context.Context, base, quote uint32,
+	commit order.Commitment, archivedCutoff time.Time) ([]db.OrderWithStatus, error) {
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return nil, err
+	}
+	found, oid, err := orderForCommit(ctx, a.db, a.dbName, marketSchema, commit)
+	if err != nil {
+		if ctx.Err() == nil {
+			a.fatalBackendErr(err)
+		}
+		return nil, err
+	}
+	var oids []order.OrderID
+	if found {
+		oids = append(oids, oid)
+	}
+	archived, err := archivedOrderIDsForCommitSince(ctx, a.db, a.dbName, marketSchema, commit, archivedCutoff)
+	if err != nil {
+		if ctx.Err() == nil {
+			a.fatalBackendErr(err)
+		}
+		return nil, err
+	}
+	oids = append(oids, archived...)
+
+	orders := make([]db.OrderWithStatus, 0, len(oids))
+	for _, oid := range oids {
+		ord, status, err := a.order(ctx, oid, base, quote)
+		if err != nil {
+			return nil, err
+		}
+		orders = append(orders, db.OrderWithStatus{Order: ord, Status: status})
+	}
+	return orders, nil
+}
+
+func archivedOrderIDsForCommitSince(ctx context.Context, dbe sqlQueryer, dbName, marketSchema string,
+	commit order.Commitment, cutoff time.Time) ([]order.OrderID, error) {
+	var oids []order.OrderID
+	for _, tableName := range []string{
+		fullOrderTableName(dbName, marketSchema, false),
+		fullCancelOrderTableName(dbName, marketSchema, false),
+	} {
+		stmt := fmt.Sprintf(internal.SelectOrderByCommitSince, tableName)
+		ids, err := scanOrderIDRows(dbe.QueryContext(ctx, stmt, commit, cutoff))
+		if err != nil {
+			return nil, err
+		}
+		oids = append(oids, ids...)
+	}
+	return oids, nil
+}
+
 // OrderWithCommit searches all markets' active trade and cancel orders for
 // the given commitment.
 func (a *Archiver) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
@@ -1451,10 +1512,10 @@ func findOrder(dbe sqlQueryer, oid order.OrderID, fullTable string) (bool, pgOrd
 }
 
 // loadTrade does NOT set BaseAsset and QuoteAsset!
-func loadTrade(dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
+func loadTrade(ctx context.Context, dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
 	// Search active orders first.
 	fullTable := fullOrderTableName(dbName, marketSchema, true)
-	ord, status, err := loadTradeFromTable(dbe, fullTable, oid)
+	ord, status, err := loadTradeFromTable(ctx, dbe, fullTable, oid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// try archived orders next
@@ -1468,7 +1529,7 @@ func loadTrade(dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (ord
 
 	// Search archived orders.
 	fullTable = fullOrderTableName(dbName, marketSchema, false)
-	ord, status, err = loadTradeFromTable(dbe, fullTable, oid)
+	ord, status, err = loadTradeFromTable(ctx, dbe, fullTable, oid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, orderStatusUnknown, db.ArchiveError{Code: db.ErrUnknownOrder}
@@ -1482,7 +1543,7 @@ func loadTrade(dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (ord
 }
 
 // loadTradeFromTable does NOT set BaseAsset and QuoteAsset!
-func loadTradeFromTable(dbe *sql.DB, fullTable string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
+func loadTradeFromTable(ctx context.Context, dbe *sql.DB, fullTable string, oid order.OrderID) (order.Order, pgOrderStatus, error) {
 	stmt := fmt.Sprintf(internal.SelectOrder, fullTable)
 
 	var prefix order.Prefix
@@ -1491,7 +1552,7 @@ func loadTradeFromTable(dbe *sql.DB, fullTable string, oid order.OrderID) (order
 	var tif order.TimeInForce
 	var rate uint64
 	var status pgOrderStatus
-	err := dbe.QueryRow(stmt, oid).Scan(&id, &prefix.OrderType, &trade.Sell,
+	err := dbe.QueryRowContext(ctx, stmt, oid).Scan(&id, &prefix.OrderType, &trade.Sell,
 		&prefix.AccountID, &trade.Address, &prefix.ClientTime, &prefix.ServerTime,
 		&prefix.Commit, (*dbCoins)(&trade.Coins),
 		&trade.Quantity, &rate, &tif, &status, &trade.FillAmt)
@@ -1762,13 +1823,13 @@ func storeCancelOrder(dbe sqlExecutor, tableName string, co *order.CancelOrder, 
 }
 
 // loadCancelOrderFromTable does NOT set BaseAsset and QuoteAsset!
-func loadCancelOrderFromTable(dbe *sql.DB, fullTable string, oid order.OrderID) (*order.CancelOrder, pgOrderStatus, error) {
+func loadCancelOrderFromTable(ctx context.Context, dbe *sql.DB, fullTable string, oid order.OrderID) (*order.CancelOrder, pgOrderStatus, error) {
 	stmt := fmt.Sprintf(internal.SelectCancelOrder, fullTable)
 
 	var co order.CancelOrder
 	var id order.OrderID
 	var status pgOrderStatus
-	err := dbe.QueryRow(stmt, oid).Scan(&id, &co.AccountID, &co.ClientTime,
+	err := dbe.QueryRowContext(ctx, stmt, oid).Scan(&id, &co.AccountID, &co.ClientTime,
 		&co.ServerTime, &co.Commit, &co.TargetOrderID, &status)
 	if err != nil {
 		return nil, orderStatusUnknown, err
@@ -1780,10 +1841,10 @@ func loadCancelOrderFromTable(dbe *sql.DB, fullTable string, oid order.OrderID) 
 }
 
 // loadCancelOrder does NOT set BaseAsset and QuoteAsset!
-func loadCancelOrder(dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (*order.CancelOrder, pgOrderStatus, error) {
+func loadCancelOrder(ctx context.Context, dbe *sql.DB, dbName, marketSchema string, oid order.OrderID) (*order.CancelOrder, pgOrderStatus, error) {
 	// Search active orders first.
 	fullTable := fullCancelOrderTableName(dbName, marketSchema, true)
-	co, status, err := loadCancelOrderFromTable(dbe, fullTable, oid)
+	co, status, err := loadCancelOrderFromTable(ctx, dbe, fullTable, oid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	// try archived orders next
@@ -1797,7 +1858,7 @@ func loadCancelOrder(dbe *sql.DB, dbName, marketSchema string, oid order.OrderID
 
 	// Search archived orders.
 	fullTable = fullCancelOrderTableName(dbName, marketSchema, false)
-	co, status, err = loadCancelOrderFromTable(dbe, fullTable, oid)
+	co, status, err = loadCancelOrderFromTable(ctx, dbe, fullTable, oid)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, orderStatusUnknown, db.ArchiveError{Code: db.ErrUnknownOrder}

@@ -56,6 +56,7 @@ const (
 type MarketTunnel interface {
 	// AcceptOrderCommand validates and accepts an order.
 	AcceptOrderCommand(context.Context, *orderRecord, *mesh.CommandCompletion) *msgjson.Error
+	HandleOrderResubmission(ctx context.Context, rec *orderRecord, completion *mesh.CommandCompletion) (handled bool, rpcErr *msgjson.Error)
 	// MidGap returns the mid-gap market rate, which is ths rate halfway between
 	// the best buy order and the best sell order in the order book.
 	MidGap() uint64
@@ -238,20 +239,9 @@ func (r *OrderRouter) executeLimit(cmdCtx *mesh.CommandContext) *msgjson.Error {
 		return rpcErr
 	}
 
-	if _, tier := r.auth.AcctStatus(user); tier < 1 {
-		return msgjson.NewError(msgjson.AccountClosedError, "account %v with tier %d may not submit trade orders", user, tier)
-	}
-
 	tunnel, assets, sell, rpcErr := r.extractMarketDetails(&limit.Prefix, &limit.Trade)
 	if rpcErr != nil {
 		return rpcErr
-	}
-
-	// Spare some resources if the market is closed now. Any orders that make it
-	// through to a closed market will receive a similar error from the market
-	// command handler.
-	if !tunnel.Running() {
-		return msgjson.NewError(msgjson.MarketNotRunningError, "market closed to new orders")
 	}
 
 	// Check that OrderType is set correctly
@@ -260,13 +250,8 @@ func (r *OrderRouter) executeLimit(cmdCtx *mesh.CommandContext) *msgjson.Error {
 			msgjson.LimitOrderNum, limit.OrderType)
 	}
 
-	// Check that the rate is non-zero and obeys the rate step interval.
 	if limit.Rate == 0 {
 		return msgjson.NewError(msgjson.OrderParameterError, "rate = 0 not allowed")
-	}
-	if rateStep := tunnel.RateStep(); limit.Rate%rateStep != 0 {
-		return msgjson.NewError(msgjson.OrderParameterError, "rate (%d) not a multiple of ratestep (%d)",
-			limit.Rate, rateStep)
 	}
 
 	// Check time-in-force
@@ -278,11 +263,6 @@ func (r *OrderRouter) executeLimit(cmdCtx *mesh.CommandContext) *msgjson.Error {
 		force = order.ImmediateTiF
 	default:
 		return msgjson.NewError(msgjson.OrderParameterError, "unknown time-in-force")
-	}
-
-	rpcErr = r.checkPrefixTrade(assets, tunnel.LotSize(), &limit.Prefix, &limit.Trade, true)
-	if rpcErr != nil {
-		return rpcErr
 	}
 
 	// Commitment
@@ -329,6 +309,31 @@ func (r *OrderRouter) executeLimit(cmdCtx *mesh.CommandContext) *msgjson.Error {
 		msgID: msg.ID,
 	}
 
+	if handled, rpcErr := tunnel.HandleOrderResubmission(cmdCtx, oRecord, cmdCtx.Completion); handled {
+		return rpcErr
+	}
+
+	if rateStep := tunnel.RateStep(); limit.Rate%rateStep != 0 {
+		return msgjson.NewError(msgjson.OrderParameterError, "rate (%d) not a multiple of ratestep (%d)",
+			limit.Rate, rateStep)
+	}
+
+	rpcErr = r.checkPrefixTrade(assets, tunnel.LotSize(), &limit.Prefix, &limit.Trade, true)
+	if rpcErr != nil {
+		return rpcErr
+	}
+
+	if _, tier := r.auth.AcctStatus(user); tier < 1 {
+		return msgjson.NewError(msgjson.AccountClosedError, "account %v with tier %d may not submit trade orders", user, tier)
+	}
+
+	// Spare some resources if the market is closed now. Any orders that make it
+	// through to a closed market will receive a similar error from the market
+	// command handler.
+	if !tunnel.Running() {
+		return msgjson.NewError(msgjson.MarketNotRunningError, "market closed to new orders")
+	}
+
 	return r.processTrade(oRecord, tunnel, cmdCtx.Completion, assets, limit.Coins, sell, limit.Rate, limit.RedeemSig, limit.Serialize())
 }
 
@@ -360,30 +365,14 @@ func (r *OrderRouter) executeMarket(cmdCtx *mesh.CommandContext) *msgjson.Error 
 		return rpcErr
 	}
 
-	if _, tier := r.auth.AcctStatus(user); tier < 1 {
-		return msgjson.NewError(msgjson.AccountClosedError, "account %v with tier %d may not submit trade orders", user, tier)
-	}
-
 	tunnel, assets, sell, rpcErr := r.extractMarketDetails(&market.Prefix, &market.Trade)
 	if rpcErr != nil {
 		return rpcErr
 	}
 
-	if !tunnel.Running() {
-		mktName, _ := dex.MarketName(market.Base, market.Quote)
-		return msgjson.NewError(msgjson.MarketNotRunningError, "market %s closed to new orders", mktName)
-	}
-
 	// Check that OrderType is set correctly
 	if market.OrderType != msgjson.MarketOrderNum {
 		return msgjson.NewError(msgjson.OrderParameterError, "wrong order type set for market order")
-	}
-
-	// Passing sell as the checkLot parameter causes the lot size check to be
-	// ignored for market buy orders.
-	rpcErr = r.checkPrefixTrade(assets, tunnel.LotSize(), &market.Prefix, &market.Trade, sell)
-	if rpcErr != nil {
-		return rpcErr
 	}
 
 	// Commitment.
@@ -423,6 +412,26 @@ func (r *OrderRouter) executeMarket(cmdCtx *mesh.CommandContext) *msgjson.Error 
 		order: mo,
 		req:   market,
 		msgID: msg.ID,
+	}
+
+	if handled, rpcErr := tunnel.HandleOrderResubmission(cmdCtx, oRecord, cmdCtx.Completion); handled {
+		return rpcErr
+	}
+
+	// Passing sell as the checkLot parameter causes the lot size check to be
+	// ignored for market buy orders.
+	rpcErr = r.checkPrefixTrade(assets, tunnel.LotSize(), &market.Prefix, &market.Trade, sell)
+	if rpcErr != nil {
+		return rpcErr
+	}
+
+	if _, tier := r.auth.AcctStatus(user); tier < 1 {
+		return msgjson.NewError(msgjson.AccountClosedError, "account %v with tier %d may not submit trade orders", user, tier)
+	}
+
+	if !tunnel.Running() {
+		mktName, _ := dex.MarketName(market.Base, market.Quote)
+		return msgjson.NewError(msgjson.MarketNotRunningError, "market %s closed to new orders", mktName)
 	}
 
 	return r.processTrade(oRecord, tunnel, cmdCtx.Completion, assets, market.Coins, sell, 0, market.RedeemSig, market.Serialize())
@@ -506,6 +515,10 @@ func (r *OrderRouter) processTrade(oRecord *orderRecord, tunnel MarketTunnel, co
 		}
 		// TODO: Check all markets here?
 		if tunnel.CoinLocked(assets.funding.ID, coinID) {
+			// An identical request may have been accepted since the initial lookup.
+			if handled, rpcErr := tunnel.HandleOrderResubmission(context.Background(), oRecord, completion); handled {
+				return rpcErr
+			}
 			return msgjson.NewError(msgjson.FundingError, "coin %s is locked", fmtCoinID(assets.funding.ID, coinID))
 		}
 		coinStrs = append(coinStrs, coinStr)
@@ -845,18 +858,9 @@ func (r *OrderRouter) executeCancel(cmdCtx *mesh.CommandContext) *msgjson.Error 
 	var targetID order.OrderID
 	copy(targetID[:], cancel.TargetID)
 
-	if !tunnel.Cancelable(targetID) {
-		return msgjson.NewError(msgjson.UnknownOrderError, "target order not known: %v", targetID)
-	}
-
 	// Check that OrderType is set correctly
 	if cancel.OrderType != msgjson.CancelOrderNum {
 		return msgjson.NewError(msgjson.OrderParameterError, "wrong order type set for cancel order")
-	}
-
-	rpcErr = checkTimes(&cancel.Prefix)
-	if rpcErr != nil {
-		return rpcErr
 	}
 
 	// Commitment.
@@ -885,6 +889,19 @@ func (r *OrderRouter) executeCancel(cmdCtx *mesh.CommandContext) *msgjson.Error 
 		order: co,
 		req:   cancel,
 		msgID: msg.ID,
+	}
+
+	if handled, rpcErr := tunnel.HandleOrderResubmission(cmdCtx, oRecord, cmdCtx.Completion); handled {
+		return rpcErr
+	}
+
+	rpcErr = checkTimes(&cancel.Prefix)
+	if rpcErr != nil {
+		return rpcErr
+	}
+
+	if !tunnel.Cancelable(targetID) {
+		return msgjson.NewError(msgjson.UnknownOrderError, "target order not known: %v", targetID)
 	}
 
 	return tunnel.AcceptOrderCommand(cmdCtx, oRecord, cmdCtx.Completion)
