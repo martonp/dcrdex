@@ -231,6 +231,7 @@ type OrderArchiver interface {
 	ApplyMarketResumedEvent(ctx context.Context, meta *EventLogMeta, update *MarketResumedUpdate) (*MarketResumedApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
+	ApplySuspendedCancelEvent(ctx context.Context, meta *EventLogMeta, update *SuspendedCancelUpdate) (*SuspendedCancelApplyResult, error)
 	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
 }
 
@@ -1084,6 +1085,33 @@ type EpochProcessedUpdate struct {
 	CancelsFailed   []*order.CancelOrder
 	CancelsExecuted []*order.CancelOrder
 	Matches         []*order.Match
+}
+
+// SuspendedCancelUpdate contains a cancel order, its target details, and the
+// expected match for canceling an order while the market is suspended.
+type SuspendedCancelUpdate struct {
+	Market          string
+	Base            uint32
+	Quote           uint32
+	Cancel          *order.CancelOrder
+	TargetOrderID   order.OrderID
+	TargetAccount   account.AccountID
+	TargetSell      bool
+	EpochIdx        int64
+	EpochDur        int64
+	FeeRateBase     uint64
+	FeeRateQuote    uint64
+	MatchServerTime time.Time
+	Match           *order.Match
+}
+
+// SuspendedCancelApplyResult contains the event log entry, executed cancel,
+// stored target order, and match derived from the stored target.
+type SuspendedCancelApplyResult struct {
+	Log         *EventLogEntry
+	Cancel      *order.CancelOrder
+	TargetOrder *order.LimitOrder
+	Match       *order.Match
 }
 
 // StartupOrderRevoke contains an order and its startup revocation reason.

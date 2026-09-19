@@ -91,3 +91,97 @@ func TestMarketStartedUpdateEventTxData(t *testing.T) {
 		})
 	}
 }
+
+func TestSuspendedCancelUpdateEventTxData(t *testing.T) {
+	var acct account.AccountID
+	acct[0] = 1
+	const base, quote uint32 = 42, 0
+
+	target := &order.LimitOrder{
+		P: order.Prefix{
+			AccountID:  acct,
+			BaseAsset:  base,
+			QuoteAsset: quote,
+			OrderType:  order.LimitOrderType,
+			ClientTime: time.UnixMilli(1000),
+			ServerTime: time.UnixMilli(1001),
+		},
+		T: order.Trade{
+			Sell:     true,
+			Quantity: 10,
+		},
+		Rate:  5,
+		Force: order.StandingTiF,
+	}
+	cancel := &order.CancelOrder{
+		P: order.Prefix{
+			AccountID:  acct,
+			BaseAsset:  base,
+			QuoteAsset: quote,
+			OrderType:  order.CancelOrderType,
+			ClientTime: time.UnixMilli(2000),
+			ServerTime: time.UnixMilli(2001),
+		},
+		TargetOrderID: target.ID(),
+	}
+	match := &order.Match{
+		Taker:    cancel,
+		Maker:    target,
+		Quantity: target.Remaining(),
+		Rate:     target.Rate,
+		Epoch:    order.EpochID{Idx: 123, Dur: 500},
+		Status:   order.MatchComplete,
+	}
+	update := &SuspendedCancelUpdate{
+		Market:          "dcr_btc",
+		Base:            base,
+		Quote:           quote,
+		Cancel:          cancel,
+		TargetOrderID:   target.ID(),
+		TargetAccount:   acct,
+		TargetSell:      target.Sell,
+		EpochIdx:        123,
+		EpochDur:        500,
+		MatchServerTime: time.UnixMilli(3000),
+		Match:           match,
+	}
+
+	incompleteMatch := *match
+	incompleteMatch.Status = order.NewlyMatched
+	missingMaker := *match
+	missingMaker.Maker = nil
+	missingTaker := *match
+	missingTaker.Taker = nil
+	for _, tc := range []struct {
+		name   string
+		update *SuspendedCancelUpdate
+	}{
+		{name: "nil update"},
+		{name: "missing cancel", update: &SuspendedCancelUpdate{Match: match}},
+		{name: "missing match", update: &SuspendedCancelUpdate{Cancel: cancel}},
+		{name: "incomplete match", update: &SuspendedCancelUpdate{Cancel: cancel, Match: &incompleteMatch}},
+		{name: "missing maker", update: &SuspendedCancelUpdate{Cancel: cancel, Match: &missingMaker}},
+		{name: "missing taker", update: &SuspendedCancelUpdate{Cancel: cancel, Match: &missingTaker}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.update.EventTxData(); err == nil {
+				t.Fatal("expected encoding error")
+			}
+		})
+	}
+
+	txData, err := update.EventTxData()
+	if err != nil {
+		t.Fatalf("EventTxData error: %v", err)
+	}
+	_, pushes, err := encode.DecodeBlob(txData)
+	if err != nil {
+		t.Fatalf("DecodeBlob error: %v", err)
+	}
+	if len(pushes) == 0 {
+		t.Fatalf("no tx data pushes")
+	}
+	if !bytes.Equal(pushes[len(pushes)-1], []byte{byte(order.MatchComplete)}) {
+		t.Fatalf("status push = %x, want %x", pushes[len(pushes)-1], []byte{byte(order.MatchComplete)})
+	}
+}

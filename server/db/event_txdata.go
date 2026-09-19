@@ -372,6 +372,48 @@ func (u *EpochProcessedUpdate) EventTxData() ([]byte, error) {
 }
 
 // EventTxData returns the versioned transaction data recorded in the event log
+// for a suspended_cancel event.
+func (u *SuspendedCancelUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil suspended cancel update")
+	}
+	if u.Cancel == nil {
+		return nil, fmt.Errorf("nil suspended cancel order")
+	}
+	if u.Match == nil {
+		return nil, fmt.Errorf("nil suspended cancel match")
+	}
+	if u.Match.Maker == nil || u.Match.Taker == nil {
+		return nil, fmt.Errorf("nil suspended cancel match order")
+	}
+	if u.Match.Status != order.MatchComplete {
+		return nil, fmt.Errorf("suspended cancel match status %d, want %d", u.Match.Status, order.MatchComplete)
+	}
+	mid := u.Match.ID()
+	makerID := u.Match.Maker.ID()
+	takerID := u.Match.Taker.ID()
+	return encode.BuildyBytes{0}.
+		AddData([]byte(u.Market)).
+		AddData(encode.Uint32Bytes(u.Base)).
+		AddData(encode.Uint32Bytes(u.Quote)).
+		AddData(u.Cancel.Serialize()).
+		AddData(u.TargetOrderID[:]).
+		AddData(u.TargetAccount[:]).
+		AddData(boolBytes(u.TargetSell)).
+		AddData(int64Bytes(u.EpochIdx)).
+		AddData(int64Bytes(u.EpochDur)).
+		AddData(encode.Uint64Bytes(u.FeeRateBase)).
+		AddData(encode.Uint64Bytes(u.FeeRateQuote)).
+		AddData(int64Bytes(u.MatchServerTime.UnixMilli())).
+		AddData(mid[:]).
+		AddData(makerID[:]).
+		AddData(takerID[:]).
+		AddData(encode.Uint64Bytes(u.Match.Quantity)).
+		AddData(encode.Uint64Bytes(u.Match.Rate)).
+		AddData([]byte{byte(u.Match.Status)}), nil
+}
+
+// EventTxData returns the versioned transaction data recorded in the event log
 // for an orders_revoked event.
 func (u *OrdersRevokedUpdate) EventTxData() ([]byte, error) {
 	if u == nil {

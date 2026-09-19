@@ -397,6 +397,156 @@ func TestApplyOrderAcceptedEvent(t *testing.T) {
 	}
 }
 
+func TestApplySuspendedCancelEvent(t *testing.T) {
+	ctx := context.Background()
+	const epochDur = int64(EpochDuration)
+	for _, tc := range []struct {
+		name      string
+		matchLots uint64
+		wantErr   string
+	}{
+		{name: "cancel remaining quantity", matchLots: 2},
+		{name: "reject original quantity", matchLots: 3, wantErr: "match ID mismatch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+
+			target := newLimitOrder(true, 4_900_000, 3, order.StandingTiF, 0)
+			target.AddFill(LotSize)
+			targetEpoch := target.Time() / epochDur
+			persistBook := true
+			seedMarketLifecycle(t, &db.MarketLifecycle{
+				Market:            "dcr_btc",
+				State:             db.MarketStateSuspended,
+				StartEpochIdx:     targetEpoch,
+				StartEpochDur:     epochDur,
+				FinalEpochIdx:     targetEpoch + 1,
+				FinalEpochDur:     epochDur,
+				ProcessedEpochIdx: targetEpoch + 1,
+				PersistBook:       &persistBook,
+				RunParams:         testMarketRunParams(),
+			})
+			if err := storeOrderForTest(archie, target, targetEpoch, epochDur, order.OrderStatusBooked); err != nil {
+				t.Fatalf("store target: %v", err)
+			}
+			cancel := newCancelOrder(target.ID(), AssetDCR, AssetBTC, 30)
+			cancel.AccountID = target.AccountID
+			epoch := order.EpochID{Idx: uint64(cancel.Time() / epochDur), Dur: uint64(epochDur)}
+			match := newMatch(target, cancel, tc.matchLots*LotSize, epoch)
+			match.Status = order.MatchComplete
+			wantMatch := newMatch(target, cancel, target.Remaining(), epoch)
+			wantMatch.Status = order.MatchComplete
+			update := &db.SuspendedCancelUpdate{
+				Market:          "dcr_btc",
+				Base:            AssetDCR,
+				Quote:           AssetBTC,
+				Cancel:          cancel,
+				TargetOrderID:   target.ID(),
+				TargetAccount:   target.AccountID,
+				TargetSell:      target.Sell,
+				EpochIdx:        int64(epoch.Idx),
+				EpochDur:        epochDur,
+				FeeRateBase:     match.FeeRateBase,
+				FeeRateQuote:    match.FeeRateQuote,
+				MatchServerTime: cancel.ServerTime,
+				Match:           match,
+			}
+			event := []byte(tc.name)
+			tip := testEventApplyTip(t, nil, 1, meshevents.EventKindSuspendedCancel, event, update)
+			result, applyErr := archie.ApplySuspendedCancelEvent(ctx, &db.EventLogMeta{
+				Seq: 1, Event: event, ExpectedTipHash: tip,
+			}, update)
+			if tc.wantErr != "" {
+				if applyErr == nil || !strings.Contains(applyErr.Error(), tc.wantErr) {
+					t.Fatalf("apply error = %v, want %q", applyErr, tc.wantErr)
+				}
+				if result != nil {
+					t.Fatalf("rejected cancel returned result %+v", result)
+				}
+			} else if applyErr != nil {
+				t.Fatalf("ApplySuspendedCancelEvent: %v", applyErr)
+			}
+
+			wantTargetStatus := order.OrderStatusCanceled
+			if tc.wantErr != "" {
+				wantTargetStatus = order.OrderStatusBooked
+			}
+			storedTarget, status, err := archie.Order(target.ID(), AssetDCR, AssetBTC)
+			if err != nil || status != wantTargetStatus {
+				t.Fatalf("target status = %v, error = %v, want %v", status, err, wantTargetStatus)
+			}
+			if !bytes.Equal(order.EncodeOrder(storedTarget), order.EncodeOrder(target)) {
+				t.Fatal("stored target data changed")
+			}
+			entries, err := archie.EventLogEntriesAfter(ctx, 0, 2)
+			if err != nil {
+				t.Fatalf("EventLogEntriesAfter: %v", err)
+			}
+			if tc.wantErr != "" {
+				if _, _, err := archie.Order(cancel.ID(), AssetDCR, AssetBTC); !db.IsErrOrderUnknown(err) {
+					t.Fatalf("cancel lookup error = %v, want unknown order", err)
+				}
+				for _, mid := range []order.MatchID{match.ID(), wantMatch.ID()} {
+					if _, err := archie.MatchByID(mid, AssetDCR, AssetBTC); !db.IsErrMatchUnknown(err) {
+						t.Fatalf("match %v lookup error = %v, want unknown match", mid, err)
+					}
+				}
+				if len(entries) != 0 {
+					t.Fatalf("event log has %d entries after rejection, want none", len(entries))
+				}
+				return
+			}
+
+			storedCancel, status, err := archie.Order(cancel.ID(), AssetDCR, AssetBTC)
+			if err != nil || status != order.OrderStatusExecuted {
+				t.Fatalf("cancel status = %v, error = %v, want executed", status, err)
+			}
+			if !bytes.Equal(order.EncodeOrder(storedCancel), order.EncodeOrder(cancel)) {
+				t.Fatal("stored cancel differs from submitted cancel")
+			}
+			if result.Cancel == nil || !bytes.Equal(order.EncodeOrder(result.Cancel), order.EncodeOrder(cancel)) {
+				t.Fatal("returned cancel differs from submitted cancel")
+			}
+			if result.TargetOrder == nil || !bytes.Equal(order.EncodeOrder(result.TargetOrder), order.EncodeOrder(target)) {
+				t.Fatal("returned target differs from stored target")
+			}
+			gotMatch := result.Match
+			if gotMatch == nil || gotMatch.Maker == nil || gotMatch.Taker == nil {
+				t.Fatal("returned match is missing orders")
+			}
+			if gotMatch.ID() != wantMatch.ID() || gotMatch.Maker.ID() != target.ID() || gotMatch.Taker.ID() != cancel.ID() {
+				t.Fatalf("returned match has wrong IDs: %+v", gotMatch)
+			}
+			if gotMatch.Quantity != target.Remaining() || gotMatch.Rate != target.Rate || gotMatch.Status != order.MatchComplete {
+				t.Fatalf("returned match = %+v, want completed match for remaining quantity %d at rate %d", gotMatch, target.Remaining(), target.Rate)
+			}
+			if gotMatch.Epoch != epoch || gotMatch.FeeRateBase != match.FeeRateBase || gotMatch.FeeRateQuote != match.FeeRateQuote {
+				t.Fatalf("returned match has wrong epoch or fee rates: %+v", gotMatch)
+			}
+			storedMatch, err := archie.MatchByID(wantMatch.ID(), AssetDCR, AssetBTC)
+			if err != nil {
+				t.Fatalf("MatchByID: %v", err)
+			}
+			if storedMatch.ID != wantMatch.ID() || storedMatch.Maker != target.ID() || storedMatch.Taker != cancel.ID() {
+				t.Fatalf("stored match has wrong IDs: %+v", storedMatch)
+			}
+			if storedMatch.Quantity != target.Remaining() || storedMatch.Rate != target.Rate || storedMatch.Epoch != epoch {
+				t.Fatalf("stored match has wrong quantity, rate, or epoch: %+v", storedMatch)
+			}
+			if storedMatch.Status != order.MatchComplete || storedMatch.Active {
+				t.Fatalf("stored match = %+v, want complete and inactive", storedMatch)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("event log has %d entries, want 1", len(entries))
+			}
+			requireEventApplyLog(t, result.Log, 1, meshevents.EventKindSuspendedCancel, event, tip, update)
+			requireEventApplyLog(t, entries[0], 1, meshevents.EventKindSuspendedCancel, event, tip, update)
+		})
+	}
+}
+
 func TestOrdersWithCommit(t *testing.T) {
 	ctx := context.Background()
 	const epochDur int64 = 6000
