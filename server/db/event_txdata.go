@@ -299,3 +299,22 @@ func (u *EpochProcessedUpdate) EventTxData() ([]byte, error) {
 		matches,
 	)
 }
+
+// EventTxData returns the versioned transaction data recorded in the event log
+// for an orders_revoked event.
+func (u *OrdersRevokedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil orders revoked update")
+	}
+	orders, err := orderIDsTxData(u.Orders)
+	if err != nil {
+		return nil, err
+	}
+	if len(orders) > encode.MaxDataLen {
+		return nil, fmt.Errorf("revoked order data size %d exceeds maximum %d", len(orders), encode.MaxDataLen)
+	}
+	return encode.BuildyBytes{0}.
+		AddData([]byte{byte(u.Reason)}).
+		AddData(int64Bytes(u.RevokeTime.UnixMilli())).
+		AddData(orders), nil
+}

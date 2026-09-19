@@ -82,6 +82,50 @@ func (a *Archiver) applyMarketStartedEpochRevokesTx(tx *sql.Tx, update *db.Marke
 	return nil
 }
 
+// ApplyOrdersRevokedEvent revokes booked orders, records their generated
+// cancel orders, and records non-penalizing reputation outcomes.
+func (a *Archiver) ApplyOrdersRevokedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, update *db.OrdersRevokedUpdate) (*db.EventLogEntry, error) {
+	if err := validateOrdersRevokedUpdate(update); err != nil {
+		return nil, err
+	}
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyRepEventTx(ctx, meta, meshevents.EventKindOrdersRevoked, txData, policy, func(tx *sql.Tx, repUpdates *reputationOutcomeBatch) error {
+		for _, lo := range update.Orders {
+			oid, user := lo.ID(), lo.User()
+			cancelID, err := a.revokeBookedOrderByID(tx, oid, user, lo.Base(), lo.Quote(), false, update.RevokeTime)
+			if err != nil {
+				return fmt.Errorf("orders_revoked revoke %v: %w", oid, err)
+			}
+			// Server revocations do not count as user cancellations.
+			repUpdates.orders = append(repUpdates.orders, &reputationOrderOutcome{
+				user: user,
+				oid:  cancelID,
+			})
+		}
+		return nil
+	})
+}
+
+func validateOrdersRevokedUpdate(update *db.OrdersRevokedUpdate) error {
+	if update == nil {
+		return fmt.Errorf("nil orders revoked update")
+	}
+	if !meshevents.ValidOrderRevokeReason(update.Reason) {
+		return fmt.Errorf("invalid order revoke reason %d", update.Reason)
+	}
+	if update.RevokeTime.IsZero() {
+		return fmt.Errorf("empty orders_revoked revoke time")
+	}
+	if len(update.Orders) == 0 {
+		return fmt.Errorf("empty orders_revoked order list")
+	}
+	return nil
+}
+
 // ApplyEpochProcessedEvent records an epoch's preimage results, order changes,
 // matches, and reputation outcomes, and advances the last processed epoch.
 func (a *Archiver) ApplyEpochProcessedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, update *db.EpochProcessedUpdate) (*db.EventLogEntry, error) {
