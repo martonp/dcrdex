@@ -198,3 +198,161 @@ func (a *Archiver) notifyRepInputsOnCommit(err error, users ...account.AccountID
 		listener(users...)
 	}
 }
+
+type reputationPreimageOutcome struct {
+	user account.AccountID
+	oid  order.OrderID
+	miss bool
+}
+
+type reputationOrderOutcome struct {
+	user            account.AccountID
+	oid             order.OrderID
+	penalizedCancel bool
+}
+
+// reputationOutcomeBatch contains the reputation outcomes to record for one event.
+type reputationOutcomeBatch struct {
+	preimages []*reputationPreimageOutcome
+	orders    []*reputationOrderOutcome
+}
+
+// reputationClassKey identifies the account and outcome class to prune.
+type reputationClassKey struct {
+	user  account.AccountID
+	class db.OutcomeClass
+}
+
+// applyRepEventTx applies an event and records its reputation outcomes in
+// the same transaction. It prunes older outcomes to the configured limits
+// and notifies the reputation listener if the transaction committed or
+// its commit outcome is unknown.
+//
+// apply updates the event's database state and adds reputation outcomes
+// to the batch. Those outcomes are written after apply returns successfully.
+func (a *Archiver) applyRepEventTx(ctx context.Context, meta *db.EventLogMeta, kind string, txData []byte,
+	policy *db.ReputationOutcomePolicy, apply func(*sql.Tx, *reputationOutcomeBatch) error) (*db.EventLogEntry, error) {
+
+	batch := new(reputationOutcomeBatch)
+	logEntry, err := a.applyEventTx(ctx, meta, kind, txData, func(tx *sql.Tx) error {
+		if err := apply(tx, batch); err != nil {
+			return err
+		}
+		return a.storeReputationOutcomeBatch(ctx, tx, policy, batch)
+	})
+	a.notifyRepInputsOnCommit(err, reputationBatchAccounts(batch)...)
+	return logEntry, err
+}
+
+// storeReputationOutcomeBatch writes and prunes outcome rows for the batch.
+func (a *Archiver) storeReputationOutcomeBatch(
+	ctx context.Context,
+	tx *sql.Tx,
+	policy *db.ReputationOutcomePolicy,
+	batch *reputationOutcomeBatch,
+) error {
+	keys := reputationClassKeys(batch)
+	if len(keys) == 0 {
+		return nil
+	}
+	// Guard against programmer error: a missing limit would prune all outcomes
+	// for the account and class.
+	for _, key := range keys {
+		if outcomeRetentionLimit(policy, key.class) <= 0 {
+			return fmt.Errorf("missing reputation outcome limit for class %d", key.class)
+		}
+	}
+	handleDBError := func(err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		a.fatalBackendErr(err)
+		return err
+	}
+	for _, update := range batch.preimages {
+		outcome := db.OutcomePreimageSuccess
+		if update.miss {
+			outcome = db.OutcomePreimageMiss
+		}
+		if err := a.insertPoints(ctx, tx, update.user, update.oid, db.OutcomeClassPreimage, outcome); err != nil {
+			return handleDBError(err)
+		}
+	}
+	for _, update := range batch.orders {
+		outcome := db.OutcomeOrderComplete
+		if update.penalizedCancel {
+			outcome = db.OutcomeOrderCanceled
+		}
+		if err := a.insertPoints(ctx, tx, update.user, update.oid, db.OutcomeClassOrder, outcome); err != nil {
+			return handleDBError(err)
+		}
+	}
+
+	// Prune once per account and outcome class after inserting the whole batch.
+	pruneStmt := fmt.Sprintf(internal.PrunePointsPastLimit, a.tables.points)
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx, pruneStmt, key.user, key.class, outcomeRetentionLimit(policy, key.class)); err != nil {
+			return handleDBError(err)
+		}
+	}
+	return nil
+}
+
+func (a *Archiver) insertPoints(ctx context.Context, tx *sql.Tx, user account.AccountID, link [32]byte,
+	class db.OutcomeClass, outcome db.Outcome) error {
+	stmt := fmt.Sprintf(internal.InsertPoints, a.tables.points)
+	_, err := tx.ExecContext(ctx, stmt, user, link[:], class, outcome)
+	return err
+}
+
+func outcomeRetentionLimit(policy *db.ReputationOutcomePolicy, class db.OutcomeClass) int {
+	if policy == nil {
+		return 0
+	}
+	switch class {
+	case db.OutcomeClassPreimage:
+		return policy.PreimageLimit
+	case db.OutcomeClassOrder:
+		return policy.OrderLimit
+	default:
+		return 0
+	}
+}
+
+func reputationClassKeys(batch *reputationOutcomeBatch) []reputationClassKey {
+	if batch == nil {
+		return nil
+	}
+	keys := make(map[reputationClassKey]struct{})
+	for _, update := range batch.preimages {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassPreimage}] = struct{}{}
+		}
+	}
+	for _, update := range batch.orders {
+		if update != nil {
+			keys[reputationClassKey{user: update.user, class: db.OutcomeClassOrder}] = struct{}{}
+		}
+	}
+	distinct := make([]reputationClassKey, 0, len(keys))
+	for key := range keys {
+		distinct = append(distinct, key)
+	}
+	return distinct
+}
+
+// reputationBatchAccounts returns each account represented in the batch once,
+// even if it has multiple outcomes or outcomes in different classes.
+func reputationBatchAccounts(batch *reputationOutcomeBatch) []account.AccountID {
+	keys := reputationClassKeys(batch)
+	seen := make(map[account.AccountID]struct{}, len(keys))
+	users := make([]account.AccountID, 0, len(keys))
+	for _, key := range keys {
+		if _, found := seen[key.user]; found {
+			continue
+		}
+		seen[key.user] = struct{}{}
+		users = append(users, key.user)
+	}
+	return users
+}

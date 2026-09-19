@@ -953,6 +953,17 @@ type MarketStartedUpdate struct {
 	EpochRevokes []*StartupOrderRevoke
 }
 
+// ReputationOutcomePolicy sets how many outcomes of each class are retained
+// per account and which successful cancellations count as penalties.
+type ReputationOutcomePolicy struct {
+	PreimageLimit int
+	OrderLimit    int
+
+	// Successful cancellations with a nonnegative epoch gap below this
+	// threshold are penalized.
+	FreeCancelThreshold int32
+}
+
 // StartupOrderRevoke contains an order and its startup revocation reason.
 type StartupOrderRevoke struct {
 	Order  order.Order
