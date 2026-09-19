@@ -19,6 +19,11 @@ import (
 
 const cancelThreshWindow = 100 // spec
 
+// storeOrderForTest stores an order with the specified epoch and status.
+func storeOrderForTest(a *Archiver, ord order.Order, epochIdx, epochDur int64, status order.OrderStatus) error {
+	return a.storeOrder(a.db, ord, epochIdx, epochDur, db.EpochGapNA, marketToPgStatus(status))
+}
+
 func TestStoreOrder(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)

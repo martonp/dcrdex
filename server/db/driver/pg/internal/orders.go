@@ -103,6 +103,8 @@ const (
 		commit, coins, quantity, rate, force, status, filled
 	FROM %s WHERE account_id = $1;`
 
+	SelectOrderIDsByStatus = `SELECT oid FROM %s WHERE status = $1 ORDER BY oid;`
+
 	// SelectUserOrderStatuses retrieves the order IDs and statuses of all orders
 	// for the given account ID. Only applies to market and limit orders.
 	SelectUserOrderStatuses = `SELECT oid, status FROM %s WHERE account_id = $1;`
