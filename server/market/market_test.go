@@ -291,6 +291,10 @@ func (b *tBalancer) CheckBalance(acctAddr string, assetID, redeemAssetID uint32,
 	return true
 }
 
+func (b *tBalancer) CheckReserved(acctAddr string, assetID uint32) bool {
+	return b.CheckBalance(acctAddr, assetID, assetID, 0, 0, 0)
+}
+
 func randomOrderID() order.OrderID {
 	pk := randomBytes(order.OrderIDSize)
 	var id order.OrderID

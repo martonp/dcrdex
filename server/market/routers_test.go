@@ -749,10 +749,11 @@ func TestMain(m *testing.M) {
 		60:  assetETH,
 		966: assetMATIC,
 	}
-	balancer, err := NewDEXBalancer(pendingAccounters, assets, matchNegotiator)
+	balancer, err := NewDEXBalancer(assets, matchNegotiator)
 	if err != nil {
 		panic("NewDEXBalancer error:" + err.Error())
 	}
+	balancer.SetMarkets(pendingAccounters)
 	oRig.router = NewOrderRouter(&OrderRouterConfig{
 		AuthManager:  oRig.auth,
 		Assets:       assets,

@@ -86,6 +86,9 @@ type Balancer interface {
 	// trade the outgoing number of lots (totaling qty) and incoming number of
 	// redeems.
 	CheckBalance(acctAddr string, assetID, redeemAssetID uint32, qty, lots uint64, redeems int) bool
+	// CheckReserved reports whether the account can still fund its existing
+	// DEX commitments for this asset. No new order is being placed.
+	CheckReserved(acctAddr string, assetID uint32) bool
 }
 
 // Config is the Market configuration.
