@@ -93,13 +93,9 @@ type MarketTunnel interface {
 	// since a start epoch may be set.
 	Running() bool
 
-	// CheckUnfilled checks a user's unfilled book orders that are funded by
-	// coins for a given asset to ensure that their funding coins are not spent.
-	// If any of an unfilled order's funding coins are spent, the order is
-	// unbooked (removed from the in-memory book, revoked in the DB, a
-	// cancellation marked against the user, coins unlocked, and orderbook
-	// subscribers notified). See Unbook for details.
-	CheckUnfilled(assetID uint32, user account.AccountID) (unbooked []*order.LimitOrder)
+	// CheckUnfilled revokes a user's unfilled booked orders whose funding
+	// coins are spent and returns the revoked orders.
+	CheckUnfilled(assetID uint32, user account.AccountID) []*order.LimitOrder
 
 	// Parcels calculates the number of active parcels for the market.
 	Parcels(user account.AccountID, settlingQty uint64) float64
