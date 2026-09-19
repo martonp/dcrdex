@@ -799,18 +799,6 @@ func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx in
 	return
 }
 
-// ResumeEpoch returns the first epoch starting after both asSoonAs and the
-// current time, using the current run's epoch duration. It returns zero if
-// the market is already running.
-func (m *Market) ResumeEpoch(asSoonAs time.Time) int64 {
-	if m.Running() {
-		return 0
-	}
-
-	dur := m.liveParams.Load().epochDur
-	return 1 + max(asSoonAs.UnixMilli(), time.Now().UnixMilli())/dur
-}
-
 // buildScheduleResumeEvent builds an event scheduling resumption and returns
 // the scheduled starting epoch and its start time.
 // It fails if the market is already running.
@@ -947,6 +935,13 @@ func (m *Market) Status() *Status {
 		Base:          m.base,
 		Quote:         m.quote,
 	}
+}
+
+// LifecycleState returns the market's stored lifecycle state.
+func (m *Market) LifecycleState() db.MarketState {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState
 }
 
 // Running indicates is the market is accepting new orders. This will return
