@@ -908,6 +908,12 @@ func (lc *MarketLifecycle) ResumeTime() time.Time {
 	return time.UnixMilli(lc.PendingEpochIdx * lc.PendingEpochDur).UTC()
 }
 
+// MarketStartedApplyResult is the stored outcome of a market_started event.
+type MarketStartedApplyResult struct {
+	Log       *EventLogEntry
+	Lifecycle *MarketLifecycle
+}
+
 // MarketStartedUpdate contains the decoded orders and resolved market asset IDs
 // for a market_started event. This type exists in addition to
 // meshevents.MarketStartedEvent so the database and in-memory updates can share

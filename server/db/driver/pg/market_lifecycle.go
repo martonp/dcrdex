@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 
+	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
 )
@@ -77,6 +79,37 @@ func (a *Archiver) updateMarketLifecycleTx(tx *sql.Tx, lc *db.MarketLifecycle) e
 	return nil
 }
 
+// applyMarketStartedLifecycleTx projects the market_started event into the
+// lifecycle row.
+func (a *Archiver) applyMarketStartedLifecycleTx(tx *sql.Tx, update *db.MarketStartedUpdate) (*db.MarketLifecycle, error) {
+	lc, err := a.marketLifecycleForUpdate(tx, update.Market)
+	if err != nil {
+		return nil, err
+	}
+	next, changed, err := db.ProjectMarketStartedLifecycle(lc, update)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return next, nil
+	}
+	if lc == nil {
+		err = a.upsertMarketLifecycleTx(tx, next)
+	} else {
+		err = a.updateMarketLifecycleTx(tx, next)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func sortOrderIDs(ids []order.OrderID) {
+	sort.Slice(ids, func(i, j int) bool {
+		return string(ids[i][:]) < string(ids[j][:])
+	})
+}
+
 func (a *Archiver) validateLifecycleMarket(market string, base, quote uint32) error {
 	marketSchema, err := a.marketSchema(base, quote)
 	if err != nil {
@@ -91,4 +124,45 @@ func (a *Archiver) validateLifecycleMarket(market string, base, quote uint32) er
 			market, base, quote, mkt.Name)
 	}
 	return nil
+}
+
+func selectOrderIDsByStatus(dbe sqlQueryer, tableName string, status pgOrderStatus) ([]order.OrderID, error) {
+	return scanOrderIDRows(dbe.Query(fmt.Sprintf(internal.SelectOrderIDsByStatus, tableName), status))
+}
+
+func scanOrderIDRows(rows *sql.Rows, err error) ([]order.OrderID, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []order.OrderID
+	for rows.Next() {
+		var oid order.OrderID
+		if err := rows.Scan(&oid); err != nil {
+			return nil, err
+		}
+		ids = append(ids, oid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (a *Archiver) activeEpochOrderIDsTx(tx *sql.Tx, base, quote uint32) ([]order.OrderID, error) {
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return nil, err
+	}
+	tradesActive := fullOrderTableName(a.dbName, marketSchema, orderStatusEpoch.active())
+	tradeIDs, err := selectOrderIDsByStatus(tx, tradesActive, orderStatusEpoch)
+	if err != nil {
+		return nil, err
+	}
+	cancelsActive := fullCancelOrderTableName(a.dbName, marketSchema, orderStatusEpoch.active())
+	cancelIDs, err := selectOrderIDsByStatus(tx, cancelsActive, orderStatusEpoch)
+	if err != nil {
+		return nil, err
+	}
+	return append(tradeIDs, cancelIDs...), nil
 }
