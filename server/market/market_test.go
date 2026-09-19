@@ -1503,6 +1503,461 @@ func TestSwapDone(t *testing.T) {
 	})
 }
 
+func TestMarketEpochDriverStartupAndAdvance(t *testing.T) {
+	mkt, _, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	dur := int64(mkt.EpochDuration())
+	startEpoch := currentEpochWithHeadroom(t, dur)
+	// Startup should replace a previously scheduled start with the current epoch.
+	mkt.startEpochIdx = startEpoch + 2
+
+	tm := mkt.mesh.(*tMesh)
+	advanceEvents := observeDriverEvents(tm, meshevents.EventKindAdvanceEpoch)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startupDone, runDone := startTestEpochDriver(t, mkt, ctx, cancel)
+
+	select {
+	case err := <-startupDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for market_started startup result")
+	}
+
+	status := mkt.Status()
+	if !status.Running || status.ActiveEpoch != startEpoch || status.StartEpoch != startEpoch {
+		t.Fatalf("status = running %v active %d start %d, want true/%d/%d",
+			status.Running, status.ActiveEpoch, status.StartEpoch, startEpoch, startEpoch)
+	}
+	mkt.epochMtx.RLock()
+	currentEpoch, nextEpoch := mkt.currentEpoch, mkt.nextEpoch
+	mkt.epochMtx.RUnlock()
+	if currentEpoch == nil || currentEpoch.Epoch != startEpoch {
+		t.Fatalf("current epoch = %v, want %d", currentEpoch, startEpoch)
+	}
+	if nextEpoch == nil || nextEpoch.Epoch != startEpoch+1 {
+		t.Fatalf("next epoch = %v, want %d", nextEpoch, startEpoch+1)
+	}
+	advanceDeadline := nextEpoch.Start.Add(time.Duration(dur/2) * time.Millisecond)
+	select {
+	case observed := <-advanceEvents:
+		advance, err := meshevents.DecodeAdvanceEpochEvent(observed.event.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.submittedAt.Before(nextEpoch.Start) || observed.submittedAt.After(advanceDeadline) {
+			t.Fatalf("advance_epoch submitted at %v, want between %v and %v",
+				observed.submittedAt, nextEpoch.Start, advanceDeadline)
+		}
+		if advance.ClosedEpochIdx != startEpoch || advance.OpenedEpochIdx != startEpoch+1 {
+			t.Fatalf("advance_epoch closed/opened = %d/%d, want %d/%d",
+				advance.ClosedEpochIdx, advance.OpenedEpochIdx, startEpoch, startEpoch+1)
+		}
+	case <-time.After(time.Until(advanceDeadline)):
+		t.Fatal("timed out waiting for first advance_epoch")
+	}
+	cancel()
+	waitForDriverStop(t, runDone)
+	if len(tm.entries) < 2 || tm.entries[0].Kind != meshevents.EventKindMarketStarted ||
+		tm.entries[1].Kind != meshevents.EventKindAdvanceEpoch {
+		t.Fatal("expected one market_started followed by advance_epoch")
+	}
+}
+
+func TestMarketEpochDriverResumeRescheduled(t *testing.T) {
+	mkt, storage, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	dur := int64(mkt.EpochDuration())
+	nowEpoch := currentEpochWithHeadroom(t, dur)
+	firstResumeEpoch := nowEpoch + 2
+	rescheduledResumeEpoch := firstResumeEpoch + 2
+	persist := true
+	setTestMarketLifecycle(mkt, storage, &db.MarketLifecycle{
+		Market:          mkt.name,
+		State:           db.MarketStateSuspended,
+		StartEpochIdx:   firstResumeEpoch,
+		StartEpochDur:   dur,
+		PendingAction:   db.MarketPendingResume,
+		PendingEpochIdx: firstResumeEpoch,
+		PendingEpochDur: dur,
+		PersistBook:     &persist,
+		RunParams:       mkt.configuredParams.MarketRunParams,
+	})
+
+	resumeEvents := observeDriverEvents(mkt.mesh.(*tMesh), meshevents.EventKindMarketResumed)
+	ctx, cancel := context.WithCancel(context.Background())
+	startupDone, runDone := startTestEpochDriver(t, mkt, ctx, cancel)
+
+	select {
+	case err := <-startupDone:
+		if err != nil {
+			t.Fatalf("startup error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for suspended startup")
+	}
+
+	reschedule := &meshevents.MarketResumeScheduledEvent{Market: mkt.name, StartEpochIdx: rescheduledResumeEpoch, EpochDur: dur}
+	rescheduleEvent, err := mesh.NewEvent(reschedule)
+	if err != nil {
+		t.Fatalf("build schedule_resume event: %v", err)
+	}
+	if _, err := mkt.mesh.ApplyEvent(context.Background(), rescheduleEvent); err != nil {
+		t.Fatalf("apply schedule_resume event: %v", err)
+	}
+
+	// The first resume must wait for the new schedule, even after the old time passes.
+	resumeTime := time.UnixMilli(rescheduledResumeEpoch * dur)
+	resumeDeadline := resumeTime.Add(time.Duration(dur/2) * time.Millisecond)
+	select {
+	case observed := <-resumeEvents:
+		resumed, err := meshevents.DecodeMarketResumedEvent(observed.event.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observed.submittedAt.Before(resumeTime) || observed.submittedAt.After(resumeDeadline) {
+			t.Fatalf("market resumed at %v, want between %v and %v",
+				observed.submittedAt, resumeTime, resumeDeadline)
+		}
+		if resumed.StartEpochIdx != rescheduledResumeEpoch || resumed.EpochDur != dur {
+			t.Fatalf("resume epoch = %d:%d, want %d:%d", resumed.StartEpochIdx,
+				resumed.EpochDur, rescheduledResumeEpoch, dur)
+		}
+	case <-time.After(time.Until(resumeDeadline)):
+		t.Fatal("market did not resume at the new scheduled time")
+	}
+	cancel()
+	waitForDriverStop(t, runDone)
+	if len(storage.marketResumedUpdates) != 1 {
+		t.Fatalf("resume applications = %d, want 1", len(storage.marketResumedUpdates))
+	}
+}
+
+func TestMarketEpochDriverWaitsForChainSync(t *testing.T) {
+	mkt, _, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	// Even existing epoch queues must wait for chain synchronization.
+	dur := int64(mkt.EpochDuration())
+	mkt.startEpochIdx = 1
+	mkt.currentEpoch = NewEpoch(10, dur)
+	mkt.nextEpoch = NewEpoch(11, dur)
+	swapper := &unsyncedDriverSwapper{checked: make(chan struct{}, 1)}
+	mkt.swapper = swapper
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startupDone, runDone := startTestEpochDriver(t, mkt, ctx, cancel)
+	select {
+	case <-swapper.checked:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not check chain synchronization")
+	}
+
+	select {
+	case err := <-startupDone:
+		t.Fatalf("startup result while unsynced: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	select {
+	case <-runDone:
+		t.Fatalf("market run returned before cancellation")
+	default:
+	}
+	cancel()
+	select {
+	case err := <-startupDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("startup error after cancellation = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for canceled startup result")
+	}
+	waitForDriverStop(t, runDone)
+	if events := mkt.mesh.(*tMesh).entries; len(events) != 0 {
+		t.Fatalf("events while unsynced = %d, want 0", len(events))
+	}
+	status := mkt.Status()
+	if status.Running || status.ActiveEpoch != 0 {
+		t.Fatalf("market status after canceled startup = running %v active %d, want false/0",
+			status.Running, status.ActiveEpoch)
+	}
+}
+
+func TestMarketEpochDriverProcessingLimit(t *testing.T) {
+	const processedEpoch = int64(10)
+	lastAllowedClose := processedEpoch + db.MaxUnprocessedClosedEpochs
+
+	t.Run("within limit", func(t *testing.T) {
+		driver := &marketEpochDriver{m: &Market{processedEpochIdx: processedEpoch}}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := driver.waitForEpochProcessing(ctx, lastAllowedClose); err != nil {
+			t.Fatalf("closing at the limit: %v", err)
+		}
+	})
+
+	t.Run("waits for processing", func(t *testing.T) {
+		mkt := &Market{processedEpochIdx: processedEpoch, closureWake: make(chan struct{}, 1)}
+		driver := &marketEpochDriver{m: mkt}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- driver.waitForEpochProcessing(ctx, lastAllowedClose+1)
+		}()
+		defer func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("processing waiter did not stop")
+			}
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("advanced before processing caught up: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		mkt.epochMtx.Lock()
+		mkt.processedEpochIdx++
+		mkt.epochMtx.Unlock()
+		mkt.wakeClosureWaiter()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("processing caught up: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("still waiting after processing caught up")
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		driver := &marketEpochDriver{m: &Market{processedEpochIdx: processedEpoch}}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- driver.waitForEpochProcessing(ctx, lastAllowedClose+1)
+		}()
+		defer func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("processing waiter did not stop")
+			}
+		}()
+		select {
+		case err := <-done:
+			t.Fatalf("wait returned before cancellation: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("wait error = %v, want context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("wait ignored cancellation")
+		}
+	})
+}
+
+func TestMarketEpochDriverStopsOnAdvanceError(t *testing.T) {
+	mkt, _, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	failed := false
+	mkt.mesh.(*tMesh).events[meshevents.EventKindAdvanceEpoch] = func(*mesh.EventApplyContext, *mesh.Event) (*db.EventLogEntry, error) {
+		failed = true
+		return nil, errors.New("advance failed")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready, done := startTestEpochDriver(t, mkt, ctx, cancel)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("driver did not stop after advancement failed")
+	}
+	if !failed || ctx.Err() != nil {
+		t.Fatal("driver must stop on advancement failure without canceling its parent")
+	}
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("startup: %v", err)
+		}
+	default:
+		t.Fatal("driver did not report startup")
+	}
+	if len(ready) != 0 {
+		t.Fatal("driver reported startup more than once")
+	}
+	status := mkt.Status()
+	if status.Running || status.ActiveEpoch != 0 {
+		t.Fatalf("market not stopped: running=%v, active epoch=%d", status.Running, status.ActiveEpoch)
+	}
+}
+
+func TestMarketEpochDriverDrainsOnProcessingError(t *testing.T) {
+	mkt, _, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	processed := 0
+	mkt.mesh.(*tMesh).events[meshevents.EventKindEpochProcessed] = func(*mesh.EventApplyContext, *mesh.Event) (*db.EventLogEntry, error) {
+		processed++
+		return nil, errors.New("processing failed")
+	}
+	driver := &marketEpochDriver{m: mkt, epochPump: newEpochPump()}
+	// Queue more completed epochs than fit in the pump's output buffer.
+	for i := int64(1); i <= 4; i++ {
+		epoch := driver.epochPump.Insert(NewEpoch(i, int64(mkt.EpochDuration())))
+		epoch.complete(nil, nil, nil, time.Time{})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pumpDone, processingDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		driver.epochPump.Run(ctx)
+	}()
+	go func() {
+		defer close(processingDone)
+		driver.runEpochProcessing(ctx, cancel)
+	}()
+
+	for _, worker := range []struct {
+		name string
+		done <-chan struct{}
+	}{{"pump", pumpDone}, {"processing", processingDone}} {
+		select {
+		case <-worker.done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not stop after processing failed", worker.name)
+		}
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatal("processing failure did not cancel the workers")
+	}
+	if processed != 1 {
+		t.Fatalf("processed %d epochs, want only the failed epoch", processed)
+	}
+	if len(driver.epochPump.ready) != 0 {
+		t.Fatal("pump output was not drained")
+	}
+}
+
+// startTestEpochDriver leaves readiness checks to the test and joins the driver
+// before the market fixture is cleaned up.
+func startTestEpochDriver(t *testing.T, mkt *Market, ctx context.Context, cancel context.CancelFunc) (<-chan error, <-chan struct{}) {
+	t.Helper()
+	ready := make(chan error, 2) // Leave room to detect a duplicate startup result.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		newMarketEpochDriver(mkt).run(ctx, ready)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		waitForDriverStop(t, done)
+	})
+	return ready, done
+}
+
+func waitForDriverStop(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("epoch driver did not stop")
+	}
+}
+
+type observedDriverEvent struct {
+	event       *mesh.Event
+	submittedAt time.Time
+}
+
+// observeDriverEvents reports successful applications with their submission times.
+func observeDriverEvents(tm *tMesh, kind string) <-chan observedDriverEvent {
+	events := make(chan observedDriverEvent, 1)
+	apply := tm.events[kind]
+	tm.events[kind] = func(ctx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+		submittedAt := time.Now()
+		entry, err := apply(ctx, event)
+		if err == nil {
+			select {
+			case events <- observedDriverEvent{event, submittedAt}:
+			case <-ctx.Done():
+			}
+		}
+		return entry, err
+	}
+	return events
+}
+
+type unsyncedDriverSwapper struct {
+	epochProcessedTestSwapper
+	checked chan struct{}
+}
+
+func (s *unsyncedDriverSwapper) ChainsSynced(uint32, uint32) (bool, error) {
+	select {
+	case s.checked <- struct{}{}:
+	default:
+	}
+	return false, nil
+}
+
+func currentEpochWithHeadroom(t *testing.T, dur int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Duration(dur) * time.Millisecond)
+	for time.Now().Before(deadline) {
+		nowMS := time.Now().UnixMilli()
+		if nowMS%dur < dur/4 {
+			return nowMS / dur
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for epoch headroom")
+	return 0
+}
+
+func waitForOrderAdmission(t *testing.T, mkt *Market) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if mkt.Running() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for order admission")
+}
+
 func TestMarket_Suspend(t *testing.T) {
 	// Create the market.
 	mkt, _, _, cleanup, err := newTestMarket()
@@ -4791,6 +5246,10 @@ func TestApplyAdvanceEpochEvent(t *testing.T) {
 		if _, _, _, err := mkt.acceptedOrderEpoch(lo); err == nil {
 			t.Fatal("draining market accepted an order")
 		}
+		if !mkt.drainingFinalEpoch(closedEpochIdx, epochDur) || mkt.drainingFinalEpoch(closedEpochIdx-1, epochDur) ||
+			mkt.drainingFinalEpoch(closedEpochIdx, epochDur*2) {
+			t.Fatal("incorrect final draining epoch")
+		}
 		lo.SetTime(time.UnixMilli((closedEpochIdx+1)*epochDur - 1))
 		if mkt.orderAtOrAfterSuspendBoundary(lo) {
 			t.Fatal("order before final boundary rejected")
@@ -5957,7 +6416,7 @@ func TestSubmitMarketStarted(t *testing.T) {
 			if (currentEpoch != nil) != tc.wantOpenEpoch {
 				t.Fatalf("current epoch = %v, want opened %t", currentEpoch, tc.wantOpenEpoch)
 			}
-			if got := mkt.lifecycleState == db.MarketStateDraining; got != !tc.wantOpenEpoch {
+			if got := mkt.isDraining(); got != !tc.wantOpenEpoch {
 				t.Fatalf("finalizing suspend = %t, want %t", got, !tc.wantOpenEpoch)
 			}
 		})
