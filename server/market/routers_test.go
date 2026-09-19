@@ -300,6 +300,10 @@ func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxSc
 func (a *TAuth) AcctStatus(user account.AccountID) (connected bool, tier int64) {
 	return true, 1
 }
+func (a *TAuth) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
+	return &db.ReputationOutcomePolicy{PreimageLimit: 40, OrderLimit: 100, FreeCancelThreshold: 2}
+}
+
 func (a *TAuth) RecordCompletedOrder(account.AccountID, order.OrderID, time.Time) {}
 func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epochGap int32, t time.Time) {
 	a.cancelOrder = coid
@@ -2018,22 +2022,25 @@ func TestRouter(t *testing.T) {
 	compareTrade(&epochNote.BookOrderNote, mo, "link 2 market 2 epoch update (market order)")
 
 	// Make a new standing limit order with a quantity of at least 3 lots for
-	// the market 2 sell book. Book it with a bookAction, fill 1 lot, and send
-	// an updateRemainingAction update.
+	// the market 2 sell book. Book it with one lot filled, then update its
+	// remaining quantity.
 	lo = makeLO(seller2, mkRate2(1.0, 1.2), randLots(10)+1, order.StandingTiF)
 	lo.FillAmt = mkt2.LotSize
 
-	sig := &updateSignal{
-		action: bookAction,
-		data: sigDataBookedOrder{
-			order:    lo,
-			epochIdx: 12344365,
-		},
-	}
-	src2.feed <- sig
+	router.applyBookedOrder(router.books[mktName2], lo)
 
 	bookNote := getBookNoteFromLink(t, link1)
 	compareLO(bookNote, lo, msgjson.StandingOrderNum, "book notification, link1, market 2")
+	if bookNote.Seq == 0 {
+		t.Fatal("expected non-zero book note sequence")
+	}
+	book := router.books[mktName2]
+	book.mtx.RLock()
+	stored := book.orders[lo.ID()]
+	book.mtx.RUnlock()
+	if stored == nil {
+		t.Fatalf("booked order %v missing from router book", lo.ID())
+	}
 	if bookNote.MarketID != mktName2 {
 		t.Fatalf("wrong market id. wanted %s, got %s", mktName2, bookNote.MarketID)
 	}
@@ -2048,15 +2055,7 @@ func TestRouter(t *testing.T) {
 	// Update the order's remaining quantity. Leave one lot remaining.
 	lo.FillAmt = lo.Quantity - mkt2.LotSize
 
-	sig = &updateSignal{
-		action: updateRemainingAction,
-		data: sigDataUpdateRemaining{
-			order:    lo,
-			epochIdx: 12344365,
-		},
-	}
-
-	src2.feed <- sig
+	router.updateRemaining(router.books[mktName2], lo)
 
 	urNote := getUpdateRemainingNoteFromLink(t, link2)
 	if urNote.Remaining != lo.Remaining() {
@@ -2066,7 +2065,7 @@ func TestRouter(t *testing.T) {
 	link1.getSend()
 
 	// Now unbook the order.
-	sig = &updateSignal{
+	sig := &updateSignal{
 		action: unbookAction,
 		data: sigDataUnbookedOrder{
 			order:    lo,
@@ -2302,13 +2301,10 @@ func TestPriceFeed(t *testing.T) {
 		t.Fatal("spot volume not communicated")
 	}
 
-	rig.source1.feed <- &updateSignal{
-		action: epochReportAction,
-		data: sigDataEpochReport{
-			spot:  &msgjson.Spot{Vol24: 12345},
-			stats: &matcher.MatchCycleStats{},
-		},
-	}
+	rig.router.publishEpochReport(rig.router.books[mktName1], &epochReport{
+		spot:  &msgjson.Spot{Vol24: 12345},
+		stats: &matcher.MatchCycleStats{},
+	})
 
 	update := link.getSend()
 	spot = new(msgjson.Spot)

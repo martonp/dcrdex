@@ -11,6 +11,7 @@ import (
 	"decred.org/dcrdex/dex"
 	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
@@ -33,7 +34,7 @@ const LifecycleTransitionStarted LifecycleTransition = 1
 type LifecycleUpdated func(transition LifecycleTransition, lc *db.MarketLifecycle)
 
 // Events returns the market event appliers keyed by event kind.
-func Events(markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated LifecycleUpdated) map[string]mesh.EventApplier {
+func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func(account.AccountID, *msgjson.Message) error, lifecycleUpdated LifecycleUpdated) map[string]mesh.EventApplier {
 	return map[string]mesh.EventApplier{
 		meshevents.EventKindOrderAccepted: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyOrderAcceptedEvent(applyCtx, markets, bookRouter, event)
@@ -43,6 +44,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated
 		},
 		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
+		},
+		meshevents.EventKindEpochProcessed: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyEpochProcessedEvent(applyCtx, markets, bookRouter, sendIfLocal, event)
 		},
 	}
 }
@@ -291,4 +295,45 @@ func applyAdvanceEpochEvent(applyCtx *mesh.EventApplyContext, markets map[string
 		book.setEpoch(advance.OpenedEpochIdx)
 	}
 	return logEntry, nil
+}
+
+func applyEpochProcessedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter,
+	sendIfLocal func(account.AccountID, *msgjson.Message) error, event *mesh.Event) (*db.EventLogEntry, error) {
+
+	processed, err := meshevents.DecodeEpochProcessedEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, processed.Market)
+	if err != nil {
+		return nil, err
+	}
+	result, err := mkt.applyEpochProcessedEvent(applyCtx, processed, event)
+	if err != nil {
+		return nil, err
+	}
+	bookRouter.applyEpochProcessedEvent(book, processed, result)
+	for _, ord := range result.nomatched {
+		oid := ord.Order.ID()
+		msg, err := noMatchMessage(oid)
+		if err != nil {
+			log.Errorf("Failed to encode 'nomatch' notification.")
+			continue
+		}
+		if err := sendIfLocal(ord.Order.User(), msg); err != nil {
+			log.Infof("Failed to send nomatch to user %s: %v", ord.Order.User(), err)
+		}
+	}
+	bookRouter.publishEpochReport(book, &epochReport{
+		epochIdx:     processed.EpochIdx,
+		epochDur:     processed.EpochDur,
+		spot:         result.spot,
+		stats:        result.stats,
+		baseFeeRate:  processed.FeeRateBase,
+		quoteFeeRate: processed.FeeRateQuote,
+		matches:      result.matchReport,
+	})
+	mkt.sendMMSnapshots(processed.EpochIdx, processed.EpochDur)
+	applyCtx.SetResult(result)
+	return result.dbLog, nil
 }

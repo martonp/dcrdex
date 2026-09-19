@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -63,7 +64,8 @@ var errEpochOrderStorage = errors.New("epoch order storage failure")
 
 // Swapper coordinates atomic swaps for one or more matchsets.
 type Swapper interface {
-	Negotiate(matchSets []*order.MatchSet)
+	TrackMatches(matchSets []*order.MatchSet)
+	RequestMatchAcks(matchSets []*order.MatchSet)
 	CheckUnspent(ctx context.Context, asset uint32, coinID []byte) error
 	ChainsSynced(base, quote uint32) (bool, error)
 }
@@ -2500,9 +2502,11 @@ type epochProcessedResult struct {
 	unbooked    []*order.LimitOrder
 	updates     *matcher.OrdersUpdated
 	stats       *matcher.MatchCycleStats
+	spot        *msgjson.Spot
 	matchReport [][2]int64
 
 	dbUpdate       *db.EpochProcessedUpdate
+	dbLog          *db.EventLogEntry
 	updateLastRate bool
 }
 
@@ -2857,13 +2861,53 @@ func (m *Market) processReadyEpoch(epoch *readyEpoch, notifyChan chan<- *updateS
 	}
 
 	// Send MM epoch snapshots to subscribers.
-	m.sendMMSnapshots(epoch)
+	m.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	// Initiate the swaps.
 	if len(matches) > 0 {
 		log.Debugf("Negotiating %d matches for epoch %d:%d", len(matches),
 			epoch.Epoch, epoch.Duration)
-		m.swapper.Negotiate(matches)
+		m.swapper.TrackMatches(matches)
+		m.swapper.RequestMatchAcks(matches)
+	}
+}
+
+func (m *Market) applyEpochProcessedEvent(applyCtx *mesh.EventApplyContext, event *meshevents.EpochProcessedEvent, raw *mesh.Event) (*epochProcessedResult, error) {
+	m.bookMtx.Lock()
+	result, err := m.buildEpochProcessedUpdate(event)
+	if err != nil {
+		m.bookMtx.Unlock()
+		return nil, err
+	}
+	dbLog, err := m.storage.ApplyEpochProcessedEvent(
+		applyCtx, dbEventLogMeta(applyCtx.Position, raw), m.auth.ReputationOutcomePolicy(), result.dbUpdate)
+	if err != nil {
+		m.bookMtx.Unlock()
+		return nil, err
+	}
+	result.dbLog = dbLog
+	m.applyEpochProcessedBookLocked(event, result)
+	m.bookMtx.Unlock()
+	m.epochMtx.Lock()
+	if event.EpochIdx > m.processedEpochIdx {
+		m.processedEpochIdx = event.EpochIdx
+	}
+	m.epochMtx.Unlock()
+	m.wakeClosureWaiter()
+	m.finalizePreimageMisses(result.misses)
+	m.finalizeEpochProcessed(uint64(event.EpochIdx), result)
+	return result, nil
+}
+
+// finalizePreimageMisses releases funding coins for orders revoked for missing
+// preimages and notifies their owners.
+func (m *Market) finalizePreimageMisses(misses []order.Order) {
+	for _, ord := range misses {
+		oid, user := ord.ID(), ord.User()
+		log.Infof("Revoked order %v from user %v for missing its preimage.",
+			oid, user)
+		m.unlockOrderCoins(ord)
+		go m.sendRevokeOrderNote(oid, user)
 	}
 }
 
@@ -3103,6 +3147,108 @@ func (m *Market) buildEpochProcessedUpdate(event *meshevents.EpochProcessedEvent
 		dbUpdate:       dbUpdate,
 		updateLastRate: stats.EndRate != event.LastRate || len(matches) > 0,
 	}, nil
+}
+
+// matchSetsEqual compares the planned matches with those produced on the live book.
+func matchSetsEqual(a, b []*order.MatchSet) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		aSet, bSet := a[i], b[i]
+		if aSet.Taker.ID() != bSet.Taker.ID() ||
+			aSet.Epoch != bSet.Epoch ||
+			aSet.FeeRateBase != bSet.FeeRateBase ||
+			aSet.FeeRateQuote != bSet.FeeRateQuote ||
+			aSet.Total != bSet.Total ||
+			len(aSet.Makers) != len(bSet.Makers) ||
+			!slices.Equal(aSet.Amounts, bSet.Amounts) ||
+			!slices.Equal(aSet.Rates, bSet.Rates) {
+			return false
+		}
+		for j := range aSet.Makers {
+			if aSet.Makers[j].ID() != bSet.Makers[j].ID() {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// applyEpochProcessedBookLocked reruns matching on the live book after the
+// database update commits, then updates the quantities awaiting settlement.
+// The caller must hold bookMtx.
+func (m *Market) applyEpochProcessedBookLocked(event *meshevents.EpochProcessedEvent, result *epochProcessedResult) {
+	seed, matches, _, failed, doneOK, partial, booked, nomatched, unbooked, updates, stats := m.matcher.Match(m.book, result.revealed)
+	// The database has committed the planned results. Continuing with different
+	// in-memory results would leave the market inconsistent.
+	if !bytes.Equal(seed, result.seed) {
+		panic("live epoch match seed mismatch")
+	}
+	stampEpochMatchSets(event, matches)
+	if !matchSetsEqual(matches, result.matches) {
+		panic("live epoch match result mismatch")
+	}
+	applyEpochStatsLastRate(stats, event.LastRate)
+
+	result.matches = matches
+	result.failed = failed
+	result.doneOK = doneOK
+	result.partial = partial
+	result.booked = booked
+	result.nomatched = nomatched
+	result.unbooked = unbooked
+	result.updates = updates
+	result.stats = stats
+	result.matchReport = epochMatchReport(matches)
+
+	canceled := make([]order.OrderID, 0)
+	for _, ms := range matches {
+		for _, match := range ms.Matches() {
+			if co, ok := match.Taker.(*order.CancelOrder); ok {
+				canceled = append(canceled, co.TargetOrderID)
+				continue
+			}
+			m.settling[match.Taker.ID()] += match.Quantity
+			m.settling[match.Maker.ID()] += match.Quantity
+		}
+	}
+	// An order may trade and then be canceled in the same epoch. Remove canceled
+	// orders after adding all match quantities; they receive no completion credit.
+	for _, oid := range canceled {
+		delete(m.settling, oid)
+	}
+}
+
+// finalizeEpochProcessed releases funding locks, updates market statistics,
+// and registers matches with the swapper.
+func (m *Market) finalizeEpochProcessed(epochID uint64, result *epochProcessedResult) {
+	if result.updateLastRate {
+		m.lastRate = result.stats.EndRate
+	}
+
+	// Completed, failed, and unbooked orders release their funding locks.
+	// Orders remaining on the book keep their locks.
+	for _, ord := range result.doneOK {
+		m.unlockOrderCoins(ord.Order)
+	}
+	for _, ord := range result.failed {
+		m.unlockOrderCoins(ord.Order)
+	}
+	for _, ord := range result.unbooked {
+		m.unlockOrderCoins(ord)
+	}
+
+	// Update the API data collector.
+	spot, err := m.dataCollector.ReportEpoch(m.Base(), m.Quote(), epochID, result.stats)
+	if err != nil {
+		log.Errorf("Error updating API data collector: %v", err)
+	}
+	result.spot = spot
+
+	if len(result.matches) > 0 {
+		m.swapper.TrackMatches(result.matches)
+	}
 }
 
 func (m *Market) validateOrderAcceptedEvent(ord order.Order, book *msgBook) (*validatedOrderAcceptedEvent, error) {
@@ -3382,7 +3528,7 @@ func (m *Market) SubscribeMMSnapshots(user account.AccountID, unsub bool) {
 
 // sendMMSnapshots builds and sends signed epoch snapshots to all MM snapshot
 // subscribers after the book has been updated for the given epoch.
-func (m *Market) sendMMSnapshots(epoch *readyEpoch) {
+func (m *Market) sendMMSnapshots(epochIdx, epochDur int64) {
 	m.mmSnapshotMtx.RLock()
 	if len(m.mmSnapshotSubs) == 0 {
 		m.mmSnapshotMtx.RUnlock()
@@ -3410,9 +3556,9 @@ func (m *Market) sendMMSnapshots(epoch *readyEpoch) {
 	m.bookMtx.Unlock()
 
 	base, quote := m.Base(), m.Quote()
-	mktID := m.marketInfo.Name
-	epochIdx := uint64(epoch.Epoch)
-	epochDur := uint64(epoch.Duration)
+	mktID := m.name
+	msgEpochIdx := uint64(epochIdx)
+	msgEpochDur := uint64(epochDur)
 
 	// Build per-account order lists in a single pass over the book.
 	type acctOrders struct {
@@ -3471,8 +3617,8 @@ func (m *Market) sendMMSnapshots(epoch *readyEpoch) {
 			MarketID:   mktID,
 			Base:       base,
 			Quote:      quote,
-			EpochIdx:   epochIdx,
-			EpochDur:   epochDur,
+			EpochIdx:   msgEpochIdx,
+			EpochDur:   msgEpochDur,
 			AccountID:  acctID[:],
 			BuyOrders:  buys,
 			SellOrders: sells,

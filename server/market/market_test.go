@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -37,6 +36,7 @@ import (
 	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 	"decred.org/dcrdex/server/swap"
+	"runtime"
 )
 
 type TArchivist struct {
@@ -54,6 +54,8 @@ type TArchivist struct {
 	marketStartedUpdates []*db.MarketStartedUpdate
 	advanceEpochEvents   []*meshevents.AdvanceEpochEvent
 	lifecycle            *db.MarketLifecycle
+	poisonEpochProcessed bool
+	epochProcessed       []*db.EpochProcessedUpdate
 	commitOrders         []db.OrderWithStatus
 	commitOrdersErr      error
 }
@@ -104,7 +106,7 @@ func newTMesh(mkt *Market, authMgr *TAuth) *tMesh {
 	return &tMesh{
 		events: Events(map[string]*Market{
 			mktName: mkt,
-		}, bookRouter, nil),
+		}, bookRouter, authMgr.SendIfLocal, nil),
 	}
 }
 
@@ -141,9 +143,30 @@ func newMarketEventRig(t *testing.T, opts ...any) *marketEventRig {
 		bookRouter: bookRouter,
 		events: Events(map[string]*Market{
 			mktName: mkt,
-		}, bookRouter, nil),
+		}, bookRouter, auth.SendIfLocal, nil),
 		cleanup: cleanup,
 	}
+}
+
+type epochProcessedTestSwapper struct {
+	tracked []*order.MatchSet
+	acked   []*order.MatchSet
+}
+
+func (s *epochProcessedTestSwapper) TrackMatches(matchSets []*order.MatchSet) {
+	s.tracked = append(s.tracked, matchSets...)
+}
+
+func (s *epochProcessedTestSwapper) RequestMatchAcks(matchSets []*order.MatchSet) {
+	s.acked = append(s.acked, matchSets...)
+}
+
+func (s *epochProcessedTestSwapper) CheckUnspent(context.Context, uint32, []byte) error {
+	return nil
+}
+
+func (s *epochProcessedTestSwapper) ChainsSynced(uint32, uint32) (bool, error) {
+	return true, nil
 }
 
 func (rig *marketEventRig) apply(t *testing.T, event mesh.EventEncoder) *mesh.Event {
@@ -359,6 +382,28 @@ func (ta *TArchivist) failOnEpochOrder(ord order.Order) {
 	ta.mtx.Lock()
 	ta.poisonEpochOrder = ord
 	ta.mtx.Unlock()
+}
+func (ta *TArchivist) ApplyEpochProcessedEvent(_ context.Context, _ *db.EventLogMeta, _ *db.ReputationOutcomePolicy, update *db.EpochProcessedUpdate) (*db.EventLogEntry, error) {
+	ta.mtx.Lock()
+	if ta.poisonEpochProcessed {
+		ta.mtx.Unlock()
+		return nil, errors.New("epoch processed storage failure")
+	}
+	if ta.lifecycle != nil {
+		next, err := db.ProjectEpochProcessedLifecycle(ta.lifecycle, ta.lifecycle.Market, update.Epoch.Idx, update.Epoch.Dur)
+		if err != nil {
+			ta.mtx.Unlock()
+			return nil, err
+		}
+		ta.lifecycle = next
+	}
+	ta.epochProcessed = append(ta.epochProcessed, update)
+	epochInserted := ta.epochInserted
+	ta.mtx.Unlock()
+	if epochInserted != nil {
+		epochInserted <- struct{}{}
+	}
+	return new(db.EventLogEntry), nil
 }
 func (ta *TArchivist) InsertEpoch(ed *db.EpochResults) error {
 	if ta.epochInserted != nil { // the test wants to know
@@ -2920,7 +2965,7 @@ func TestSendMMSnapshots(t *testing.T) {
 	auth.sends = auth.sends[:0]
 	auth.sendsMtx.Unlock()
 
-	mkt.sendMMSnapshots(epoch)
+	mkt.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	auth.sendsMtx.Lock()
 	nSends := len(auth.sends)
@@ -2964,7 +3009,7 @@ func TestSendMMSnapshots(t *testing.T) {
 	auth.sends = auth.sends[:0]
 	auth.sendsMtx.Unlock()
 
-	mkt.sendMMSnapshots(epoch)
+	mkt.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	auth.sendsMtx.Lock()
 	sends := make([]*msgjson.Message, len(auth.sends))
@@ -3039,7 +3084,7 @@ func TestSendMMSnapshots(t *testing.T) {
 	auth.sends = auth.sends[:0]
 	auth.sendsMtx.Unlock()
 
-	mkt.sendMMSnapshots(epoch)
+	mkt.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	auth.sendsMtx.Lock()
 	sends = make([]*msgjson.Message, len(auth.sends))
@@ -3093,7 +3138,7 @@ func TestSendMMSnapshotsAutoUnsub(t *testing.T) {
 	epoch := &readyEpoch{
 		EpochQueue: NewEpoch(100, 500),
 	}
-	mkt.sendMMSnapshots(epoch)
+	mkt.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	// user1 should have been auto-unsubscribed.
 	mkt.mmSnapshotMtx.RLock()
@@ -3151,7 +3196,7 @@ func TestSendMMSnapshotsBothSides(t *testing.T) {
 	epoch := &readyEpoch{
 		EpochQueue: NewEpoch(100, 500),
 	}
-	mkt.sendMMSnapshots(epoch)
+	mkt.sendMMSnapshots(epoch.Epoch, epoch.Duration)
 
 	auth.sendsMtx.Lock()
 	sends := make([]*msgjson.Message, len(auth.sends))
@@ -4345,6 +4390,297 @@ func TestBuildEpochProcessedUpdate(t *testing.T) {
 	}
 }
 
+func TestApplyEpochProcessedEvent(t *testing.T) {
+	const epochIdx int64 = 4321
+
+	type fixture struct {
+		*marketEventRig
+		swapper *epochProcessedTestSwapper
+		link    *TLink
+	}
+	newFixture := func(t *testing.T) *fixture {
+		t.Helper()
+		rig := newMarketEventRig(t)
+		t.Cleanup(rig.cleanup)
+		swapper := new(epochProcessedTestSwapper)
+		rig.mkt.swapper = swapper
+		lifecycle := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone,
+			epochIdx+1, int64(rig.mkt.EpochDuration()))
+		lifecycle.ProcessedEpochIdx = epochIdx - 1
+		rig.storage.lifecycle = lifecycle
+		rig.mkt.epochMtx.Lock()
+		rig.mkt.projectMarketLifecycleLocked(lifecycle)
+		rig.mkt.epochMtx.Unlock()
+		rig.bookRouter.books[rig.mkt.name].setEpoch(epochIdx + 1)
+		return &fixture{marketEventRig: rig, swapper: swapper}
+	}
+	requireFundingLocked := func(t *testing.T, f *fixture, ord order.Order, locked bool) {
+		t.Helper()
+		asset := f.mkt.Quote()
+		if ord.Trade().Sell {
+			asset = f.mkt.Base()
+		}
+		for _, coin := range ord.Trade().Coins {
+			if got := f.mkt.CoinLocked(asset, coin); got != locked {
+				t.Fatalf("order %v coin %x locked = %v, want %v", ord.ID(), coin, got, locked)
+			}
+		}
+	}
+	bookOrder := func(t *testing.T, f *fixture, ord *order.LimitOrder) {
+		t.Helper()
+		ord.SetTime(time.UnixMilli(epochIdx*int64(f.mkt.EpochDuration()) - 1))
+		bookStandingOrder(t, f.marketEventRig, ord)
+	}
+	apply := func(t *testing.T, f *fixture, revealed []*matcher.OrderRevealed, missed []order.Order) error {
+		t.Helper()
+		mkt := f.mkt
+		epochDur := int64(mkt.EpochDuration())
+		orders := make([]order.Order, 0, len(revealed)+len(missed))
+		for _, ord := range revealed {
+			orders = append(orders, ord.Order)
+		}
+		orders = append(orders, missed...)
+		for i, ord := range orders {
+			ord.SetTime(time.UnixMilli(epochIdx*epochDur + int64(i) + 1))
+			seedEpochOrder(f.storage, ord, epochIdx, epochDur)
+		}
+		// Closed-epoch orders retain funding locks but are no longer in the queues.
+		if err := mkt.restoreEpochState(f.storage.lifecycle); err != nil {
+			t.Fatalf("restore epoch state: %v", err)
+		}
+		for _, ord := range orders {
+			if ord.Trade() != nil {
+				requireFundingLocked(t, f, ord, true)
+			}
+		}
+		f.link = f.subscribeBook(t)
+		matchTime := time.UnixMilli((epochIdx + 1) * epochDur)
+		event := meshevents.NewEpochProcessedEvent(mkt.name, epochIdx, epochDur,
+			matchTime, 10, 10, mkt.lastRate, matcher.CSum(orders), revealed, missed, matchTime)
+		return f.applyErr(t, event)
+	}
+	requireApplied := func(t *testing.T, f *fixture, err error, matchSets int) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("apply epoch_processed: %v", err)
+		}
+		if len(f.storage.epochProcessed) != 1 {
+			t.Fatalf("epoch processed updates = %d, want 1", len(f.storage.epochProcessed))
+		}
+		update := f.storage.epochProcessed[0]
+		if update.Epoch == nil || update.Epoch.Idx != epochIdx {
+			t.Fatalf("epoch update = %+v, want idx %d", update.Epoch, epochIdx)
+		}
+		if f.mkt.processedEpochIdx != epochIdx || f.storage.lifecycle.ProcessedEpochIdx != epochIdx {
+			t.Fatal("successful apply did not advance the processed epoch")
+		}
+		if len(f.swapper.tracked) != matchSets {
+			t.Fatalf("tracked match sets = %d, want %d", len(f.swapper.tracked), matchSets)
+		}
+	}
+	requireRoute := func(t *testing.T, msg *msgjson.Message, route string) {
+		t.Helper()
+		if msg == nil {
+			t.Fatalf("missing %q notification", route)
+		}
+		if msg.Route != route {
+			t.Fatalf("notification route = %q, want %q", msg.Route, route)
+		}
+	}
+	requireMatchProof := func(t *testing.T, f *fixture, preimages []order.Preimage, misses []order.OrderID) {
+		t.Helper()
+		msg := f.link.getSend()
+		requireRoute(t, msg, msgjson.MatchProofRoute)
+		var note msgjson.MatchProofNote
+		if err := json.Unmarshal(msg.Payload, &note); err != nil {
+			t.Fatalf("match proof note: %v", err)
+		}
+		if note.MarketID != f.mkt.name || note.Epoch != uint64(epochIdx) {
+			t.Fatalf("match proof market/epoch = %q/%d, want %q/%d",
+				note.MarketID, note.Epoch, f.mkt.name, epochIdx)
+		}
+		if len(note.Preimages) != len(preimages) || len(note.Misses) != len(misses) {
+			t.Fatalf("match proof reveals/misses = %d/%d, want %d/%d",
+				len(note.Preimages), len(note.Misses), len(preimages), len(misses))
+		}
+		for i, pi := range preimages {
+			if !bytes.Equal(note.Preimages[i], pi[:]) {
+				t.Fatalf("match proof preimage = %x, want %x", note.Preimages[i], pi)
+			}
+		}
+		for i, oid := range misses {
+			if !bytes.Equal(note.Misses[i], oid[:]) {
+				t.Fatalf("match proof miss = %x, want %x", note.Misses[i], oid)
+			}
+		}
+	}
+	requireNoteOrder := func(t *testing.T, f *fixture, marketID string, orderID msgjson.Bytes, ord order.Order) {
+		t.Helper()
+		oid := ord.ID()
+		if marketID != f.mkt.name || !bytes.Equal(orderID, oid[:]) {
+			t.Fatalf("book note market/order = %q/%x, want %q/%x", marketID, orderID, f.mkt.name, oid)
+		}
+	}
+	requireNoBookSends := func(t *testing.T, f *fixture) {
+		t.Helper()
+		f.link.mtx.Lock()
+		defer f.link.mtx.Unlock()
+		if len(f.link.sends) != 0 {
+			t.Fatalf("unexpected book notifications = %d", len(f.link.sends))
+		}
+	}
+	requireNoAuthSends := func(t *testing.T, f *fixture) {
+		t.Helper()
+		f.auth.sendsMtx.Lock()
+		defer f.auth.sendsMtx.Unlock()
+		if len(f.auth.sends) != 0 {
+			t.Fatalf("unexpected auth notifications = %d", len(f.auth.sends))
+		}
+	}
+	requireEpochReport := func(t *testing.T, f *fixture) {
+		t.Helper()
+		requireRoute(t, f.link.getSend(), msgjson.EpochReportRoute)
+		requireNoBookSends(t, f)
+	}
+
+	t.Run("books unmatched standing order", func(t *testing.T) {
+		f := newFixture(t)
+		ord, pi := makeLORevealed(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		ord.Coins = []order.CoinID{{0x31}}
+		err := apply(t, f, []*matcher.OrderRevealed{{Order: ord, Preimage: pi}}, nil)
+		requireApplied(t, f, err, 0)
+
+		if !f.mkt.book.HaveOrder(ord.ID()) || !f.mkt.Cancelable(ord.ID()) {
+			t.Fatal("standing order was not booked and made cancelable")
+		}
+		requireFundingLocked(t, f, ord, true)
+		requireMatchProof(t, f, []order.Preimage{pi}, nil)
+		note := getBookNoteFromLink(t, f.link)
+		requireNoteOrder(t, f, note.MarketID, note.OrderID, ord)
+		requireEpochReport(t, f)
+
+		msg := f.auth.getSend()
+		requireRoute(t, msg, msgjson.NoMatchRoute)
+		var noMatch msgjson.NoMatch
+		if err := json.Unmarshal(msg.Payload, &noMatch); err != nil {
+			t.Fatalf("nomatch note: %v", err)
+		}
+		oid := ord.ID()
+		if !bytes.Equal(noMatch.OrderID, oid[:]) {
+			t.Fatalf("nomatch order = %x, want %x", noMatch.OrderID, oid)
+		}
+		requireNoAuthSends(t, f)
+	})
+
+	t.Run("partial trade updates remaining and tracks match", func(t *testing.T) {
+		f := newFixture(t)
+		maker := makeLO(buyer3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		maker.Coins = []order.CoinID{{0x41}}
+		bookOrder(t, f, maker)
+		taker, pi := makeLORevealed(seller3, maker.Rate-dcrRateStep, 1, order.ImmediateTiF)
+		taker.Coins = []order.CoinID{{0x51}}
+		err := apply(t, f, []*matcher.OrderRevealed{{Order: taker, Preimage: pi}}, nil)
+		requireApplied(t, f, err, 1)
+
+		if !f.mkt.book.HaveOrder(maker.ID()) || maker.Filled() != taker.Quantity {
+			t.Fatal("maker was not partially filled and retained on the book")
+		}
+		if f.mkt.book.HaveOrder(taker.ID()) {
+			t.Fatal("immediate taker was booked")
+		}
+		if f.mkt.settling[maker.ID()] != taker.Quantity || f.mkt.settling[taker.ID()] != taker.Quantity {
+			t.Fatal("match quantities were not added to settling orders")
+		}
+		requireFundingLocked(t, f, maker, true)
+		requireFundingLocked(t, f, taker, false)
+		requireMatchProof(t, f, []order.Preimage{pi}, nil)
+		note := getUpdateRemainingNoteFromLink(t, f.link)
+		requireNoteOrder(t, f, note.MarketID, note.OrderID, maker)
+		if note.Remaining != maker.Remaining() {
+			t.Fatalf("update remaining = %d, want %d", note.Remaining, maker.Remaining())
+		}
+		requireEpochReport(t, f)
+		requireNoAuthSends(t, f)
+	})
+
+	t.Run("cancel unbooks target with an unsettled fill", func(t *testing.T) {
+		f := newFixture(t)
+		target := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		target.Coins = []order.CoinID{{0x61}}
+		target.AddFill(f.mkt.LotSize())
+		bookOrder(t, f, target)
+		f.mkt.settling[target.ID()] = f.mkt.LotSize()
+		cancel, pi := makeCORevealed(seller3, target.ID())
+		err := apply(t, f, []*matcher.OrderRevealed{{Order: cancel, Preimage: pi}}, nil)
+		requireApplied(t, f, err, 1)
+
+		if f.mkt.book.HaveOrder(target.ID()) || f.mkt.Cancelable(target.ID()) {
+			t.Fatal("canceled target is still on the book or cancelable")
+		}
+		if _, found := f.mkt.settling[target.ID()]; found {
+			t.Fatal("canceled target is still settling")
+		}
+		requireFundingLocked(t, f, target, false)
+		requireMatchProof(t, f, []order.Preimage{pi}, nil)
+		note := getUnbookNoteFromLink(t, f.link)
+		requireNoteOrder(t, f, note.MarketID, note.OrderID, target)
+		requireEpochReport(t, f)
+		requireNoAuthSends(t, f)
+	})
+
+	t.Run("missing preimage", func(t *testing.T) {
+		f := newFixture(t)
+		missed := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		missed.Coins = []order.CoinID{{0x71}}
+		err := apply(t, f, nil, []order.Order{missed})
+		requireApplied(t, f, err, 0)
+
+		if f.mkt.book.HaveOrder(missed.ID()) {
+			t.Fatal("order with a missing preimage was booked")
+		}
+		requireFundingLocked(t, f, missed, false)
+		requireMatchProof(t, f, nil, []order.OrderID{missed.ID()})
+		requireEpochReport(t, f)
+	})
+
+	t.Run("storage failure leaves state unchanged", func(t *testing.T) {
+		f := newFixture(t)
+		maker := makeLO(buyer3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+		maker.Coins = []order.CoinID{{0x41}}
+		bookOrder(t, f, maker)
+		taker, pi := makeLORevealed(seller3, maker.Rate-dcrRateStep, 1, order.ImmediateTiF)
+		taker.Coins = []order.CoinID{{0x51}}
+		missed := makeLO(seller3, maker.Rate, 1, order.StandingTiF)
+		missed.Coins = []order.CoinID{{0x71}}
+		f.storage.poisonEpochProcessed = true
+		err := apply(t, f, []*matcher.OrderRevealed{{Order: taker, Preimage: pi}}, []order.Order{missed})
+		if err == nil || !strings.Contains(err.Error(), "epoch processed storage failure") {
+			t.Fatalf("apply error = %v, want storage failure", err)
+		}
+
+		if len(f.storage.epochProcessed) != 0 || len(f.swapper.tracked) != 0 {
+			t.Fatal("storage failure recorded an update or tracked matches")
+		}
+		if f.mkt.processedEpochIdx != epochIdx-1 || f.storage.lifecycle.ProcessedEpochIdx != epochIdx-1 {
+			t.Fatal("storage failure advanced the processed epoch")
+		}
+		if !f.mkt.book.HaveOrder(maker.ID()) || maker.Filled() != 0 {
+			t.Fatal("storage failure changed the maker's book state")
+		}
+		if f.mkt.book.HaveOrder(taker.ID()) {
+			t.Fatal("storage failure booked the taker")
+		}
+		if len(f.mkt.settling) != 0 {
+			t.Fatalf("storage failure added settling orders: %v", f.mkt.settling)
+		}
+		requireFundingLocked(t, f, maker, true)
+		requireFundingLocked(t, f, taker, true)
+		requireFundingLocked(t, f, missed, true)
+		requireNoBookSends(t, f)
+		requireNoAuthSends(t, f)
+	})
+}
+
 // useApplierMesh routes the market's own event submissions through the rig's
 // appliers, so they run the same projection every node applies.
 func (rig *marketEventRig) useApplierMesh() {
@@ -4430,6 +4766,9 @@ func TestSubmitMarketStarted(t *testing.T) {
 				t.Fatalf("market started updates = %d, want 1", len(storage.marketStartedUpdates))
 			}
 			requireEpochRevokeSet(t, storage.marketStartedUpdates[0], leftover)
+			if len(storage.epochProcessed) != 0 {
+				t.Fatalf("startup processed %d epochs, want none", len(storage.epochProcessed))
+			}
 
 			mkt.epochMtx.RLock()
 			currentEpoch := mkt.currentEpoch
