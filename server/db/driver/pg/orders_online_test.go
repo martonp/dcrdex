@@ -489,6 +489,78 @@ func TestOrdersWithCommit(t *testing.T) {
 	})
 }
 
+func TestApplyAdvanceEpochEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	update := &meshevents.AdvanceEpochEvent{
+		Market:         "dcr_btc",
+		ClosedEpochIdx: 42,
+		OpenedEpochIdx: 43,
+		EpochDur:       6000,
+	}
+	seedMarketLifecycle(t, &db.MarketLifecycle{
+		RunParams:         testMarketRunParams(),
+		Market:            update.Market,
+		State:             db.MarketStateRunning,
+		StartEpochIdx:     update.ClosedEpochIdx,
+		StartEpochDur:     update.EpochDur,
+		PendingAction:     db.MarketPendingNone,
+		ActiveEpochIdx:    update.ClosedEpochIdx,
+		ProcessedEpochIdx: update.ClosedEpochIdx - 1,
+	})
+
+	// Record the event and advance the active epoch.
+	event := []byte("advance-epoch-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindAdvanceEpoch, event, update)
+	log, err := archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{Event: event}, update)
+	if err != nil {
+		t.Fatalf("ApplyAdvanceEpochEvent error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindAdvanceEpoch, event, tip, update)
+	assertEventLogFrontier(t, ctx, 1, tip)
+	lifecycle, err := archie.MarketLifecycle(update.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle error: %v", err)
+	}
+	if lifecycle.ActiveEpochIdx != update.OpenedEpochIdx {
+		t.Fatalf("active epoch cursor = %d, want %d", lifecycle.ActiveEpochIdx, update.OpenedEpochIdx)
+	}
+
+	// The closed epoch is no longer active, so the same update is rejected.
+	if _, err := archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{
+		Seq:   2,
+		Event: []byte("advance-epoch-stale"),
+	}, update); err == nil {
+		t.Fatalf("ApplyAdvanceEpochEvent accepted a closed epoch behind the cursor")
+	}
+	assertEventLogFrontier(t, ctx, 1, tip)
+
+	// A wrong expected tip rolls back both the event and lifecycle update.
+	forked := *update
+	forked.ClosedEpochIdx, forked.OpenedEpochIdx = 43, 44
+	_, err = archie.ApplyAdvanceEpochEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           []byte("advance-epoch-bad-tip"),
+		ExpectedTipHash: wrongEventTip(),
+	}, &forked)
+	var divergence *db.EventLogDivergenceError
+	if !errors.As(err, &divergence) {
+		t.Fatalf("ApplyAdvanceEpochEvent error = %T %[1]v, want EventLogDivergenceError", err)
+	}
+	assertEventLogFrontier(t, ctx, 1, tip)
+	// The active epoch must not change after rollback.
+	lifecycle, err = archie.MarketLifecycle(update.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle error: %v", err)
+	}
+	if lifecycle.ActiveEpochIdx != update.OpenedEpochIdx {
+		t.Fatalf("active epoch cursor after rollback = %d, want %d", lifecycle.ActiveEpochIdx, update.OpenedEpochIdx)
+	}
+}
+
 func TestBookOrder(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)

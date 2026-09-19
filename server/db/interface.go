@@ -224,6 +224,7 @@ type OrderArchiver interface {
 	OrdersWithCommit(ctx context.Context, base, quote uint32, commit order.Commitment, archivedCutoff time.Time) ([]OrderWithStatus, error)
 	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
+	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 }
 
 // Account holds data returned by Accounts.

@@ -256,6 +256,18 @@ func (a *Archiver) ApplyOrderAcceptedEvent(ctx context.Context, meta *db.EventLo
 	})
 }
 
+// ApplyAdvanceEpochEvent advances the market's active epoch, or enters
+// the draining state when its final epoch closes.
+func (a *Archiver) ApplyAdvanceEpochEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindAdvanceEpoch, txData, func(tx *sql.Tx) error {
+		return a.applyAdvanceEpochLifecycleTx(tx, event)
+	})
+}
+
 // NewEpochOrder stores the given order with epoch status. This is equivalent to
 // StoreOrder with OrderStatusEpoch.
 func (a *Archiver) NewEpochOrder(ord order.Order, epochIdx, epochDur int64, epochGap int32) error {
