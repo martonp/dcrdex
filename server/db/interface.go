@@ -907,3 +907,27 @@ func (lc *MarketLifecycle) SuspendTime() time.Time {
 func (lc *MarketLifecycle) ResumeTime() time.Time {
 	return time.UnixMilli(lc.PendingEpochIdx * lc.PendingEpochDur).UTC()
 }
+
+// MarketStartedUpdate contains the decoded orders and resolved market asset IDs
+// for a market_started event. This type exists in addition to
+// meshevents.MarketStartedEvent so the database and in-memory updates can share
+// the same validated orders without decoding them again.
+type MarketStartedUpdate struct {
+	Market          string
+	Base            uint32
+	Quote           uint32
+	CurrentEpochIdx int64
+	EpochDur        int64
+	RunParams       meshevents.MarketRunParams
+	RevocationTime  time.Time
+	BookedRevokes   []*StartupOrderRevoke
+	// EpochRevokes lists the abandoned epoch orders. It must include every
+	// active epoch order exactly once.
+	EpochRevokes []*StartupOrderRevoke
+}
+
+// StartupOrderRevoke contains an order and its startup revocation reason.
+type StartupOrderRevoke struct {
+	Order  order.Order
+	Reason meshevents.StartupOrderRevokeReason
+}
