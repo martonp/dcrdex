@@ -469,6 +469,29 @@ func (auth *AuthManager) Auth(user account.AccountID, msg, sig []byte) error {
 	return checkSigS256(msg, sig, client.acct.PubKey)
 }
 
+// VerifyUserSig checks a signature with the user's public key. It uses the
+// connected client's key when available, or loads it from the database.
+func (auth *AuthManager) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
+	client := auth.user(user)
+	if client != nil {
+		return checkSigS256(msg, sig, client.acct.PubKey)
+	}
+
+	acctInfo, err := auth.storage.AccountInfo(user)
+	if err != nil {
+		return err
+	}
+	if acctInfo == nil {
+		return fmt.Errorf("account %s not found", user)
+	}
+
+	pubKey, err := secp256k1.ParsePubKey(acctInfo.Pubkey)
+	if err != nil {
+		return fmt.Errorf("error decoding secp256k1 public key: %w", err)
+	}
+	return checkSigS256(msg, sig, pubKey)
+}
+
 // SignMsg signs the message with the DEX private key, returning the DER encoded
 // signature. SHA256 is used to hash the message before signing it.
 func (auth *AuthManager) SignMsg(msg []byte) []byte {

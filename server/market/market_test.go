@@ -3201,6 +3201,137 @@ func TestMarket_lockOrderCoins(t *testing.T) {
 	}
 }
 
+func orderFromAcceptedEvent(t *testing.T, event *mesh.Event) order.Order {
+	t.Helper()
+	if event.Kind != meshevents.EventKindOrderAccepted {
+		t.Fatalf("wrong event kind. got %q, want %q", event.Kind, meshevents.EventKindOrderAccepted)
+	}
+	accepted, err := meshevents.DecodeOrderAcceptedEvent(event.Payload)
+	if err != nil {
+		t.Fatalf("DecodeOrderAcceptedEvent error: %v", err)
+	}
+	ord, err := accepted.Order()
+	if err != nil {
+		t.Fatalf("accepted order error: %v", err)
+	}
+	return ord
+}
+
+func TestAcceptOrderCommandRestampsAfterMissedEpoch(t *testing.T) {
+	mkt, _, _, cleanup, err := newTestMarket()
+	if err != nil {
+		t.Fatalf("newTestMarket failure: %v", err)
+	}
+	defer cleanup()
+
+	// AcceptOrderCommand only accepts new orders once the market is running.
+	mkt.running.Store(true)
+
+	const requestID = uint64(42)
+	lo := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+	user := lo.User()
+	commit := lo.Commitment()
+	rec := &orderRecord{
+		order: lo,
+		req: &msgjson.LimitOrder{
+			Prefix: msgjson.Prefix{
+				AccountID:  user[:],
+				Base:       lo.Base(),
+				Quote:      lo.Quote(),
+				OrderType:  msgjson.LimitOrderNum,
+				ClientTime: uint64(lo.ClientTime.UnixMilli()),
+				Commit:     commit[:],
+			},
+		},
+		msgID: requestID,
+	}
+
+	var events []*mesh.Event
+	applied := false
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands: map[string]mesh.CommandExecutor{
+			commandKindLimit: func(cmd *mesh.CommandContext) *msgjson.Error {
+				return mkt.AcceptOrderCommand(cmd.Context, rec, cmd.Completion)
+			},
+		},
+		Events: map[string]mesh.EventApplier{
+			meshevents.EventKindOrderAccepted: func(_ *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+				events = append(events, event)
+				if len(events) == 1 {
+					time.Sleep(2 * time.Millisecond)
+					return nil, ErrEpochMissed
+				}
+				defer func() { applied = true }()
+				return &db.EventLogEntry{
+					Seq:     1,
+					Kind:    event.Kind,
+					Event:   event.Payload,
+					TipHash: []byte{1},
+				}, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewService error: %v", err)
+	}
+
+	msg, err := msgjson.NewRequest(requestID, msgjson.LimitRoute, nil)
+	if err != nil {
+		t.Fatalf("NewRequest error: %v", err)
+	}
+	var response *msgjson.Message
+	rpcErr := meshSvc.ExecuteCommand(context.Background(), mesh.CommandRequest{
+		Kind: commandKindLimit,
+		User: user,
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			if !applied {
+				t.Error("response delivered before successful event apply returned")
+			}
+			if response != nil {
+				t.Fatalf("multiple command responses")
+			}
+			response = resp
+			return nil
+		},
+	})
+	if rpcErr != nil {
+		t.Fatalf("ExecuteCommand error: %v", rpcErr)
+	}
+	if response == nil {
+		t.Fatalf("missing command response")
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+	firstOrder := orderFromAcceptedEvent(t, events[0])
+	secondOrder := orderFromAcceptedEvent(t, events[1])
+	if firstOrder.Time() == secondOrder.Time() {
+		t.Fatalf("retry did not restamp order time")
+	}
+	if firstOrder.ID() == secondOrder.ID() {
+		t.Fatalf("retry did not create a new order ID")
+	}
+
+	var result msgjson.OrderResult
+	if err := response.UnmarshalResult(&result); err != nil {
+		t.Fatalf("response result: %v", err)
+	}
+	resultOrderID, err := order.IDFromBytes(result.OrderID)
+	if err != nil {
+		t.Fatalf("response order id: %v", err)
+	}
+	if resultOrderID != secondOrder.ID() {
+		t.Fatalf("response order id = %v, want retried order id %v", resultOrderID, secondOrder.ID())
+	}
+	if result.ServerTime != uint64(secondOrder.Time()) {
+		t.Fatalf("response server time = %d, want %d", result.ServerTime, secondOrder.Time())
+	}
+}
+
 func TestApplyOrderAcceptedEvent(t *testing.T) {
 	type applyCase struct {
 		name           string
