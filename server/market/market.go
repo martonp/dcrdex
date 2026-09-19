@@ -603,6 +603,19 @@ func (m *Market) applyMarketLifecycleRow(lifecycle *db.MarketLifecycle) {
 	m.wakeLifecycleDriver()
 }
 
+func (m *Market) drainingFinalEpoch(epochIdx, epochDur int64) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateDraining &&
+		m.suspendEpochIdx == epochIdx && m.liveParams.Load().epochDur == epochDur
+}
+
+func (m *Market) isDraining() bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateDraining
+}
+
 func (m *Market) hasPendingResume(epochIdx, epochDur int64) bool {
 	m.epochMtx.RLock()
 	defer m.epochMtx.RUnlock()
