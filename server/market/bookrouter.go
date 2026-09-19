@@ -132,11 +132,9 @@ type sigDataMatchProof struct {
 	matchProof *order.MatchProof
 }
 
-// BookSource is a source of a market's order book and a feed of updates to the
-// order book and epoch queue.
+// BookSource provides a market's booked orders.
 type BookSource interface {
 	Book() (epoch int64, buys []*order.LimitOrder, sells []*order.LimitOrder)
-	OrderFeed() <-chan *updateSignal
 	Base() uint32
 	Quote() uint32
 }
@@ -193,9 +191,9 @@ func (s *subscribers) lastSeq() uint64 {
 // as msgjson.BookOrderNote structures.
 type msgBook struct {
 	name string
-	// mtx guards orders and epochIdx
+	// mtx guards running, orders, recentMatches, and epochIdx.
 	mtx           sync.RWMutex
-	running       bool
+	running       bool // ready to serve book snapshots, even when the market is suspended
 	orders        map[order.OrderID]*msgjson.BookOrderNote
 	recentMatches [][3]int64
 	epochIdx      int64
@@ -259,19 +257,28 @@ func (book *msgBook) update(lo *order.LimitOrder) *msgjson.BookOrderNote {
 	return msgOrder
 }
 
-// Remove the order from the order book.
-func (book *msgBook) remove(lo *order.LimitOrder) {
+// remove removes an order from the cache and reports whether it was present.
+func (book *msgBook) remove(lo *order.LimitOrder) bool {
 	book.mtx.Lock()
 	defer book.mtx.Unlock()
+	if _, found := book.orders[lo.ID()]; !found {
+		return false
+	}
 	delete(book.orders, lo.ID())
+	return true
 }
 
-// addBulkOrders adds the lists of orders to the order book, and records the
-// currently active epoch. Use this for the initial sync of the orderbook.
-func (book *msgBook) addBulkOrders(epoch int64, orderSets ...[]*order.LimitOrder) {
+// replaceOrders replaces the cached orders and records the book epoch.
+func (book *msgBook) replaceOrders(epoch int64, orderSets ...[]*order.LimitOrder) {
+	n := 0
+	for _, set := range orderSets {
+		n += len(set)
+	}
+
 	book.mtx.Lock()
 	defer book.mtx.Unlock()
 	book.epochIdx = epoch
+	book.orders = make(map[order.OrderID]*msgjson.BookOrderNote, n)
 	for _, set := range orderSets {
 		for _, lo := range set {
 			book.orders[lo.ID()] = limitOrderToMsgOrder(lo, book.name)
@@ -279,22 +286,23 @@ func (book *msgBook) addBulkOrders(epoch int64, orderSets ...[]*order.LimitOrder
 	}
 }
 
-// BookRouter handles order book subscriptions, syncing the market with a group
-// of subscribers, and maintaining an intermediate copy of the orderbook in
-// message payload format for quick, full-book syncing.
+// BookRouter manages client order-book subscriptions, caches booked orders
+// in message format for initial snapshots, and sends updates to subscribers.
+// It also serves price-feed subscriptions and fee-rate requests.
 type BookRouter struct {
 	books     map[string]*msgBook
 	feeSource FeeSource
+
+	seedOnce sync.Once
 
 	priceFeeders *subscribers
 	spotsMtx     sync.RWMutex
 	spots        map[string]*msgjson.Spot
 }
 
-// NewBookRouter is a constructor for a BookRouter. Routes are registered with
-// comms and a monitoring goroutine is started for each BookSource specified.
-// The input sources is a mapping of market names to sources for order and epoch
-// queue information.
+// NewBookRouter creates a book router and registers its request handlers.
+// sources maps market names to order book sources. Call SeedBooks afterward
+// to initialize the cached books from the markets' restored state.
 func NewBookRouter(sources map[string]BookSource, feeSource FeeSource, route func(route string, handler comms.MsgHandler)) *BookRouter {
 	router := &BookRouter{
 		books:     make(map[string]*msgBook),
@@ -326,24 +334,52 @@ func NewBookRouter(sources map[string]BookSource, feeSource FeeSource, route fun
 	return router
 }
 
-// Run implements dex.Runner, and is blocking.
+// Run waits for cancellation, then makes the cached books unavailable and clears them.
 func (r *BookRouter) Run(ctx context.Context) {
-	var wg sync.WaitGroup
-	for _, b := range r.books {
-		wg.Add(1)
-		go func(b *msgBook) {
-			r.runBook(ctx, b)
-			wg.Done()
-		}(b)
+	<-ctx.Done()
+
+	for _, book := range r.books {
+		book.mtx.Lock()
+		book.running = false
+		book.orders = make(map[order.OrderID]*msgjson.BookOrderNote)
+		book.mtx.Unlock()
+		log.Infof("Book router terminating for market %q", book.name)
 	}
-	wg.Wait()
+}
+
+// SeedBooks initializes the cached books from the markets' restored state.
+// Call it after loading market state and before serving subscriptions or
+// applying replicated events.
+// Subsequent calls have no effect.
+func (r *BookRouter) SeedBooks() {
+	r.seedOnce.Do(func() {
+		for _, book := range r.books {
+			r.seedBook(book)
+		}
+	})
+}
+
+// seedBook initializes a market's cached book and marks it ready for subscriptions.
+func (r *BookRouter) seedBook(book *msgBook) {
+	book.mtx.Lock()
+	defer book.mtx.Unlock()
+
+	epoch, buys, sells := book.source.Book()
+	book.epochIdx = epoch
+	book.orders = make(map[order.OrderID]*msgjson.BookOrderNote, len(buys)+len(sells))
+	for _, orders := range [][]*order.LimitOrder{buys, sells} {
+		for _, lo := range orders {
+			book.orders[lo.ID()] = limitOrderToMsgOrder(lo, book.name)
+		}
+	}
+	book.running = true
 }
 
 // runBook is a monitoring loop for an order book.
 func (r *BookRouter) runBook(ctx context.Context, book *msgBook) {
 	// Get the initial book.
 	feed := book.source.OrderFeed()
-	book.addBulkOrders(book.source.Book())
+	book.replaceOrders(book.source.Book())
 	subs := book.subs
 
 	defer func() {
@@ -754,6 +790,21 @@ func (r *BookRouter) sendNote(route string, subs *subscribers, note any) {
 		}
 		subs.mtx.Unlock()
 	}
+}
+
+// unbookOrder removes an order from the book projection and
+// notifies subscribers, doing nothing if the order was not in the projection.
+func (r *BookRouter) unbookOrder(book *msgBook, lo *order.LimitOrder) {
+	if !book.remove(lo) {
+		return
+	}
+	oid := lo.ID()
+	note := &msgjson.UnbookOrderNote{
+		Seq:      book.subs.nextSeq(),
+		MarketID: book.name,
+		OrderID:  oid[:],
+	}
+	r.sendNote(msgjson.UnbookOrderRoute, book.subs, note)
 }
 
 // cancelOrderToMsgOrder converts an *order.CancelOrder to a

@@ -1468,7 +1468,6 @@ func makeCORevealed(writer *ordertest.Writer, targetID order.OrderID) (*order.Ca
 type TBookSource struct {
 	buys  []*order.LimitOrder
 	sells []*order.LimitOrder
-	feed  chan *updateSignal
 	base  uint32
 	quote uint32
 }
@@ -1943,6 +1942,13 @@ func TestRouter(t *testing.T) {
 	// Make sure the order is no longer stored in the router's books
 	if router.books[mktName2].orders[lo.ID()] != nil {
 		t.Fatalf("order still in book after unbookAction")
+	}
+
+	// Unbooking an already removed order must not send another notification.
+	seq := router.books[mktName2].subs.lastSeq()
+	router.unbookOrder(router.books[mktName2], lo)
+	if got := router.books[mktName2].subs.lastSeq(); got != seq {
+		t.Fatalf("duplicate removal advanced sequence from %d to %d", seq, got)
 	}
 
 	// Now unsubscribe link 1 from market 1.
