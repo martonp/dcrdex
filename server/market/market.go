@@ -1846,287 +1846,35 @@ func (m *Market) lazy(do func()) {
 	}()
 }
 
-// Run is the main order processing loop, which takes new orders, notifies book
-// subscribers, and cycles the epochs. The caller should cancel the provided
-// Context to stop the market. The outgoing order feed channels persist after
-// Run returns for possible Market resume, and for Swapper's unbook callback to
-// function using sendToFeeds.
-func (m *Market) Run(ctx context.Context) {
+// Run drives the market's epoch loop on the acting master. Call
+// SetMeshService first. marketStartupDone, if set, receives the startup
+// outcome; success can still have order acceptance closed if the market
+// starts suspended.
+func (m *Market) Run(ctx context.Context, marketStartupDone func(error)) {
+	reportMarketStartup := func(err error) {
+		if marketStartupDone != nil {
+			marketStartupDone(err)
+		}
+	}
+
 	// Prevent multiple incantations of Run.
 	if !atomic.CompareAndSwapUint32(&m.up, 0, 1) {
 		log.Errorf("Run: Market not stopped!")
+		reportMarketStartup(Error("market already running"))
 		return
 	}
 	defer atomic.StoreUint32(&m.up, 0)
 
-	var running bool
-	ctxRun, cancel := context.WithCancel(ctx)
-	var wgFeeds, wgEpochs sync.WaitGroup
-	notifyChan := make(chan *updateSignal, 32)
-
-	// For clarity, define the shutdown sequence in a single closure rather than
-	// the defer stack.
-	defer func() {
-		// Drain the order router of incoming orders that made it in after the
-		// main loop broke and before flagging the market stopped. Do this in a
-		// goroutine because the market is flagged as stopped under runMtx lock
-		// in this defer and there is a risk of deadlock in SubmitOrderAsync
-		// that sends under runMtx lock as well.
-		wgFeeds.Add(1)
-		go func() {
-			defer wgFeeds.Done()
-			for sig := range m.orderRouter {
-				sig.errChan <- ErrMarketNotRunning
-			}
-		}()
-
-		// Under lock, flag as not running.
-		m.runMtx.Lock() // block while SubmitOrderAsync is sending to the drain
-		if !running {
-			// In case the market is stopped before the first epoch, close the
-			// running channel so that waitForEpochOpen does not hang.
-			close(m.running)
-		}
-		m.running = make(chan struct{})
-		running = false
-		close(m.orderRouter) // stop the order router drain
-		m.runMtx.Unlock()
-
-		// Stop and wait for epoch pump and processing pipeline goroutines.
-		cancel() // may already be done by suspend
-		wgEpochs.Wait()
-		// Book mod goroutines done, may purge if requested.
-
-		// persistBook is set under epochMtx lock.
-		m.epochMtx.Lock()
-
-		// Signal to the book router of the suspend now that the closed epoch
-		// processing pipeline is finished (wgEpochs).
-		notifyChan <- &updateSignal{
-			action: suspendAction,
-			data: sigDataSuspend{
-				finalEpoch:  m.activeEpochIdx,
-				persistBook: m.persistBook,
-			},
-		}
-
-		if !m.persistBook {
-			m.PurgeBook()
-		}
-
-		m.persistBook = true // future resume default
-		m.activeEpochIdx = 0
-
-		// Revoke any unmatched epoch orders (if context was canceled, not a
-		// clean suspend stopped the market).
-		for oid, ord := range m.epochOrders {
-			log.Infof("Dropping epoch order %v", oid)
-			if co, ok := ord.(*order.CancelOrder); ok {
-				if err := m.storage.FailCancelOrder(co); err != nil {
-					log.Errorf("Failed to set orphaned epoch cancel order %v as executed: %v", oid, err)
-				}
-				continue
-			}
-			if err := m.storage.ExecuteOrder(ord); err != nil {
-				log.Errorf("Failed to set orphaned epoch trade order %v as executed: %v", oid, err)
-			}
-		}
-		m.epochMtx.Unlock()
-
-		// Stop and wait for the order feed goroutine.
-		close(notifyChan)
-		wgFeeds.Wait()
-
-		m.tasks.Wait()
-
-		log.Infof("Market %q stopped.", m.marketInfo.Name)
-	}()
-
-	// Start outgoing order feed notification goroutine.
-	wgFeeds.Add(1)
+	driver := newMarketEpochDriver(m)
+	ready := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
-		defer wgFeeds.Done()
-		for sig := range notifyChan {
-			m.sendToFeeds(sig)
-		}
+		defer close(done)
+		driver.run(ctx, ready)
 	}()
 
-	// Start the closed epoch pump, which drives preimage collection and orderly
-	// epoch processing.
-	eq := newEpochPump()
-	wgEpochs.Add(1)
-	go func() {
-		defer wgEpochs.Done()
-		eq.Run(ctxRun)
-	}()
-
-	// Start the closed epoch processing pipeline.
-	wgEpochs.Add(1)
-	go func() {
-		defer wgEpochs.Done()
-		for ep := range eq.ready {
-			// prepEpoch has completed preimage collection.
-			m.processReadyEpoch(ep, notifyChan)
-		}
-		log.Debugf("epoch pump drained for market %s", m.marketInfo.Name)
-		// There must be no more notify calls.
-	}()
-
-	m.epochMtx.Lock()
-	nextEpochIdx := m.startEpochIdx
-	if nextEpochIdx == 0 {
-		log.Warnf("Run: startEpochIdx not set. Starting at the next epoch.")
-		now := time.Now().UnixMilli()
-		nextEpochIdx = 1 + now/int64(m.EpochDuration())
-		m.startEpochIdx = nextEpochIdx
-	}
-	m.epochMtx.Unlock()
-
-	epochDuration := int64(m.marketInfo.EpochDuration)
-	nextEpoch := NewEpoch(nextEpochIdx, epochDuration)
-	epochCycle := time.After(time.Until(nextEpoch.Start))
-
-	var currentEpoch *EpochQueue
-	cycleEpoch := func() {
-		if currentEpoch != nil {
-			// Process the epoch asynchronously since there is a delay while the
-			// preimages are requested and clients respond with their preimages.
-			if !m.enqueueEpoch(eq, currentEpoch) {
-				return
-			}
-
-			// The epoch is closed, long live the epoch.
-			sig := &updateSignal{
-				action: newEpochAction,
-				data:   sigDataNewEpoch{idx: nextEpoch.Epoch},
-			}
-			notifyChan <- sig
-		}
-
-		// Guard activeEpochIdx and suspendEpochIdx.
-		m.epochMtx.Lock()
-		defer m.epochMtx.Unlock()
-
-		// Check suspendEpochIdx and suspend if the just-closed epoch idx is the
-		// suspend epoch.
-		if m.suspendEpochIdx == nextEpoch.Epoch-1 {
-			// Reject incoming orders.
-			currentEpoch = nil
-			cancel() // graceful market shutdown
-			return
-		}
-
-		currentEpoch = nextEpoch
-		nextEpochIdx = currentEpoch.Epoch + 1
-		m.activeEpochIdx = currentEpoch.Epoch
-
-		if !running {
-			// Check that both blockchains are synced before actually starting.
-			synced, err := m.swapper.ChainsSynced(m.marketInfo.Base, m.marketInfo.Quote)
-			if err != nil {
-				log.Errorf("Not starting %s market because of ChainsSynced error: %v", m.marketInfo.Name, err)
-			} else if !synced {
-				log.Debugf("Delaying start of %s market because chains aren't synced", m.marketInfo.Name)
-			} else {
-				// Open up SubmitOrderAsync.
-				close(m.running)
-				running = true
-				log.Infof("Market %s now accepting orders, epoch %d:%d", m.marketInfo.Name,
-					currentEpoch.Epoch, epochDuration)
-				// Signal to the book router if this is a resume.
-				if m.suspendEpochIdx != 0 {
-					notifyChan <- &updateSignal{
-						action: resumeAction,
-						data: sigDataResume{
-							epochIdx: currentEpoch.Epoch,
-							// TODO: signal config or new config
-						},
-					}
-				}
-			}
-		}
-
-		// Replace the next epoch and set the cycle Timer.
-		nextEpoch = NewEpoch(nextEpochIdx, epochDuration)
-		epochCycle = time.After(time.Until(nextEpoch.Start))
-	}
-
-	// Set the orderRouter field now since the main loop below receives on it,
-	// even though SubmitOrderAsync disallows sends on orderRouter when the
-	// market is not running.
-	m.orderRouter = make(chan *orderUpdateSignal, 32) // implicitly guarded by m.runMtx since Market is not running yet
-
-	for {
-		if ctxRun.Err() != nil {
-			return
-		}
-
-		if err := m.storage.LastErr(); err != nil {
-			log.Criticalf("Archivist failing. Last unexpected error: %v", err)
-			return
-		}
-
-		// Prioritize the epoch cycle.
-		select {
-		case <-epochCycle:
-			cycleEpoch()
-		default:
-		}
-
-		// cycleEpoch can cancel ctxRun if suspend initiated.
-		if ctxRun.Err() != nil {
-			return
-		}
-
-		// Wait for the next signal (cancel, new order, or epoch cycle).
-		select {
-		case <-ctxRun.Done():
-			return
-
-		case s := <-m.orderRouter:
-			if currentEpoch == nil {
-				// The order is not time-stamped yet, so the ID cannot be computed.
-				log.Debugf("Order type %v received prior to market start.", s.rec.order.Type())
-				s.errChan <- ErrMarketNotRunning
-				continue
-			}
-
-			// Set the order's server time stamp, giving the order a valid ID.
-			sTime := time.Now().Truncate(time.Millisecond).UTC()
-			s.rec.order.SetTime(sTime) // Order.ID()/UID()/String() is OK now.
-			log.Tracef("Received order %v at %v", s.rec.order, sTime)
-
-			// Push the order into the next epoch if receiving and stamping it
-			// took just a little too long.
-			var orderEpoch *EpochQueue
-			switch {
-			case currentEpoch.IncludesTime(sTime):
-				orderEpoch = currentEpoch
-			case nextEpoch.IncludesTime(sTime):
-				log.Infof("Order %v (sTime=%d) fell into the next epoch [%d,%d)",
-					s.rec.order, sTime.UnixNano(), nextEpoch.Start.Unix(), nextEpoch.End.Unix())
-				orderEpoch = nextEpoch
-			default:
-				// This should not happen.
-				log.Errorf("Time %d does not fit into current or next epoch!",
-					sTime.UnixNano())
-				s.errChan <- ErrEpochMissed
-				continue
-			}
-
-			// Process the order in the target epoch queue.
-			err := m.processOrder(s.rec, orderEpoch, notifyChan, s.errChan)
-			if err != nil {
-				log.Errorf("Failed to process order %v: %v", s.rec.order, err)
-				// Signal to the other Run goroutines to return.
-				return
-			}
-
-		case <-epochCycle:
-			cycleEpoch()
-		}
-	}
-
+	reportMarketStartup(<-ready)
+	<-done
 }
 
 func (m *Market) coinsLocked(o order.Order) ([]order.CoinID, uint32) {

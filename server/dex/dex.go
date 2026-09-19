@@ -949,19 +949,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 
 	authMgr := auth.NewAuthManager(&authCfg)
-	// Auth commands use the mesh service in single-server mode until market
-	// and swap state changes also participate in replication.
-	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
-		Commands:       authMgr.Commands(),
-		Events:         authMgr.Events(),
-		EventLogReader: storage,
-		Logger:         cfg.LogBackend.NewLogger("MSH", log.Level()),
-		OnHalt:         func(err error) { cfg.RequestShutdown(fmt.Sprintf("mesh halted: %v", err)) },
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create auth mesh service: %w", err)
-	}
-	authMgr.SetMeshService(meshSvc)
 
 	log.Infof("Cancellation rate threshold %f, new user grace period %d cancels",
 		cfg.CancelThreshold, authMgr.GraceLimit())
@@ -1057,8 +1044,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			CoinLockerQuote: quoteCoinLocker,
 			DataCollector:   dataAPI,
 			Balancer:        dexBalancer,
-			CheckParcelLimit: func(user account.AccountID, calcParcels market.MarketParcelCalculator) bool {
-				return orderRouter.CheckParcelLimit(user, mktInf.Name, calcParcels)
+			CheckParcelLimit: func(user account.AccountID, asOf time.Time, calcParcels market.MarketParcelCalculator) (bool, error) {
+				return orderRouter.CheckParcelLimit(user, mktInf.Name, asOf, calcParcels)
 			},
 			MinimumRate: minRate,
 		})
@@ -1077,14 +1064,11 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	dexBalancer.SetMarkets(pendingAccounters)
 
-	// Set start epoch index for each market. Also create BookSources for the
-	// BookRouter, and MarketTunnels for the OrderRouter.
-	now := time.Now().UnixMilli()
+	// Market status is refreshed after mesh loads the stored lifecycle.
 	bookSources := make(map[string]market.BookSource, len(cfg.Markets))
 	cfgMarkets := make([]*msgjson.Market, 0, len(cfg.Markets))
 	for name, mkt := range markets {
-		startEpochIdx := 1 + now/int64(mkt.EpochDuration())
-		mkt.SetStartEpochIdx(startEpochIdx)
+		status := mkt.Status()
 		bookSources[name] = mkt
 		cfgMarkets = append(cfgMarkets, &msgjson.Market{
 			Name:            name,
@@ -1096,7 +1080,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			MarketBuyBuffer: mkt.MarketBuyBuffer(),
 			ParcelSize:      mkt.ParcelSize(),
 			MarketStatus: msgjson.MarketStatus{
-				StartEpoch: uint64(startEpochIdx),
+				StartEpoch: uint64(status.StartEpoch),
 			},
 		})
 	}
@@ -1133,11 +1117,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	// The data API gets the order book from the book router.
 	dataAPI.SetBookSource(bookRouter)
 
-	// Market, now that book router is running.
-	for name, mkt := range markets {
-		startSubSys(marketSubSysName(name), mkt)
-	}
-
 	// Order router
 	orderRouter = market.NewOrderRouter(&market.OrderRouterConfig{
 		Assets:       backedAssets,
@@ -1149,6 +1128,49 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	})
 	startSubSys("OrderRouter", orderRouter)
 
+	commands := authMgr.Commands()
+	if err := mergeMeshCommands(commands, orderRouter.Commands()); err != nil {
+		return nil, err
+	}
+	if err := mergeMeshCommands(commands, market.LifecycleCommands(markets)); err != nil {
+		return nil, err
+	}
+	var dexMgr *DEX
+	events := authMgr.Events()
+	if err := mergeMeshEvents(events, market.Events(markets, bookRouter, authMgr.SendIfLocal, newLifecycleUpdated(func() *DEX { return dexMgr }))); err != nil {
+		return nil, err
+	}
+	mktNames := make([]string, 0, len(markets))
+	for name := range markets {
+		mktNames = append(mktNames, name)
+	}
+	sort.Strings(mktNames)
+	var stateLoaders []mesh.StateLoader
+	var masterWorkers []mesh.MasterWorker
+	for _, name := range mktNames {
+		mkt := markets[name]
+		stateLoaders = append(stateLoaders, mesh.StateLoader{Name: "market " + name, Load: func(context.Context) error { return mkt.LoadState() }})
+		masterWorkers = append(masterWorkers, mesh.MasterWorker{Name: "market " + name, Run: mkt.Run})
+	}
+	stateLoaders = append(stateLoaders,
+		mesh.StateLoader{Name: "BookRouter", Load: func(context.Context) error { bookRouter.SeedBooks(); return nil }},
+		mesh.StateLoader{Name: "DataAPI", Load: func(context.Context) error { return dataAPI.LoadCaches() }},
+	)
+	// Auth and market use mesh in single-server mode until swap is converted.
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		Commands: commands, Events: events, StateLoaders: stateLoaders, MasterWorkers: masterWorkers,
+		EventLogReader: storage, Logger: cfg.LogBackend.NewLogger("MSH", log.Level()),
+		OnHalt: func(err error) { cfg.RequestShutdown(fmt.Sprintf("mesh halted: %v", err)) },
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create mesh service: %w", err)
+	}
+	authMgr.SetMeshService(meshSvc)
+	orderRouter.SetMeshService(meshSvc)
+	for _, mkt := range markets {
+		mkt.SetMeshService(meshSvc)
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1158,7 +1180,8 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, err
 	}
 
-	dexMgr := &DEX{
+	dexMgr = &DEX{
+		meshSvc:     meshSvc,
 		network:     cfg.Network,
 		markets:     markets,
 		assets:      lockableAssets,
@@ -1196,6 +1219,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	if err := meshSvc.WaitUntilReadyForComms(ctx); err != nil {
 		return nil, err
+	}
+	for _, mkt := range markets {
+		dexMgr.updateConfigMarketStatus(mkt.Status())
 	}
 	startSubSys("Comms Server", server)
 
@@ -1563,6 +1589,34 @@ func (dm *DEX) updateConfigMarketLifecycle(lc *db.MarketLifecycle) {
 	dm.configRespMtx.Lock()
 	defer dm.configRespMtx.Unlock()
 	dm.configResp.setMktLifecycle(lc)
+}
+
+// updateConfigMarketStatus projects a market's current status into the served
+// config response. Used once after startup readiness: the statuses baked at
+// construction are placeholders, since market lifecycles only load via the
+// mesh state loaders.
+func (dm *DEX) updateConfigMarketStatus(status *market.Status) {
+	name, err := dex.MarketName(status.Base, status.Quote)
+	if err != nil {
+		log.Errorf("updateConfigMarketStatus: bad market %d-%d: %v", status.Base, status.Quote, err)
+		return
+	}
+	dm.configRespMtx.Lock()
+	defer dm.configRespMtx.Unlock()
+	for _, mkt := range dm.configResp.configMsg.Markets {
+		if mkt.Name == name {
+			mkt.MarketStatus.StartEpoch = uint64(status.StartEpoch)
+			mkt.MarketStatus.FinalEpoch = uint64(status.SuspendEpoch)
+			mkt.MarketStatus.Persist = status.PersistBook
+			mkt.LotSize = status.LotSize
+			mkt.RateStep = status.RateStep
+			mkt.ParcelSize = status.ParcelSize
+			mkt.EpochLen = status.EpochDuration
+			dm.configResp.remarshal()
+			return
+		}
+	}
+	log.Errorf("Failed to update MarketStatus for market %q", name)
 }
 
 // broadcastLifecycleNote sends a suspend/resume schedule note to clients.

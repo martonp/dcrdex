@@ -220,6 +220,34 @@ func (rig *marketEventRig) subscribeBook(t *testing.T) *TLink {
 	return link
 }
 
+type submitOrderRPCError struct {
+	msgErr *msgjson.Error
+}
+
+func (e submitOrderRPCError) Error() string {
+	return e.msgErr.Message
+}
+
+func (e submitOrderRPCError) Is(target error) bool {
+	if target == nil {
+		return false
+	}
+	if target == ErrInternalServer {
+		return e.msgErr.Code == msgjson.RPCInternalError || e.msgErr.Code == msgjson.RPCInternal ||
+			strings.Contains(e.msgErr.Message, errEpochOrderStorage.Error())
+	}
+	return strings.Contains(e.msgErr.Message, target.Error())
+}
+
+func submitOrderCommand(t *testing.T, mkt *Market, auth *TAuth, rec *orderRecord) error {
+	t.Helper()
+	svc, req := prepareOrderCommand(t, mkt, auth, rec)
+	if msgErr := svc.ExecuteCommand(context.Background(), req); msgErr != nil {
+		return submitOrderRPCError{msgErr: msgErr}
+	}
+	return nil
+}
+
 func prepareOrderCommand(t *testing.T, mkt *Market, auth *TAuth, rec *orderRecord) (*mesh.Service, mesh.CommandRequest) {
 	t.Helper()
 
@@ -2263,9 +2291,10 @@ func TestMarket_Run(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
+	mkt.startEpochIdx = unsyncedEpochIdx
 	go func() {
 		defer wg.Done()
-		mkt.Start(ctx, unsyncedEpochIdx)
+		mkt.Run(ctx, nil)
 	}()
 
 	// Make an order for the first epoch.
@@ -2341,7 +2370,7 @@ func TestMarket_Run(t *testing.T) {
 	//auth.Send will update preimagesByOrderID
 
 	// Submit order before market starts running
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err == nil {
 		t.Error("order successfully submitted to stopped market")
 	}
@@ -2376,7 +2405,7 @@ func TestMarket_Run(t *testing.T) {
 
 	oRecord = newOR()
 	storMsgPI(oRecord.msgID, pi)
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2399,7 +2428,7 @@ func TestMarket_Run(t *testing.T) {
 	loSell.Quantity = maxTakerQty     // one lot already booked
 
 	storMsgPI(oRecordSell.msgID, pi)
-	err = mkt.SubmitOrder(oRecordSell)
+	err = submitOrderCommand(t, mkt, auth, oRecordSell)
 	if err == nil {
 		t.Fatal("should have rejected too large likely-taker")
 	}
@@ -2417,7 +2446,7 @@ func TestMarket_Run(t *testing.T) {
 	// rate matches with the booked sell = likely taker
 
 	storMsgPI(oRecordBuy.msgID, piBuy)
-	err = mkt.SubmitOrder(oRecordBuy)
+	err = submitOrderCommand(t, mkt, auth, oRecordBuy)
 	if err == nil {
 		t.Fatal("should have rejected too large likely-taker")
 	}
@@ -2426,7 +2455,7 @@ func TestMarket_Run(t *testing.T) {
 	loSell.Quantity = maxTakerQty - dcrLotSize // the limit
 
 	storMsgPI(oRecordSell.msgID, piSell)
-	err = mkt.SubmitOrder(oRecordSell)
+	err = submitOrderCommand(t, mkt, auth, oRecordSell)
 	if err != nil {
 		t.Fatalf("should have allowed that likely-taker: %v", err)
 	}
@@ -2434,7 +2463,7 @@ func TestMarket_Run(t *testing.T) {
 	// Another in the same epoch will push over the limit
 	loBuy.Quantity = dcrLotSize // just one lot
 	storMsgPI(oRecordBuy.msgID, pi)
-	err = mkt.SubmitOrder(oRecordBuy)
+	err = submitOrderCommand(t, mkt, auth, oRecordBuy)
 	if err == nil {
 		t.Fatalf("should have rejected too likely-taker that pushed the limit with existing epoch status takers")
 	}
@@ -2499,7 +2528,7 @@ func TestMarket_Run(t *testing.T) {
 	// Submit the invalid cancel order first because it would be caught by the
 	// duplicate check if we do it after the valid one is submitted.
 	storMsgPI(coRecordWrongAccount.msgID, piBadCo)
-	err = mkt.SubmitOrder(&coRecordWrongAccount)
+	err = submitOrderCommand(t, mkt, auth, &coRecordWrongAccount)
 	if err == nil {
 		t.Errorf("An invalid order was processed, but it should not have been.")
 	} else if !errors.Is(err, ErrCancelNotPermitted) {
@@ -2508,7 +2537,7 @@ func TestMarket_Run(t *testing.T) {
 
 	// Valid cancel order
 	storMsgPI(coRecord.msgID, piCo)
-	err = mkt.SubmitOrder(&coRecord)
+	err = submitOrderCommand(t, mkt, auth, &coRecord)
 	if err != nil {
 		t.Fatalf("Failed to submit order: %v", err)
 	}
@@ -2528,7 +2557,7 @@ func TestMarket_Run(t *testing.T) {
 		order: coDup,
 	}
 	storMsgPI(coRecordDup.msgID, piCoDup)
-	err = mkt.SubmitOrder(&coRecordDup)
+	err = submitOrderCommand(t, mkt, auth, &coRecordDup)
 	if err == nil {
 		t.Errorf("An duplicate cancel order was processed, but it should not have been.")
 	} else if !errors.Is(err, ErrDuplicateCancelOrder) {
@@ -2558,47 +2587,78 @@ func TestMarket_Run(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mkt.Run(ctx)
+		mkt.Run(ctx, nil)
 	}()
-	mkt.waitForEpochOpen()
+	waitForOrderAdmission(t, mkt)
 
 	// fresh oRecord
 	oRecord = newOR()
 	storMsgPI(oRecord.msgID, pi)
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err != nil {
-		t.Error(err)
+		t.Fatalf("first order: %v", err)
+	}
+	firstOrder := oRecord.order
+	firstID := firstOrder.ID()
+	firstServerTime := firstOrder.Time()
+	for auth.getSend() != nil {
 	}
 
-	// Submit another order with the same Commitment in the same Epoch.
 	oRecord = newOR()
 	storMsgPI(oRecord.msgID, pi)
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
+	if err != nil {
+		t.Fatalf("identical resend: %v", err)
+	}
+	msg := auth.getSend()
+	if msg == nil {
+		t.Fatal("identical resend delivered no result")
+	}
+	var res msgjson.OrderResult
+	if err := msg.UnmarshalResult(&res); err != nil {
+		t.Fatalf("identical resend result: %v", err)
+	}
+	gotID, err := order.IDFromBytes(res.OrderID)
+	if err != nil {
+		t.Fatalf("identical resend order id: %v", err)
+	}
+	if gotID != firstID {
+		t.Errorf("identical resend order ID = %v, want %v", gotID, firstID)
+	}
+	if res.ServerTime != uint64(firstServerTime) {
+		t.Errorf("identical resend server time = %d, want %d", res.ServerTime, firstServerTime)
+	}
+
+	oRecord = newOR()
+	oRecord.order.(*order.LimitOrder).Quantity *= 2
+	storMsgPI(oRecord.msgID, pi)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err == nil {
-		t.Errorf("A duplicate order was processed, but it should not have been.")
+		t.Errorf("A duplicate commitment was processed, but it should not have been.")
 	} else if !errors.Is(err, ErrInvalidCommitment) {
 		t.Errorf(`expected ErrInvalidCommitment ("%v"), got "%v"`, ErrInvalidCommitment, err)
 	}
 
 	// Send an order with a bad lot size.
 	oRecord = newOR()
-	oRecord.order.(*order.LimitOrder).Quantity += mkt.marketInfo.LotSize / 2
+	oRecord.order.(*order.LimitOrder).Quantity += mkt.configuredParams.LotSize / 2
 	storMsgPI(oRecord.msgID, pi)
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err == nil {
 		t.Errorf("An invalid order was processed, but it should not have been.")
 	} else if !errors.Is(err, ErrInvalidOrder) {
 		t.Errorf(`expected ErrInvalidOrder ("%v"), got "%v"`, ErrInvalidOrder, err)
 	}
 
-	// Rate too low
+	// Rate too low. The live floor is the run's adopted parameter set, so
+	// pin a floor above the order's rate there.
 	oRecord = newOR()
-	mkt.minimumRate = oRecord.order.(*order.LimitOrder).Rate + 1
+	setTestRunMinimumRate(t, mkt, oRecord.order.(*order.LimitOrder).Rate+1)
 	storMsgPI(oRecord.msgID, pi)
-	if err = mkt.SubmitOrder(oRecord); !errors.Is(err, ErrInvalidRate) {
+	if err = submitOrderCommand(t, mkt, auth, oRecord); !errors.Is(err, ErrInvalidRate) {
 		t.Errorf("An invalid rate was accepted, but it should not have been.")
 	}
-	mkt.minimumRate = 0
+	setTestRunMinimumRate(t, mkt, 0)
 
 	// Let the epoch cycle and the fake client respond with its preimage
 	// (handlePreimageResp done)..
@@ -2612,7 +2672,7 @@ func TestMarket_Run(t *testing.T) {
 	// oRecord.order.SetTime(time.Now()) // This will register a different order ID with the DB in the next statement.
 	// storage.failOnCommitWithOrder(oRecord.order)
 	// storMsgPI(oRecord.msgID, pi)
-	// err = mkt.SubmitOrder(oRecord) // Will re-stamp the order, but the commit will be the same.
+	// err = submitOrderCommand(t, mkt, auth, oRecord) // Will re-stamp the order, but the commit will be the same.
 	// if err == nil {
 	// 	t.Errorf("A duplicate order was processed, but it should not have been.")
 	// } else if !errors.Is(err, ErrInvalidCommitment) {
@@ -2623,7 +2683,7 @@ func TestMarket_Run(t *testing.T) {
 	oRecord = newOR()
 	oRecord.order.(*order.LimitOrder).Commit = order.Commitment{}
 	storMsgPI(oRecord.msgID, pi)
-	err = mkt.SubmitOrder(oRecord)
+	err = submitOrderCommand(t, mkt, auth, oRecord)
 	if err == nil {
 		t.Errorf("An order with a zero Commitment was processed, but it should not have been.")
 	} else if !errors.Is(err, ErrInvalidCommitment) {
@@ -2640,12 +2700,11 @@ func TestMarket_Run(t *testing.T) {
 	limit.Commit = commit[:] // oRecord.req
 	storMsgPI(oRecord.msgID, pi)
 	storage.failOnEpochOrder(lo) // force storage to fail on this order
-	if err = mkt.SubmitOrder(oRecord); !errors.Is(err, ErrInternalServer) {
+	if err = submitOrderCommand(t, mkt, auth, oRecord); !errors.Is(err, ErrInternalServer) {
 		t.Errorf(`expected ErrInternalServer ("%v"), got "%v"`, ErrInternalServer, err)
 	}
 
-	// NOTE: The Market is now stopping on its own because of the storage failure.
-
+	cancel()
 	wg.Wait()
 	cleanup()
 }
@@ -5870,6 +5929,19 @@ func requireRevokedOrderGone(t *testing.T, mkt *Market, lo *order.LimitOrder) {
 			t.Fatalf("revoked order %v coin %x remains locked", lo.ID(), coin)
 		}
 	}
+}
+
+// setTestRunMinimumRate pins a rate floor in the market's adopted run
+// parameters, the only floor live admission reads.
+func setTestRunMinimumRate(t *testing.T, mkt *Market, rate uint64) {
+	t.Helper()
+	run := mkt.liveParams.Load()
+	if run == nil {
+		t.Fatalf("market has no adopted run parameters")
+	}
+	cpy := *run
+	cpy.MinimumRate = rate
+	mkt.liveParams.Store(&cpy)
 }
 
 func TestBuildEpochProcessedUpdate(t *testing.T) {
