@@ -54,6 +54,8 @@ type TArchivist struct {
 	advanceEpochEvents            []*meshevents.AdvanceEpochEvent
 	lifecycle                     *db.MarketLifecycle
 	marketSuspendScheduledUpdates []*db.MarketSuspendScheduledUpdate
+	marketSuspendedUpdates        []*db.MarketSuspendedUpdate
+	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
 	ordersRevokedUpdates          []*db.OrdersRevokedUpdate
@@ -363,6 +365,18 @@ func (ta *TArchivist) ApplyMarketSuspendScheduledEvent(_ context.Context, _ *db.
 	}
 	ta.lifecycle = next
 	return &db.MarketSuspendScheduledApplyResult{Log: new(db.EventLogEntry), Lifecycle: next}, nil
+}
+
+func (ta *TArchivist) ApplyMarketSuspendedEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketSuspendedUpdate) (*db.MarketSuspendedApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.marketSuspendedUpdates = append(ta.marketSuspendedUpdates, update)
+	next, err := db.ProjectMarketSuspended(ta.lifecycle, update)
+	if err != nil {
+		return nil, err
+	}
+	ta.lifecycle = next
+	return &db.MarketSuspendedApplyResult{Log: new(db.EventLogEntry), Lifecycle: next, PurgeOrders: ta.lifecyclePurgeOrders}, nil
 }
 
 func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
@@ -4610,6 +4624,140 @@ func TestExecuteLifecycleCommand(t *testing.T) {
 			t.Fatalf("result = %+v, error = %v, want epoch 42", result, err)
 		}
 	})
+}
+
+func TestSubmitMarketSuspend(t *testing.T) {
+	const finalEpoch int64 = 41
+	for _, tc := range []struct {
+		name              string
+		processedEpochIdx int64
+		wantErr           string
+	}{
+		{
+			name: "final epoch still processing", processedEpochIdx: finalEpoch - 1,
+			wantErr: "is not processed",
+		},
+		{
+			name: "final epoch processed", processedEpochIdx: finalEpoch,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newMarketEventRig(t)
+			defer rig.cleanup()
+			mkt := rig.mkt
+			epochDur := int64(mkt.EpochDuration())
+			row := seedLifecycleRow(db.MarketStateDraining, db.MarketPendingNone, finalEpoch, epochDur)
+			row.ProcessedEpochIdx = tc.processedEpochIdx
+			setTestMarketLifecycle(mkt, rig.storage, row)
+			rig.useApplierMesh()
+
+			err := mkt.submitMarketSuspend(context.Background())
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("suspend error = %v, want %q", err, tc.wantErr)
+				}
+				if mkt.lifecycleState != db.MarketStateDraining {
+					t.Fatalf("market state = %v, want draining", mkt.lifecycleState)
+				}
+				if !reflect.DeepEqual(rig.storage.lifecycle, row) {
+					t.Fatalf("rejected suspension changed stored lifecycle: got %+v, want %+v", rig.storage.lifecycle, row)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mkt.lifecycleState != db.MarketStateSuspended {
+				t.Fatalf("market state = %v, want suspended", mkt.lifecycleState)
+			}
+			if mkt.suspendEpochIdx != finalEpoch {
+				t.Fatalf("final epoch = %d, want %d", mkt.suspendEpochIdx, finalEpoch)
+			}
+			if len(rig.storage.marketSuspendedUpdates) != 1 {
+				t.Fatalf("suspension updates = %d, want 1", len(rig.storage.marketSuspendedUpdates))
+			}
+			update := rig.storage.marketSuspendedUpdates[0]
+			if update.FinalEpochIdx != finalEpoch || update.EpochDur != epochDur {
+				t.Fatalf("suspension update = %+v, want final epoch %d and duration %d", update, finalEpoch, epochDur)
+			}
+		})
+	}
+}
+
+func TestApplyMarketSuspendedEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		persistBook bool
+	}{
+		{name: "retain booked orders", persistBook: true},
+		{name: "purge booked orders", persistBook: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newMarketEventRig(t)
+			defer rig.cleanup()
+			mkt := rig.mkt
+			const finalEpoch int64 = 40
+			epochDur := int64(mkt.EpochDuration())
+			row := seedLifecycleRow(db.MarketStateDraining, db.MarketPendingNone, finalEpoch, epochDur)
+			row.ProcessedEpochIdx = finalEpoch
+			row.PersistBook = &tc.persistBook
+			setTestMarketLifecycle(mkt, rig.storage, row)
+
+			bookedOrder := makeLO(seller3, mkRate3(1.0, 1.2), 2, order.StandingTiF)
+			bookedOrder.Coins = []order.CoinID{{0x71, 0x72}}
+			bookStandingOrder(t, rig, bookedOrder)
+			mkt.settling[bookedOrder.ID()] = mkt.LotSize()
+			rig.bookRouter.SeedBooks()
+			link := rig.subscribeBook(t)
+			if !tc.persistBook {
+				rig.storage.lifecyclePurgeOrders = []order.OrderID{bookedOrder.ID()}
+			}
+
+			event := &meshevents.MarketSuspendedEvent{Market: mkt.name, FinalEpochIdx: finalEpoch, EpochDur: epochDur}
+			event.Timestamp = (finalEpoch + 1) * epochDur
+			rig.apply(t, event)
+			if mkt.lifecycleState != db.MarketStateSuspended {
+				t.Fatalf("market state = %v, want suspended", mkt.lifecycleState)
+			}
+			if retained := mkt.book.HaveOrder(bookedOrder.ID()); retained != tc.persistBook {
+				t.Fatalf("book order retained = %t, want %t", retained, tc.persistBook)
+			}
+			if locked := mkt.CoinLocked(bookedOrder.Base(), bookedOrder.Coins[0]); locked != tc.persistBook {
+				t.Fatalf("funding locked = %t, want %t", locked, tc.persistBook)
+			}
+			if _, settling := mkt.settling[bookedOrder.ID()]; settling != tc.persistBook {
+				t.Fatalf("settling entry retained = %t, want %t", settling, tc.persistBook)
+			}
+			snapshot := rig.bookRouter.msgOrderBook(rig.bookRouter.books[mkt.name])
+			wantOrders := 0
+			if tc.persistBook {
+				wantOrders = 1
+			}
+			if snapshot == nil || len(snapshot.Orders) != wantOrders {
+				t.Fatalf("book snapshot = %+v, want %d orders", snapshot, wantOrders)
+			}
+			revokes, _ := collectOwnerNotes(t, rig.auth)
+			if tc.persistBook {
+				if len(revokes) != 0 {
+					t.Fatalf("owner revocations = %v, want none", revokes)
+				}
+			} else if len(revokes) != 1 || !revokes[bookedOrder.ID()] {
+				t.Fatalf("owner revocations = %v, want only %v", revokes, bookedOrder.ID())
+			}
+			msg := link.getSend()
+			if msg == nil || msg.Route != msgjson.SuspensionRoute {
+				t.Fatalf("notification = %v, want suspension", msg)
+			}
+			var note msgjson.TradeSuspension
+			if err := json.Unmarshal(msg.Payload, &note); err != nil {
+				t.Fatal(err)
+			}
+			if note.MarketID != mkt.name || note.FinalEpoch != uint64(finalEpoch) || note.Persist != tc.persistBook {
+				t.Fatalf("unexpected suspension note: %+v", note)
+			}
+			requireNoBookNoteFromLink(t, link)
+		})
+	}
 }
 
 func requireEpochNoteFromLink(t *testing.T, link *TLink, mkt *Market, ord order.Order, epochIdx int64, wantOrderType uint8) {

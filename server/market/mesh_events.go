@@ -33,6 +33,7 @@ type LifecycleTransition uint8
 const (
 	LifecycleTransitionStarted LifecycleTransition = iota + 1
 	LifecycleTransitionScheduleSuspend
+	LifecycleTransitionSuspend
 )
 
 // LifecycleUpdated is a callback that receives the applied lifecycle
@@ -50,6 +51,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func
 		},
 		meshevents.EventKindMarketSuspendScheduled: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketSuspendScheduledEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
+		},
+		meshevents.EventKindMarketSuspended: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyMarketSuspendedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
 		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
@@ -442,6 +446,40 @@ func applyMarketSuspendScheduledEvent(applyCtx *mesh.EventApplyContext, markets 
 	mkt.applyMarketLifecycleRow(result.Lifecycle)
 	if lifecycleUpdated != nil {
 		lifecycleUpdated(LifecycleTransitionScheduleSuspend, result.Lifecycle)
+	}
+	return result.Log, nil
+}
+
+// applyMarketSuspendedEvent completes suspension and updates the book and subscribers.
+func applyMarketSuspendedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated LifecycleUpdated, event *mesh.Event) (*db.EventLogEntry, error) {
+	payload, err := meshevents.DecodeMarketSuspendedEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, payload.Market)
+	if err != nil {
+		return nil, err
+	}
+	update := &db.MarketSuspendedUpdate{
+		Market:        payload.Market,
+		Base:          mkt.base,
+		Quote:         mkt.quote,
+		FinalEpochIdx: payload.FinalEpochIdx,
+		EpochDur:      payload.EpochDur,
+		Timestamp:     time.UnixMilli(payload.Timestamp).UTC(),
+	}
+	result, err := mkt.storage.ApplyMarketSuspendedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), update)
+	if err != nil {
+		return nil, err
+	}
+	mkt.applyMarketLifecycleRow(result.Lifecycle)
+	persist := result.Lifecycle.PersistBook != nil && *result.Lifecycle.PersistBook
+	if !persist {
+		mkt.applyMarketSuspendPurge(result.PurgeOrders)
+	}
+	bookRouter.applyMarketSuspendedEvent(book, result.Lifecycle.FinalEpochIdx, persist, result.PurgeOrders)
+	if lifecycleUpdated != nil {
+		lifecycleUpdated(LifecycleTransitionSuspend, result.Lifecycle)
 	}
 	return result.Log, nil
 }

@@ -5,8 +5,11 @@ package pg
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
+	"time"
 
+	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/meshevents"
 )
@@ -61,5 +64,104 @@ func TestApplyMarketSuspendScheduledEvent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(stored, &want) {
 		t.Fatalf("stored lifecycle = %+v, want %+v", stored, want)
+	}
+}
+
+func TestApplyMarketSuspendedEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		persistBook bool
+	}{
+		{name: "purge book", persistBook: false},
+		{name: "retain book", persistBook: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+
+			const epochDur = int64(EpochDuration)
+			const finalEpochIdx int64 = 30000
+			draining := &db.MarketLifecycle{
+				Market:        "dcr_btc",
+				State:         db.MarketStateDraining,
+				StartEpochIdx: finalEpochIdx - 10,
+				StartEpochDur: epochDur,
+				FinalEpochIdx: finalEpochIdx,
+				FinalEpochDur: epochDur,
+				PendingAction: db.MarketPendingNone,
+				PersistBook:   &tc.persistBook,
+				// The final epoch must be processed before suspension.
+				ProcessedEpochIdx: finalEpochIdx,
+				RunParams:         testMarketRunParams(),
+			}
+			seedMarketLifecycle(t, draining)
+
+			bookedOrders := []*order.LimitOrder{
+				newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0),
+				newLimitOrder(true, 5_100_000, 1, order.StandingTiF, 10),
+			}
+			for _, lo := range bookedOrders {
+				if err := storeOrderForTest(archie, lo, finalEpochIdx-2, epochDur, order.OrderStatusBooked); err != nil {
+					t.Fatalf("store order %v: %v", lo.ID(), err)
+				}
+			}
+
+			update := &db.MarketSuspendedUpdate{
+				Market:        draining.Market,
+				Base:          AssetDCR,
+				Quote:         AssetBTC,
+				FinalEpochIdx: finalEpochIdx,
+				EpochDur:      epochDur,
+				Timestamp:     time.UnixMilli((finalEpochIdx + 1) * epochDur).UTC(),
+			}
+			result, err := archie.ApplyMarketSuspendedEvent(context.Background(), &db.EventLogMeta{Event: []byte("ml-suspend")}, update)
+			if err != nil {
+				t.Fatalf("ApplyMarketSuspendedEvent: %v", err)
+			}
+
+			if result.Log.Kind != meshevents.EventKindMarketSuspended {
+				t.Fatalf("event kind = %q, want %q", result.Log.Kind, meshevents.EventKindMarketSuspended)
+			}
+			wantLifecycle := *draining
+			wantLifecycle.State = db.MarketStateSuspended
+			if !reflect.DeepEqual(result.Lifecycle, &wantLifecycle) {
+				t.Fatalf("returned lifecycle = %+v, want %+v", result.Lifecycle, wantLifecycle)
+			}
+			stored, err := archie.MarketLifecycle(update.Market)
+			if err != nil {
+				t.Fatalf("MarketLifecycle: %v", err)
+			}
+			if !reflect.DeepEqual(stored, &wantLifecycle) {
+				t.Fatalf("stored lifecycle = %+v, want %+v", stored, wantLifecycle)
+			}
+
+			var wantPurge []order.OrderID
+			wantStatus := order.OrderStatusBooked
+			if !tc.persistBook {
+				for _, lo := range bookedOrders {
+					wantPurge = append(wantPurge, lo.ID())
+				}
+				sortOrderIDs(wantPurge)
+				wantStatus = order.OrderStatusRevoked
+			}
+			if !slices.Equal(result.PurgeOrders, wantPurge) {
+				t.Fatalf("purge orders = %v, want %v", result.PurgeOrders, wantPurge)
+			}
+			for _, lo := range bookedOrders {
+				if _, status, err := archie.Order(lo.ID(), lo.Base(), lo.Quote()); err != nil || status != wantStatus {
+					t.Fatalf("order %v status = %v (err %v), want %v", lo.ID(), status, err, wantStatus)
+				}
+			}
+
+			if !tc.persistBook {
+				for _, lo := range bookedOrders {
+					cancel := makePseudoCancel(lo.ID(), lo.User(), lo.Base(), lo.Quote(), update.Timestamp)
+					if _, status, err := archie.Order(cancel.ID(), lo.Base(), lo.Quote()); err != nil || status != order.OrderStatusRevoked {
+						t.Fatalf("revocation cancel for %v: status %v, error %v", lo.ID(), status, err)
+					}
+				}
+			}
+		})
 	}
 }

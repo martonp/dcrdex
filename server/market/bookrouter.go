@@ -831,6 +831,23 @@ func (r *BookRouter) applyOrderAcceptedEvent(book *msgBook, note *msgjson.EpochO
 	r.sendNote(msgjson.EpochOrderRoute, book.subs, note)
 }
 
+func (r *BookRouter) applyMarketSuspendedEvent(book *msgBook, finalEpoch int64, persistBook bool, purged []order.OrderID) {
+	note := &msgjson.TradeSuspension{
+		MarketID:   book.name,
+		FinalEpoch: uint64(finalEpoch),
+		Persist:    persistBook,
+	}
+	if !persistBook {
+		note.Seq = book.subs.nextSeq()
+		book.mtx.Lock()
+		book.orders = make(map[order.OrderID]*msgjson.BookOrderNote)
+		book.mtx.Unlock()
+	}
+	r.sendNote(msgjson.SuspensionRoute, book.subs, note)
+	log.Infof("Market %q suspended after epoch %d, persist book = %v, purged orders = %d.",
+		book.name, finalEpoch, persistBook, len(purged))
+}
+
 // applyBookedOrder applies a newly booked limit order to the local book
 // projection and notifies local subscribers.
 func (r *BookRouter) applyBookedOrder(book *msgBook, lo *order.LimitOrder) {

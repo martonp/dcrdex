@@ -86,6 +86,90 @@ func TestProjectMarketSuspendScheduled(t *testing.T) {
 	}
 }
 
+func TestProjectMarketSuspended(t *testing.T) {
+	const epochDur int64 = 10_000
+	persistBook := true
+	update := &MarketSuspendedUpdate{
+		Market:        "dcr_btc",
+		FinalEpochIdx: 20,
+		EpochDur:      epochDur,
+	}
+	draining := MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateDraining,
+		StartEpochIdx:     10,
+		StartEpochDur:     epochDur,
+		FinalEpochIdx:     20,
+		FinalEpochDur:     epochDur,
+		ProcessedEpochIdx: 20,
+		PersistBook:       &persistBook,
+		RunParams:         testRunParams(),
+	}
+
+	suspended := draining
+	suspended.State = MarketStateSuspended
+
+	unprocessedFinalEpoch := draining
+	unprocessedFinalEpoch.ProcessedEpochIdx = 19
+	running := MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateRunning,
+		StartEpochIdx:     10,
+		StartEpochDur:     epochDur,
+		ActiveEpochIdx:    19,
+		ProcessedEpochIdx: 18,
+		FinalEpochIdx:     20,
+		FinalEpochDur:     epochDur,
+		PendingAction:     MarketPendingSuspend,
+		PendingEpochIdx:   20,
+		PendingEpochDur:   epochDur,
+		PersistBook:       &persistBook,
+		RunParams:         testRunParams(),
+	}
+
+	for _, tc := range []struct {
+		name    string
+		prev    *MarketLifecycle
+		update  *MarketSuspendedUpdate
+		want    *MarketLifecycle
+		wantErr bool
+	}{
+		{
+			name: "final epoch processed", prev: &draining, update: update,
+			want: &suspended,
+		},
+		{
+			name: "unprocessed final epoch", prev: &unprocessedFinalEpoch, update: update,
+			wantErr: true,
+		},
+		{
+			name: "running market", prev: &running, update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing lifecycle", update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing update", prev: &draining,
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProjectMarketSuspended(tc.prev, tc.update)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("lifecycle = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProjectMarketStartedLifecycle(t *testing.T) {
 	persist := true
 	const market = "dcr_btc"
