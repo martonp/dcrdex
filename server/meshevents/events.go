@@ -31,6 +31,7 @@ const (
 	EventKindMarketStarted       = "market_started"
 
 	EventKindMarketSuspendScheduled = "market_suspend_scheduled"
+	EventKindMarketSuspended        = "market_suspended"
 	EventKindAdvanceEpoch           = "advance_epoch"
 	EventKindEpochProcessed         = "epoch_processed"
 	EventKindOrdersRevoked          = "orders_revoked"

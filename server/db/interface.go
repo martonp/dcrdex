@@ -226,6 +226,7 @@ type OrderArchiver interface {
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
 	MarketLifecycle(market string) (*MarketLifecycle, error)
 	ApplyMarketSuspendScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendScheduledUpdate) (*MarketSuspendScheduledApplyResult, error)
+	ApplyMarketSuspendedEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendedUpdate) (*MarketSuspendedApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
@@ -947,6 +948,25 @@ type MarketSuspendScheduledUpdate struct {
 type MarketSuspendScheduledApplyResult struct {
 	Log       *EventLogEntry
 	Lifecycle *MarketLifecycle
+}
+
+// MarketSuspendedUpdate identifies the market and final trading epoch
+// for completing a scheduled suspension.
+type MarketSuspendedUpdate struct {
+	Market        string
+	Base, Quote   uint32
+	FinalEpochIdx int64
+	EpochDur      int64
+	// Timestamp is the revocation time for orders removed when purging the book.
+	Timestamp time.Time
+}
+
+// MarketSuspendedApplyResult contains the updated lifecycle, event log entry,
+// and IDs of orders revoked when purging the book.
+type MarketSuspendedApplyResult struct {
+	Log         *EventLogEntry
+	Lifecycle   *MarketLifecycle
+	PurgeOrders []order.OrderID
 }
 
 // MarketStartedApplyResult is the stored outcome of a market_started event.

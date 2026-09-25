@@ -600,6 +600,27 @@ func (m *Market) applyMarketLifecycleRow(lifecycle *db.MarketLifecycle) {
 	m.wakeLifecycleDriver()
 }
 
+func (m *Market) applyMarketSuspendPurge(purged []order.OrderID) {
+	if len(purged) == 0 {
+		return
+	}
+	m.bookMtx.Lock()
+	var removed []*order.LimitOrder
+	for _, oid := range purged {
+		lo, ok := m.book.Remove(oid)
+		if !ok {
+			continue
+		}
+		delete(m.settling, oid)
+		removed = append(removed, lo)
+	}
+	m.bookMtx.Unlock()
+	for _, lo := range removed {
+		m.unlockOrderCoins(lo)
+		m.sendRevokeOrderNote(lo.ID(), lo.User())
+	}
+}
+
 // buildScheduleSuspendEvent builds an event scheduling suspension and returns
 // the final trading epoch. That epoch ends at or after asSoonAs.
 func (m *Market) buildScheduleSuspendEvent(asSoonAs time.Time, persistBook bool) (*mesh.Event, *SuspendEpoch, error) {
@@ -632,6 +653,29 @@ func (m *Market) buildScheduleSuspendEvent(asSoonAs time.Time, persistBook bool)
 		return nil, nil, err
 	}
 	return meshEvent, &SuspendEpoch{Idx: finalEpochIdx, End: finalEpochEnd}, nil
+}
+
+// submitMarketSuspend submits the event that completes the scheduled suspension.
+func (m *Market) submitMarketSuspend(ctx context.Context) error {
+	m.epochMtx.RLock()
+	finalEpochIdx := m.suspendEpochIdx
+	finalEpochDur := m.liveParams.Load().epochDur
+	m.epochMtx.RUnlock()
+	if finalEpochIdx == 0 || finalEpochDur == 0 {
+		return fmt.Errorf("market %s has no final epoch to suspend", m.name)
+	}
+	event := &meshevents.MarketSuspendedEvent{
+		Market:        m.name,
+		FinalEpochIdx: finalEpochIdx,
+		EpochDur:      finalEpochDur,
+	}
+	event.Timestamp = time.Now().UnixMilli()
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = m.mesh.ApplyEvent(ctx, meshEvent)
+	return err
 }
 
 func (m *Market) validateScheduleSuspendEvent(finalEpochIdx, finalEpochDur int64) error {

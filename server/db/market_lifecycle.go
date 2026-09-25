@@ -36,6 +36,38 @@ func ProjectMarketSuspendScheduled(prev *MarketLifecycle, update *MarketSuspendS
 	return &next, nil
 }
 
+// ProjectMarketSuspended returns the lifecycle after applying a market_suspended
+// event. The market must be draining and its final epoch must be processed.
+func ProjectMarketSuspended(prev *MarketLifecycle, update *MarketSuspendedUpdate) (*MarketLifecycle, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_suspended update")
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", update.Market)
+	}
+	if prev.State != MarketStateDraining {
+		return nil, fmt.Errorf("cannot suspend market %s in state %d",
+			update.Market, prev.State)
+	}
+	if !sameLifecycleEpoch(prev.FinalEpochIdx, prev.FinalEpochDur, update.FinalEpochIdx, update.EpochDur) {
+		return nil, fmt.Errorf("suspend final epoch mismatch for market %s", update.Market)
+	}
+	if prev.ProcessedEpochIdx != prev.FinalEpochIdx {
+		return nil, fmt.Errorf("cannot suspend market %s: final epoch %d is not processed (last processed epoch %d)",
+			update.Market, prev.FinalEpochIdx, prev.ProcessedEpochIdx)
+	}
+	if prev.PersistBook == nil {
+		return nil, fmt.Errorf("suspend missing persist_book")
+	}
+	next := *prev
+	next.State = MarketStateSuspended
+	next.PendingAction = MarketPendingNone
+	next.PendingEpochIdx = 0
+	next.PendingEpochDur = 0
+	next.ActiveEpochIdx = 0
+	return &next, nil
+}
+
 // ProjectMarketStartedLifecycle returns the lifecycle state after startup
 // recovery. It performs no storage I/O. changed is false when no update is needed.
 func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedUpdate) (next *MarketLifecycle, changed bool, err error) {
