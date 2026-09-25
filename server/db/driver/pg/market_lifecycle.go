@@ -232,6 +232,84 @@ func (a *Archiver) ApplyMarketResumeScheduledEvent(ctx context.Context, meta *db
 	return result, nil
 }
 
+// ApplyMarketResumedEvent revokes the selected booked orders and resumes trading with the new parameters.
+func (a *Archiver) ApplyMarketResumedEvent(ctx context.Context, meta *db.EventLogMeta, update *db.MarketResumedUpdate) (*db.MarketResumedApplyResult, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_resumed update")
+	}
+	if err := a.validateLifecycleMarket(update.Market, update.Base, update.Quote); err != nil {
+		return nil, err
+	}
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	result := &db.MarketResumedApplyResult{}
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindMarketResumed, txData, func(tx *sql.Tx) error {
+		lc, err := a.marketLifecycleForUpdate(tx, update.Market)
+		if err != nil {
+			return err
+		}
+		next, err := db.ProjectMarketResumed(lc, update)
+		if err != nil {
+			return err
+		}
+		result.ResumeRevokes, err = a.revokeResumeOrdersTx(tx, update)
+		if err != nil {
+			return err
+		}
+		result.Lifecycle = next
+		return a.updateMarketLifecycleTx(tx, next)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Log = logEntry
+	return result, nil
+}
+
+// revokeResumeOrdersTx revokes the requested orders. Orders that are not booked
+// are skipped.
+func (a *Archiver) revokeResumeOrdersTx(tx *sql.Tx, update *db.MarketResumedUpdate) ([]*db.StartupOrderRevoke, error) {
+	booked, err := a.bookedOrderIDSetTx(tx, update.Base, update.Quote)
+	if err != nil {
+		return nil, err
+	}
+	revoked := make([]*db.StartupOrderRevoke, 0, len(update.ResumeRevokes))
+	for _, revoke := range update.ResumeRevokes {
+		if revoke == nil || revoke.Order == nil {
+			return nil, fmt.Errorf("nil resume booked revoke")
+		}
+		ord := revoke.Order
+		if !booked[ord.ID()] {
+			continue
+		}
+		if _, err := a.revokeBookedOrderByID(tx, ord.ID(), ord.User(), update.Base, update.Quote, true, update.Timestamp); err != nil {
+			return nil, err
+		}
+		revoked = append(revoked, revoke)
+	}
+	return revoked, nil
+}
+
+// bookedOrderIDSetTx returns the IDs of the market's booked orders.
+func (a *Archiver) bookedOrderIDSetTx(tx *sql.Tx, base, quote uint32) (map[order.OrderID]bool, error) {
+	marketSchema, err := a.marketSchema(base, quote)
+	if err != nil {
+		return nil, err
+	}
+	tradesActive := fullOrderTableName(a.dbName, marketSchema, orderStatusBooked.active())
+	ids, err := selectOrderIDsByStatus(tx, tradesActive, orderStatusBooked)
+	if err != nil {
+		return nil, err
+	}
+	booked := make(map[order.OrderID]bool, len(ids))
+	for _, oid := range ids {
+		booked[oid] = true
+	}
+	return booked, nil
+}
+
 // purgeBookAtTx revokes all booked orders in a market and records a
 // server-generated cancel for each at revokeTime. It returns the revoked order
 // IDs in sorted order.

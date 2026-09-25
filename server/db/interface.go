@@ -228,6 +228,7 @@ type OrderArchiver interface {
 	ApplyMarketSuspendScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendScheduledUpdate) (*MarketSuspendScheduledApplyResult, error)
 	ApplyMarketSuspendedEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendedUpdate) (*MarketSuspendedApplyResult, error)
 	ApplyMarketResumeScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketResumeScheduledUpdate) (*MarketResumeScheduledApplyResult, error)
+	ApplyMarketResumedEvent(ctx context.Context, meta *EventLogMeta, update *MarketResumedUpdate) (*MarketResumedApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
@@ -984,6 +985,28 @@ type MarketResumeScheduledUpdate struct {
 type MarketResumeScheduledApplyResult struct {
 	Log       *EventLogEntry
 	Lifecycle *MarketLifecycle
+}
+
+// MarketResumedUpdate contains the market, epoch, trading parameters, and order
+// revocations for completing a scheduled resumption.
+type MarketResumedUpdate struct {
+	Market        string
+	Base, Quote   uint32
+	StartEpochIdx int64
+	EpochDur      int64
+	Timestamp     time.Time
+	// ResumeRevokes lists orders to revoke before resuming trading. Orders that
+	// are no longer booked are skipped.
+	ResumeRevokes []*StartupOrderRevoke
+	RunParams     meshevents.MarketRunParams
+}
+
+// MarketResumedApplyResult contains the updated lifecycle, event log entry,
+// and orders revoked when resuming trading.
+type MarketResumedApplyResult struct {
+	Log           *EventLogEntry
+	Lifecycle     *MarketLifecycle
+	ResumeRevokes []*StartupOrderRevoke
 }
 
 // MarketStartedApplyResult is the stored outcome of a market_started event.

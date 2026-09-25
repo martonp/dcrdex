@@ -56,6 +56,7 @@ type TArchivist struct {
 	marketSuspendScheduledUpdates []*db.MarketSuspendScheduledUpdate
 	marketSuspendedUpdates        []*db.MarketSuspendedUpdate
 	marketResumeScheduledUpdates  []*db.MarketResumeScheduledUpdate
+	marketResumedUpdates          []*db.MarketResumedUpdate
 	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
@@ -392,6 +393,17 @@ func (ta *TArchivist) ApplyMarketResumeScheduledEvent(_ context.Context, _ *db.E
 	return &db.MarketResumeScheduledApplyResult{Log: new(db.EventLogEntry), Lifecycle: next}, nil
 }
 
+func (ta *TArchivist) ApplyMarketResumedEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketResumedUpdate) (*db.MarketResumedApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.marketResumedUpdates = append(ta.marketResumedUpdates, update)
+	next, err := db.ProjectMarketResumed(ta.lifecycle, update)
+	if err != nil {
+		return nil, err
+	}
+	ta.lifecycle = next
+	return &db.MarketResumedApplyResult{Log: new(db.EventLogEntry), Lifecycle: next, ResumeRevokes: update.ResumeRevokes}, nil
+}
 func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
 	ta.mtx.Lock()
 	defer ta.mtx.Unlock()
@@ -4004,6 +4016,131 @@ func TestApplyMarketStartedEvent(t *testing.T) {
 	})
 }
 
+func TestApplyMarketResumedEvent(t *testing.T) {
+	const scheduledEpochIdx int64 = 88
+	newPendingResumeRig := func(t *testing.T) *marketEventRig {
+		t.Helper()
+		rig := newMarketEventRig(t)
+		t.Cleanup(rig.cleanup)
+		mkt := rig.mkt
+		epochDur := int64(mkt.EpochDuration())
+		persistBook := true
+		setTestMarketLifecycle(mkt, rig.storage, &db.MarketLifecycle{
+			Market:          mkt.name,
+			State:           db.MarketStateSuspended,
+			StartEpochIdx:   scheduledEpochIdx,
+			StartEpochDur:   epochDur,
+			PendingAction:   db.MarketPendingResume,
+			PendingEpochIdx: scheduledEpochIdx,
+			PendingEpochDur: epochDur,
+			PersistBook:     &persistBook,
+			RunParams:       mkt.configuredParams.MarketRunParams,
+		})
+		return rig
+	}
+
+	t.Run("late resume revokes listed orders", func(t *testing.T) {
+		rig := newPendingResumeRig(t)
+		mkt := rig.mkt
+		revokedOrder := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		revokedOrder.Coins = []order.CoinID{{0xd1, 0xe2, 0xf3}}
+		bookStandingOrder(t, rig, revokedOrder)
+		book := rig.bookRouter.books[mkt.name]
+		rig.bookRouter.SeedBooks()
+		link := rig.subscribeBook(t)
+
+		epochDur := int64(mkt.EpochDuration())
+		resumedEpochIdx := scheduledEpochIdx + 2
+		event := &meshevents.MarketResumedEvent{
+			Market:        mkt.name,
+			StartEpochIdx: scheduledEpochIdx,
+			EpochDur:      epochDur,
+			Timestamp:     resumedEpochIdx * epochDur,
+			RunParams:     mkt.configuredParams.MarketRunParams,
+			ResumeRevokes: []meshevents.StartupOrderRevokeRecord{
+				meshevents.NewStartupOrderRevokeRecord(revokedOrder, meshevents.StartupOrderRevokeReasonFundingCoinSpent),
+			},
+		}
+		rig.apply(t, event)
+
+		requireRevokedOrderGone(t, mkt, revokedOrder)
+		snapshot := rig.bookRouter.msgOrderBook(book)
+		if snapshot == nil || snapshot.Epoch != uint64(resumedEpochIdx) {
+			t.Fatalf("book snapshot = %+v, want epoch %d", snapshot, resumedEpochIdx)
+		}
+		if len(snapshot.Orders) != 0 {
+			t.Fatalf("book snapshot has %d orders, want none", len(snapshot.Orders))
+		}
+
+		unbookMsg := link.getSend()
+		if unbookMsg == nil || unbookMsg.Route != msgjson.UnbookOrderRoute {
+			t.Fatalf("first route = %v, want %q", unbookMsg, msgjson.UnbookOrderRoute)
+		}
+		var unbookNote msgjson.UnbookOrderNote
+		if err := json.Unmarshal(unbookMsg.Payload, &unbookNote); err != nil {
+			t.Fatalf("unbook note: %v", err)
+		}
+		oid := revokedOrder.ID()
+		if !bytes.Equal(unbookNote.OrderID, oid[:]) {
+			t.Fatalf("unbook order id = %x, want %x", unbookNote.OrderID, oid)
+		}
+		resumeMsg := link.getSend()
+		if resumeMsg == nil || resumeMsg.Route != msgjson.ResumptionRoute {
+			t.Fatalf("second route = %v, want %q", resumeMsg, msgjson.ResumptionRoute)
+		}
+		var resumeNote msgjson.TradeResumption
+		if err := json.Unmarshal(resumeMsg.Payload, &resumeNote); err != nil {
+			t.Fatalf("resume note: %v", err)
+		}
+		if resumeNote.MarketID != mkt.name || resumeNote.StartEpoch != uint64(resumedEpochIdx) {
+			t.Fatalf("resume note = %+v, want market %s at epoch %d", resumeNote, mkt.name, resumedEpochIdx)
+		}
+	})
+
+	t.Run("lot size change requires revoking incompatible orders", func(t *testing.T) {
+		rig := newPendingResumeRig(t)
+		mkt := rig.mkt
+		oldParams := mkt.configuredParams.MarketRunParams
+		incompatibleOrder := makeLO(seller3, mkRate3(1.0, 1.2), 1, order.StandingTiF)
+		incompatibleOrder.Coins = []order.CoinID{{0x81, 0x01}}
+		bookStandingOrder(t, rig, incompatibleOrder)
+		compatibleOrder := makeLO(seller3, mkRate3(1.1, 1.3), 2, order.StandingTiF)
+		compatibleOrder.Coins = []order.CoinID{{0x81, 0x02}}
+		bookStandingOrder(t, rig, compatibleOrder)
+
+		newParams := oldParams
+		newParams.LotSize = oldParams.LotSize * 2
+		epochDur := int64(mkt.EpochDuration())
+		event := &meshevents.MarketResumedEvent{
+			Market:        mkt.name,
+			StartEpochIdx: scheduledEpochIdx,
+			EpochDur:      epochDur,
+			Timestamp:     scheduledEpochIdx * epochDur,
+			RunParams:     newParams,
+		}
+		if err := rig.applyErr(t, event); err == nil || !strings.Contains(err.Error(), "incompatible with lot size") {
+			t.Fatalf("resume error = %v, want rejection because the incompatible order was not listed for revocation", err)
+		}
+		if mkt.LotSize() != oldParams.LotSize {
+			t.Fatalf("rejected resume changed the adopted lot size")
+		}
+
+		event.ResumeRevokes = []meshevents.StartupOrderRevokeRecord{
+			meshevents.NewStartupOrderRevokeRecord(incompatibleOrder, meshevents.StartupOrderRevokeReasonLotSizeIncompatible),
+		}
+		rig.apply(t, event)
+		if mkt.LotSize() != newParams.LotSize {
+			t.Fatalf("adopted lot size = %d, want %d", mkt.LotSize(), newParams.LotSize)
+		}
+		if mkt.book.HaveOrder(incompatibleOrder.ID()) {
+			t.Fatalf("incompatible order remained booked")
+		}
+		if mkt.book.Order(compatibleOrder.ID()) == nil {
+			t.Fatalf("compatible order left the book")
+		}
+	})
+}
+
 // revokeBeforeApplyMesh changes book state after funding checks, before applying
 // their event, without relying on concurrent goroutine timing.
 type revokeBeforeApplyMesh struct {
@@ -4744,6 +4881,107 @@ func TestSubmitMarketSuspend(t *testing.T) {
 			update := rig.storage.marketSuspendedUpdates[0]
 			if update.FinalEpochIdx != finalEpoch || update.EpochDur != epochDur {
 				t.Fatalf("suspension update = %+v, want final epoch %d and duration %d", update, finalEpoch, epochDur)
+			}
+		})
+	}
+}
+
+func TestSubmitMarketResume(t *testing.T) {
+	const scheduledEpochIdx, epochDur int64 = 500, 1000
+	type bookedOrder struct {
+		lots       uint64
+		wantRevoke bool
+	}
+	for _, tc := range []struct {
+		name               string
+		requestedEpoch     int64
+		configuredEpochDur int64
+		configuredLotSize  uint64
+		orders             []bookedOrder
+		wantErr            string
+	}{
+		{
+			name:               "resume with updated parameters",
+			requestedEpoch:     scheduledEpochIdx,
+			configuredEpochDur: epochDur,
+			configuredLotSize:  2 * dcrLotSize,
+			// Doubling the lot size invalidates the one-lot order but retains the two-lot order.
+			orders: []bookedOrder{{lots: 1, wantRevoke: true}, {lots: 2}},
+		},
+		{
+			name:               "mismatched schedule",
+			requestedEpoch:     scheduledEpochIdx + 1,
+			configuredEpochDur: epochDur,
+			configuredLotSize:  dcrLotSize,
+			wantErr:            "no matching pending resume",
+		},
+		{
+			name:               "changed epoch duration",
+			requestedEpoch:     scheduledEpochIdx,
+			configuredEpochDur: 2000,
+			configuredLotSize:  dcrLotSize,
+			wantErr:            "revert the configured duration",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newMarketEventRig(t)
+			defer rig.cleanup()
+			mkt := rig.mkt
+			mkt.swapper = new(epochProcessedTestSwapper) // Booked orders have unspent funding.
+			resumeScheduled := seedLifecycleRow(db.MarketStateSuspended, db.MarketPendingNone, 40, epochDur)
+			resumeScheduled.StartEpochIdx = scheduledEpochIdx
+			resumeScheduled.PendingEpochIdx = scheduledEpochIdx
+			resumeScheduled.PendingEpochDur = epochDur
+			resumeScheduled.PendingAction = db.MarketPendingResume
+			resumeScheduled.FinalEpochIdx = 0
+			resumeScheduled.FinalEpochDur = 0
+			setTestMarketLifecycle(mkt, rig.storage, resumeScheduled)
+			mkt.configuredParams.epochDur = tc.configuredEpochDur
+			mkt.configuredParams.LotSize = tc.configuredLotSize
+			meshSvc := &tMesh{events: rig.events}
+			mkt.SetMeshService(meshSvc)
+
+			var wantRevoked []order.OrderID
+			for i, spec := range tc.orders {
+				lo := makeLO(seller3, mkRate3(1.0, 1.2), spec.lots, order.StandingTiF)
+				lo.Coins = []order.CoinID{{byte(i + 1)}}
+				bookStandingOrder(t, rig, lo)
+				rig.storage.bookedOrders = append(rig.storage.bookedOrders, lo)
+				if spec.wantRevoke {
+					wantRevoked = append(wantRevoked, lo.ID())
+				}
+			}
+
+			err := mkt.submitMarketResume(context.Background(), tc.requestedEpoch, epochDur)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resume error = %v, want %q", err, tc.wantErr)
+				}
+				if len(meshSvc.entries) != 0 || len(rig.storage.marketResumedUpdates) != 0 {
+					t.Fatalf("rejected resume produced %d event entries and %d resume updates, want none", len(meshSvc.entries), len(rig.storage.marketResumedUpdates))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rig.storage.marketResumedUpdates) != 1 {
+				t.Fatalf("resume updates = %d, want 1", len(rig.storage.marketResumedUpdates))
+			}
+			update := rig.storage.marketResumedUpdates[0]
+			if update.StartEpochIdx != scheduledEpochIdx || update.EpochDur != epochDur {
+				t.Fatalf("resume epoch = %d with duration %d, want %d with duration %d", update.StartEpochIdx, update.EpochDur, scheduledEpochIdx, epochDur)
+			}
+			if update.RunParams != mkt.configuredParams.MarketRunParams {
+				t.Fatalf("resume parameters = %+v, want %+v", update.RunParams, mkt.configuredParams.MarketRunParams)
+			}
+			if len(update.ResumeRevokes) != len(wantRevoked) {
+				t.Fatalf("resume revoked %d orders, want %d", len(update.ResumeRevokes), len(wantRevoked))
+			}
+			for _, revoke := range update.ResumeRevokes {
+				if !slices.Contains(wantRevoked, revoke.Order.ID()) || revoke.Reason != meshevents.StartupOrderRevokeReasonLotSizeIncompatible {
+					t.Fatalf("unexpected resume revocation: %+v", revoke)
+				}
 			}
 		})
 	}

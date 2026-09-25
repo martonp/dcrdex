@@ -6,6 +6,7 @@ package db
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"decred.org/dcrdex/server/meshevents"
 )
@@ -227,6 +228,94 @@ func TestProjectMarketResumeScheduled(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := ProjectMarketResumeScheduled(tc.prev, tc.update)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("lifecycle = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProjectMarketResumed(t *testing.T) {
+	const epochDur int64 = 10_000
+	persistBook := true
+	resumeScheduled := MarketLifecycle{
+		Market:            "dcr_btc",
+		State:             MarketStateSuspended,
+		StartEpochIdx:     30,
+		StartEpochDur:     epochDur,
+		PendingAction:     MarketPendingResume,
+		PendingEpochIdx:   30,
+		PendingEpochDur:   epochDur,
+		ProcessedEpochIdx: 20,
+		PersistBook:       &persistBook,
+		RunParams:         testRunParams(),
+	}
+	newRunParams := resumeScheduled.RunParams
+	newRunParams.LotSize *= 2
+	update := &MarketResumedUpdate{
+		Market:        resumeScheduled.Market,
+		StartEpochIdx: 30,
+		EpochDur:      epochDur,
+		Timestamp:     time.UnixMilli(30 * epochDur),
+		RunParams:     newRunParams,
+	}
+	resumed := MarketLifecycle{
+		Market:            resumeScheduled.Market,
+		State:             MarketStateRunning,
+		StartEpochIdx:     30,
+		StartEpochDur:     epochDur,
+		ActiveEpochIdx:    30,
+		ProcessedEpochIdx: 29,
+		RunParams:         newRunParams,
+	}
+
+	missingParams := *update
+	missingParams.RunParams = meshevents.MarketRunParams{}
+
+	// A late resumption opens the epoch containing the event timestamp.
+	lateUpdate := *update
+	lateUpdate.Timestamp = time.UnixMilli(32 * epochDur)
+	resumedLate := resumed
+	resumedLate.StartEpochIdx = 32
+	resumedLate.ActiveEpochIdx = 32
+	resumedLate.ProcessedEpochIdx = 31
+
+	for _, tc := range []struct {
+		name    string
+		prev    *MarketLifecycle
+		update  *MarketResumedUpdate
+		want    *MarketLifecycle
+		wantErr bool
+	}{
+		{
+			name: "resume at scheduled epoch", prev: &resumeScheduled, update: update,
+			want: &resumed,
+		},
+		{
+			name: "resume after scheduled epoch", prev: &resumeScheduled, update: &lateUpdate,
+			want: &resumedLate,
+		},
+		{
+			name: "missing run parameters", prev: &resumeScheduled, update: &missingParams,
+			wantErr: true,
+		},
+		{
+			name: "missing lifecycle", update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing update", prev: &resumeScheduled,
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProjectMarketResumed(tc.prev, tc.update)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
 			}

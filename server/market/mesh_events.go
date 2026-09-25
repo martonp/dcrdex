@@ -35,6 +35,7 @@ const (
 	LifecycleTransitionScheduleSuspend
 	LifecycleTransitionSuspend
 	LifecycleTransitionScheduleResume
+	LifecycleTransitionResume
 )
 
 // LifecycleUpdated is a callback that receives the applied lifecycle
@@ -58,6 +59,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func
 		},
 		meshevents.EventKindMarketResumeScheduled: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketResumeScheduledEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
+		},
+		meshevents.EventKindMarketResumed: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyMarketResumedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
 		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
@@ -513,6 +517,51 @@ func applyMarketResumeScheduledEvent(applyCtx *mesh.EventApplyContext, markets m
 	if lifecycleUpdated != nil {
 		lifecycleUpdated(LifecycleTransitionScheduleResume, result.Lifecycle)
 	}
+	return result.Log, nil
+}
+
+// applyMarketResumedEvent adopts the new trading parameters and removes revoked orders.
+func applyMarketResumedEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated LifecycleUpdated, event *mesh.Event) (*db.EventLogEntry, error) {
+	payload, err := meshevents.DecodeMarketResumedEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	mkt, book, err := marketAndBook(markets, bookRouter, payload.Market)
+	if err != nil {
+		return nil, err
+	}
+	resumeRevokes, err := decodeStartupOrderRevokeRecords(payload.ResumeRevokes)
+	if err != nil {
+		return nil, err
+	}
+	// The revoke set must cover every order the new lot size strands.
+	revoked := make(map[order.OrderID]bool, len(resumeRevokes))
+	for _, revoke := range resumeRevokes {
+		revoked[revoke.Order.ID()] = true
+	}
+	if err := mkt.book.CheckLotSize(payload.RunParams.LotSize, revoked); err != nil {
+		return nil, fmt.Errorf("resume for %s: %w", payload.Market, err)
+	}
+	update := &db.MarketResumedUpdate{
+		Market:        payload.Market,
+		Base:          mkt.base,
+		Quote:         mkt.quote,
+		StartEpochIdx: payload.StartEpochIdx,
+		EpochDur:      payload.EpochDur,
+		Timestamp:     time.UnixMilli(payload.Timestamp).UTC(),
+		ResumeRevokes: resumeRevokes,
+		RunParams:     payload.RunParams,
+	}
+	result, err := mkt.storage.ApplyMarketResumedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), update)
+	if err != nil {
+		return nil, err
+	}
+	removed := mkt.applyMarketResumeCleanup(result.ResumeRevokes)
+	mkt.applyMarketLifecycleRow(result.Lifecycle)
+	if lifecycleUpdated != nil {
+		lifecycleUpdated(LifecycleTransitionResume, result.Lifecycle)
+	}
+	bookRouter.applyMarketResumedEvent(book, result.Lifecycle.StartEpochIdx, removed)
 	return result.Log, nil
 }
 
