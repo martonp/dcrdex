@@ -165,3 +165,58 @@ func TestApplyMarketSuspendedEvent(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyMarketResumeScheduledEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	const epochDur int64 = 10_000
+	persistBook := true
+	suspended := &db.MarketLifecycle{
+		Market:            "dcr_btc",
+		State:             db.MarketStateSuspended,
+		StartEpochIdx:     10,
+		StartEpochDur:     epochDur,
+		FinalEpochIdx:     15,
+		FinalEpochDur:     epochDur,
+		ProcessedEpochIdx: 15,
+		PersistBook:       &persistBook,
+		RunParams:         testMarketRunParams(),
+	}
+	seedMarketLifecycle(t, suspended)
+
+	update := &db.MarketResumeScheduledUpdate{
+		Market:        suspended.Market,
+		Base:          AssetDCR,
+		Quote:         AssetBTC,
+		StartEpochIdx: 20,
+		EpochDur:      epochDur,
+	}
+	result, err := archie.ApplyMarketResumeScheduledEvent(context.Background(), &db.EventLogMeta{Event: []byte("schedule")}, update)
+	if err != nil {
+		t.Fatalf("ApplyMarketResumeScheduledEvent: %v", err)
+	}
+
+	if result.Log.Kind != meshevents.EventKindMarketResumeScheduled {
+		t.Fatalf("event kind = %q, want %q", result.Log.Kind, meshevents.EventKindMarketResumeScheduled)
+	}
+	want := *suspended
+	want.PendingAction = db.MarketPendingResume
+	want.PendingEpochIdx = 20
+	want.PendingEpochDur = epochDur
+	want.StartEpochIdx = 20
+	want.FinalEpochIdx = 0
+	want.FinalEpochDur = 0
+	if !reflect.DeepEqual(result.Lifecycle, &want) {
+		t.Fatalf("returned lifecycle = %+v, want %+v", result.Lifecycle, want)
+	}
+
+	stored, err := archie.MarketLifecycle(suspended.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle: %v", err)
+	}
+	if !reflect.DeepEqual(stored, &want) {
+		t.Fatalf("stored lifecycle = %+v, want %+v", stored, want)
+	}
+}

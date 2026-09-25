@@ -34,6 +34,7 @@ const (
 	LifecycleTransitionStarted LifecycleTransition = iota + 1
 	LifecycleTransitionScheduleSuspend
 	LifecycleTransitionSuspend
+	LifecycleTransitionScheduleResume
 )
 
 // LifecycleUpdated is a callback that receives the applied lifecycle
@@ -54,6 +55,9 @@ func Events(markets map[string]*Market, bookRouter *BookRouter, sendIfLocal func
 		},
 		meshevents.EventKindMarketSuspended: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyMarketSuspendedEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
+		},
+		meshevents.EventKindMarketResumeScheduled: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			return applyMarketResumeScheduledEvent(applyCtx, markets, bookRouter, lifecycleUpdated, event)
 		},
 		meshevents.EventKindAdvanceEpoch: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			return applyAdvanceEpochEvent(applyCtx, markets, bookRouter, event)
@@ -480,6 +484,34 @@ func applyMarketSuspendedEvent(applyCtx *mesh.EventApplyContext, markets map[str
 	bookRouter.applyMarketSuspendedEvent(book, result.Lifecycle.FinalEpochIdx, persist, result.PurgeOrders)
 	if lifecycleUpdated != nil {
 		lifecycleUpdated(LifecycleTransitionSuspend, result.Lifecycle)
+	}
+	return result.Log, nil
+}
+
+// applyMarketResumeScheduledEvent stores the resumption schedule and updates market state.
+func applyMarketResumeScheduledEvent(applyCtx *mesh.EventApplyContext, markets map[string]*Market, bookRouter *BookRouter, lifecycleUpdated LifecycleUpdated, event *mesh.Event) (*db.EventLogEntry, error) {
+	payload, err := meshevents.DecodeMarketResumeScheduledEvent(event.Payload)
+	if err != nil {
+		return nil, err
+	}
+	mkt, _, err := marketAndBook(markets, bookRouter, payload.Market)
+	if err != nil {
+		return nil, err
+	}
+	update := &db.MarketResumeScheduledUpdate{
+		Market:        payload.Market,
+		Base:          mkt.base,
+		Quote:         mkt.quote,
+		StartEpochIdx: payload.StartEpochIdx,
+		EpochDur:      payload.EpochDur,
+	}
+	result, err := mkt.storage.ApplyMarketResumeScheduledEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), update)
+	if err != nil {
+		return nil, err
+	}
+	mkt.applyMarketLifecycleRow(result.Lifecycle)
+	if lifecycleUpdated != nil {
+		lifecycleUpdated(LifecycleTransitionScheduleResume, result.Lifecycle)
 	}
 	return result.Log, nil
 }

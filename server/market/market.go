@@ -760,23 +760,39 @@ func (m *Market) Suspend(asSoonAs time.Time, persistBook bool) (finalEpochIdx in
 	return
 }
 
-// ResumeEpoch gets the next available resume epoch index for the currently
-// configured epoch duration for the market and the provided earliest allowable
-// start time. The market must be running, otherwise the zero index is returned.
-func (m *Market) ResumeEpoch(asSoonAs time.Time) (startEpochIdx int64) {
-	// Only allow scheduling a resume if the market is not running.
+// ResumeEpoch returns the first epoch starting after both asSoonAs and the
+// current time, using the current run's epoch duration. It returns zero if
+// the market is already running.
+func (m *Market) ResumeEpoch(asSoonAs time.Time) int64 {
 	if m.Running() {
-		return
+		return 0
 	}
 
-	dur := int64(m.EpochDuration())
+	dur := m.liveParams.Load().epochDur
+	return 1 + max(asSoonAs.UnixMilli(), time.Now().UnixMilli())/dur
+}
 
-	now := time.Now().UnixMilli()
-	nextEpochIdx := 1 + now/dur
-
-	ms := asSoonAs.UnixMilli()
-	startEpochIdx = max(1+ms/dur, nextEpochIdx)
-	return
+// buildScheduleResumeEvent builds an event scheduling resumption and returns
+// the scheduled starting epoch and its start time.
+// It fails if the market is already running.
+func (m *Market) buildScheduleResumeEvent(asSoonAs time.Time) (*mesh.Event, int64, time.Time, error) {
+	if m.Running() {
+		return nil, 0, time.Time{}, fmt.Errorf("unable to resume market %s at time %v", m.name, asSoonAs)
+	}
+	epochDur := m.liveParams.Load().epochDur
+	// Resume at the first epoch starting after both the requested time and now.
+	startEpochIdx := 1 + max(asSoonAs.UnixMilli(), time.Now().UnixMilli())/epochDur
+	startTime := time.UnixMilli(epochDur * startEpochIdx)
+	event := &meshevents.MarketResumeScheduledEvent{
+		Market:        m.name,
+		StartEpochIdx: startEpochIdx,
+		EpochDur:      epochDur,
+	}
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return nil, 0, time.Time{}, err
+	}
+	return meshEvent, startEpochIdx, startTime, nil
 }
 
 // SetStartEpochIdx sets the starting epoch index. This should generally be

@@ -200,6 +200,38 @@ func (a *Archiver) ApplyMarketSuspendedEvent(ctx context.Context, meta *db.Event
 	return result, nil
 }
 
+// ApplyMarketResumeScheduledEvent records the scheduled resumption epoch.
+func (a *Archiver) ApplyMarketResumeScheduledEvent(ctx context.Context, meta *db.EventLogMeta, update *db.MarketResumeScheduledUpdate) (*db.MarketResumeScheduledApplyResult, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_resume_scheduled update")
+	}
+	if err := a.validateLifecycleMarket(update.Market, update.Base, update.Quote); err != nil {
+		return nil, err
+	}
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	result := &db.MarketResumeScheduledApplyResult{}
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindMarketResumeScheduled, txData, func(tx *sql.Tx) error {
+		lc, err := a.marketLifecycleForUpdate(tx, update.Market)
+		if err != nil {
+			return err
+		}
+		next, err := db.ProjectMarketResumeScheduled(lc, update)
+		if err != nil {
+			return err
+		}
+		result.Lifecycle = next
+		return a.updateMarketLifecycleTx(tx, next)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Log = logEntry
+	return result, nil
+}
+
 // purgeBookAtTx revokes all booked orders in a market and records a
 // server-generated cancel for each at revokeTime. It returns the revoked order
 // IDs in sorted order.

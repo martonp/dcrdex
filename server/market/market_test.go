@@ -55,6 +55,7 @@ type TArchivist struct {
 	lifecycle                     *db.MarketLifecycle
 	marketSuspendScheduledUpdates []*db.MarketSuspendScheduledUpdate
 	marketSuspendedUpdates        []*db.MarketSuspendedUpdate
+	marketResumeScheduledUpdates  []*db.MarketResumeScheduledUpdate
 	lifecyclePurgeOrders          []order.OrderID
 	poisonEpochProcessed          bool
 	epochProcessed                []*db.EpochProcessedUpdate
@@ -377,6 +378,18 @@ func (ta *TArchivist) ApplyMarketSuspendedEvent(_ context.Context, _ *db.EventLo
 	}
 	ta.lifecycle = next
 	return &db.MarketSuspendedApplyResult{Log: new(db.EventLogEntry), Lifecycle: next, PurgeOrders: ta.lifecyclePurgeOrders}, nil
+}
+
+func (ta *TArchivist) ApplyMarketResumeScheduledEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketResumeScheduledUpdate) (*db.MarketResumeScheduledApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.marketResumeScheduledUpdates = append(ta.marketResumeScheduledUpdates, update)
+	next, err := db.ProjectMarketResumeScheduled(ta.lifecycle, update)
+	if err != nil {
+		return nil, err
+	}
+	ta.lifecycle = next
+	return &db.MarketResumeScheduledApplyResult{Log: new(db.EventLogEntry), Lifecycle: next}, nil
 }
 
 func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
@@ -4547,6 +4560,58 @@ func TestScheduleSuspendCommand(t *testing.T) {
 			if stored.PendingEpochIdx != tc.wantEpoch || stored.FinalEpochIdx != tc.wantEpoch ||
 				stored.PersistBook == nil || *stored.PersistBook != tc.persistBook {
 				t.Fatalf("unexpected stored suspension: %+v", stored)
+			}
+		})
+	}
+}
+
+func TestScheduleResumeCommand(t *testing.T) {
+	const epochDur int64 = 500
+	futureEpoch := time.Now().Add(time.Hour).UnixMilli() / epochDur
+	for _, tc := range []struct {
+		name      string
+		state     db.MarketState
+		asSoonAs  time.Time
+		wantEpoch int64
+		wantErr   string
+	}{
+		{
+			name: "suspended market", state: db.MarketStateSuspended,
+			asSoonAs: time.UnixMilli(futureEpoch * epochDur), wantEpoch: futureEpoch + 1,
+		},
+		{
+			name: "already running", state: db.MarketStateRunning,
+			wantErr: "unable to resume market",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig, svc := newLifecycleCommandRig(t)
+			mkt := rig.mkt
+			setTestMarketLifecycle(mkt, rig.storage, seedLifecycleRow(tc.state, db.MarketPendingNone, 40, epochDur))
+			startEpoch, startTime, err := ExecuteScheduleResume(context.Background(), svc, mkt.name, tc.asSoonAs)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resume error = %v, want %q", err, tc.wantErr)
+				}
+				if len(rig.storage.marketResumeScheduledUpdates) != 0 {
+					t.Fatal("rejected resume reached storage")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantTime := time.UnixMilli(tc.wantEpoch * epochDur)
+			if startEpoch != tc.wantEpoch || !startTime.Equal(wantTime) {
+				t.Fatalf("resume = %d %v, want %d %v", startEpoch, startTime, tc.wantEpoch, wantTime)
+			}
+			if len(rig.storage.marketResumeScheduledUpdates) != 1 {
+				t.Fatal("expected one scheduling update")
+			}
+			update := rig.storage.marketResumeScheduledUpdates[0]
+			if update.Market != mkt.name ||
+				update.StartEpochIdx != tc.wantEpoch || update.EpochDur != epochDur {
+				t.Fatalf("unexpected scheduling update: %+v", update)
 			}
 		})
 	}

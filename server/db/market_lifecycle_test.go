@@ -170,6 +170,76 @@ func TestProjectMarketSuspended(t *testing.T) {
 	}
 }
 
+func TestProjectMarketResumeScheduled(t *testing.T) {
+	const epochDur int64 = 10_000
+	persistBook := true
+	update := &MarketResumeScheduledUpdate{
+		Market:        "dcr_btc",
+		StartEpochIdx: 30,
+		EpochDur:      epochDur,
+	}
+	suspended := MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateSuspended,
+		StartEpochIdx:     10,
+		StartEpochDur:     epochDur,
+		FinalEpochIdx:     20,
+		FinalEpochDur:     epochDur,
+		ProcessedEpochIdx: 20,
+		PersistBook:       &persistBook,
+		RunParams:         testRunParams(),
+	}
+
+	resumeScheduled := suspended
+	resumeScheduled.StartEpochIdx = 30
+	resumeScheduled.FinalEpochIdx = 0
+	resumeScheduled.FinalEpochDur = 0
+	resumeScheduled.PendingAction = MarketPendingResume
+	resumeScheduled.PendingEpochIdx = 30
+	resumeScheduled.PendingEpochDur = epochDur
+
+	draining := suspended
+	draining.State = MarketStateDraining
+
+	for _, tc := range []struct {
+		name    string
+		prev    *MarketLifecycle
+		update  *MarketResumeScheduledUpdate
+		want    *MarketLifecycle
+		wantErr bool
+	}{
+		{
+			name: "schedule resume", prev: &suspended, update: update,
+			want: &resumeScheduled,
+		},
+		{
+			name: "market still draining", prev: &draining, update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing lifecycle", update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing update", prev: &suspended,
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProjectMarketResumeScheduled(tc.prev, tc.update)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("lifecycle = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProjectMarketStartedLifecycle(t *testing.T) {
 	persist := true
 	const market = "dcr_btc"

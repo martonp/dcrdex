@@ -68,6 +68,32 @@ func ProjectMarketSuspended(prev *MarketLifecycle, update *MarketSuspendedUpdate
 	return &next, nil
 }
 
+// ProjectMarketResumeScheduled returns the lifecycle after applying the event.
+func ProjectMarketResumeScheduled(prev *MarketLifecycle, update *MarketResumeScheduledUpdate) (*MarketLifecycle, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_resume_scheduled update")
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", update.Market)
+	}
+	if prev.State != MarketStateSuspended {
+		return nil, fmt.Errorf("cannot schedule resume for market %s in state %d",
+			update.Market, prev.State)
+	}
+	if prev.PersistBook == nil {
+		return nil, fmt.Errorf("schedule_resume missing persisted persist_book")
+	}
+	next := *prev
+	next.StartEpochIdx = update.StartEpochIdx
+	next.StartEpochDur = update.EpochDur
+	next.FinalEpochIdx = 0
+	next.FinalEpochDur = 0
+	next.PendingAction = MarketPendingResume
+	next.PendingEpochIdx = update.StartEpochIdx
+	next.PendingEpochDur = update.EpochDur
+	return &next, nil
+}
+
 // ProjectMarketStartedLifecycle returns the lifecycle state after startup
 // recovery. It performs no storage I/O. changed is false when no update is needed.
 func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedUpdate) (next *MarketLifecycle, changed bool, err error) {
