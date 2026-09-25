@@ -18,6 +18,7 @@ const (
 	commandKindMarket          = "market"
 	commandKindCancel          = "cancel"
 	commandKindScheduleSuspend = "schedule_suspend"
+	commandKindScheduleResume  = "schedule_resume"
 
 	lifecycleCommandTimeout = 2 * time.Minute
 )
@@ -42,12 +43,25 @@ type scheduleSuspendResult struct {
 	EndMs    int64 `json:"endMs"`
 }
 
+type scheduleResumeRequest struct {
+	Market string `json:"market"`
+	TimeMs int64  `json:"timeMs,omitempty"`
+}
+
+type scheduleResumeResult struct {
+	EpochIdx int64 `json:"epochIdx"`
+	StartMs  int64 `json:"startMs"`
+}
+
 // LifecycleCommands returns the command handlers for scheduling market
 // suspension and resumption.
 func LifecycleCommands(markets map[string]*Market) map[string]mesh.CommandExecutor {
 	return map[string]mesh.CommandExecutor{
 		commandKindScheduleSuspend: func(cmdCtx *mesh.CommandContext) *msgjson.Error {
 			return handleScheduleSuspend(cmdCtx, markets)
+		},
+		commandKindScheduleResume: func(cmdCtx *mesh.CommandContext) *msgjson.Error {
+			return handleScheduleResume(cmdCtx, markets)
 		},
 	}
 }
@@ -98,6 +112,53 @@ func handleScheduleSuspend(cmdCtx *mesh.CommandContext, markets map[string]*Mark
 	}); err != nil {
 		mesh.LogApplyFailure(log, err, "Failed to apply schedule_suspend for market %s: %v", req.Market, err)
 		return mesh.ClientError(err, msgjson.RPCInternalError, "failed to apply schedule_suspend: %v", err)
+	}
+	return nil
+}
+
+// ExecuteScheduleResume schedules a market resumption and returns the
+// scheduled starting epoch and its start time.
+func ExecuteScheduleResume(ctx context.Context, meshSvc *mesh.Service, market string, asSoonAs time.Time) (startEpoch int64, startTime time.Time, err error) {
+	if meshSvc == nil {
+		return 0, time.Time{}, fmt.Errorf("mesh service is not configured")
+	}
+	req := &scheduleResumeRequest{Market: market}
+	if !asSoonAs.IsZero() {
+		req.TimeMs = asSoonAs.UnixMilli()
+	}
+	var result scheduleResumeResult
+	if err := executeLifecycleCommand(ctx, meshSvc.ExecuteCommand, commandKindScheduleResume, req, &result); err != nil {
+		return 0, time.Time{}, err
+	}
+	if result.EpochIdx == 0 {
+		return 0, time.Time{}, fmt.Errorf("schedule_resume returned zero epoch")
+	}
+	return result.EpochIdx, time.UnixMilli(result.StartMs), nil
+}
+
+// handleScheduleResume builds and emits the resumption scheduling event,
+// then responds with the scheduled starting epoch.
+func handleScheduleResume(cmdCtx *mesh.CommandContext, markets map[string]*Market) *msgjson.Error {
+	var req scheduleResumeRequest
+	if err := cmdCtx.Request.Msg.Unmarshal(&req); err != nil {
+		return msgjson.NewError(msgjson.RPCParseError, "error parsing schedule_resume request")
+	}
+
+	mkt := markets[req.Market]
+	if mkt == nil {
+		return msgjson.NewError(msgjson.UnknownMarketError, "unknown market %s", req.Market)
+	}
+
+	event, startEpoch, startTime, err := mkt.buildScheduleResumeEvent(unixMilliOrZero(req.TimeMs))
+	if err != nil {
+		return msgjson.NewError(msgjson.RPCInternalError, "failed to schedule resume: %v", err)
+	}
+
+	if err = cmdCtx.Completion.Emit(cmdCtx.Context, event, func() any {
+		return &scheduleResumeResult{EpochIdx: startEpoch, StartMs: startTime.UnixMilli()}
+	}); err != nil {
+		mesh.LogApplyFailure(log, err, "Failed to apply schedule_resume for market %s: %v", req.Market, err)
+		return mesh.ClientError(err, msgjson.RPCInternalError, "failed to apply schedule_resume: %v", err)
 	}
 	return nil
 }

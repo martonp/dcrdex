@@ -227,6 +227,7 @@ type OrderArchiver interface {
 	MarketLifecycle(market string) (*MarketLifecycle, error)
 	ApplyMarketSuspendScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendScheduledUpdate) (*MarketSuspendScheduledApplyResult, error)
 	ApplyMarketSuspendedEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendedUpdate) (*MarketSuspendedApplyResult, error)
+	ApplyMarketResumeScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketResumeScheduledUpdate) (*MarketResumeScheduledApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
@@ -967,6 +968,22 @@ type MarketSuspendedApplyResult struct {
 	Log         *EventLogEntry
 	Lifecycle   *MarketLifecycle
 	PurgeOrders []order.OrderID
+}
+
+// MarketResumeScheduledUpdate identifies the market and first trading epoch
+// for scheduling a resumption.
+type MarketResumeScheduledUpdate struct {
+	Market        string
+	Base, Quote   uint32
+	StartEpochIdx int64
+	EpochDur      int64
+}
+
+// MarketResumeScheduledApplyResult contains the updated lifecycle and event log
+// entry for a scheduled resumption.
+type MarketResumeScheduledApplyResult struct {
+	Log       *EventLogEntry
+	Lifecycle *MarketLifecycle
 }
 
 // MarketStartedApplyResult is the stored outcome of a market_started event.
