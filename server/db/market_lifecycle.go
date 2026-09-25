@@ -13,6 +13,29 @@ import (
 // for processing after an epoch closes.
 const MaxUnprocessedClosedEpochs = 2
 
+// ProjectMarketSuspendScheduled returns the lifecycle after applying the event.
+func ProjectMarketSuspendScheduled(prev *MarketLifecycle, update *MarketSuspendScheduledUpdate) (*MarketLifecycle, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_suspend_scheduled update")
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", update.Market)
+	}
+	if prev.State != MarketStateRunning {
+		return nil, fmt.Errorf("cannot schedule suspend for market %s in state %d",
+			update.Market, prev.State)
+	}
+	next := *prev
+	next.FinalEpochIdx = update.FinalEpochIdx
+	next.FinalEpochDur = update.EpochDur
+	next.PendingAction = MarketPendingSuspend
+	next.PendingEpochIdx = update.FinalEpochIdx
+	next.PendingEpochDur = update.EpochDur
+	persist := update.PersistBook
+	next.PersistBook = &persist
+	return &next, nil
+}
+
 // ProjectMarketStartedLifecycle returns the lifecycle state after startup
 // recovery. It performs no storage I/O. changed is false when no update is needed.
 func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedUpdate) (next *MarketLifecycle, changed bool, err error) {

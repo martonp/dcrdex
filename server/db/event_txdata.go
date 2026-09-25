@@ -18,6 +18,13 @@ func int32Bytes(v int32) []byte {
 	return encode.Uint32Bytes(uint32(v))
 }
 
+func boolBytes(v bool) []byte {
+	if v {
+		return encode.ByteTrue
+	}
+	return encode.ByteFalse
+}
+
 func orderTypeBytes(t order.OrderType) []byte {
 	return []byte{byte(t)}
 }
@@ -143,6 +150,21 @@ func (u *MarketStartedUpdate) EventTxData() ([]byte, error) {
 		AddData(int64Bytes(u.RevocationTime.UnixMilli())).
 		AddData(bookedRevokes).
 		AddData(epochRevokes), nil
+}
+
+// EventTxData returns the versioned transaction data for market_suspend_scheduled.
+func (u *MarketSuspendScheduledUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil market_suspend_scheduled update")
+	}
+	return encodeEventTxData(
+		[]byte(u.Market),
+		encode.Uint32Bytes(u.Base),
+		encode.Uint32Bytes(u.Quote),
+		int64Bytes(u.FinalEpochIdx),
+		int64Bytes(u.EpochDur),
+		boolBytes(u.PersistBook),
+	)
 }
 
 // encodeEventTxData encodes versioned fields, rejecting oversized fields

@@ -4,6 +4,7 @@
 package pg
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -125,6 +126,38 @@ func (a *Archiver) validateLifecycleMarket(market string, base, quote uint32) er
 			market, base, quote, mkt.Name)
 	}
 	return nil
+}
+
+// ApplyMarketSuspendScheduledEvent records the suspension schedule and book retention choice.
+func (a *Archiver) ApplyMarketSuspendScheduledEvent(ctx context.Context, meta *db.EventLogMeta, update *db.MarketSuspendScheduledUpdate) (*db.MarketSuspendScheduledApplyResult, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_suspend_scheduled update")
+	}
+	if err := a.validateLifecycleMarket(update.Market, update.Base, update.Quote); err != nil {
+		return nil, err
+	}
+	txData, err := update.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	result := &db.MarketSuspendScheduledApplyResult{}
+	logEntry, err := a.applyEventTx(ctx, meta, meshevents.EventKindMarketSuspendScheduled, txData, func(tx *sql.Tx) error {
+		lc, err := a.marketLifecycleForUpdate(tx, update.Market)
+		if err != nil {
+			return err
+		}
+		next, err := db.ProjectMarketSuspendScheduled(lc, update)
+		if err != nil {
+			return err
+		}
+		result.Lifecycle = next
+		return a.updateMarketLifecycleTx(tx, next)
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Log = logEntry
+	return result, nil
 }
 
 func (a *Archiver) applyAdvanceEpochLifecycleTx(tx *sql.Tx, event *meshevents.AdvanceEpochEvent) error {

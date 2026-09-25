@@ -29,8 +29,10 @@ const (
 	EventKindPrepaidBondsCreated = "prepaid_bonds_created"
 	EventKindOrderAccepted       = "order_accepted"
 	EventKindMarketStarted       = "market_started"
-	EventKindAdvanceEpoch        = "advance_epoch"
-	EventKindEpochProcessed      = "epoch_processed"
-	EventKindOrdersRevoked       = "orders_revoked"
-	EventKindReputationForgiven  = "reputation_forgiven"
+
+	EventKindMarketSuspendScheduled = "market_suspend_scheduled"
+	EventKindAdvanceEpoch           = "advance_epoch"
+	EventKindEpochProcessed         = "epoch_processed"
+	EventKindOrdersRevoked          = "orders_revoked"
+	EventKindReputationForgiven     = "reputation_forgiven"
 )

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -38,25 +39,26 @@ import (
 )
 
 type TArchivist struct {
-	mtx                  sync.Mutex
-	poisonEpochOrder     order.Order
-	orderWithKnownCommit order.OrderID
-	commitForKnownOrder  order.Commitment
-	bookedOrders         []*order.LimitOrder
-	canceledOrders       []*order.LimitOrder
-	archivedCancels      []*order.CancelOrder
-	epochInserted        chan struct{}
-	revoked              order.Order
-	epochOrders          []epochOrderWrite
-	orderAcceptedUpdates []*db.OrderAcceptedUpdate
-	marketStartedUpdates []*db.MarketStartedUpdate
-	advanceEpochEvents   []*meshevents.AdvanceEpochEvent
-	lifecycle            *db.MarketLifecycle
-	poisonEpochProcessed bool
-	epochProcessed       []*db.EpochProcessedUpdate
-	ordersRevokedUpdates []*db.OrdersRevokedUpdate
-	commitOrders         []db.OrderWithStatus
-	commitOrdersErr      error
+	mtx                           sync.Mutex
+	poisonEpochOrder              order.Order
+	orderWithKnownCommit          order.OrderID
+	commitForKnownOrder           order.Commitment
+	bookedOrders                  []*order.LimitOrder
+	canceledOrders                []*order.LimitOrder
+	archivedCancels               []*order.CancelOrder
+	epochInserted                 chan struct{}
+	revoked                       order.Order
+	epochOrders                   []epochOrderWrite
+	orderAcceptedUpdates          []*db.OrderAcceptedUpdate
+	marketStartedUpdates          []*db.MarketStartedUpdate
+	advanceEpochEvents            []*meshevents.AdvanceEpochEvent
+	lifecycle                     *db.MarketLifecycle
+	marketSuspendScheduledUpdates []*db.MarketSuspendScheduledUpdate
+	poisonEpochProcessed          bool
+	epochProcessed                []*db.EpochProcessedUpdate
+	ordersRevokedUpdates          []*db.OrdersRevokedUpdate
+	commitOrders                  []db.OrderWithStatus
+	commitOrdersErr               error
 }
 
 type tMesh struct {
@@ -350,6 +352,17 @@ func (ta *TArchivist) MarketLifecycle(string) (*db.MarketLifecycle, error) {
 		cpy.PersistBook = &persist
 	}
 	return &cpy, nil
+}
+func (ta *TArchivist) ApplyMarketSuspendScheduledEvent(_ context.Context, _ *db.EventLogMeta, update *db.MarketSuspendScheduledUpdate) (*db.MarketSuspendScheduledApplyResult, error) {
+	ta.mtx.Lock()
+	defer ta.mtx.Unlock()
+	ta.marketSuspendScheduledUpdates = append(ta.marketSuspendScheduledUpdates, update)
+	next, err := db.ProjectMarketSuspendScheduled(ta.lifecycle, update)
+	if err != nil {
+		return nil, err
+	}
+	ta.lifecycle = next
+	return &db.MarketSuspendScheduledApplyResult{Log: new(db.EventLogEntry), Lifecycle: next}, nil
 }
 
 func (ta *TArchivist) ApplyAdvanceEpochEvent(_ context.Context, _ *db.EventLogMeta, event *meshevents.AdvanceEpochEvent) (*db.EventLogEntry, error) {
@@ -4337,6 +4350,25 @@ func TestApplyAdvanceEpochEvent(t *testing.T) {
 			mkt.pendingLifecycleEpochIdx != 0 || mkt.pendingLifecycleEpochDur != 0 {
 			t.Fatal("final close did not stop intake and clear the pending suspension")
 		}
+		if mkt.currentEpoch != nil || mkt.nextEpoch != nil {
+			t.Fatal("draining market still has epoch queues")
+		}
+		epochDur := f.event.EpochDur
+		if err := mkt.validateScheduleSuspendEvent(closedEpochIdx+1, epochDur); err == nil {
+			t.Fatal("draining market accepted another suspend schedule")
+		}
+		lo := epochStampedLO(t, closedEpochIdx, epochDur, 1, order.CoinID{0x45})
+		if _, _, _, err := mkt.acceptedOrderEpoch(lo); err == nil {
+			t.Fatal("draining market accepted an order")
+		}
+		lo.SetTime(time.UnixMilli((closedEpochIdx+1)*epochDur - 1))
+		if mkt.orderAtOrAfterSuspendBoundary(lo) {
+			t.Fatal("order before final boundary rejected")
+		}
+		lo.SetTime(time.UnixMilli((closedEpochIdx + 1) * epochDur))
+		if !mkt.orderAtOrAfterSuspendBoundary(lo) {
+			t.Fatal("order at final boundary allowed")
+		}
 	})
 
 	for _, tt := range []struct {
@@ -4375,6 +4407,209 @@ func TestApplyAdvanceEpochEvent(t *testing.T) {
 			requireEpochState(t, f, closedEpochIdx, closedEpochIdx, append(f.closed, f.next...), nil)
 		})
 	}
+}
+
+func newLifecycleCommandRig(t *testing.T) (*marketEventRig, *mesh.Service) {
+	t.Helper()
+	rig := newMarketEventRig(t)
+	t.Cleanup(rig.cleanup)
+	svc, err := mesh.NewService(&mesh.ServiceConfig{
+		EventLogReader: emptyEventLogReader{},
+		OnHalt:         func(error) {},
+		Commands:       LifecycleCommands(map[string]*Market{rig.mkt.name: rig.mkt}),
+		Events:         rig.events,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rig, svc
+}
+
+func TestScheduleSuspendCommand(t *testing.T) {
+	const current, epochDur int64 = 40, 500
+	for _, tc := range []struct {
+		name          string
+		activeEpoch   int64
+		pendingEpoch  int64
+		retainQueue   bool
+		unknownMarket bool
+		asSoonAs      time.Time
+		persistBook   bool
+		wantEpoch     int64
+		wantErr       string
+	}{
+		{
+			name: "past epoch", activeEpoch: current,
+			asSoonAs: time.UnixMilli((current - 1) * epochDur), persistBook: true,
+			wantEpoch: current + 1,
+		},
+		{
+			name: "future epoch boundary", activeEpoch: current,
+			asSoonAs: time.UnixMilli((current + 4) * epochDur), persistBook: true,
+			wantEpoch: current + 3,
+		},
+		{
+			name: "inside future epoch", activeEpoch: current,
+			asSoonAs: time.UnixMilli((current+4)*epochDur + 1), persistBook: true,
+			wantEpoch: current + 4,
+		},
+		{
+			name: "reschedule earlier without keeping the book", activeEpoch: current, pendingEpoch: current + 3,
+			wantEpoch: current + 1,
+		},
+		{
+			name: "final epoch already open", activeEpoch: current, pendingEpoch: current,
+			wantErr: "is already closing",
+		},
+		{
+			name:    "no epoch",
+			wantErr: "without an active epoch",
+		},
+		{
+			name: "stopped worker with retained epoch", retainQueue: true,
+			asSoonAs: time.UnixMilli((current + 4) * epochDur),
+			wantErr:  "without an active epoch",
+		},
+		{
+			name: "unknown market", activeEpoch: current, unknownMarket: true,
+			wantErr: "unknown market",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig, svc := newLifecycleCommandRig(t)
+			mkt := rig.mkt
+			row := seedLifecycleRow(db.MarketStateRunning, db.MarketPendingNone, current, epochDur)
+			// Create the live epoch queues before adding a pending suspension.
+			setTestMarketLifecycle(mkt, rig.storage, row)
+			if tc.pendingEpoch != 0 {
+				persist := true
+				row.PendingAction = db.MarketPendingSuspend
+				row.PendingEpochIdx, row.FinalEpochIdx = tc.pendingEpoch, tc.pendingEpoch
+				row.PendingEpochDur, row.FinalEpochDur = epochDur, epochDur
+				row.PersistBook = &persist
+				setTestMarketLifecycle(mkt, rig.storage, row)
+			}
+			mkt.activeEpochIdx = tc.activeEpoch
+			if tc.activeEpoch == 0 {
+				mkt.running.Store(false)
+				if !tc.retainQueue {
+					mkt.currentEpoch, mkt.nextEpoch = nil, nil
+				}
+			}
+			marketName := mkt.name
+			if tc.unknownMarket {
+				marketName = "nope_btc"
+			}
+
+			susp, err := ExecuteScheduleSuspend(context.Background(), svc, marketName, tc.asSoonAs, tc.persistBook)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("suspend error = %v, want %q", err, tc.wantErr)
+				}
+				if len(rig.storage.marketSuspendScheduledUpdates) != 0 {
+					t.Fatal("rejected schedule reached storage")
+				}
+				if !reflect.DeepEqual(rig.storage.lifecycle, row) {
+					t.Fatalf("rejected schedule changed stored lifecycle: got %+v, want %+v", rig.storage.lifecycle, row)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantEnd := time.UnixMilli((tc.wantEpoch + 1) * epochDur)
+			if susp.Idx != tc.wantEpoch || !susp.End.Equal(wantEnd) {
+				t.Fatalf("suspend = %+v, want epoch %d ending %v", susp, tc.wantEpoch, wantEnd)
+			}
+			if len(rig.storage.marketSuspendScheduledUpdates) != 1 {
+				t.Fatal("expected one scheduling update")
+			}
+			update := rig.storage.marketSuspendScheduledUpdates[0]
+			if update.Market != mkt.name ||
+				update.FinalEpochIdx != tc.wantEpoch || update.EpochDur != epochDur || update.PersistBook != tc.persistBook {
+				t.Fatalf("unexpected scheduling update: %+v", update)
+			}
+			stored := rig.storage.lifecycle
+			if stored.PendingEpochIdx != tc.wantEpoch || stored.FinalEpochIdx != tc.wantEpoch ||
+				stored.PersistBook == nil || *stored.PersistBook != tc.persistBook {
+				t.Fatalf("unexpected stored suspension: %+v", stored)
+			}
+		})
+	}
+}
+
+func TestExecuteLifecycleCommand(t *testing.T) {
+	response, err := msgjson.NewResponse(1, scheduleSuspendResult{EpochIdx: 42}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("response through callback", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		requests := make(chan mesh.CommandRequest, 1)
+		execute := func(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
+			requests <- req
+			return nil
+		}
+		var result scheduleSuspendResult
+		done := make(chan error, 1)
+		go func() {
+			done <- executeLifecycleCommand(ctx, execute, commandKindScheduleSuspend, scheduleSuspendRequest{}, &result)
+		}()
+		select {
+		case req := <-requests:
+			if err := req.Respond(response); err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("command was not executed")
+		}
+		if err := <-done; err != nil || result.EpochIdx != 42 {
+			t.Fatalf("result = %+v, error = %v, want epoch 42", result, err)
+		}
+	})
+
+	t.Run("execution error", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		execErr := msgjson.NewError(msgjson.RPCInternalError, "execution failed")
+		execute := func(context.Context, mesh.CommandRequest) *msgjson.Error { return execErr }
+		var result scheduleSuspendResult
+		err := executeLifecycleCommand(ctx, execute, commandKindScheduleSuspend, scheduleSuspendRequest{}, &result)
+		if !errors.Is(err, execErr) || result.EpochIdx != 0 {
+			t.Fatalf("result = %+v, error = %v, want execution error", result, err)
+		}
+	})
+
+	t.Run("canceled", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		execute := func(context.Context, mesh.CommandRequest) *msgjson.Error {
+			cancel()
+			return nil
+		}
+		var result scheduleSuspendResult
+		err := executeLifecycleCommand(ctx, execute, commandKindScheduleSuspend, scheduleSuspendRequest{}, &result)
+		if !errors.Is(err, context.Canceled) || result.EpochIdx != 0 {
+			t.Fatalf("result = %+v, error = %v, want cancellation", result, err)
+		}
+	})
+
+	t.Run("response before cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		execute := func(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
+			_ = req.Respond(response)
+			cancel()
+			return nil
+		}
+		var result scheduleSuspendResult
+		err := executeLifecycleCommand(ctx, execute, commandKindScheduleSuspend, scheduleSuspendRequest{}, &result)
+		if err != nil || result.EpochIdx != 42 {
+			t.Fatalf("result = %+v, error = %v, want epoch 42", result, err)
+		}
+	})
 }
 
 func requireEpochNoteFromLink(t *testing.T, link *TLink, mkt *Market, ord order.Order, epochIdx int64, wantOrderType uint8) {
@@ -5005,7 +5240,7 @@ func TestSubmitMarketStarted(t *testing.T) {
 			if (currentEpoch != nil) != tc.wantOpenEpoch {
 				t.Fatalf("current epoch = %v, want opened %t", currentEpoch, tc.wantOpenEpoch)
 			}
-			if got := mkt.isDraining(); got != !tc.wantOpenEpoch {
+			if got := mkt.lifecycleState == db.MarketStateDraining; got != !tc.wantOpenEpoch {
 				t.Fatalf("finalizing suspend = %t, want %t", got, !tc.wantOpenEpoch)
 			}
 		})
