@@ -196,6 +196,26 @@ func (u *MarketResumeScheduledUpdate) EventTxData() ([]byte, error) {
 	)
 }
 
+// EventTxData returns the versioned transaction data for market_resumed.
+func (u *MarketResumedUpdate) EventTxData() ([]byte, error) {
+	if u == nil {
+		return nil, fmt.Errorf("nil market_resumed update")
+	}
+	resumeRevokes, err := startupOrderRevokesTxData(u.ResumeRevokes)
+	if err != nil {
+		return nil, err
+	}
+	return encodeEventTxData(
+		[]byte(u.Market),
+		encode.Uint32Bytes(u.Base),
+		encode.Uint32Bytes(u.Quote),
+		int64Bytes(u.StartEpochIdx),
+		int64Bytes(u.EpochDur),
+		int64Bytes(u.Timestamp.UnixMilli()),
+		resumeRevokes,
+	)
+}
+
 // encodeEventTxData encodes versioned fields, rejecting oversized fields
 // instead of letting BuildyBytes.AddData panic.
 func encodeEventTxData(fields ...[]byte) ([]byte, error) {

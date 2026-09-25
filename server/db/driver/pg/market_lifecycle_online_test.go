@@ -220,3 +220,108 @@ func TestApplyMarketResumeScheduledEvent(t *testing.T) {
 		t.Fatalf("stored lifecycle = %+v, want %+v", stored, want)
 	}
 }
+
+func TestApplyMarketResumedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	const epochDur = int64(EpochDuration)
+	const resumeEpochIdx int64 = 40000
+	persistBook := true
+	resumeScheduled := &db.MarketLifecycle{
+		RunParams:         testMarketRunParams(),
+		Market:            "dcr_btc",
+		State:             db.MarketStateSuspended,
+		StartEpochIdx:     resumeEpochIdx,
+		StartEpochDur:     epochDur,
+		PendingAction:     db.MarketPendingResume,
+		PendingEpochIdx:   resumeEpochIdx,
+		PendingEpochDur:   epochDur,
+		PersistBook:       &persistBook,
+		ProcessedEpochIdx: resumeEpochIdx - 10,
+	}
+	seedMarketLifecycle(t, resumeScheduled)
+
+	// The revoke list includes a booked order, an already-revoked order, and
+	// an unknown order. A booked order outside the list must be retained.
+	selectedBooked := newLimitOrder(false, 4_900_000, 1, order.StandingTiF, 0)
+	alreadyRevoked := newLimitOrder(true, 5_100_000, 1, order.StandingTiF, 10)
+	neverStored := newLimitOrder(false, 4_800_000, 1, order.StandingTiF, 20)
+	unselectedBooked := newLimitOrder(true, 5_200_000, 1, order.StandingTiF, 30)
+	for _, lo := range []*order.LimitOrder{selectedBooked, alreadyRevoked, unselectedBooked} {
+		if err := storeOrderForTest(archie, lo, resumeEpochIdx-25, epochDur, order.OrderStatusBooked); err != nil {
+			t.Fatalf("store order %v: %v", lo.ID(), err)
+		}
+	}
+	if _, _, err := archie.RevokeOrderUncounted(alreadyRevoked); err != nil {
+		t.Fatalf("revoke order %v: %v", alreadyRevoked.ID(), err)
+	}
+
+	newRunParams := resumeScheduled.RunParams
+	newRunParams.ParcelSize *= 2
+	timestamp := time.UnixMilli(resumeEpochIdx * epochDur).UTC()
+	update := &db.MarketResumedUpdate{
+		Market:        "dcr_btc",
+		Base:          AssetDCR,
+		Quote:         AssetBTC,
+		StartEpochIdx: resumeEpochIdx,
+		EpochDur:      epochDur,
+		Timestamp:     timestamp,
+		RunParams:     newRunParams,
+		ResumeRevokes: []*db.StartupOrderRevoke{
+			{Order: selectedBooked, Reason: meshevents.StartupOrderRevokeReasonFundingCoinSpent},
+			{Order: alreadyRevoked, Reason: meshevents.StartupOrderRevokeReasonFundingCoinSpent},
+			{Order: neverStored, Reason: meshevents.StartupOrderRevokeReasonFundingCoinSpent},
+		},
+	}
+	result, err := archie.ApplyMarketResumedEvent(ctx, &db.EventLogMeta{Event: []byte("ml-resume")}, update)
+	if err != nil {
+		t.Fatalf("ApplyMarketResumedEvent error: %v", err)
+	}
+
+	if result.Log.Kind != meshevents.EventKindMarketResumed {
+		t.Fatalf("event kind = %q, want %q", result.Log.Kind, meshevents.EventKindMarketResumed)
+	}
+
+	wantLifecycle := &db.MarketLifecycle{
+		Market:            "dcr_btc",
+		State:             db.MarketStateRunning,
+		StartEpochIdx:     resumeEpochIdx,
+		StartEpochDur:     epochDur,
+		ActiveEpochIdx:    resumeEpochIdx,
+		ProcessedEpochIdx: resumeEpochIdx - 1,
+		RunParams:         newRunParams,
+	}
+	if !reflect.DeepEqual(result.Lifecycle, wantLifecycle) {
+		t.Fatalf("returned lifecycle = %+v, want %+v", result.Lifecycle, wantLifecycle)
+	}
+	stored, err := archie.MarketLifecycle(update.Market)
+	if err != nil {
+		t.Fatalf("MarketLifecycle: %v", err)
+	}
+	if !reflect.DeepEqual(stored, wantLifecycle) {
+		t.Fatalf("stored lifecycle = %+v, want %+v", stored, wantLifecycle)
+	}
+
+	if len(result.ResumeRevokes) != 1 || result.ResumeRevokes[0].Order.ID() != selectedBooked.ID() {
+		t.Fatalf("applied resume revokes = %+v, want only %v", result.ResumeRevokes, selectedBooked.ID())
+	}
+	for _, tc := range []struct {
+		name       string
+		ord        *order.LimitOrder
+		wantStatus order.OrderStatus
+	}{
+		{name: "selected", ord: selectedBooked, wantStatus: order.OrderStatusRevoked},
+		{name: "already revoked", ord: alreadyRevoked, wantStatus: order.OrderStatusRevoked},
+		{name: "unselected", ord: unselectedBooked, wantStatus: order.OrderStatusBooked},
+	} {
+		if _, status, err := archie.Order(tc.ord.ID(), AssetDCR, AssetBTC); err != nil || status != tc.wantStatus {
+			t.Fatalf("%s order %v status = %v (err %v), want %v", tc.name, tc.ord.ID(), status, err, tc.wantStatus)
+		}
+	}
+	if _, _, err := archie.Order(neverStored.ID(), AssetDCR, AssetBTC); !db.IsErrOrderUnknown(err) {
+		t.Fatalf("order %v lookup error = %v, want ErrUnknownOrder", neverStored.ID(), err)
+	}
+}

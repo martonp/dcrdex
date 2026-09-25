@@ -94,6 +94,38 @@ func ProjectMarketResumeScheduled(prev *MarketLifecycle, update *MarketResumeSch
 	return &next, nil
 }
 
+// ProjectMarketResumed returns the lifecycle after applying the event.
+func ProjectMarketResumed(prev *MarketLifecycle, update *MarketResumedUpdate) (*MarketLifecycle, error) {
+	if update == nil {
+		return nil, fmt.Errorf("nil market_resumed update")
+	}
+	if prev == nil {
+		return nil, fmt.Errorf("missing lifecycle row for market %s", update.Market)
+	}
+	if prev.State != MarketStateSuspended || prev.PendingAction != MarketPendingResume {
+		return nil, fmt.Errorf("cannot resume market %s in lifecycle %d/%d",
+			update.Market, prev.State, prev.PendingAction)
+	}
+	if !sameLifecycleEpoch(prev.PendingEpochIdx, prev.PendingEpochDur, update.StartEpochIdx, update.EpochDur) {
+		return nil, fmt.Errorf("resume pending epoch mismatch for market %s", update.Market)
+	}
+	if err := update.RunParams.Validate(); err != nil {
+		return nil, fmt.Errorf("resume for market %s: %w", update.Market, err)
+	}
+	// If resumption is late, start in the epoch containing the event timestamp.
+	openEpochIdx := max(prev.PendingEpochIdx, update.Timestamp.UnixMilli()/prev.PendingEpochDur)
+	return &MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateRunning,
+		StartEpochIdx:     openEpochIdx,
+		StartEpochDur:     update.EpochDur,
+		PendingAction:     MarketPendingNone,
+		ActiveEpochIdx:    openEpochIdx,
+		ProcessedEpochIdx: openEpochIdx - 1,
+		RunParams:         update.RunParams,
+	}, nil
+}
+
 // ProjectMarketStartedLifecycle returns the lifecycle state after startup
 // recovery. It performs no storage I/O. changed is false when no update is needed.
 func ProjectMarketStartedLifecycle(prev *MarketLifecycle, update *MarketStartedUpdate) (next *MarketLifecycle, changed bool, err error) {

@@ -848,6 +848,18 @@ func (r *BookRouter) applyMarketSuspendedEvent(book *msgBook, finalEpoch int64, 
 		book.name, finalEpoch, persistBook, len(purged))
 }
 
+func (r *BookRouter) applyMarketResumedEvent(book *msgBook, startEpoch int64, removed []*order.LimitOrder) {
+	book.setEpoch(startEpoch)
+	for _, lo := range removed {
+		r.unbookOrder(book, lo)
+	}
+	r.sendNote(msgjson.ResumptionRoute, book.subs, &msgjson.TradeResumption{
+		MarketID:   book.name,
+		StartEpoch: uint64(startEpoch),
+	})
+	log.Infof("Market %q resumed at epoch %d", book.name, startEpoch)
+}
+
 // applyBookedOrder applies a newly booked limit order to the local book
 // projection and notifies local subscribers.
 func (r *BookRouter) applyBookedOrder(book *msgBook, lo *order.LimitOrder) {

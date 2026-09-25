@@ -162,6 +162,10 @@ type Market struct {
 	currentEpoch             *EpochQueue
 	nextEpoch                *EpochQueue
 
+	// resumeSubmitMtx prevents suspended cancellations while resume checks
+	// booked orders and applies its event.
+	resumeSubmitMtx sync.RWMutex
+
 	matcher  *matcher.Matcher
 	swapper  Swapper
 	auth     AuthManager
@@ -600,6 +604,15 @@ func (m *Market) applyMarketLifecycleRow(lifecycle *db.MarketLifecycle) {
 	m.wakeLifecycleDriver()
 }
 
+func (m *Market) hasPendingResume(epochIdx, epochDur int64) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.lifecycleState == db.MarketStateSuspended &&
+		m.pendingLifecycleAction == db.MarketPendingResume &&
+		m.pendingLifecycleEpochIdx == epochIdx &&
+		m.pendingLifecycleEpochDur == epochDur
+}
+
 func (m *Market) applyMarketSuspendPurge(purged []order.OrderID) {
 	if len(purged) == 0 {
 		return
@@ -619,6 +632,32 @@ func (m *Market) applyMarketSuspendPurge(purged []order.OrderID) {
 		m.unlockOrderCoins(lo)
 		m.sendRevokeOrderNote(lo.ID(), lo.User())
 	}
+}
+
+func (m *Market) applyMarketResumeCleanup(revokes []*db.StartupOrderRevoke) []*order.LimitOrder {
+	if len(revokes) == 0 {
+		return nil
+	}
+	m.bookMtx.Lock()
+	var revokedOrders []order.Order
+	var unbookedOrders []*order.LimitOrder
+	for _, revoke := range revokes {
+		if revoke == nil || revoke.Order == nil {
+			continue
+		}
+		lo, ok := m.book.Remove(revoke.Order.ID())
+		if ok {
+			delete(m.settling, lo.ID())
+			unbookedOrders = append(unbookedOrders, lo)
+		}
+		revokedOrders = append(revokedOrders, revoke.Order)
+	}
+	m.bookMtx.Unlock()
+	for _, ord := range revokedOrders {
+		m.unlockOrderCoins(ord)
+		m.sendRevokeOrderNote(ord.ID(), ord.User())
+	}
+	return unbookedOrders
 }
 
 // buildScheduleSuspendEvent builds an event scheduling suspension and returns
@@ -793,6 +832,48 @@ func (m *Market) buildScheduleResumeEvent(asSoonAs time.Time) (*mesh.Event, int6
 		return nil, 0, time.Time{}, err
 	}
 	return meshEvent, startEpochIdx, startTime, nil
+}
+
+// submitMarketResume rechecks booked orders and submits a resume event with
+// the required revocations and configured trading parameters.
+func (m *Market) submitMarketResume(ctx context.Context, pendingEpochIdx, pendingEpochDur int64) error {
+	m.resumeSubmitMtx.Lock()
+	defer m.resumeSubmitMtx.Unlock()
+
+	if !m.hasPendingResume(pendingEpochIdx, pendingEpochDur) {
+		return fmt.Errorf("market %s has no matching pending resume epoch %d:%d",
+			m.name, pendingEpochIdx, pendingEpochDur)
+	}
+
+	// Changing the duration would change the time identified by the scheduled epoch.
+	if pendingEpochDur != m.configuredParams.epochDur {
+		return fmt.Errorf("market %s epoch duration changed from %d to %d; revert the configured duration, "+
+			"resume, and change it at the next market start",
+			m.name, pendingEpochDur, m.configuredParams.epochDur)
+	}
+
+	runParams := m.configuredParams.MarketRunParams
+	bookedRevokes, err := m.startupBookedRevokes(ctx, runParams.LotSize)
+	if err != nil {
+		return err
+	}
+
+	// Keep the scheduled epoch so application can verify the pending resume.
+	// If funding checks finish late, the timestamp determines the opening epoch.
+	event := &meshevents.MarketResumedEvent{
+		Market:        m.name,
+		StartEpochIdx: pendingEpochIdx,
+		EpochDur:      pendingEpochDur,
+	}
+	event.Timestamp = time.Now().UnixMilli()
+	event.ResumeRevokes = encodeStartupOrderRevokes(bookedRevokes)
+	event.RunParams = runParams
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return err
+	}
+	_, err = m.mesh.ApplyEvent(ctx, meshEvent)
+	return err
 }
 
 // SetStartEpochIdx sets the starting epoch index. This should generally be
