@@ -20,6 +20,72 @@ func testRunParams() meshevents.MarketRunParams {
 	}
 }
 
+func TestProjectMarketSuspendScheduled(t *testing.T) {
+	const epochDur int64 = 10_000
+	update := &MarketSuspendScheduledUpdate{
+		Market:        "dcr_btc",
+		FinalEpochIdx: 20,
+		EpochDur:      epochDur,
+		PersistBook:   true,
+	}
+	running := MarketLifecycle{
+		Market:            update.Market,
+		State:             MarketStateRunning,
+		StartEpochIdx:     10,
+		StartEpochDur:     epochDur,
+		ActiveEpochIdx:    15,
+		ProcessedEpochIdx: 14,
+		RunParams:         testRunParams(),
+	}
+	scheduled := running
+	scheduled.FinalEpochIdx = 20
+	scheduled.FinalEpochDur = epochDur
+	scheduled.PendingAction = MarketPendingSuspend
+	scheduled.PendingEpochIdx = 20
+	scheduled.PendingEpochDur = epochDur
+	scheduled.PersistBook = &update.PersistBook
+
+	draining := running
+	draining.State = MarketStateDraining
+	for _, tc := range []struct {
+		name    string
+		prev    *MarketLifecycle
+		update  *MarketSuspendScheduledUpdate
+		want    *MarketLifecycle
+		wantErr bool
+	}{
+		{
+			name: "running market", prev: &running, update: update,
+			want: &scheduled,
+		},
+		{
+			name: "draining market", prev: &draining, update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing lifecycle", update: update,
+			wantErr: true,
+		},
+		{
+			name: "missing update", prev: &running,
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProjectMarketSuspendScheduled(tc.prev, tc.update)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, want error %t", err, tc.wantErr)
+			}
+			if tc.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("lifecycle = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProjectMarketStartedLifecycle(t *testing.T) {
 	persist := true
 	const market = "dcr_btc"

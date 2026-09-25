@@ -224,6 +224,8 @@ type OrderArchiver interface {
 	OrdersWithCommit(ctx context.Context, base, quote uint32, commit order.Commitment, archivedCutoff time.Time) ([]OrderWithStatus, error)
 	ApplyOrderAcceptedEvent(ctx context.Context, meta *EventLogMeta, update *OrderAcceptedUpdate) (*EventLogEntry, error)
 	ApplyMarketStartedEvent(ctx context.Context, meta *EventLogMeta, update *MarketStartedUpdate) (*MarketStartedApplyResult, error)
+	MarketLifecycle(market string) (*MarketLifecycle, error)
+	ApplyMarketSuspendScheduledEvent(ctx context.Context, meta *EventLogMeta, update *MarketSuspendScheduledUpdate) (*MarketSuspendScheduledApplyResult, error)
 	ApplyAdvanceEpochEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AdvanceEpochEvent) (*EventLogEntry, error)
 	ApplyEpochProcessedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *EpochProcessedUpdate) (*EventLogEntry, error)
 	ApplyOrdersRevokedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, update *OrdersRevokedUpdate) (*EventLogEntry, error)
@@ -929,6 +931,22 @@ func (lc *MarketLifecycle) SuspendTime() time.Time {
 // meaningful while PendingAction is MarketPendingResume.
 func (lc *MarketLifecycle) ResumeTime() time.Time {
 	return time.UnixMilli(lc.PendingEpochIdx * lc.PendingEpochDur).UTC()
+}
+
+// MarketSuspendScheduledUpdate contains the event fields and resolved market asset IDs.
+type MarketSuspendScheduledUpdate struct {
+	Market        string
+	Base, Quote   uint32
+	FinalEpochIdx int64
+	EpochDur      int64
+	// PersistBook specifies whether suspension keeps booked orders.
+	PersistBook bool
+}
+
+// MarketSuspendScheduledApplyResult contains the stored lifecycle and event log entry.
+type MarketSuspendScheduledApplyResult struct {
+	Log       *EventLogEntry
+	Lifecycle *MarketLifecycle
 }
 
 // MarketStartedApplyResult is the stored outcome of a market_started event.

@@ -600,6 +600,65 @@ func (m *Market) applyMarketLifecycleRow(lifecycle *db.MarketLifecycle) {
 	m.wakeLifecycleDriver()
 }
 
+// buildScheduleSuspendEvent builds an event scheduling suspension and returns
+// the final trading epoch. That epoch ends at or after asSoonAs.
+func (m *Market) buildScheduleSuspendEvent(asSoonAs time.Time, persistBook bool) (*mesh.Event, *SuspendEpoch, error) {
+	m.epochMtx.RLock()
+	activeEpochIdx := m.activeEpochIdx
+	epochDur := m.liveParams.Load().epochDur
+	m.epochMtx.RUnlock()
+	if activeEpochIdx == 0 {
+		return nil, nil, fmt.Errorf("unable to schedule suspend for market %s without an active epoch", m.name)
+	}
+
+	ms := asSoonAs.UnixMilli()
+	finalEpochIdx := ms / epochDur
+	// At an exact boundary, the preceding epoch ends at the requested time.
+	if ms%epochDur == 0 {
+		finalEpochIdx--
+	}
+	// The next epoch may already contain accepted orders.
+	finalEpochIdx = max(finalEpochIdx, activeEpochIdx+1)
+	finalEpochEnd := time.UnixMilli((finalEpochIdx + 1) * epochDur)
+
+	event := &meshevents.MarketSuspendScheduledEvent{
+		Market:        m.name,
+		FinalEpochIdx: finalEpochIdx,
+		EpochDur:      epochDur,
+	}
+	event.PersistBook = persistBook
+	meshEvent, err := mesh.NewEvent(event)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meshEvent, &SuspendEpoch{Idx: finalEpochIdx, End: finalEpochEnd}, nil
+}
+
+func (m *Market) validateScheduleSuspendEvent(finalEpochIdx, finalEpochDur int64) error {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	if finalEpochDur != int64(m.EpochDuration()) {
+		return fmt.Errorf("schedule_suspend epoch duration %d mismatches market duration %d",
+			finalEpochDur, m.EpochDuration())
+	}
+	if m.lifecycleState != db.MarketStateRunning {
+		return fmt.Errorf("schedule_suspend rejected for non-running market %s", m.name)
+	}
+	if m.currentEpoch == nil {
+		return fmt.Errorf("schedule_suspend rejected: running market %s has no current epoch", m.name)
+	}
+	// A pending suspension cannot be moved once its final epoch is active.
+	if m.pendingLifecycleAction == db.MarketPendingSuspend && m.pendingLifecycleEpochIdx == m.currentEpoch.Epoch {
+		return fmt.Errorf("schedule_suspend rejected: market %s final epoch %d is already closing",
+			m.name, m.currentEpoch.Epoch)
+	}
+	if finalEpochIdx <= m.currentEpoch.Epoch {
+		return fmt.Errorf("schedule_suspend final epoch %d is not after current epoch %d",
+			finalEpochIdx, m.currentEpoch.Epoch)
+	}
+	return nil
+}
+
 // SuspendASAP suspends requests the market to gracefully suspend epoch cycling
 // as soon as possible, always allowing an active epoch to close. See also
 // Suspend.
@@ -915,9 +974,12 @@ func (m *Market) stampedOrderAcceptedEvent(rec *orderRecord) (*mesh.Event, *msgj
 	return event, result, nil
 }
 
-// checkOrderEligibility checks the account tier and parcel limit for a new
-// order. Cancel orders bypass these checks.
+// checkOrderEligibility checks the suspension boundary and the account
+// tier and parcel limit for a new order. Cancel orders bypass the account checks.
 func (m *Market) checkOrderEligibility(ord order.Order) error {
+	if m.orderAtOrAfterSuspendBoundary(ord) {
+		return ErrMarketNotRunning
+	}
 	if ord.Type() == order.CancelOrderType {
 		return nil
 	}
@@ -927,6 +989,25 @@ func (m *Market) checkOrderEligibility(ord order.Order) error {
 		return ErrSuspendedAccount
 	}
 	return m.validateOrderAcceptedParcelLimit(ord)
+}
+
+func (m *Market) orderAtOrAfterSuspendBoundary(ord order.Order) bool {
+	m.epochMtx.RLock()
+	defer m.epochMtx.RUnlock()
+	return m.orderAtOrAfterSuspendBoundaryLocked(ord)
+}
+
+func (m *Market) orderAtOrAfterSuspendBoundaryLocked(ord order.Order) bool {
+	finalIdx, finalDur := m.pendingLifecycleEpochIdx, m.pendingLifecycleEpochDur
+	if m.lifecycleState == db.MarketStateDraining {
+		finalIdx, finalDur = m.suspendEpochIdx, m.liveParams.Load().epochDur
+	} else if m.pendingLifecycleAction != db.MarketPendingSuspend {
+		return false
+	}
+	if finalIdx == 0 || finalDur == 0 {
+		return false
+	}
+	return ord.Time() >= (finalIdx+1)*finalDur
 }
 
 // AcceptOrderCommand submits an order_accepted event, restamping the order
@@ -3010,6 +3091,9 @@ func (m *Market) acceptedOrderEpoch(ord order.Order) (epochIdx, epochDur int64, 
 
 	if m.currentEpoch == nil {
 		return 0, 0, nil, fmt.Errorf("order_accepted with no active epoch on market %s", m.name)
+	}
+	if m.orderAtOrAfterSuspendBoundaryLocked(ord) {
+		return 0, 0, nil, ErrMarketNotRunning
 	}
 	if m.currentEpoch.IncludesTime(sTime) {
 		return m.currentEpoch.Epoch, m.currentEpoch.Duration, m.currentEpoch, nil
