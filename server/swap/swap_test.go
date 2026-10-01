@@ -327,6 +327,9 @@ func (m *TAuthManager) popResp(id account.AccountID) (msg *msgjson.Message, resp
 type TStorage struct {
 	mtx sync.Mutex
 
+	activeSwaps []*db.SwapDataFull
+	orders      map[order.OrderID]order.Order
+
 	swapDataByID map[order.MatchID]*db.SwapDataFull
 
 	matchAckEvents            []*meshevents.MatchAcksRecordedEvent
@@ -370,9 +373,22 @@ func (ts *TStorage) fatalBackendErr(err error) {
 }
 
 func (ts *TStorage) Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if ts.orders != nil {
+		ord, found := ts.orders[oid]
+		if !found {
+			return nil, order.OrderStatusUnknown, db.ArchiveError{Code: db.ErrUnknownOrder}
+		}
+		return ord, order.OrderStatusExecuted, nil
+	}
 	return nil, order.OrderStatusUnknown, nil // not loading swaps
 }
-func (ts *TStorage) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
+func (ts *TStorage) ActiveSwaps() ([]*db.SwapDataFull, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	return ts.activeSwaps, nil
+}
 func (ts *TStorage) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
 	return 0, nil, nil
 }
@@ -498,6 +514,8 @@ type TBackend struct {
 	lbl             string
 	invalidFeeRate  bool
 	rejectSwapAddrs bool
+
+	wantRedeemContract []byte // optional expected contract data for Redemption
 }
 
 func newTBackend(lbl string) TBackend {
@@ -540,6 +558,9 @@ func (a *TBackend) Redemption(redemptionID, cpSwapCoinID, contractData []byte) (
 	redeem, found := a.redemptions[redeemKey{string(redemptionID), string(cpSwapCoinID)}]
 	if !found || redeem == nil {
 		return nil, asset.CoinNotFoundError
+	}
+	if a.wantRedeemContract != nil && !bytes.Equal(contractData, a.wantRedeemContract) {
+		return nil, fmt.Errorf("redemption contract = %x, want %x", contractData, a.wantRedeemContract)
 	}
 	return redeem, nil
 }
@@ -772,6 +793,7 @@ func tNewUnstartedRig(matchInfo *tMatch) *testRig {
 	acctAsset := TNewAsset(acctBackend, ACCTID)
 
 	swapper, err := NewSwapper(&Config{
+		NoResume: true,
 		Assets: map[uint32]*SwapperAsset{
 			ABCID:  {abcAsset, abcCoinLocker},
 			XYZID:  {xyzAsset, xyzCoinLocker},
@@ -4453,5 +4475,183 @@ func TestDeleteMatchCleansUpSecretHashes(t *testing.T) {
 	rig.swapper.activeCoinsMtx.Unlock()
 }
 
-// TODO: TestSwapper_restoreActiveSwaps? It would be almost entirely driven by
-// stubbed out asset backend and storage.
+// seedActiveSwap adds an active match and its orders to the storage stub.
+func seedActiveSwap(ts *TStorage, info *tMatch, status order.MatchStatus, makerAddr, takerAddr string) *db.SwapData {
+	match := info.match
+	if ts.orders == nil {
+		ts.orders = make(map[order.OrderID]order.Order)
+	}
+	ts.orders[info.makerOID] = match.Maker
+	ts.orders[info.takerOID] = match.Taker
+	sd := &db.SwapData{MakerSwapAddr: makerAddr, TakerSwapAddr: takerAddr}
+	ts.activeSwaps = append(ts.activeSwaps, &db.SwapDataFull{
+		Base:  match.Maker.Base(),
+		Quote: match.Maker.Quote(),
+		MatchData: &db.MatchData{
+			ID:            info.matchID,
+			Taker:         info.takerOID,
+			TakerAcct:     info.taker.acct,
+			TakerAddr:     info.taker.addr,
+			TakerSell:     !match.Maker.T.Sell,
+			Maker:         info.makerOID,
+			MakerAcct:     info.maker.acct,
+			MakerAddr:     info.maker.addr,
+			Epoch:         match.Epoch,
+			Quantity:      match.Quantity,
+			Rate:          match.Rate,
+			BaseRate:      match.FeeRateBase,
+			QuoteRate:     match.FeeRateQuote,
+			Active:        true,
+			Status:        status,
+			MakerSwapAddr: makerAddr,
+			TakerSwapAddr: takerAddr,
+		},
+		SwapData: sd,
+	})
+	return sd
+}
+
+func TestRestoreActiveSwaps(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    order.MatchStatus
+		makerAddr string
+		takerAddr string
+	}{
+		{name: "newly matched", status: order.NewlyMatched},
+		{name: "maker acknowledged", status: order.NewlyMatched, makerAddr: "maker-addr"},
+		{name: "maker redeemed", status: order.MakerRedeemed, makerAddr: "maker-addr", takerAddr: "taker-addr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			maker, taker := tNewUser("maker"), tNewUser("taker")
+			makerOrder, takerOrder := limitLimitPair(1e8, 1e8, 1e8, 1e8, maker, taker, true)
+			makerOrder.T.Coins = []order.CoinID{randBytes(36), randBytes(36)}
+			takerOrder.T.Coins = []order.CoinID{randBytes(36)}
+			info := tMatchInfo(maker, taker, 1e8, 1e8, makerOrder, takerOrder)
+			rig := tNewUnstartedRig(info)
+			sd := seedActiveSwap(rig.storage, info, tc.status, tc.makerAddr, tc.takerAddr)
+			var contractA, contractB *asset.Contract
+			var redemption *TCoin
+			if tc.makerAddr != "" {
+				sd.SigMatchAckMaker = randBytes(70)
+			}
+			if tc.takerAddr != "" {
+				sd.SigMatchAckTaker = randBytes(70)
+			}
+			if tc.status == order.MakerRedeemed {
+				sd.RedeemASecret = randBytes(32)
+				secretHash := sha256.Sum256(sd.RedeemASecret)
+				info.secretHash = secretHash[:]
+				contractA = &asset.Contract{Coin: &TCoin{id: randBytes(36)}, SecretHash: info.secretHash}
+				contractB = &asset.Contract{Coin: &TCoin{id: randBytes(36)}, SecretHash: info.secretHash}
+				redemption = &TCoin{id: randBytes(36)}
+				sd.ContractACoinID, sd.ContractA = contractA.ID(), randBytes(50)
+				sd.ContractBCoinID, sd.ContractB = contractB.ID(), randBytes(50)
+				sd.ContractAAckSig, sd.ContractBAckSig = randBytes(70), randBytes(70)
+				sd.RedeemACoinID = redemption.ID()
+				sd.RedeemAAckSig = randBytes(70)
+				rig.abcNode.setContract(contractA, false)
+				rig.xyzNode.setContract(contractB, false)
+				rig.xyzNode.setRedemption(redemption, contractB, false)
+				rig.xyzNode.wantRedeemContract = sd.ContractB
+			}
+
+			if err := rig.swapper.RestoreActiveSwaps(false); err != nil {
+				t.Fatal(err)
+			}
+			for _, coin := range makerOrder.T.Coins {
+				if !rig.swapper.coins[ABCID].Locker.CoinLocked(coin) {
+					t.Fatal("maker funding coin not locked after restore")
+				}
+			}
+			for _, coin := range takerOrder.T.Coins {
+				if !rig.swapper.coins[XYZID].Locker.CoinLocked(coin) {
+					t.Fatal("taker funding coin not locked after restore")
+				}
+			}
+
+			tracker := rig.getTracker()
+			if tracker == nil {
+				t.Fatal("no tracker restored for the active match")
+			}
+			if tracker.Status != tc.status || tracker.makerSwapAddr != tc.makerAddr || tracker.takerSwapAddr != tc.takerAddr {
+				t.Fatalf("restored tracker = %v %q/%q, want %v %q/%q",
+					tracker.Status, tracker.makerSwapAddr, tracker.takerSwapAddr, tc.status, tc.makerAddr, tc.takerAddr)
+			}
+			wantSigs := order.Signatures{
+				MakerMatch: sd.SigMatchAckMaker, TakerMatch: sd.SigMatchAckTaker,
+				MakerAudit: sd.ContractBAckSig, TakerAudit: sd.ContractAAckSig,
+				TakerRedeem: sd.RedeemAAckSig,
+			}
+			if !reflect.DeepEqual(tracker.Sigs, wantSigs) {
+				t.Fatalf("restored signatures = %x, want %x", tracker.Sigs, wantSigs)
+			}
+			if tracker.makerStatus.swap != contractA || tracker.takerStatus.swap != contractB {
+				t.Fatal("restored contracts do not match the backend contracts")
+			}
+			if tc.status == order.MakerRedeemed {
+				if tracker.makerStatus.redemption != redemption || !bytes.Equal(tracker.makerStatus.secret, sd.RedeemASecret) {
+					t.Fatal("maker redemption or secret was not restored")
+				}
+				for _, key := range []string{swapContractKey(sd.ContractACoinID, sd.ContractA), swapContractKey(sd.ContractBCoinID, sd.ContractB)} {
+					if rig.swapper.activeCoinIDs[key] != info.matchID {
+						t.Fatal("restored contract was not registered for duplicate detection")
+					}
+				}
+				if rig.swapper.activeSecretHashes[secretHashKey(info.secretHash)] != info.matchID {
+					t.Fatal("restored secret hash was not registered for duplicate detection")
+				}
+			}
+		})
+	}
+}
+
+func TestRestoreActiveSwapsFailures(t *testing.T) {
+	maker, taker := tNewUser("maker"), tNewUser("taker")
+	makerOrder, takerOrder := limitLimitPair(1e8, 1e8, 1e8, 1e8, maker, taker, true)
+	makerOrder.T.Coins = []order.CoinID{randBytes(36), randBytes(36)}
+	takerOrder.T.Coins = []order.CoinID{randBytes(36)}
+	info := tMatchInfo(maker, taker, 1e8, 1e8, makerOrder, takerOrder)
+	for _, tc := range []struct {
+		name    string
+		corrupt func(*TStorage)
+		wantErr string
+	}{
+		{"missing taker order", func(ts *TStorage) {
+			delete(ts.orders, info.takerOID)
+		}, "failed to load taker order"},
+		{"missing maker order", func(ts *TStorage) {
+			delete(ts.orders, info.makerOID)
+		}, "failed to load maker order"},
+		{"taker order ID mismatch", func(ts *TStorage) {
+			ts.orders[info.takerOID] = info.match.Maker
+		}, fmt.Sprintf("loaded taker order %v for active match %v, but computed ID", info.takerOID, info.matchID)},
+		{"maker order ID mismatch", func(ts *TStorage) {
+			ts.orders[info.makerOID] = info.match.Taker
+		}, fmt.Sprintf("loaded maker order %v for active match %v, but computed ID", info.makerOID, info.matchID)},
+		{"corrupt match row", func(ts *TStorage) {
+			ts.activeSwaps[0].MatchData.Quantity++
+		}, fmt.Sprintf("loaded match %v, but computed ID", info.matchID)},
+		{"missing swap contract", func(ts *TStorage) {
+			ts.activeSwaps[0].Status = order.MakerSwapCast
+			ts.activeSwaps[0].SwapData.ContractACoinID = randBytes(36)
+		}, "unable to find swap out coin"},
+		{"conflicting funding coin", func(ts *TStorage) {
+			otherMaker, otherTaker := tNewUser("other maker"), tNewUser("other taker")
+			otherMakerOrder, otherTakerOrder := limitLimitPair(1e8, 1e8, 1e8, 1e8, otherMaker, otherTaker, true)
+			otherMakerOrder.T.Coins = []order.CoinID{makerOrder.T.Coins[0]}
+			otherTakerOrder.T.Coins = []order.CoinID{randBytes(36)}
+			other := tMatchInfo(otherMaker, otherTaker, 1e8, 1e8, otherMakerOrder, otherTakerOrder)
+			seedActiveSwap(ts, other, order.NewlyMatched, "", "")
+		}, "failed to seed swap coin locks"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := tNewUnstartedRig(info)
+			seedActiveSwap(rig.storage, info, order.NewlyMatched, "maker-addr", "taker-addr")
+			tc.corrupt(rig.storage)
+			if err := rig.swapper.RestoreActiveSwaps(false); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("restore error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}

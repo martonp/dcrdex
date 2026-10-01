@@ -373,7 +373,7 @@ func NewSwapper(cfg *Config) (*Swapper, error) {
 	}
 
 	if !cfg.NoResume {
-		err := swapper.restoreActiveSwaps(cfg.AllowPartialRestore)
+		err := swapper.RestoreActiveSwaps(cfg.AllowPartialRestore)
 		if err != nil {
 			return nil, err
 		}
@@ -626,7 +626,12 @@ func (s *Swapper) ChainsSynced(base, quote uint32) (bool, error) {
 	return quoteSynced, nil
 }
 
-func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
+// RestoreActiveSwaps restores active matches and their funding locks from the
+// database. If allowPartial is true, matches requiring unavailable assets are
+// skipped. Other load errors fail the restore.
+// It must run at most once, before processing requests or events. NewSwapper
+// calls it unless NoResume is set.
+func (s *Swapper) RestoreActiveSwaps(allowPartial bool) error {
 	// Load active swap data from DB.
 	swapData, err := s.storage.ActiveSwaps()
 	if err != nil {
@@ -665,11 +670,12 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		ContractScript  []byte // {a,b}Contract
 		RedeemTime      int64  // {a,b}RedeemTime
 		RedeemCoinIn    []byte // {a,b}aRedeemCoinID
+		RedeemSecret    []byte // aRedeemSecret (maker only)
 		// SwapConfirmTime is not stored in the DB, so use time.Now() if the
 		// contract has reached SwapConf.
 	}
 
-	translateSwapStatus := func(ss *swapStatus, ssd *swapStatusData, cpSwapCoin []byte) error {
+	translateSwapStatus := func(ss *swapStatus, ssd, counterparty *swapStatusData) error {
 		ss.swapAsset, ss.redeemAsset = ssd.SwapAsset, ssd.RedeemAsset
 
 		swapCoin := ssd.ContractCoinOut
@@ -695,12 +701,13 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 
 		if redeemCoin := ssd.RedeemCoinIn; len(redeemCoin) > 0 {
 			assetID := ssd.RedeemAsset
-			redeem, err := s.coins[assetID].Backend.Redemption(redeemCoin, cpSwapCoin, ssd.ContractScript)
+			redeem, err := s.coins[assetID].Backend.Redemption(redeemCoin, counterparty.ContractCoinOut, counterparty.ContractScript)
 			if err != nil {
 				return fmt.Errorf("unable to find redeem in coin %x for asset %d: %w", redeemCoin, assetID, err)
 			}
 			ss.redemption = redeem
 			ss.redeemTime = time.UnixMilli(ssd.RedeemTime)
+			ss.secret = ssd.RedeemSecret
 		}
 
 		return nil
@@ -708,6 +715,11 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 
 	s.matches = make(map[order.MatchID]*matchTracker, len(swapData))
 	s.userMatches = make(map[account.AccountID]map[order.MatchID]*matchTracker)
+
+	// An order can back several matches; lock it once.
+	seenOrders := make(map[order.OrderID]bool)
+	assetOrders := make(map[uint32][]order.Order)
+
 	for _, sd := range swapData {
 		if missingAssets[sd.Base] {
 			log.Warnf("Dropping match %v with no backend available for base asset %d", sd.ID, sd.Base)
@@ -721,28 +733,25 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		// This is a different Order instance from whatever Market or other
 		// subsystems might have. As such, the mutable fields or accessors of
 		// mutable data should not be used.
+		// Active matches may reference archived orders. Every referenced order
+		// must be loaded so the match can continue settling.
 		taker, _, err := s.storage.Order(sd.MatchData.Taker, sd.Base, sd.Quote)
 		if err != nil {
-			log.Errorf("Failed to load taker order: %v", err)
-			continue
+			return fmt.Errorf("failed to load taker order %v for active match %v: %w", sd.MatchData.Taker, sd.MatchData.ID, err)
 		}
 		if taker.ID() != sd.MatchData.Taker {
-			log.Errorf("Failed to load order %v, computed ID %v instead", sd.MatchData.Taker, taker.ID())
-			continue
+			return fmt.Errorf("loaded taker order %v for active match %v, but computed ID %v", sd.MatchData.Taker, sd.MatchData.ID, taker.ID())
 		}
 		maker, _, err := s.storage.Order(sd.MatchData.Maker, sd.Base, sd.Quote)
 		if err != nil {
-			log.Errorf("Failed to load taker order: %v", err)
-			continue
+			return fmt.Errorf("failed to load maker order %v for active match %v: %w", sd.MatchData.Maker, sd.MatchData.ID, err)
 		}
 		if maker.ID() != sd.MatchData.Maker {
-			log.Errorf("Failed to load order %v, computed ID %v instead", sd.MatchData.Maker, maker.ID())
-			continue
+			return fmt.Errorf("loaded maker order %v for active match %v, but computed ID %v", sd.MatchData.Maker, sd.MatchData.ID, maker.ID())
 		}
 		makerLO, ok := maker.(*order.LimitOrder)
 		if !ok {
-			log.Errorf("Maker order was not a limit order: %T", maker)
-			continue
+			return fmt.Errorf("maker order %v for active match %v is not a limit order: %T", sd.MatchData.Maker, sd.MatchData.ID, maker)
 		}
 
 		match := &order.Match{
@@ -754,19 +763,18 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			FeeRateQuote: sd.QuoteRate,
 			Epoch:        sd.Epoch,
 			Status:       sd.Status,
-			Sigs: order.Signatures{ // not really needed
+			Sigs: order.Signatures{
 				MakerMatch:  sd.SwapData.SigMatchAckMaker,
 				TakerMatch:  sd.SwapData.SigMatchAckTaker,
-				MakerAudit:  sd.SwapData.ContractAAckSig,
-				TakerAudit:  sd.SwapData.ContractBAckSig,
+				MakerAudit:  sd.SwapData.ContractBAckSig, // maker's acknowledgement of the taker's contract
+				TakerAudit:  sd.SwapData.ContractAAckSig, // taker's acknowledgement of the maker's contract
 				TakerRedeem: sd.SwapData.RedeemAAckSig,
 			},
 		}
 
 		mid := sd.MatchData.ID
 		if mid != match.ID() { // serialization is order IDs, qty, and rate
-			log.Errorf("Failed to load Match %v, computed ID %v instead", mid, match.ID())
-			continue
+			return fmt.Errorf("loaded match %v, but computed ID %v", mid, match.ID())
 		}
 
 		// Identify which asset each party swaps and redeems.
@@ -795,6 +803,7 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			ContractScript:  sd.SwapData.ContractA,
 			RedeemTime:      sd.SwapData.RedeemATime,
 			RedeemCoinIn:    sd.SwapData.RedeemACoinID,
+			RedeemSecret:    sd.SwapData.RedeemASecret,
 		}
 		takerStatus := &swapStatusData{
 			SwapAsset:       makerRedeemAsset,
@@ -806,13 +815,11 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			RedeemCoinIn:    sd.SwapData.RedeemBCoinID,
 		}
 
-		if err := translateSwapStatus(mt.makerStatus, makerStatus, takerStatus.ContractCoinOut); err != nil {
-			log.Errorf("Loading match %v failed: %v", mid, err)
-			continue
+		if err := translateSwapStatus(mt.makerStatus, makerStatus, takerStatus); err != nil {
+			return fmt.Errorf("failed to load maker swap status for match %v: %w", mid, err)
 		}
-		if err := translateSwapStatus(mt.takerStatus, takerStatus, makerStatus.ContractCoinOut); err != nil {
-			log.Errorf("Loading match %v failed: %v", mid, err)
-			continue
+		if err := translateSwapStatus(mt.takerStatus, takerStatus, makerStatus); err != nil {
+			return fmt.Errorf("failed to load taker swap status for match %v: %w", mid, err)
 		}
 
 		log.Infof("Resuming swap %v in status %v", mid, mt.Status)
@@ -823,6 +830,32 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		}
 		if len(takerStatus.ContractCoinOut) > 0 {
 			s.registerSwapContractDedup(mid, takerStatus.ContractCoinOut, takerStatus.ContractScript, nil, false)
+		}
+
+		for _, ord := range []order.Order{makerLO, taker} {
+			oid := ord.ID()
+			if seenOrders[oid] {
+				continue
+			}
+			seenOrders[oid] = true
+			assetID := ord.Quote()
+			if ord.Trade().Sell {
+				assetID = ord.Base()
+			}
+			assetOrders[assetID] = append(assetOrders[assetID], ord)
+		}
+	}
+
+	// Restore funding locks for both orders of every active match. Fail if
+	// different orders claim the same funding coin.
+	for assetID, orders := range assetOrders {
+		swapperAsset := s.coins[assetID]
+		if swapperAsset.Locker == nil {
+			continue // account-based assets have no coin locker
+		}
+		if failed := swapperAsset.Locker.LockOrdersCoins(orders); len(failed) > 0 {
+			return fmt.Errorf("failed to seed swap coin locks for %d orders of asset %d (first %v)",
+				len(failed), assetID, failed[0].ID())
 		}
 	}
 
