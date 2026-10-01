@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,6 +183,13 @@ func (m *TAuthManager) recordSend(user account.AccountID, msg *msgjson.Message, 
 		}
 	}
 	return nil
+}
+
+func (m *TAuthManager) ntfnWasLocal(user account.AccountID, route string) (local, ok bool) {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	local, ok = m.ntfnLocal[user][route]
+	return
 }
 
 func (m *TAuthManager) Request(user account.AccountID, msg *msgjson.Message,
@@ -827,6 +835,10 @@ func tNewUnstartedRig(matchInfo *tMatch) *testRig {
 
 func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
 	rig := tNewUnstartedRig(matchInfo)
+	return rig, rig.start()
+}
+
+func (rig *testRig) start() func() {
 	swapper := rig.swapper
 	storage := rig.storage
 
@@ -862,7 +874,7 @@ func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
 
 	rig.swapperWaiter = ssw
 	rig.swapperDone = swapperDone
-	return rig, cleanup
+	return cleanup
 }
 
 func (rig *testRig) applyMatchesAndRequestAcks(t *testing.T, matchSets ...*order.MatchSet) {
@@ -1824,12 +1836,17 @@ func testSwap(t *testing.T, rig *testRig) {
 }
 
 func TestSwaps(t *testing.T) {
-	rig, cleanup := tNewTestRig(nil)
-	defer cleanup()
-
-	rig.auth.auditReq = make(chan struct{}, 1)
-	rig.auth.redeemReceived = make(chan struct{}, 2)
-	rig.auth.redemptionReq = make(chan struct{}, 2)
+	newRig := func(t *testing.T) *testRig {
+		t.Helper()
+		rig := tNewUnstartedRig(nil)
+		// Keep retries and inactivity penalties out of these successful swaps.
+		rig.swapper.bTimeout = time.Hour
+		rig.auth.auditReq = make(chan struct{}, 1)
+		rig.auth.redeemReceived = make(chan struct{}, 2)
+		rig.auth.redemptionReq = make(chan struct{}, 2)
+		t.Cleanup(rig.start())
+		return rig
+	}
 
 	for _, makerSell := range []bool{true, false} {
 		sellStr := " buy"
@@ -1837,22 +1854,26 @@ func TestSwaps(t *testing.T) {
 			sellStr = " sell"
 		}
 		t.Run("perfect limit-limit match"+sellStr, func(t *testing.T) {
+			rig := newRig(t)
 			rig.matches = tPerfectLimitLimit(uint64(1e8), uint64(1e8), makerSell)
 			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("perfect limit-market match"+sellStr, func(t *testing.T) {
+			rig := newRig(t)
 			rig.matches = tPerfectLimitMarket(uint64(1e8), uint64(1e8), makerSell)
 			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("imperfect limit-market match"+sellStr, func(t *testing.T) {
+			rig := newRig(t)
 			// only requirement is that maker val > taker val.
 			rig.matches = tMarketPair(uint64(10e8), uint64(2e8), uint64(5e8), makerSell)
 			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("imperfect limit-limit match"+sellStr, func(t *testing.T) {
+			rig := newRig(t)
 			rig.matches = tLimitPair(uint64(10e8), uint64(2e8), uint64(2e8), uint64(5e8), uint64(5e8), makerSell)
 			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
@@ -1863,6 +1884,7 @@ func TestSwaps(t *testing.T) {
 				marketStr = " market"
 			}
 			t.Run("three match set"+sellStr+marketStr, func(t *testing.T) {
+				rig := newRig(t)
 				matchQtys := []uint64{uint64(1e8), uint64(9e8), uint64(3e8)}
 				rates := []uint64{uint64(10e8), uint64(11e8), uint64(12e8)}
 				// one taker, 3 makers => 4 'match' requests
@@ -4202,48 +4224,405 @@ func TestFailMatch(t *testing.T) {
 }
 
 func TestUserConnectedResend(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		master                 bool
+		makerReconnects        bool
+		bothAcked              bool
+		setup                  func(*matchTracker)
+		wantRoute, wantAddress string
+	}{
+		{
+			name:            "master sends maker the counterparty address",
+			master:          true,
+			makerReconnects: true,
+			bothAcked:       true,
+			wantAddress:     "taker-addr",
+		},
+		{
+			name:        "master sends taker the counterparty address",
+			master:      true,
+			bothAcked:   true,
+			wantAddress: "maker-addr",
+		},
+		{
+			name:            "maker reconnect does not resend taker's pending request",
+			master:          true,
+			makerReconnects: true,
+		},
+		{
+			name:      "master resends taker's pending match request",
+			master:    true,
+			wantRoute: msgjson.MatchRoute,
+		},
+		{
+			name:      "master resends taker's pending audit request",
+			master:    true,
+			bothAcked: true,
+			setup: func(match *matchTracker) {
+				match.Status = order.MakerSwapCast
+				match.makerStatus.swap = &asset.Contract{
+					Coin:         &TCoin{id: randBytes(36)},
+					ContractData: randBytes(32),
+					TxData:       randBytes(50),
+				}
+				match.makerStatus.swapTime = time.Now()
+			},
+			wantRoute:   msgjson.AuditRoute,
+			wantAddress: "maker-addr",
+		},
+		{
+			name:      "master resends taker's pending redemption request",
+			master:    true,
+			bothAcked: true,
+			setup: func(match *matchTracker) {
+				match.Status = order.MakerRedeemed
+				match.makerStatus.redemption = &TCoin{id: randBytes(36)}
+				match.makerStatus.redeemTime = time.Now()
+				match.makerStatus.secret = randBytes(32)
+			},
+			wantRoute:   msgjson.RedemptionRoute,
+			wantAddress: "maker-addr",
+		},
+		{
+			name:            "non-master sends maker the local counterparty address",
+			makerReconnects: true,
+			bothAcked:       true,
+			wantAddress:     "taker-addr",
+		},
+		{
+			name:        "non-master sends taker the local counterparty address",
+			bothAcked:   true,
+			wantAddress: "maker-addr",
+		},
+		{
+			name:            "non-master maker reconnect sends nothing with taker's ack missing",
+			makerReconnects: true,
+		},
+		{name: "non-master does not resend taker's pending request"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			rig.swapper.master.Store(tt.master)
+			tracker := rig.getTracker()
+			tracker.makerSwapAddr = "maker-addr"
+			if tt.bothAcked {
+				tracker.takerSwapAddr = "taker-addr"
+				tracker.counterPartyAddrsSent = true
+			}
+
+			if tt.setup != nil {
+				tt.setup(tracker)
+			}
+
+			user, otherUser := info.taker.acct, info.maker.acct
+			if tt.makerReconnects {
+				user, otherUser = otherUser, user
+			}
+			rig.swapper.UserConnected(user)
+
+			if tt.wantRoute != "" {
+				req := rig.auth.popReq(user)
+				if req == nil || req.req.Route != tt.wantRoute {
+					t.Fatalf("request = %v, want %s", req, tt.wantRoute)
+				}
+			}
+			if tt.wantAddress != "" {
+				var note msgjson.CounterPartyAddress
+				if err := rig.auth.getNtfn(user, msgjson.CounterPartyAddressRoute, &note); err != nil {
+					t.Fatal(err)
+				}
+				if note.Address != tt.wantAddress {
+					t.Fatalf("address = %q, want %q", note.Address, tt.wantAddress)
+				}
+				if local, ok := rig.auth.ntfnWasLocal(user, msgjson.CounterPartyAddressRoute); !ok || !local {
+					t.Fatal("counterparty address notification was not local")
+				}
+			}
+			rig.auth.mtx.Lock()
+			remaining := len(rig.auth.reqs[user]) + len(rig.auth.ntfns[user])
+			otherMessages := len(rig.auth.reqs[otherUser]) + len(rig.auth.ntfns[otherUser])
+			rig.auth.mtx.Unlock()
+			if remaining != 0 {
+				t.Fatalf("reconnecting user received %d unexpected messages", remaining)
+			}
+			if otherMessages != 0 {
+				t.Fatalf("other user received %d messages", otherMessages)
+			}
+		})
+	}
+}
+
+// newStaleRig makes a rig with one tracked match at status and the given
+// per-match addresses. Event times are aged a full bTimeout so only last-send
+// stamps can hold a re-send back. Contracts and the maker redemption follow
+// from status; audit acknowledgements must be set by the caller.
+func newStaleRig(status order.MatchStatus, makerAddr, takerAddr string) (*testRig, *matchTracker, *tMatchSet) {
 	set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
 	matchInfo := set.matchInfos[0]
-	rig, cleanup := tNewTestRig(matchInfo)
-	defer cleanup()
-
-	rig.applyMatchesAndRequestAcks(t, set.matchSet)
-
+	rig := tNewUnstartedRig(matchInfo)
+	rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
 	tracker := rig.getTracker()
-
-	// Set per-match addresses directly to simulate both sides having acked.
-	makerAddr := "maker-addr"
-	takerAddr := "taker-addr"
-	tracker.mtx.Lock()
+	aged := time.Now().Add(-rig.swapper.bTimeout)
+	tracker.Status = status
 	tracker.makerSwapAddr = makerAddr
 	tracker.takerSwapAddr = takerAddr
-	tracker.counterPartyAddrsSent = true
-	tracker.mtx.Unlock()
+	tracker.time = aged
+	tContract := func() *asset.Contract {
+		return &asset.Contract{
+			Coin:         &TCoin{id: randBytes(36)},
+			ContractData: encode.RandomBytes(32),
+			TxData:       encode.RandomBytes(50),
+		}
+	}
+	switch status {
+	case order.MakerSwapCast, order.TakerSwapCast, order.MakerRedeemed:
+		tracker.makerStatus.swap = tContract()
+		tracker.makerStatus.swapTime = aged
+		if status == order.MakerRedeemed {
+			tracker.makerStatus.redemption = &TCoin{id: randBytes(36)}
+			tracker.makerStatus.redeemTime = aged
+			tracker.makerStatus.secret = encode.RandomBytes(32)
+		}
+	}
+	if status == order.TakerSwapCast || status == order.MakerRedeemed {
+		tracker.takerStatus.swap = tContract()
+		tracker.takerStatus.swapTime = aged
+	}
+	return rig, tracker, set
+}
 
-	// Clear any notifications.
-	rig.auth.mtx.Lock()
-	rig.auth.ntfns = make(map[account.AccountID][]*msgjson.Message)
-	rig.auth.mtx.Unlock()
+func popRoutes(auth *TAuthManager, user account.AccountID) (routes []string) {
+	for {
+		req := auth.popReq(user)
+		if req == nil {
+			return
+		}
+		routes = append(routes, req.req.Route)
+	}
+}
 
-	// Simulate maker reconnecting.
-	rig.swapper.UserConnected(matchInfo.maker.acct)
+func drainStaleComms(rig *testRig, set *tMatchSet) {
+	maker, taker := set.matchInfos[0].maker.acct, set.matchInfos[0].taker.acct
+	popRoutes(rig.auth, maker)
+	popRoutes(rig.auth, taker)
+	_ = rig.auth.getNtfn(maker, msgjson.CounterPartyAddressRoute, new(msgjson.CounterPartyAddress))
+	_ = rig.auth.getNtfn(taker, msgjson.CounterPartyAddressRoute, new(msgjson.CounterPartyAddress))
+}
 
-	// Maker should receive a counterparty_address notification with taker's addr.
+func requireQuiet(t *testing.T, rig *testRig, set *tMatchSet) {
+	t.Helper()
+	maker, taker := set.matchInfos[0].maker.acct, set.matchInfos[0].taker.acct
+	if got := popRoutes(rig.auth, maker); len(got) != 0 {
+		t.Fatalf("maker routes = %v, want none", got)
+	}
+	if got := popRoutes(rig.auth, taker); len(got) != 0 {
+		t.Fatalf("taker routes = %v, want none", got)
+	}
+	if err := rig.auth.getNtfn(maker, msgjson.CounterPartyAddressRoute, new(msgjson.CounterPartyAddress)); err == nil {
+		t.Fatalf("unexpected maker counterparty address")
+	}
+	if err := rig.auth.getNtfn(taker, msgjson.CounterPartyAddressRoute, new(msgjson.CounterPartyAddress)); err == nil {
+		t.Fatalf("unexpected taker counterparty address")
+	}
+}
+
+// requireCounterpartyAddress checks the address sent through Send rather than
+// SendIfLocal. An empty want requires no notification.
+func requireCounterpartyAddress(t *testing.T, auth *TAuthManager, side string, user account.AccountID, want string) {
+	t.Helper()
 	var cpa msgjson.CounterPartyAddress
-	err := rig.auth.getNtfn(matchInfo.maker.acct, msgjson.CounterPartyAddressRoute, &cpa)
-	if err != nil {
-		t.Fatalf("no counterparty_address resend on reconnect: %v", err)
+	err := auth.getNtfn(user, msgjson.CounterPartyAddressRoute, &cpa)
+	if want == "" {
+		if err == nil {
+			t.Fatalf("unexpected %s counterparty address %q", side, cpa.Address)
+		}
+		return
 	}
-	if cpa.Address != takerAddr {
-		t.Fatalf("expected resent addr %q, got %q", takerAddr, cpa.Address)
+	if err != nil {
+		t.Fatalf("%s counterparty address: %v", side, err)
+	}
+	if cpa.Address != want {
+		t.Fatalf("%s counterparty address addr = %q, want %q", side, cpa.Address, want)
+	}
+	if local, ok := auth.ntfnWasLocal(user, msgjson.CounterPartyAddressRoute); !ok || local {
+		t.Fatalf("%s counterparty address used SendIfLocal, want Send", side)
+	}
+}
+
+func TestResendStaleRequests(t *testing.T) {
+	tests := []struct {
+		name                               string
+		status                             order.MatchStatus
+		recentAction                       bool
+		bothAuditsAcked                    bool
+		makerAddr, takerAddr               string
+		wantMaker, wantTaker               []string
+		wantMakerAddress, wantTakerAddress string
+	}{
+		{name: "recent match", recentAction: true},
+		{name: "recent match with both addresses", recentAction: true, makerAddr: "maker-addr", takerAddr: "taker-addr"},
+		{
+			name:      "newly matched, taker address missing",
+			status:    order.NewlyMatched,
+			makerAddr: "maker-addr",
+			wantTaker: []string{msgjson.MatchRoute},
+		},
+		{
+			name:             "both addresses, newly matched, address to maker only",
+			status:           order.NewlyMatched,
+			makerAddr:        "maker-addr",
+			takerAddr:        "taker-addr",
+			wantMakerAddress: "taker-addr",
+		},
+		{
+			name:             "maker swap cast, taker audit missing",
+			status:           order.MakerSwapCast,
+			makerAddr:        "maker-addr",
+			takerAddr:        "taker-addr",
+			wantTaker:        []string{msgjson.AuditRoute},
+			wantTakerAddress: "maker-addr",
+		},
+		{
+			name:            "maker redeemed, taker redeem ack missing",
+			bothAuditsAcked: true,
+			status:          order.MakerRedeemed,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+			wantTaker:       []string{msgjson.RedemptionRoute},
+		},
+		{
+			name:            "taker swap cast, nothing pending",
+			bothAuditsAcked: true,
+			status:          order.TakerSwapCast,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+		},
 	}
 
-	// Taker should NOT have received one (only maker reconnected).
-	rig.auth.mtx.Lock()
-	takerNtfns := rig.auth.ntfns[matchInfo.taker.acct]
-	rig.auth.mtx.Unlock()
-	if len(takerNtfns) > 0 {
-		t.Fatal("taker should not receive notification when only maker reconnects")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig, tracker, set := newStaleRig(tt.status, tt.makerAddr, tt.takerAddr)
+			maker, taker := set.matchInfos[0].maker.acct, set.matchInfos[0].taker.acct
+			if tt.bothAuditsAcked {
+				tracker.Sigs.MakerAudit = set.matchInfos[0].maker.sig
+				tracker.Sigs.TakerAudit = set.matchInfos[0].taker.sig
+			}
+			if tt.recentAction {
+				tracker.time = time.Now()
+			}
+			rig.swapper.resendStaleRequests()
+			if got := popRoutes(rig.auth, maker); !slices.Equal(got, tt.wantMaker) {
+				t.Fatalf("maker routes = %v, want %v", got, tt.wantMaker)
+			}
+			if got := popRoutes(rig.auth, taker); !slices.Equal(got, tt.wantTaker) {
+				t.Fatalf("taker routes = %v, want %v", got, tt.wantTaker)
+			}
+			requireCounterpartyAddress(t, rig.auth, "maker", maker, tt.wantMakerAddress)
+			requireCounterpartyAddress(t, rig.auth, "taker", taker, tt.wantTakerAddress)
+		})
+	}
+}
+
+// TestRecentRequestsAreNotResent checks that sends postpone periodic retries.
+func TestRecentRequestsAreNotResent(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		status               order.MatchStatus
+		makerAddr, takerAddr string
+		seed                 func(*testRig, *matchTracker, *tMatchSet)
+	}{
+		{
+			name:      "audit and counterparty address",
+			status:    order.MakerSwapCast,
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+			seed: func(rig *testRig, tr *matchTracker, _ *tMatchSet) {
+				rig.swapper.requestAudit(tr, false)
+				rig.swapper.sendCounterPartyAddresses(tr)
+			},
+		},
+		{
+			name:      "redemption",
+			status:    order.MakerRedeemed,
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+			seed: func(rig *testRig, tr *matchTracker, set *tMatchSet) {
+				tr.Sigs.MakerAudit = set.matchInfos[0].maker.sig
+				tr.Sigs.TakerAudit = set.matchInfos[0].taker.sig
+				rig.swapper.resendRedemptionRequest(tr)
+			},
+		},
+		{
+			name: "match", // NewlyMatched, no addresses
+			seed: func(rig *testRig, _ *matchTracker, set *tMatchSet) {
+				rig.swapper.RequestMatchAcks([]*order.MatchSet{set.matchSet})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig, tr, set := newStaleRig(tc.status, tc.makerAddr, tc.takerAddr)
+			tc.seed(rig, tr, set)
+			drainStaleComms(rig, set)
+			rig.swapper.resendStaleRequests()
+			requireQuiet(t, rig, set)
+		})
+	}
+}
+
+func TestCounterpartyAddressResendPerUser(t *testing.T) {
+	tests := []struct {
+		name                               string
+		status                             order.MatchStatus
+		takerReconnects                    bool // which side reconnects before the tick
+		wantMakerAddress, wantTakerAddress string
+		wantTaker                          []string // routes the tick re-issues to the taker
+	}{
+		{
+			name:             "newly matched, taker reconnect, address to maker",
+			status:           order.NewlyMatched,
+			takerReconnects:  true,
+			wantMakerAddress: "taker-addr",
+		},
+		{
+			name:             "maker swap cast, maker reconnect, address to taker",
+			status:           order.MakerSwapCast,
+			wantTakerAddress: "maker-addr",
+			wantTaker:        []string{msgjson.AuditRoute},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig, _, set := newStaleRig(tt.status, "maker-addr", "taker-addr")
+			maker, taker := set.matchInfos[0].maker.acct, set.matchInfos[0].taker.acct
+
+			// Reconnecting one user must not postpone a retry for the other.
+			reconnectingUser := maker
+			if tt.takerReconnects {
+				reconnectingUser = taker
+			}
+			rig.swapper.UserConnected(reconnectingUser)
+			drainStaleComms(rig, set)
+
+			// The user who needs to broadcast a swap must still receive a retry.
+			rig.swapper.resendStaleRequests()
+			if got := popRoutes(rig.auth, maker); len(got) != 0 {
+				t.Fatalf("maker routes = %v, want none", got)
+			}
+			if got := popRoutes(rig.auth, taker); !slices.Equal(got, tt.wantTaker) {
+				t.Fatalf("taker routes = %v, want %v", got, tt.wantTaker)
+			}
+			requireCounterpartyAddress(t, rig.auth, "maker", maker, tt.wantMakerAddress)
+			requireCounterpartyAddress(t, rig.auth, "taker", taker, tt.wantTakerAddress)
+
+			// The tick's send stamped its recipient's side.
+			rig.swapper.resendStaleRequests()
+			requireQuiet(t, rig, set)
+		})
 	}
 }
 

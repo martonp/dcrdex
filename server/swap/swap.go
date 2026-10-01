@@ -150,7 +150,7 @@ func (ss *swapStatus) redeemSeenTime() time.Time {
 // matchTracker embeds an order.Match and adds some data necessary for tracking
 // the match negotiation.
 type matchTracker struct {
-	mtx sync.RWMutex // Match.Sigs, Match.Status, and per-match addresses
+	mtx sync.RWMutex // Match.Sigs, Match.Status, per-match addresses, and send-attempt times
 	*order.Match
 	time        time.Time // the match request time, not epoch close
 	matchTime   time.Time // epoch close time
@@ -168,6 +168,13 @@ type matchTracker struct {
 	makerSwapAddr         string
 	takerSwapAddr         string
 	counterPartyAddrsSent bool
+	// Node-local times of the last send attempts, including failed sends.
+	// Protected by mtx. Zero means this node has not attempted the send.
+	lastMakerMatch, lastTakerMatch time.Time
+	lastMakerAudit, lastTakerAudit time.Time
+	lastMakerCounterpartyAddress   time.Time
+	lastTakerCounterpartyAddress   time.Time
+	lastRedeem                     time.Time // redemption request to the taker
 }
 
 // expiredBy returns true if the lock time of either party's *known* swap is
@@ -290,6 +297,9 @@ type Swapper struct {
 	lockTimeMaker time.Duration
 	// latencyQ is a queue for coin waiters to deal with network latency.
 	latencyQ *wait.TaperingTickerQueue
+
+	// master is true while Run is active on the acting master.
+	master atomic.Bool
 
 	// handlerMtx should be read-locked for the duration of the comms route
 	// handlers (handleInit and handleRedeem). This blocks shutdown until any
@@ -865,9 +875,242 @@ func (s *Swapper) RestoreActiveSwaps(allowPartial bool) error {
 	return nil
 }
 
+// pendingClientRequests identifies requests whose acknowledgements are still missing.
+type pendingClientRequests struct {
+	makerMatchAck  bool // 'match' request to the maker
+	takerMatchAck  bool // 'match' request to the taker
+	makerAuditAck  bool // 'audit' of the taker's contract, to the maker
+	takerAuditAck  bool // 'audit' of the maker's contract, to the taker
+	takerRedeemAck bool // 'redemption' of the maker's redeem, to the taker
+}
+
+// pendingRequests reports missing client acks. An empty per-match swap address
+// means that side has not acked the match.
+func pendingRequests(match *matchTracker) pendingClientRequests {
+	makerContractKnown, _ := match.makerStatus.contractState()
+	takerContractKnown, _ := match.takerStatus.contractState()
+
+	match.mtx.RLock()
+	defer match.mtx.RUnlock()
+
+	var pending pendingClientRequests
+	// Match requests are no longer needed once both contracts are recorded.
+	switch match.Status {
+	case order.NewlyMatched, order.MakerSwapCast:
+		pending.makerMatchAck = match.makerSwapAddr == ""
+		pending.takerMatchAck = match.takerSwapAddr == ""
+	}
+
+	// Settlement may advance before an audit acknowledgement is recorded.
+	switch match.Status {
+	case order.MakerSwapCast, order.TakerSwapCast, order.MakerRedeemed:
+		pending.makerAuditAck = takerContractKnown && len(match.Sigs.MakerAudit) == 0
+		pending.takerAuditAck = makerContractKnown && len(match.Sigs.TakerAudit) == 0
+	}
+
+	pending.takerRedeemAck = match.Status == order.MakerRedeemed && len(match.Sigs.TakerRedeem) == 0
+	return pending
+}
+
+// resendStaleRequests resends outstanding requests and counterparty addresses
+// once their resend interval has elapsed.
+func (s *Swapper) resendStaleRequests() {
+	now := time.Now()
+	for _, mt := range s.matchSlice() {
+		s.resendPendingRequests(mt, nil, now)
+		s.resendStaleCounterPartyAddress(mt, now)
+	}
+}
+
+// requestResendDue reports whether half the broadcast timeout has elapsed
+// since the triggering action and since the last send attempt.
+func (s *Swapper) requestResendDue(event, last, now time.Time) bool {
+	interval := s.bTimeout / 2
+	return now.Sub(event) >= interval && (last.IsZero() || now.Sub(last) >= interval)
+}
+
+// resendPendingRequestsNow re-issues missing client requests without the
+// tick's age and last-send gates.
+func (s *Swapper) resendPendingRequestsNow(match *matchTracker, user *account.AccountID) {
+	s.resendPendingRequests(match, user, time.Time{})
+}
+
+// resendPendingRequests re-issues missing client requests for match.
+// A nil user includes both sides. A zero now sends immediately.
+func (s *Swapper) resendPendingRequests(match *matchTracker, user *account.AccountID, now time.Time) {
+	pending := pendingRequests(match)
+	include := func(u account.AccountID) bool { return user == nil || *user == u }
+
+	var matchTime, makerSwapTime, takerSwapTime, redeemTime time.Time
+	var lastMakerMatch, lastTakerMatch, lastMakerAudit, lastTakerAudit, lastRedeem time.Time
+	if !now.IsZero() {
+		ms, ts := match.makerStatus, match.takerStatus
+		ms.mtx.RLock()
+		makerSwapTime, redeemTime = ms.swapTime, ms.redeemTime
+		ms.mtx.RUnlock()
+		ts.mtx.RLock()
+		takerSwapTime = ts.swapTime
+		ts.mtx.RUnlock()
+		match.mtx.RLock()
+		matchTime = match.time
+		lastMakerMatch, lastTakerMatch = match.lastMakerMatch, match.lastTakerMatch
+		lastMakerAudit, lastTakerAudit = match.lastMakerAudit, match.lastTakerAudit
+		lastRedeem = match.lastRedeem
+		match.mtx.RUnlock()
+	}
+
+	due := func(pending bool, event, last time.Time) bool {
+		if !pending {
+			return false
+		}
+		if now.IsZero() {
+			return true
+		}
+		return s.requestResendDue(event, last, now)
+	}
+
+	maker, taker := match.Maker.User(), match.Taker.User()
+	if due(pending.makerMatchAck, matchTime, lastMakerMatch) && include(maker) {
+		s.resendMatchRequest(match, true)
+	}
+	if due(pending.takerMatchAck, matchTime, lastTakerMatch) && include(taker) {
+		s.resendMatchRequest(match, false)
+	}
+	// Each side audits the counterparty's contract, so the age anchor is the
+	// counterparty's swap time.
+	if due(pending.makerAuditAck, takerSwapTime, lastMakerAudit) && include(maker) {
+		s.requestAudit(match, true)
+	}
+	if due(pending.takerAuditAck, makerSwapTime, lastTakerAudit) && include(taker) {
+		s.requestAudit(match, false)
+	}
+	if due(pending.takerRedeemAck, redeemTime, lastRedeem) && include(taker) {
+		s.resendRedemptionRequest(match)
+	}
+}
+
+// resendStaleCounterPartyAddress resends the counterparty's address to the
+// user who still needs to broadcast a swap, wherever that user is connected.
+func (s *Swapper) resendStaleCounterPartyAddress(match *matchTracker, now time.Time) {
+	match.mtx.RLock()
+	if match.makerSwapAddr == "" || match.takerSwapAddr == "" {
+		match.mtx.RUnlock()
+		return
+	}
+	var recipient account.AccountID
+	var last time.Time
+	switch match.Status {
+	case order.NewlyMatched:
+		recipient, last = match.Maker.User(), match.lastMakerCounterpartyAddress
+	case order.MakerSwapCast:
+		recipient, last = match.Taker.User(), match.lastTakerCounterpartyAddress
+	default:
+		match.mtx.RUnlock()
+		return
+	}
+	// A reconnect by the other user must not postpone this user's resend.
+	due := s.requestResendDue(match.time, last, now)
+	match.mtx.RUnlock()
+	if due {
+		s.sendCounterPartyAddress(match, recipient, false)
+	}
+}
+
+// resendMatchRequest rebuilds and re-issues a 'match' ack request to one side.
+func (s *Swapper) resendMatchRequest(match *matchTracker, toMaker bool) {
+	match.mtx.Lock()
+	if toMaker {
+		match.lastMakerMatch = time.Now()
+	} else {
+		match.lastTakerMatch = time.Now()
+	}
+	match.mtx.Unlock()
+
+	makerMsg, takerMsg := matchNotifications(match)
+	params, user := msgjson.Signable(takerMsg), match.Taker.User()
+	if toMaker {
+		params, user = makerMsg, match.Maker.User()
+	}
+	s.authMgr.Sign(params)
+	req, err := msgjson.NewRequest(comms.NextID(), msgjson.MatchRoute, []msgjson.Signable{params})
+	if err != nil {
+		log.Errorf("error creating match re-request: %v", err)
+		return
+	}
+	acker := &messageAcker{
+		user:    user,
+		match:   match,
+		params:  params,
+		isMaker: toMaker,
+	}
+	log.Debugf("re-issuing 'match' ack request to user %v (%s) for match %v",
+		user, makerTaker(toMaker), match.ID())
+	err = s.authMgr.Request(user, req, func(_ comms.Link, resp *msgjson.Message) {
+		s.processMatchAcks(user, resp, []*messageAcker{acker})
+	})
+	if err != nil {
+		log.Infof("Failed to re-send %v request to %v for match %v: %v",
+			req.Route, user, match.ID(), err)
+	}
+}
+
+// requestAudit sends the recipient an audit request for the counterparty's
+// recorded contract.
+func (s *Swapper) requestAudit(match *matchTracker, toMaker bool) {
+	// The recipient audits the counterparty's contract.
+	counterpartyStatus, recipientOrder := match.makerStatus, match.Taker
+	if toMaker {
+		counterpartyStatus, recipientOrder = match.takerStatus, match.Maker
+	}
+	counterpartyStatus.mtx.RLock()
+	swap := counterpartyStatus.swap
+	swapTime := counterpartyStatus.swapTime
+	counterpartyStatus.mtx.RUnlock()
+	if swap == nil {
+		return
+	}
+	matchID := match.ID()
+	auditParams := &msgjson.Audit{
+		OrderID:  idToBytes(recipientOrder.ID()),
+		MatchID:  matchID[:],
+		Time:     uint64(swapTime.UnixMilli()),
+		CoinID:   swap.ID(),
+		Contract: swap.ContractData,
+		TxData:   swap.TxData,
+	}
+	s.sendAuditRequest(match, recipientOrder.User(), toMaker, auditParams)
+}
+
+// resendRedemptionRequest rebuilds and re-issues the taker's 'redemption' request.
+func (s *Swapper) resendRedemptionRequest(match *matchTracker) {
+	makerStatus := match.makerStatus
+	makerStatus.mtx.RLock()
+	redemption := makerStatus.redemption
+	secret := makerStatus.secret
+	redeemTime := makerStatus.redeemTime
+	makerStatus.mtx.RUnlock()
+	if redemption == nil {
+		return // pending only at MakerRedeemed after the redeem is recorded
+	}
+	matchID := match.ID()
+	redemptionParams := &msgjson.Redemption{
+		Redeem: msgjson.Redeem{
+			OrderID: idToBytes(match.Taker.ID()),
+			MatchID: matchID[:],
+			CoinID:  redemption.ID(),
+			Secret:  secret,
+		},
+		Time: uint64(redeemTime.UnixMilli()),
+	}
+	// Give the recipient a full response timeout for the resent request.
+	s.sendRedemptionRequest(match, match.Taker.User(), false, redemptionParams, s.bTimeout)
+}
+
 // Run is the main Swapper loop. It's primary purpose is to update transaction
 // confirmations when new blocks are mined, and to trigger inaction checks.
 func (s *Swapper) Run(ctx context.Context) {
+	s.master.Store(true)
+	defer s.master.Store(false)
 	// Permit internal cancel on anomaly such as storage failure.
 	ctxMaster, cancel := context.WithCancel(ctx)
 
@@ -1023,8 +1266,8 @@ func (s *Swapper) Run(ctx context.Context) {
 				s.checkInactionBlockBased(assetID)
 
 			case <-bcastEventTrigger:
-				// Inaction checks that are not relative to blocks.
 				s.checkInactionEventBased()
+				s.resendStaleRequests()
 
 			case <-mainLoop:
 				return
@@ -1791,30 +2034,23 @@ func (s *Swapper) processInit(ctx context.Context, completion *mesh.CommandCompl
 	// Contract now recorded and will be used to reject backward progress
 	// (duplicate or malicious requests client might still send after this point).
 	actor.status.endSwapSearch()
-	s.requestAudit(stepInfo, params, contract, swapTime)
+	s.requestAudit(stepInfo.match, counterParty.isMaker)
 
 	return wait.DontTryAgain
-}
-
-func (s *Swapper) requestAudit(stepInfo *stepInformation, params *msgjson.Init, contract *asset.Contract, swapTime time.Time) {
-	counterParty := stepInfo.counterParty
-	matchID := stepInfo.match.Match.ID()
-	// Prepare an 'audit' request for the counter-party.
-	auditParams := &msgjson.Audit{
-		OrderID:  idToBytes(counterParty.order.ID()),
-		MatchID:  matchID[:],
-		Time:     uint64(swapTime.UnixMilli()),
-		CoinID:   params.CoinID,
-		Contract: params.Contract,
-		TxData:   contract.TxData,
-	}
-	s.sendAuditRequest(stepInfo.match, counterParty.user, counterParty.isMaker, auditParams)
 }
 
 // sendAuditRequest signs and sends a contract 'audit' request to the
 // recipient, registering the acknowledgement callback. The match mtx should
 // NOT be held.
 func (s *Swapper) sendAuditRequest(match *matchTracker, recipient account.AccountID, recipientIsMaker bool, auditParams *msgjson.Audit) {
+	match.mtx.Lock()
+	if recipientIsMaker {
+		match.lastMakerAudit = time.Now()
+	} else {
+		match.lastTakerAudit = time.Now()
+	}
+	match.mtx.Unlock()
+
 	s.authMgr.Sign(auditParams)
 	notification, err := msgjson.NewRequest(comms.NextID(), msgjson.AuditRoute, auditParams)
 	if err != nil {
@@ -1958,6 +2194,12 @@ func (s *Swapper) requestRedemption(stepInfo *stepInformation, params *msgjson.R
 // recipient, registering the acknowledgement callback. The match mtx should
 // NOT be held.
 func (s *Swapper) sendRedemptionRequest(match *matchTracker, recipient account.AccountID, recipientIsMaker bool, rParams *msgjson.Redemption, expireIn time.Duration) {
+	if !recipientIsMaker { // the sweep only re-sends the taker's request
+		match.mtx.Lock()
+		match.lastRedeem = time.Now()
+		match.mtx.Unlock()
+	}
+
 	s.authMgr.Sign(rParams)
 	redemptionReq, err := msgjson.NewRequest(comms.NextID(), msgjson.RedemptionRoute, rParams)
 	if err != nil {
@@ -2432,59 +2674,67 @@ func (s *Swapper) matchAckAddress(acker *messageAcker, address string) (string, 
 // is called after both sides have acknowledged the match with per-match
 // addresses. The match mtx should NOT be held.
 func (s *Swapper) sendCounterPartyAddresses(match *matchTracker) {
-	s.sendCounterPartyAddress(match, match.Maker.User())
-	s.sendCounterPartyAddress(match, match.Taker.User())
+	s.sendCounterPartyAddress(match, match.Maker.User(), true)
+	s.sendCounterPartyAddress(match, match.Taker.User(), true)
 	log.Debugf("Sent %s notifications for match %v (maker addr -> taker, taker addr -> maker)",
 		msgjson.CounterPartyAddressRoute, match.ID())
 }
 
-// UserConnected is called when a user connects (or reconnects). It re-sends
-// counterparty_address notifications for any of the user's active matches where
-// both per-match addresses are available. This recovers from lost notifications
-// due to brief disconnects.
+// UserConnected re-sends counterparty_address notes for matches with both
+// per-match addresses, and on the acting master re-issues the user's still-
+// pending match/audit/redemption requests.
 func (s *Swapper) UserConnected(user account.AccountID) {
 	s.matchMtx.RLock()
-	userMatches := s.userMatches[user]
-	var toResend []*matchTracker
+	userMatches := make([]*matchTracker, 0, len(s.userMatches[user]))
+	for _, mt := range s.userMatches[user] {
+		userMatches = append(userMatches, mt)
+	}
+	s.matchMtx.RUnlock()
+
+	isMaster := s.master.Load()
+
 	for _, mt := range userMatches {
 		mt.mtx.RLock()
 		bothReady := mt.makerSwapAddr != "" && mt.takerSwapAddr != ""
 		mt.mtx.RUnlock()
 		if bothReady {
-			toResend = append(toResend, mt)
+			s.sendCounterPartyAddress(mt, user, true)
 		}
-	}
-	s.matchMtx.RUnlock()
-	for _, mt := range toResend {
-		s.sendCounterPartyAddress(mt, user)
+		if isMaster {
+			s.resendPendingRequestsNow(mt, &user)
+		}
 	}
 }
 
 // sendCounterPartyAddress sends the counterparty's per-match swap address to
-// the specified user for a given match. The match mtx should NOT be held.
-func (s *Swapper) sendCounterPartyAddress(match *matchTracker, user account.AccountID) {
-	match.mtx.RLock()
-	makerAddr := match.makerSwapAddr
-	takerAddr := match.takerSwapAddr
-	match.mtx.RUnlock()
-
-	mid := match.ID()
-	route := msgjson.CounterPartyAddressRoute
-
-	// Determine which side(s) the user is on and send the counterparty's
-	// address. In self-trade scenarios (maker == taker), the user needs
-	// notifications for both sides.
+// user and stamps the recipient side's last-CPA time. The match mtx should
+// NOT be held. localOnly selects SendIfLocal; the tick passes false (Send)
+// because the user may be on the slave.
+func (s *Swapper) sendCounterPartyAddress(match *matchTracker, user account.AccountID, localOnly bool) {
+	send := s.authMgr.Send
+	if localOnly {
+		send = s.authMgr.SendIfLocal
+	}
+	// A self-trade needs a notification for each side.
 	type addrNotification struct {
 		orderID order.OrderID
 		address string
 	}
 	var toSend []addrNotification
+	match.mtx.Lock()
 	if user == match.Maker.User() {
-		toSend = append(toSend, addrNotification{match.Maker.ID(), takerAddr})
+		match.lastMakerCounterpartyAddress = time.Now()
+		toSend = append(toSend, addrNotification{match.Maker.ID(), match.takerSwapAddr})
 	}
 	if user == match.Taker.User() {
-		toSend = append(toSend, addrNotification{match.Taker.ID(), makerAddr})
+		match.lastTakerCounterpartyAddress = time.Now()
+		toSend = append(toSend, addrNotification{match.Taker.ID(), match.makerSwapAddr})
 	}
+	match.mtx.Unlock()
+
+	mid := match.ID()
+	route := msgjson.CounterPartyAddressRoute
+
 	if len(toSend) == 0 {
 		return
 	}
@@ -2502,7 +2752,7 @@ func (s *Swapper) sendCounterPartyAddress(match *matchTracker, user account.Acco
 				route, user, mid, err)
 			continue
 		}
-		if err = s.authMgr.Send(user, ntfn); err != nil {
+		if err = send(user, ntfn); err != nil {
 			log.Debugf("Failed to send %s to %v, match %v: %v",
 				route, user, mid, err)
 		}
@@ -2768,6 +3018,10 @@ func (s *Swapper) RequestMatchAcks(matchSets []*order.MatchSet) {
 
 	for _, match := range ackMatches {
 		// Create an acker for maker and taker, sharing the same matchTracker.
+		match.mtx.Lock()
+		now := time.Now()
+		match.lastMakerMatch, match.lastTakerMatch = now, now
+		match.mtx.Unlock()
 		makerMsg, takerMsg := matchNotifications(match) // msgjson.Match for each party
 		addUserMatch(&messageAcker{
 			user:    match.Maker.User(),
