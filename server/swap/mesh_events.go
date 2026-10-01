@@ -59,6 +59,14 @@ func (s *Swapper) Events() map[string]mesh.EventApplier {
 			}
 			return s.applyAuditAckRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
 		},
+		// TODO(mesh): consider if we actually need the redemption acknowledgement events.
+		meshevents.EventKindRedemptionAckRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			recorded, err := meshevents.DecodeRedemptionAckRecordedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return s.applyRedemptionAckRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
+		},
 	}
 }
 
@@ -380,6 +388,61 @@ func (s *Swapper) applyAuditAckRecordedEvent(ctx context.Context, meta *db.Event
 	}
 	match.mtx.Unlock()
 	return logEntry, nil
+}
+
+func newRedemptionAckRecordedEvent(match *matchTracker, maker bool, sig []byte) (*mesh.Event, error) {
+	event := &meshevents.RedemptionAckRecordedEvent{
+		MatchID: match.ID(),
+		Base:    match.Maker.BaseAsset,
+		Quote:   match.Maker.QuoteAsset,
+		Maker:   maker,
+		Sig:     sig,
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return mesh.NewEvent(event)
+}
+
+// applyRedemptionAckRecordedEvent records an acknowledgement and updates the
+// tracked match's signature, removing the match for a maker acknowledgement.
+func (s *Swapper) applyRedemptionAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.RedemptionAckRecordedEvent) (*db.EventLogEntry, error) {
+	s.matchMtx.RLock()
+	match := s.matches[event.MatchID]
+	s.matchMtx.RUnlock()
+	if match == nil {
+		log.Debugf("Recording %s redemption ack for already removed match %v",
+			makerTaker(event.Maker), event.MatchID)
+	} else if event.Base != match.Maker.BaseAsset || event.Quote != match.Maker.QuoteAsset {
+		return nil, fmt.Errorf("redemption ack recorded market mismatch for match %v", event.MatchID)
+	}
+
+	entry, err := s.storage.ApplyRedemptionAckRecordedEvent(ctx, meta, event)
+	if err != nil {
+		return nil, fmt.Errorf("saving redemption ack signature for match %v: %w", event.MatchID, err)
+	}
+	if match == nil {
+		return entry, nil
+	}
+
+	if event.Maker {
+		// Taker redemption normally removes the match before this acknowledgement.
+		log.Errorf("Maker redemption ack found live match %v; removing it", event.MatchID)
+		s.matchMtx.Lock()
+		if s.matches[event.MatchID] == match {
+			s.deleteMatch(match)
+		}
+		s.matchMtx.Unlock()
+	}
+
+	match.mtx.Lock()
+	if event.Maker {
+		match.Sigs.MakerRedeem = append([]byte(nil), event.Sig...)
+	} else {
+		match.Sigs.TakerRedeem = append([]byte(nil), event.Sig...)
+	}
+	match.mtx.Unlock()
+	return entry, nil
 }
 
 func newMatchAcksRecordedEvent(ackTime time.Time, records []meshevents.MatchAckRecord) (*mesh.Event, error) {

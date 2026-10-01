@@ -17,6 +17,7 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/db/driver/pg/internal"
 	"decred.org/dcrdex/server/meshevents"
 )
 
@@ -765,6 +766,70 @@ func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
 				if wantOrders == 1 && (orders[0].OrderID != actorOrder || orders[0].Canceled) {
 					t.Fatalf("wrong order outcome: %+v", orders[0])
 				}
+			}
+		})
+	}
+}
+
+func TestApplyRedemptionAckRecordedEvent(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		maker bool
+	}{
+		{name: "taker signature"},
+		{name: "maker event log only", maker: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			status := order.MakerRedeemed
+			if tt.maker {
+				status = order.MatchComplete
+			}
+			pair := generateMatch(t, status, !tt.maker, randomAccountID(), randomAccountID())
+			mid := testMarketMatchID(pair.match)
+			if err := archie.updateMatchStmtWithExecutor(archie.db, mid, internal.SetParticipantRedeemAckSig, mid.MatchID, []byte("previous taker ack")); err != nil {
+				t.Fatal(err)
+			}
+			_, wantSwap, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := &meshevents.RedemptionAckRecordedEvent{
+				MatchID: mid.MatchID,
+				Base:    mid.Base,
+				Quote:   mid.Quote,
+				Maker:   tt.maker,
+				Sig:     []byte("new redemption ack"),
+			}
+			payload, err := event.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, err := archie.ApplyRedemptionAckRecordedEvent(ctx, &db.EventLogMeta{Event: payload}, event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tip := testEventApplyTip(t, nil, 1, event.Kind(), payload, event)
+			requireEventApplyLog(t, entry, 1, event.Kind(), payload, tip, event)
+			if !tt.maker {
+				wantSwap.RedeemAAckSig = event.Sig
+			}
+			gotStatus, gotSwap, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotStatus != status || !reflect.DeepEqual(gotSwap, wantSwap) {
+				t.Fatalf("swap data = %v/%+v, want %v/%+v", gotStatus, gotSwap, status, wantSwap)
+			}
+			match, err := archie.MatchByID(mid.MatchID, mid.Base, mid.Quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if match.Active != !tt.maker {
+				t.Fatalf("match active = %v, want %v", match.Active, !tt.maker)
 			}
 		})
 	}

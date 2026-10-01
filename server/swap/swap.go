@@ -1665,11 +1665,12 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 		log.Warnf("unrecognized ack type %T", acker.params)
 		return
 	}
+	if !s.matchTracked(acker.match) {
+		log.Debugf("Ignoring acknowledgement from user %v for untracked match %v", acker.user, acker.match.ID())
+		return
+	}
+
 	if acker.isAudit {
-		if !s.matchTracked(acker.match) {
-			log.Debugf("Ignoring acknowledgement from user %v for untracked match %v", acker.user, acker.match.ID())
-			return
-		}
 		log.Debugf("Received contract 'audit' acknowledgement from user %v (%s) for match %v",
 			acker.user, makerTaker(acker.isMaker), acker.match.ID())
 		event, err := newAuditAckRecordedEvent(acker.match, acker.isMaker, ack.Sig)
@@ -1688,42 +1689,22 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 		return
 	}
 
-	// Set and store the appropriate signature, based on the current step and
-	// actor.
-	mktMatch := db.MatchID(acker.match.Match)
-
-	// If this is the maker's (optional) redeem ack sig, we can stop tracking
-	// the match. Do it here to avoid lock order violation (a deadlock trap).
-	if acker.isMaker { // getting Sigs.MakerRedeem
-		log.Debugf("Deleting completed match %v", mktMatch)
-		s.matchMtx.Lock() // before locking matchTracker.mtx
-		s.deleteMatch(acker.match)
-		s.matchMtx.Unlock()
-	}
-
-	acker.match.mtx.Lock()
-	defer acker.match.mtx.Unlock()
-
 	// It's a redemption ack.
-	log.Debugf("Received 'redemption' acknowledgement from user %v (%s) for match %v (%s)",
-		acker.user, makerTaker(acker.isMaker), acker.match.Match.ID(), acker.match.Status)
+	log.Debugf("Received 'redemption' acknowledgement from user %v (%s) for match %v",
+		acker.user, makerTaker(acker.isMaker), acker.match.ID())
 
-	// This is a redemption acknowledgement. Store the ack signature, and
-	// potentially record the order as complete with the auth manager and in
-	// persistent storage.
-
-	// Record the taker's redeem ack sig. One from the maker isn't required.
-	if acker.isMaker { // maker acknowledging the redeem req we sent regarding the taker redeem
-		acker.match.Sigs.MakerRedeem = ack.Sig
-		// We don't save that pointless sig anymore; use it as a flag.
-	} else { // taker acknowledging the redeem req we sent regarding the maker redeem
-		acker.match.Sigs.TakerRedeem = ack.Sig
-		if err = s.storage.SaveRedeemAckSigB(mktMatch, ack.Sig); err != nil {
-			s.respondError(msg.ID, acker.user, msgjson.RPCInternalError,
-				"internal server error")
-			log.Errorf("SaveRedeemAckSigB failed for match %v: %v", mktMatch.String(), err)
-			return
-		}
+	event, err := newRedemptionAckRecordedEvent(acker.match, acker.isMaker, ack.Sig)
+	if err != nil {
+		log.Errorf("error creating redemption ack recorded event: %v", err)
+		s.respondError(msg.ID, acker.user, msgjson.RPCInternalError, "internal server error")
+		return
+	}
+	if _, err := s.mesh.ApplyEvent(context.Background(), event); err != nil {
+		mesh.LogApplyFailure(log, err, "error applying redemption ack recorded event for match %v: %v",
+			acker.match.Match.ID(), err)
+		msgErr := mesh.ClientError(err, msgjson.RPCInternalError, "internal server error")
+		s.respondError(msg.ID, acker.user, msgErr.Code, msgErr.Message)
+		return
 	}
 }
 

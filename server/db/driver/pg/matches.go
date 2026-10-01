@@ -998,3 +998,19 @@ func (a *Archiver) completeOrderIfSettled(dbe sqlQueryExecutor, matchesTable str
 	outcomes.orders = append(outcomes.orders, &reputationOrderOutcome{user: user, oid: oid})
 	return nil
 }
+
+// ApplyRedemptionAckRecordedEvent stores the taker's acknowledgement of the
+// maker's redemption. Maker acknowledgements only add an event-log entry.
+func (a *Archiver) ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.RedemptionAckRecordedEvent) (*db.EventLogEntry, error) {
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, event.Kind(), txData, func(tx *sql.Tx) error {
+		if event.Maker {
+			return nil
+		}
+		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+		return a.updateMatchStmtWithExecutor(tx, mid, internal.SetParticipantRedeemAckSig, event.MatchID, event.Sig)
+	})
+}

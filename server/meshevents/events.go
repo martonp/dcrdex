@@ -54,4 +54,5 @@ const (
 	EventKindSwapContractRecorded   = "swap_contract_recorded"
 	EventKindAuditAckRecorded       = "audit_ack_recorded"
 	EventKindSwapRedemptionRecorded = "swap_redemption_recorded"
+	EventKindRedemptionAckRecorded  = "redemption_ack_recorded"
 )

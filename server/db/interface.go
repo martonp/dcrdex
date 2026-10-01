@@ -655,6 +655,11 @@ type SwapArchiver interface {
 	// ApplySwapRedemptionRecordedEvent records a swap redemption and the
 	// resulting match and order reputation outcomes.
 	ApplySwapRedemptionRecordedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, event *meshevents.SwapRedemptionRecordedEvent) (*EventLogEntry, error)
+
+	// ApplyRedemptionAckRecordedEvent records a redemption acknowledgement.
+	// Maker redemption acknowledgements have no persistent state beyond the
+	// event-log row.
+	ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.RedemptionAckRecordedEvent) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified

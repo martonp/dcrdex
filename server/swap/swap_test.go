@@ -308,9 +308,11 @@ type TStorage struct {
 	applyMatchAcksRecordedErr error
 	swapContracts             []*meshevents.SwapContractRecordedEvent
 	auditAcks                 []*meshevents.AuditAckRecordedEvent
+	redemptionAcks            []*meshevents.RedemptionAckRecordedEvent
 	saveContractErr           error
 	applyAuditAckRecordedErr  error
 	redemptions               []*meshevents.SwapRedemptionRecordedEvent
+	applyRedemptionAckErr     error
 	applyRedemptionErr        error
 
 	fatalMtx sync.RWMutex
@@ -420,6 +422,16 @@ func (ts *TStorage) ApplySwapRedemptionRecordedEvent(_ context.Context, _ *db.Ev
 		return nil, ts.applyRedemptionErr
 	}
 	ts.redemptions = append(ts.redemptions, redemption)
+	return new(db.EventLogEntry), nil
+}
+
+func (ts *TStorage) ApplyRedemptionAckRecordedEvent(_ context.Context, _ *db.EventLogMeta, ack *meshevents.RedemptionAckRecordedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if ts.applyRedemptionAckErr != nil {
+		return nil, ts.applyRedemptionAckErr
+	}
+	ts.redemptionAcks = append(ts.redemptionAcks, ack)
 	return new(db.EventLogEntry), nil
 }
 
@@ -2449,6 +2461,7 @@ func TestAckMeshUnavailable(t *testing.T) {
 		isAudit bool
 	}{
 		{name: "audit", params: &msgjson.Audit{}, isAudit: true},
+		{name: "redemption", params: &msgjson.Redemption{}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
@@ -2894,6 +2907,9 @@ func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
 			if counterparty.redemption != previousCoin || !counterparty.redeemTime.Equal(previousTime) || !bytes.Equal(counterparty.secret, previousSecret) {
 				t.Fatal("application changed the counterparty's redemption")
 			}
+			if len(rig.storage.redemptionAcks) != 0 {
+				t.Fatalf("unexpected redeem ack writes: %#v", rig.storage.redemptionAcks)
+			}
 			if tt.wantErr != "" {
 				if len(rig.storage.redemptions) != 0 || tracker.Status != tt.initialStatus || actor.redemption != nil || !actor.redeemTime.IsZero() || len(actor.secret) != 0 || len(completed) != 0 {
 					t.Fatal("failed application changed storage, redemption state, or order completion")
@@ -2917,6 +2933,79 @@ func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
 			wantCompleted := []swapDoneCall{{actorOrder.ID(), false}}
 			if !reflect.DeepEqual(completed, wantCompleted) {
 				t.Fatalf("swapDone calls = %v, want %v", completed, wantCompleted)
+			}
+		})
+	}
+}
+
+func TestApplyRedemptionAckRecordedEvent(t *testing.T) {
+	storageErr := errors.New("storage error")
+	tests := []struct {
+		name         string
+		maker        bool
+		missingMatch bool
+		storageErr   error
+	}{
+		{name: "maker after match removal", maker: true, missingMatch: true},
+		{name: "maker with live match", maker: true},
+		{name: "taker"},
+		{name: "taker after match removal", missingMatch: true},
+		{name: "taker storage error", storageErr: storageErr},
+		{name: "maker storage error", maker: true, storageErr: storageErr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			makerSig, takerSig := []byte("previous maker ack"), []byte("previous taker ack")
+			tracker.Sigs.MakerRedeem, tracker.Sigs.TakerRedeem = makerSig, takerSig
+			rig.storage.applyRedemptionAckErr = tt.storageErr
+			if tt.missingMatch {
+				rig.swapper.matchMtx.Lock()
+				rig.swapper.deleteMatch(tracker)
+				rig.swapper.matchMtx.Unlock()
+			}
+
+			recorded := &meshevents.RedemptionAckRecordedEvent{
+				MatchID: info.matchID,
+				Base:    info.match.Maker.BaseAsset,
+				Quote:   info.match.Maker.QuoteAsset,
+				Maker:   tt.maker,
+				Sig:     []byte("redemption ack"),
+			}
+			event, err := newRedemptionAckRecordedEvent(tracker, tt.maker, recorded.Sig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apply := rig.swapper.Events()[meshevents.EventKindRedemptionAckRecorded]
+			_, err = apply(&mesh.EventApplyContext{Context: context.Background()}, event)
+			if !errors.Is(err, tt.storageErr) {
+				t.Fatalf("apply error = %v, want %v", err, tt.storageErr)
+			}
+
+			wantDeleted := tt.missingMatch || (tt.maker && tt.storageErr == nil)
+			if deleted := rig.getTracker() == nil; deleted != wantDeleted {
+				t.Fatalf("match deleted = %v, want %v", deleted, wantDeleted)
+			}
+			var wantAcks []*meshevents.RedemptionAckRecordedEvent
+			if tt.storageErr == nil {
+				wantAcks = []*meshevents.RedemptionAckRecordedEvent{recorded}
+				if !tt.missingMatch {
+					if tt.maker {
+						makerSig = recorded.Sig
+					} else {
+						takerSig = recorded.Sig
+					}
+				}
+			}
+			if !reflect.DeepEqual(rig.storage.redemptionAcks, wantAcks) {
+				t.Fatalf("stored acknowledgements = %+v, want %+v", rig.storage.redemptionAcks, wantAcks)
+			}
+			if !bytes.Equal(tracker.Sigs.MakerRedeem, makerSig) || !bytes.Equal(tracker.Sigs.TakerRedeem, takerSig) {
+				t.Fatalf("maker/taker signatures = %x/%x, want %x/%x", tracker.Sigs.MakerRedeem, tracker.Sigs.TakerRedeem, makerSig, takerSig)
 			}
 		})
 	}
