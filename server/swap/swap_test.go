@@ -224,6 +224,10 @@ func (m *TAuthManager) SwapSuccess(id account.AccountID, mmid db.MarketMatchID, 
 func (m *TAuthManager) Inaction(id account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
 	m.penalize(id, account.FailureToAct)
 }
+func (m *TAuthManager) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
+	return &db.ReputationOutcomePolicy{PreimageLimit: 40, MatchLimit: 60, OrderLimit: 100, FreeCancelThreshold: 2}
+}
+
 func (m *TAuthManager) penalize(id account.AccountID, rule account.Rule) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
@@ -1181,9 +1185,8 @@ func (rig *testRig) redeem_taker(expectSuccess bool) error {
 		if err := rig.waitChans("server received our redeem and we got a redemption note", rig.auth.redeemReceived, rig.auth.redemptionReq); err != nil {
 			return err
 		}
-		tracker := rig.getTracker()
-		if tracker.Status != order.MatchComplete {
-			return fmt.Errorf("unexpected swap status %d after taker redeem notification", tracker.Status)
+		if tracker := rig.getTracker(); tracker != nil {
+			return fmt.Errorf("expected completed match to be removed, found it in status %v", tracker.Status)
 		}
 		err = rig.checkServerResponseSuccess(matchInfo.taker)
 		if err != nil {
@@ -2377,33 +2380,18 @@ func TestRetriesDuringSwap(t *testing.T) {
 	})
 
 	ensureNilErr(rig.redeem_taker(true))
-	// Check that any subsequent redeem request retry will just return a
-	// settlement sequence error, and after the redemption ack, an "unknown
-	// match" error.
+	// Retry after success: match is gone.
 	err := rig.redeem_taker(false)
 	if err == nil {
 		t.Fatalf("expected 2nd redeem request to fail after 1st one succeeded")
 	}
 	ensureNilErr(rig.waitChans("server received our redeem", rig.auth.redeemReceived))
-	tracker = rig.getTracker()
-	if tracker == nil {
-		t.Fatal("missing match tracker after taker redeem")
-	}
-	if tracker.Status != order.MatchComplete {
-		t.Fatalf("unexpected swap status %d after taker redeem notification", tracker.Status)
-	}
-	ensureNilErr(rig.checkServerResponseFail(rig.matchInfo.taker, msgjson.SettlementSequenceError))
+	ensureNilErr(rig.checkServerResponseFail(rig.matchInfo.taker, msgjson.RPCUnknownMatch))
 
 	tickMempool()
 	tickMempool()
-	ensureNilErr(rig.ackRedemption_maker(true)) // will cause match to be deleted
+	ensureNilErr(rig.ackRedemption_maker(true)) // no-op; match already removed
 
-	tracker = rig.getTracker()
-	if tracker != nil {
-		t.Fatalf("expected match to be removed, found it, in status %v", tracker.Status)
-	}
-
-	// Now it will fail with "unknown match".
 	err = rig.redeem_taker(false)
 	if err == nil {
 		t.Fatalf("expected 2nd redeem request to fail after 1st one succeeded")
@@ -2801,6 +2789,182 @@ func storedSwapContracts(storage *TStorage) []*meshevents.SwapContractRecordedEv
 	storage.mtx.Lock()
 	defer storage.mtx.Unlock()
 	return append([]*meshevents.SwapContractRecordedEvent(nil), storage.swapContracts...)
+}
+
+func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
+	storageErr := errors.New("storage error")
+	redeemTime := time.UnixMilli(1670000000123).UTC()
+	tests := []struct {
+		name          string
+		maker         bool
+		initialStatus order.MatchStatus
+		storageErr    error
+		unknownMatch  bool
+		wantErr       string
+	}{
+		{name: "maker", maker: true, initialStatus: order.TakerSwapCast},
+		{name: "taker", initialStatus: order.MakerRedeemed},
+		{name: "maker storage error", maker: true, initialStatus: order.TakerSwapCast, storageErr: storageErr, wantErr: "storage error"},
+		{name: "taker storage error", initialStatus: order.MakerRedeemed, storageErr: storageErr, wantErr: "storage error"},
+		{name: "maker wrong status", maker: true, initialStatus: order.MakerRedeemed, wantErr: "requires status"},
+		{name: "taker wrong status", initialStatus: order.TakerSwapCast, wantErr: "requires status"},
+		{name: "unknown match", maker: true, initialStatus: order.TakerSwapCast, unknownMatch: true, wantErr: "unknown match"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			swapper := rig.swapper
+			swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			tracker.Status = tt.initialStatus
+			rig.storage.applyRedemptionErr = tt.storageErr
+
+			actor, counterparty := tracker.takerStatus, tracker.makerStatus
+			actorOrder, nextStatus := tracker.Taker, order.MatchComplete
+			if tt.maker {
+				actor, counterparty = tracker.makerStatus, tracker.takerStatus
+				actorOrder, nextStatus = tracker.Maker, order.MakerRedeemed
+			}
+			counterparty.swap = &asset.Contract{ContractData: randBytes(50)}
+			// A taker redeems after the maker has already revealed the secret.
+			if !tt.maker && tt.initialStatus == order.MakerRedeemed {
+				counterparty.redemption = &TCoin{id: randBytes(36)}
+				counterparty.redeemTime = redeemTime.Add(-time.Second)
+				counterparty.secret = randBytes(32)
+			}
+			previousCoin, previousTime := counterparty.redemption, counterparty.redeemTime
+			previousSecret := append([]byte(nil), counterparty.secret...)
+
+			recorded := &meshevents.SwapRedemptionRecordedEvent{
+				MatchID:    info.matchID,
+				Base:       tracker.Maker.BaseAsset,
+				Quote:      tracker.Maker.QuoteAsset,
+				Maker:      tt.maker,
+				Status:     nextStatus,
+				CoinID:     randBytes(36),
+				CoinTxID:   "redemption transaction",
+				CoinString: "redemption coin",
+				Value:      1e8,
+				FeeRate:    12,
+				RedeemTime: redeemTime.UnixMilli(),
+			}
+			if tt.maker {
+				recorded.Secret = randBytes(32)
+			}
+			if tt.unknownMatch {
+				recorded.MatchID[0] ^= 1
+			}
+			event, err := mesh.NewEvent(recorded)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var completed []swapDoneCall
+			swapper.swapDone = func(ord order.Order, _ *order.Match, faulted bool) {
+				completed = append(completed, swapDoneCall{ord.ID(), faulted})
+			}
+			coinID, contract, secretHash := randBytes(36), randBytes(50), randBytes(32)
+			swapper.registerSwapContractDedup(info.matchID, coinID, contract, secretHash, true)
+			otherMatch := info.matchID
+			otherMatch[0] ^= 1
+
+			apply := swapper.Events()[meshevents.EventKindSwapRedemptionRecorded]
+			_, err = apply(&mesh.EventApplyContext{Context: context.Background()}, event)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("apply error = %v, want %q", err, tt.wantErr)
+			}
+			if tt.storageErr != nil && !errors.Is(err, tt.storageErr) {
+				t.Fatalf("apply error = %v, want wrapped storage error", err)
+			}
+
+			wantDeleted := tt.wantErr == "" && !tt.maker
+			if gone := rig.getTracker() == nil; gone != wantDeleted {
+				t.Fatalf("match deleted = %v, want %v", gone, wantDeleted)
+			}
+			dedupErr := swapper.checkSwapContractDedup(otherMatch, coinID, contract, secretHash, true)
+			if freed := dedupErr == nil; freed != wantDeleted {
+				t.Fatalf("contract reuse entries freed = %v, want %v", freed, wantDeleted)
+			}
+			if counterparty.redemption != previousCoin || !counterparty.redeemTime.Equal(previousTime) || !bytes.Equal(counterparty.secret, previousSecret) {
+				t.Fatal("application changed the counterparty's redemption")
+			}
+			if tt.wantErr != "" {
+				if len(rig.storage.redemptions) != 0 || tracker.Status != tt.initialStatus || actor.redemption != nil || !actor.redeemTime.IsZero() || len(actor.secret) != 0 || len(completed) != 0 {
+					t.Fatal("failed application changed storage, redemption state, or order completion")
+				}
+				return
+			}
+
+			if !reflect.DeepEqual(rig.storage.redemptions, []*meshevents.SwapRedemptionRecordedEvent{recorded}) {
+				t.Fatalf("stored redemptions = %+v, want %+v", rig.storage.redemptions, recorded)
+			}
+			if tracker.Status != nextStatus || !actor.redeemTime.Equal(redeemTime) {
+				t.Fatalf("status/time = %v/%v, want %v/%v", tracker.Status, actor.redeemTime, nextStatus, redeemTime)
+			}
+			coin := actor.redemption
+			if coin == nil || !bytes.Equal(coin.ID(), recorded.CoinID) || coin.TxID() != recorded.CoinTxID || coin.String() != recorded.CoinString || coin.Value() != recorded.Value || coin.FeeRate() != recorded.FeeRate {
+				t.Fatalf("wrong reconstructed redemption: %+v", coin)
+			}
+			if !bytes.Equal(actor.secret, recorded.Secret) {
+				t.Fatalf("secret = %x, want %x", actor.secret, recorded.Secret)
+			}
+			wantCompleted := []swapDoneCall{{actorOrder.ID(), false}}
+			if !reflect.DeepEqual(completed, wantCompleted) {
+				t.Fatalf("swapDone calls = %v, want %v", completed, wantCompleted)
+			}
+		})
+	}
+}
+
+func TestDeleteMatchRetainsSharedOrderLocks(t *testing.T) {
+	set := tMultiMatchSet([]uint64{1e8, 2e8}, []uint64{5e7, 5e7}, true, false)
+	rig := tNewUnstartedRig(set.matchInfos[0])
+	swapper := rig.swapper
+	now := time.Now().UTC()
+
+	takerOrd := set.matchInfos[0].match.Taker
+	takerOrd.Trade().Coins = []order.CoinID{randBytes(36)}
+
+	trackers := make([]*matchTracker, 0, 2)
+	for _, mi := range set.matchInfos {
+		mt := &matchTracker{
+			Match:       mi.match,
+			time:        now,
+			matchTime:   now,
+			makerStatus: &swapStatus{swapAsset: ABCID, redeemAsset: XYZID},
+			takerStatus: &swapStatus{swapAsset: XYZID, redeemAsset: ABCID},
+		}
+		swapper.addMatch(mt)
+		trackers = append(trackers, mt)
+	}
+	swapper.LockOrdersCoins([]order.Order{takerOrd})
+
+	locker := swapper.coins[XYZID].Locker // buy-side taker funds with the quote asset
+	deleteTracker := func(mt *matchTracker) {
+		swapper.matchMtx.Lock()
+		swapper.deleteMatch(mt)
+		swapper.matchMtx.Unlock()
+	}
+
+	deleteTracker(trackers[0])
+	for _, coin := range takerOrd.Trade().Coins {
+		if !locker.CoinLocked(coin) {
+			t.Fatalf("shared taker order unlocked while another active match references it")
+		}
+	}
+
+	deleteTracker(trackers[1])
+	for _, coin := range takerOrd.Trade().Coins {
+		if locker.CoinLocked(coin) {
+			t.Fatalf("taker order still locked after its last active match was deleted")
+		}
+	}
 }
 
 func TestApplyMatchAcksRecordedEvent(t *testing.T) {
@@ -3419,6 +3583,11 @@ func TestCoinIDDedupSameMatch(t *testing.T) {
 	if strings.Contains(rpcErr.Message, "already in use") {
 		t.Fatal("CoinID dedup should not reject same-match retries")
 	}
+}
+
+type swapDoneCall struct {
+	oid  order.OrderID
+	fail bool
 }
 
 func TestUserConnectedResend(t *testing.T) {

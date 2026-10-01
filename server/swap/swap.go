@@ -68,6 +68,7 @@ type AuthManager interface {
 		expireTimeout time.Duration, expireFunc func()) error
 	SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time)
 	Inaction(user account.AccountID, misstep db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID)
+	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
 }
 
 // Storage updates match data in what is presumably a database.
@@ -99,6 +100,9 @@ type swapStatus struct {
 	// transaction.
 	redeemTime time.Time
 	redemption asset.Coin
+	// secret is the maker's revealed secret, included in redemption requests
+	// sent to the taker.
+	secret []byte
 }
 
 // String satisfies the Stringer interface for pretty printing. The swapStatus
@@ -424,6 +428,17 @@ func (s *Swapper) addMatch(mt *matchTracker) {
 	}
 }
 
+// orderBacksActiveMatch reports whether any active match references the
+// user's order. The matchMtx must be locked.
+func (s *Swapper) orderBacksActiveMatch(user account.AccountID, oid order.OrderID) bool {
+	for _, mt := range s.userMatches[user] {
+		if mt.Maker.ID() == oid || mt.Taker.ID() == oid {
+			return true
+		}
+	}
+	return false
+}
+
 // deleteMatch unregisters a match. The matchMtx must be locked.
 func (s *Swapper) deleteMatch(mt *matchTracker) {
 	mid := mt.ID()
@@ -441,12 +456,6 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 	delete(s.matchSecretHashes, mid)
 	s.activeCoinsMtx.Unlock()
 
-	// Unlock the maker and taker order coins. May be redundant if processBlock
-	// confirmed both swaps, but premature/quick counterparty actions that
-	// advance match status first prevent that.
-	s.unlockOrderCoins(mt.Maker)
-	s.unlockOrderCoins(mt.Taker)
-
 	// Remove the match from both maker's and taker's match maps.
 	maker, taker := mt.Maker.User(), mt.Taker.User()
 	for _, user := range []account.AccountID{maker, taker} {
@@ -463,6 +472,14 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 		if maker == taker {
 			break
 		}
+	}
+
+	// Keep an order's funding coins locked while another active match uses it.
+	if !s.orderBacksActiveMatch(maker, mt.Maker.ID()) {
+		s.unlockOrderCoins(mt.Maker)
+	}
+	if !s.orderBacksActiveMatch(taker, mt.Taker.ID()) {
+		s.unlockOrderCoins(mt.Taker)
 	}
 
 	deleteAcctMatch := func(matches map[string]map[order.MatchID]*matchTracker, acctAddr string, mt *matchTracker) {
@@ -1549,8 +1566,7 @@ func (s *Swapper) step(user account.AccountID, matchID order.MatchID) (*stepInfo
 			}
 		} else /* MakerRedeemed */ {
 			nextStep = order.MatchComplete
-			// Note that the swap is still considered "active" until both
-			// counterparties acknowledge the redemptions.
+			// Inactive/deleted when this redeem is recorded.
 			isBaseAsset = maker.Sell // taker redeem: base asset if buy (maker sell)
 			if len(match.Sigs.TakerRedeem) == 0 {
 				log.Debugf("Swap %v at status %v missing TakerRedeem signature(s) expected before MakerRedeemed->MatchComplete",
@@ -1915,20 +1931,29 @@ func (s *Swapper) sendAuditRequest(match *matchTracker, recipient account.Accoun
 	}
 }
 
-// processRedeem processes a 'redeem' request from a client. processRedeem does
-// not perform user authentication, which is handled in handleRedeem before
-// processRedeem is invoked. This method is run as a coin waiter.
-func (s *Swapper) processRedeem(msg *msgjson.Message, params *msgjson.Redeem, stepInfo *stepInformation) wait.TryDirective {
+// processRedeem checks the secret and redemption transaction, then emits a
+// swap_redemption_recorded event. It retries while the transaction is not found.
+func (s *Swapper) processRedeem(ctx context.Context, completion *mesh.CommandCompletion, params *msgjson.Redeem, stepInfo *stepInformation) wait.TryDirective {
 	// TODO(consider): Extract secret from initiator's (maker's) redemption
-	// transaction. The Backend would need a method identify the component of
+	// transaction. The Backend would need a method to identify the component of
 	// the redemption transaction that contains the secret and extract it. In a
 	// UTXO-based asset, this means finding the input that spends the output of
 	// the counterparty's contract, and process that input's signature script
-	// with FindKeyPush. Presently this is up to the clients and not stored with
-	// the server.
+	// with FindKeyPush. Presently the clients provide the secret.
 
 	// Make sure that the expected output is being spent.
 	actor, counterParty := stepInfo.actor, stepInfo.counterParty
+	failMsg := func(msgErr *msgjson.Error) wait.TryDirective {
+		actor.status.endRedeemSearch()
+		if err := completion.Fail(ctx, msgErr); err != nil {
+			log.Errorf("failed to send redeem command error for user %v: %v", actor.user, err)
+		}
+		return wait.DontTryAgain
+	}
+	fail := func(code int, format string, args ...any) wait.TryDirective {
+		return failMsg(msgjson.NewError(code, format, args...))
+	}
+
 	counterParty.status.mtx.RLock()
 	cpContract := counterParty.status.swap.ContractData
 	cpSwapCoin := counterParty.status.swap.ID()
@@ -1942,9 +1967,7 @@ func (s *Swapper) processRedeem(msg *msgjson.Message, params *msgjson.Redeem, st
 	if !chain.ValidateSecret(params.Secret, cpContract) {
 		log.Infof("Secret validation failed (match id=%v, maker=%v, secret=%v)",
 			matchID, actor.isMaker, params.Secret)
-		actor.status.endRedeemSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.InvalidRequestError, "secret validation failed")
-		return wait.DontTryAgain
+		return fail(msgjson.InvalidRequestError, "secret validation failed")
 	}
 	redemption, err := chain.Redemption(params.CoinID, cpSwapCoin, cpContract)
 	// If there is an error, don't return an error yet, since it could be due to
@@ -1957,91 +1980,45 @@ func (s *Swapper) processRedeem(msg *msgjson.Message, params *msgjson.Redeem, st
 		log.Warnf("Redemption error encountered for match %s, actor %s, using coin ID %v to satisfy contract at %x: %v",
 			stepInfo.match.ID(), actor, params.CoinID, cpSwapCoin, err)
 		actor.status.mtx.RUnlock()
-		actor.status.endRedeemSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.RedemptionError,
-			fmt.Sprintf("redemption error encountered: %v", err))
-		return wait.DontTryAgain
+		return fail(msgjson.RedemptionError, "redemption error encountered: %v", err)
 	}
 
-	newStatus := stepInfo.nextStep
+	redeemTime := unixMsNow()
+	event, err := newSwapRedemptionRecordedEvent(stepInfo, params, redemption, redeemTime)
+	if err != nil {
+		log.Errorf("error creating swap redemption recorded event: %v", err)
+		return fail(msgjson.RPCInternalError, "internal server error")
+	}
 
 	// NOTE: redemption.FeeRate is not checked since the counterparty is not
 	// inconvenienced by slow confirmation of the redemption.
 
-	// Modify the match's swapStatuses, but only if the match wasn't revoked
-	// while waiting for the txn.
-	s.matchMtx.RLock()
-	if _, found := s.matches[matchID]; !found {
-		s.matchMtx.RUnlock()
-		log.Errorf("Redeem txn found after match was revoked (match id=%v, maker=%v)",
-			matchID, actor.isMaker)
-		actor.status.endRedeemSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.RedemptionError, "match already revoked due to inaction")
-		return wait.DontTryAgain
+	if err := completion.Emit(ctx, event, func() any {
+		// Redemption now recorded and will be used to reject backward progress
+		// from duplicate or malicious requests after this point.
+		actor.status.endRedeemSearch()
+		s.authMgr.Sign(params)
+		return &msgjson.Acknowledgement{
+			MatchID: matchID[:],
+			Sig:     params.Sig,
+		}
+	}); err != nil {
+		mesh.LogApplyFailure(log, err, "error applying swap redemption recorded event for match %v: %v", matchID, err)
+		return failMsg(mesh.ClientError(err, msgjson.RPCInternalError, "internal server error"))
 	}
-
-	actor.status.mtx.Lock()
-	redeemTime := unixMsNow()
-	actor.status.redemption = redemption // redemption should not be set already (handleRedeem should gate)
-	actor.status.redeemTime = redeemTime
-	actor.status.mtx.Unlock()
-
-	match.mtx.Lock()
-	match.Status = newStatus // handleRedeem (gate mechanism) won't allow backward progress
-	match.mtx.Unlock()
-
-	// Only unlock match map after the statuses and txn times are stored,
-	// ensuring that checkInaction will not revoke the match as we respond.
-	s.matchMtx.RUnlock()
-
-	// Redemption now recorded and will be used to reject backward progress (duplicate
-	// or malicious requests client might still send after this point).
-	actor.status.endRedeemSearch()
 
 	log.Debugf("processRedeem: valid redemption %v (%s) spending contract %s received at %v from %v (%s) for match %v, "+
 		"swapStatus %v => %v", redemption, stepInfo.asset.Symbol, cpSwapStr, redeemTime, actor.user,
-		makerTaker(actor.isMaker), matchID, stepInfo.step, newStatus)
-	// If MatchComplete, we'll delete the match in processAck if the maker
-	// responds to the courtesy redemption request, or checkInactionEventBased.
+		makerTaker(actor.isMaker), matchID, stepInfo.step, stepInfo.nextStep)
+	s.requestRedemption(stepInfo, params, redeemTime)
+	return wait.DontTryAgain
+}
 
-	// Store the swap contract and the coinID (e.g. txid:vout) containing the
-	// contract script hash. Maker is party A, the initiator, who first reveals
-	// the secret. Taker is party B, the participant.
-	storFn := s.storage.SaveRedeemB // taker's redeem also sets match status to MatchComplete, active to FALSE
-	if actor.isMaker {
-		// Maker redeem stores the secret too.
-		storFn = func(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-			return s.storage.SaveRedeemA(mid, coinID, params.Secret, timestamp) // also sets match status to MakerRedeemed
-		}
-	}
-
-	redeemTimeMs := redeemTime.UnixMilli()
-	err = storFn(db.MatchID(match.Match), params.CoinID, redeemTimeMs)
-	if err != nil {
-		log.Errorf("saving redeem transaction (match id=%v, maker=%v) failed: %v",
-			matchID, actor.isMaker, err)
-		// Neither party's fault. Continue.
-	}
-
-	// Credit the user for completing the swap, adjusting the user's score.
-	if actor.user != counterParty.user {
-		s.authMgr.SwapSuccess(actor.user, db.MatchID(match.Match), match.Quantity, redeemTime) // maybe call this in swapDone callback
-	}
-
-	// Issue a positive response to the actor.
-	s.authMgr.Sign(params)
-	s.respondSuccess(msg.ID, actor.user, &msgjson.Acknowledgement{
-		MatchID: matchID[:],
-		Sig:     params.Sig,
-	})
-
-	// Cancellation rate accounting
-	ord := match.Taker
-	if actor.isMaker {
-		ord = match.Maker
-	}
-
-	s.swapDone(ord, match.Match, false)
+// requestRedemption asks the counterparty to acknowledge the recorded redemption.
+func (s *Swapper) requestRedemption(stepInfo *stepInformation, params *msgjson.Redeem, redeemTime time.Time) {
+	match := stepInfo.match
+	matchID := match.ID()
+	counterParty := stepInfo.counterParty
 
 	// Inform the counterparty, even though the maker doesn't really care about
 	// the taker's redeem details.
@@ -2052,41 +2029,48 @@ func (s *Swapper) processRedeem(msg *msgjson.Message, params *msgjson.Redeem, st
 			CoinID:  params.CoinID,
 			Secret:  params.Secret,
 		},
-		Time: uint64(redeemTimeMs),
+		Time: uint64(redeemTime.UnixMilli()),
 	}
+	s.sendRedemptionRequest(match, counterParty.user, counterParty.isMaker, rParams,
+		time.Until(redeemTime.Add(s.bTimeout)))
+}
+
+// sendRedemptionRequest signs and sends a 'redemption' request to the
+// recipient, registering the acknowledgement callback. The match mtx should
+// NOT be held.
+func (s *Swapper) sendRedemptionRequest(match *matchTracker, recipient account.AccountID, recipientIsMaker bool, rParams *msgjson.Redemption, expireIn time.Duration) {
 	s.authMgr.Sign(rParams)
 	redemptionReq, err := msgjson.NewRequest(comms.NextID(), msgjson.RedemptionRoute, rParams)
 	if err != nil {
 		log.Errorf("error creating redemption request: %v", err)
-		return wait.DontTryAgain
+		return
 	}
 
+	matchID := match.ID()
 	// Send the redemption request.
-	log.Debugf("processRedeem: sending 'redemption' request to counterparty %v (%s) "+
-		"for match %v", counterParty.user, makerTaker(counterParty.isMaker), matchID)
+	log.Debugf("sending 'redemption' request to counterparty %v (%s) "+
+		"for match %v", recipient, makerTaker(recipientIsMaker), matchID)
 
 	// Set up the redemption acknowledgement callback.
 	ack := &messageAcker{
-		user:    counterParty.user,
+		user:    recipient,
 		match:   match,
 		params:  rParams,
-		isMaker: counterParty.isMaker,
-		// isAudit: false,
+		isMaker: recipientIsMaker,
 	}
 
 	// The counterparty does not need to actually locate the redemption txn,
 	// so use the default request timeout.
 	err = s.authMgr.RequestWithTimeout(ack.user, redemptionReq, func(_ comms.Link, resp *msgjson.Message) {
 		s.processAck(resp, ack) // resp.ID == notification.ID
-	}, time.Until(redeemTime.Add(s.bTimeout)), func() {
-		log.Infof("Timeout waiting for 'redemption' request from user %v (%s) for match %v",
+	}, expireIn, func() {
+		log.Infof("Timeout waiting for 'redemption' acknowledgement from user %v (%s) for match %v",
 			ack.user, makerTaker(ack.isMaker), matchID)
 	})
 	if err != nil {
-		log.Debugf("Couldn't send 'redemption' request to user %v (%s) for match %v", ack.user, makerTaker(ack.isMaker), matchID)
+		log.Debugf("Couldn't send 'redemption' request to user %v (%s) for match %v: %v",
+			ack.user, makerTaker(ack.isMaker), matchID, err)
 	}
-
-	return wait.DontTryAgain
 }
 
 // executeInit handles the 'init' command, which is used to inform the DEX of a
@@ -2202,26 +2186,20 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 	})
 }
 
-// handleRedeem handles the 'redeem' request from a user. Most of the work is
-// performed by processRedeem, but the request is parsed and user is
-// authenticated first.
-func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *msgjson.Error {
+// executeRedeem handles the 'redeem' command. Most of the work is performed by
+// processRedeem, but the request is parsed and user is authenticated first.
+func (s *Swapper) executeRedeem(cmdCtx *mesh.CommandContext) *msgjson.Error {
+	user, msg := cmdCtx.Request.User, cmdCtx.Request.Msg
 	s.handlerMtx.RLock()
 	defer s.handlerMtx.RUnlock() // block shutdown until registered with latencyQ
 	if s.stop {
-		return &msgjson.Error{
-			Code:    msgjson.TryAgainLaterError,
-			Message: "The swapper is stopping. Try again later.",
-		}
+		return msgjson.NewError(msgjson.TryAgainLaterError, "The swapper is stopping. Try again later.")
 	}
 
 	params := new(msgjson.Redeem)
 	err := msg.Unmarshal(&params)
 	if err != nil || params == nil {
-		return &msgjson.Error{
-			Code:    msgjson.RPCParseError,
-			Message: "Error decoding 'redeem' request payload",
-		}
+		return msgjson.NewError(msgjson.RPCParseError, "Error decoding 'redeem' request payload")
 	}
 
 	rpcErr := s.authUser(user, params)
@@ -2233,14 +2211,12 @@ func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *ms
 		user, params.MatchID, params.OrderID)
 
 	if len(params.MatchID) != order.MatchIDSize {
-		return &msgjson.Error{
-			Code:    msgjson.RPCParseError,
-			Message: "Invalid 'matchid' in 'redeem' message",
-		}
+		return msgjson.NewError(msgjson.RPCParseError, "Invalid 'matchid' in 'redeem' message")
 	}
 
 	var matchID order.MatchID
 	copy(matchID[:], params.MatchID)
+
 	stepInfo, rpcErr := s.step(user, matchID)
 	if rpcErr != nil {
 		return rpcErr
@@ -2253,16 +2229,12 @@ func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *ms
 		// Ensure we only start one coin waiter for this redeem. This is an
 		// atomic CAS, so it must ultimately be followed by endRedeemSearch().
 		if !stepInfo.actor.status.startRedeemSearch() {
-			return &msgjson.Error{
-				Code:    msgjson.DuplicateRequestError, // not really a sequence error since they are still the "actor"
-				Message: "already received a redeem transaction, search in progress",
-			}
+			return msgjson.NewError(msgjson.DuplicateRequestError, "already received a redeem transaction, search in progress")
 		}
-	default: // also includes MatchComplete
-		return &msgjson.Error{
-			Code:    msgjson.SettlementSequenceError,
-			Message: "swap contracts not yet received",
-		}
+	default:
+		// Too early to redeem (e.g. contracts not both in yet). A finished
+		// match is already off the map, so a retry fails earlier as unknown.
+		return msgjson.NewError(msgjson.SettlementSequenceError, "swap contracts not yet received")
 	}
 
 	// Validate the redeem coin ID before starting a wait. This does not
@@ -2273,10 +2245,7 @@ func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *ms
 		stepInfo.actor.status.endRedeemSearch()
 		// TODO: ensure Backends provide sanitized errors or type information to
 		// provide more details to the client.
-		return &msgjson.Error{
-			Code:    msgjson.ContractError,
-			Message: "invalid 'redeem' parameters",
-		}
+		return msgjson.NewError(msgjson.ContractError, "invalid 'redeem' parameters")
 	}
 
 	// Search for the transaction for the full txWaitExpiration, even if it goes
@@ -2290,18 +2259,32 @@ func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *ms
 	s.latencyQ.Wait(&wait.Waiter{
 		Expiration: expireTime,
 		TryFunc: func() wait.TryDirective {
-			return s.processRedeem(msg, params, stepInfo)
+			return s.processRedeem(context.Background(), cmdCtx.Completion, params, stepInfo)
 		},
 		ExpireFunc: func() {
 			stepInfo.actor.status.endRedeemSearch()
 			// NOTE: We may consider a shorter expire time so the client can
 			// receive warning that there may be node or wallet connectivity
 			// trouble while they still have a chance to fix it.
-			s.respondError(msg.ID, user, msgjson.TransactionUndiscovered,
-				fmt.Sprintf("failed to find redeemed coin %v", coinStr))
+			if err := cmdCtx.Completion.Fail(context.Background(),
+				msgjson.NewError(msgjson.TransactionUndiscovered, "failed to find redeemed coin %v", coinStr)); err != nil {
+				log.Errorf("failed to send redeem timeout error for user %v: %v", user, err)
+			}
 		},
 	})
 	return nil
+}
+
+// handleRedeem routes redeem requests through the mesh command service.
+func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *msgjson.Error {
+	return s.mesh.ExecuteCommand(context.Background(), mesh.CommandRequest{
+		Kind: commandKindRedeem,
+		User: user,
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			return s.authMgr.Send(user, resp)
+		},
+	})
 }
 
 // revoke revokes the match, sending the 'revoke_match' request to each client

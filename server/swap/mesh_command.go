@@ -8,12 +8,14 @@ import (
 )
 
 const (
-	commandKindInit = "init"
+	commandKindInit   = "init"
+	commandKindRedeem = "redeem"
 )
 
 // Commands returns the mesh command handlers.
 func (s *Swapper) Commands() map[string]mesh.CommandExecutor {
 	return map[string]mesh.CommandExecutor{
-		commandKindInit: s.executeInit,
+		commandKindInit:   s.executeInit,
+		commandKindRedeem: s.executeRedeem,
 	}
 }

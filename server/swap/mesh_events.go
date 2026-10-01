@@ -45,6 +45,13 @@ func (s *Swapper) Events() map[string]mesh.EventApplier {
 			}
 			return s.applySwapContractRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
 		},
+		meshevents.EventKindSwapRedemptionRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			recorded, err := meshevents.DecodeSwapRedemptionRecordedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return s.applySwapRedemptionRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
+		},
 		meshevents.EventKindAuditAckRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			recorded, err := meshevents.DecodeAuditAckRecordedEvent(event.Payload)
 			if err != nil {
@@ -212,6 +219,127 @@ func (s *Swapper) prepareSwapContractUpdate(event *meshevents.SwapContractRecord
 	}
 
 	return match, status, contract, nil
+}
+
+func newSwapRedemptionRecordedEvent(step *stepInformation, params *msgjson.Redeem, redemption asset.Coin, redeemTime time.Time) (*mesh.Event, error) {
+	var secret dex.Bytes
+	if step.actor.isMaker {
+		secret = params.Secret
+	}
+	event := &meshevents.SwapRedemptionRecordedEvent{
+		MatchID:    step.match.ID(),
+		Base:       step.match.Maker.BaseAsset,
+		Quote:      step.match.Maker.QuoteAsset,
+		Maker:      step.actor.isMaker,
+		Status:     step.nextStep,
+		CoinID:     params.CoinID,
+		CoinTxID:   redemption.TxID(),
+		CoinString: redemption.String(),
+		Value:      redemption.Value(),
+		FeeRate:    redemption.FeeRate(),
+		Secret:     secret,
+		RedeemTime: redeemTime.UnixMilli(),
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return mesh.NewEvent(event)
+}
+
+// applySwapRedemptionRecordedEvent records a redemption, updates the match and
+// order state, and removes the match once the taker has redeemed.
+func (s *Swapper) applySwapRedemptionRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.SwapRedemptionRecordedEvent) (*db.EventLogEntry, error) {
+	match, status, redemption, err := s.prepareSwapRedemptionUpdate(event)
+	if err != nil {
+		return nil, err
+	}
+	logEntry, err := s.storage.ApplySwapRedemptionRecordedEvent(ctx, meta, s.authMgr.ReputationOutcomePolicy(), event)
+	if err != nil {
+		return nil, fmt.Errorf("saving redeem transaction (match id=%v, maker=%v): %w",
+			event.MatchID, event.Maker, err)
+	}
+
+	status.mtx.Lock()
+	status.redemption = redemption
+	status.redeemTime = time.UnixMilli(event.RedeemTime).UTC()
+	if event.Maker {
+		status.secret = append([]byte(nil), event.Secret...)
+	}
+	status.mtx.Unlock()
+
+	match.mtx.Lock()
+	match.Status = event.Status
+	match.mtx.Unlock()
+
+	actorOrder := match.Taker
+	if event.Maker {
+		actorOrder = match.Maker
+	}
+	s.swapDone(actorOrder, match.Match, false)
+
+	if !event.Maker {
+		log.Debugf("Deleting completed match %v", event.MatchID)
+		s.matchMtx.Lock()
+		if s.matches[event.MatchID] == match {
+			s.deleteMatch(match)
+		}
+		s.matchMtx.Unlock()
+	}
+	return logEntry, nil
+}
+
+// prepareSwapRedemptionUpdate checks the match and counterparty contract, then
+// reconstructs the redemption from the event's recorded details.
+func (s *Swapper) prepareSwapRedemptionUpdate(event *meshevents.SwapRedemptionRecordedEvent) (*matchTracker, *swapStatus, asset.Coin, error) {
+	s.matchMtx.RLock()
+	match := s.matches[event.MatchID]
+	s.matchMtx.RUnlock()
+	if match == nil {
+		return nil, nil, nil, fmt.Errorf("swap redemption recorded event for unknown match %v", event.MatchID)
+	}
+	if event.Base != match.Maker.BaseAsset || event.Quote != match.Maker.QuoteAsset {
+		return nil, nil, nil, fmt.Errorf("swap redemption recorded market mismatch for match %v", event.MatchID)
+	}
+
+	actorStatus, counterpartyStatus := match.takerStatus, match.makerStatus
+	if event.Maker {
+		actorStatus, counterpartyStatus = match.makerStatus, match.takerStatus
+	}
+	counterpartyStatus.mtx.RLock()
+	hasContract := counterpartyStatus.swap != nil && len(counterpartyStatus.swap.ContractData) != 0
+	counterpartyStatus.mtx.RUnlock()
+	if !hasContract {
+		return nil, nil, nil, fmt.Errorf("counterparty swap contract missing for redemption event match %v", event.MatchID)
+	}
+
+	s.matchMtx.RLock()
+	if s.matches[event.MatchID] != match {
+		s.matchMtx.RUnlock()
+		return nil, nil, nil, fmt.Errorf("redeem txn found after match was revoked (match id=%v, maker=%v)",
+			event.MatchID, event.Maker)
+	}
+	requiredStatus := order.MakerRedeemed
+	if event.Maker {
+		requiredStatus = order.TakerSwapCast
+	}
+	match.mtx.RLock()
+	localStatus := match.Status
+	match.mtx.RUnlock()
+	if localStatus != requiredStatus {
+		s.matchMtx.RUnlock()
+		return nil, nil, nil, fmt.Errorf("swap redemption recorded event requires status %v, local status is %v for match %v",
+			requiredStatus, localStatus, event.MatchID)
+	}
+	s.matchMtx.RUnlock()
+
+	redemption := &eventCoin{
+		id:         append(dex.Bytes(nil), event.CoinID...),
+		txID:       event.CoinTxID,
+		coinString: event.CoinString,
+		value:      event.Value,
+		feeRate:    event.FeeRate,
+	}
+	return match, actorStatus, redemption, nil
 }
 
 func newAuditAckRecordedEvent(match *matchTracker, maker bool, sig []byte) (*mesh.Event, error) {
