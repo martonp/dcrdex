@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"time"
 
+	"decred.org/dcrdex/dex"
+	"decred.org/dcrdex/dex/msgjson"
 	"decred.org/dcrdex/dex/order"
+	"decred.org/dcrdex/server/asset"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/mesh"
 	"decred.org/dcrdex/server/meshevents"
 )
 
-// MeshService applies swap events.
+// MeshService executes swap commands and applies swap events.
 type MeshService interface {
+	ExecuteCommand(context.Context, mesh.CommandRequest) *msgjson.Error
 	ApplyEvent(context.Context, *mesh.Event) (any, error)
 }
 
@@ -34,6 +38,13 @@ func (s *Swapper) Events() map[string]mesh.EventApplier {
 			}
 			return s.applyMatchAcksRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), acks)
 		},
+		meshevents.EventKindSwapContractRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			recorded, err := meshevents.DecodeSwapContractRecordedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return s.applySwapContractRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
+		},
 	}
 }
 
@@ -49,6 +60,151 @@ func dbEventLogMeta(position *db.EventLogPosition, event *mesh.Event) *db.EventL
 		logMeta.ExpectedTipHash = position.TipHash
 	}
 	return logMeta
+}
+
+func newSwapContractRecordedEvent(step *stepInformation, params *msgjson.Init, contract *asset.Contract, swapTime time.Time) (*mesh.Event, error) {
+	event := &meshevents.SwapContractRecordedEvent{
+		MatchID:     step.match.ID(),
+		Base:        step.match.Maker.BaseAsset,
+		Quote:       step.match.Maker.QuoteAsset,
+		Maker:       step.actor.isMaker,
+		Status:      step.nextStep,
+		CoinID:      params.CoinID,
+		CoinTxID:    contract.TxID(),
+		CoinString:  contract.String(),
+		Value:       contract.Value(),
+		FeeRate:     contract.FeeRate(),
+		Contract:    params.Contract,
+		SwapAddress: contract.SwapAddress,
+		SecretHash:  contract.SecretHash,
+		LockTime:    contract.LockTime.UnixMilli(),
+		TxData:      contract.TxData,
+		SwapTime:    swapTime.UnixMilli(),
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return mesh.NewEvent(event)
+}
+
+// eventCoin implements asset.Coin using the details recorded in an event,
+// allowing event application to reconstruct a contract without querying the
+// blockchain. Confirmation counts are fetched from the backend when requested.
+type eventCoin struct {
+	id            dex.Bytes
+	txID          string
+	coinString    string
+	value         uint64
+	feeRate       uint64
+	confirmations func(context.Context) (int64, error)
+}
+
+func (c *eventCoin) Confirmations(ctx context.Context) (int64, error) {
+	if c.confirmations != nil {
+		return c.confirmations(ctx)
+	}
+	return 0, nil
+}
+
+func (c *eventCoin) ID() []byte {
+	return c.id
+}
+
+func (c *eventCoin) TxID() string {
+	if c.txID != "" {
+		return c.txID
+	}
+	return fmt.Sprintf("%x", []byte(c.id))
+}
+
+func (c *eventCoin) String() string {
+	if c.coinString != "" {
+		return c.coinString
+	}
+	return c.TxID()
+}
+
+func (c *eventCoin) Value() uint64 {
+	return c.value
+}
+
+func (c *eventCoin) FeeRate() uint64 {
+	return c.feeRate
+}
+
+func (s *Swapper) applySwapContractRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.SwapContractRecordedEvent) (*db.EventLogEntry, error) {
+	match, status, contract, err := s.prepareSwapContractUpdate(event)
+	if err != nil {
+		return nil, err
+	}
+	logEntry, err := s.storage.ApplySwapContractRecordedEvent(ctx, meta, event)
+	if err != nil {
+		return nil, fmt.Errorf("saving swap contract for match %v: %w", event.MatchID, err)
+	}
+
+	s.registerSwapContractDedup(event.MatchID, event.CoinID, event.Contract, event.SecretHash, event.Maker)
+
+	status.mtx.Lock()
+	status.swap = contract
+	status.swapTime = time.UnixMilli(event.SwapTime).UTC()
+	status.mtx.Unlock()
+
+	match.mtx.Lock()
+	match.Status = event.Status
+	match.mtx.Unlock()
+	return logEntry, nil
+}
+
+// prepareSwapContractUpdate checks the match and contract reuse, then reconstructs
+// the contract from the event's recorded details.
+func (s *Swapper) prepareSwapContractUpdate(event *meshevents.SwapContractRecordedEvent) (*matchTracker, *swapStatus, *asset.Contract, error) {
+	s.matchMtx.RLock()
+	match := s.matches[event.MatchID]
+	s.matchMtx.RUnlock()
+	if match == nil {
+		return nil, nil, nil, fmt.Errorf("swap contract recorded event for unknown match %v", event.MatchID)
+	}
+	if event.Base != match.Maker.BaseAsset || event.Quote != match.Maker.QuoteAsset {
+		return nil, nil, nil, fmt.Errorf("swap contract recorded market mismatch for match %v", event.MatchID)
+	}
+
+	status := match.takerStatus
+	if event.Maker {
+		status = match.makerStatus
+	}
+	swapAsset := s.coins[status.swapAsset]
+	if swapAsset == nil {
+		return nil, nil, nil, fmt.Errorf("no swap asset %d for match %v", status.swapAsset, event.MatchID)
+	}
+
+	if err := s.checkSwapContractDedup(event.MatchID, event.CoinID, event.Contract, event.SecretHash, event.Maker); err != nil {
+		return nil, nil, nil, err
+	}
+
+	coin := &eventCoin{
+		id:         append(dex.Bytes(nil), event.CoinID...),
+		txID:       event.CoinTxID,
+		coinString: event.CoinString,
+		value:      event.Value,
+		feeRate:    event.FeeRate,
+		confirmations: func(ctx context.Context) (int64, error) {
+			contract, err := swapAsset.Backend.Contract(event.CoinID, event.Contract)
+			if err != nil {
+				return 0, err
+			}
+			return contract.Confirmations(ctx)
+		},
+	}
+	contract := &asset.Contract{
+		Coin:         coin,
+		SwapAddress:  event.SwapAddress,
+		ContractData: append([]byte(nil), event.Contract...),
+		SecretHash:   append([]byte(nil), event.SecretHash...),
+		LockTime:     time.UnixMilli(event.LockTime).UTC(),
+		TxData:       append([]byte(nil), event.TxData...),
+	}
+
+	return match, status, contract, nil
 }
 
 func newMatchAcksRecordedEvent(ackTime time.Time, records []meshevents.MatchAckRecord) (*mesh.Event, error) {

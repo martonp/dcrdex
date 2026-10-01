@@ -1,6 +1,7 @@
 // This code is available on the terms of the project LICENSE.md file,
 // also available online at https://blueoakcouncil.org/license/1.0.0.
 
+// Package swap coordinates and monitors atomic swap settlement.
 package swap
 
 import (
@@ -39,6 +40,9 @@ var (
 	// bursts when blocks are generated closely together (e.g. in Ethereum
 	// occasionally several blocks are generated in a single second).
 	minBlockPeriod = time.Second * 10
+
+	errSwapContractInUse = errors.New("swap contract already in use by another match")
+	errSecretHashInUse   = errors.New("secret hash already in use by another match")
 )
 
 func unixMsNow() time.Time {
@@ -1203,6 +1207,55 @@ func (s *Swapper) failMatch(match *matchTracker, userFault bool, takerAddrFault 
 	s.revoke(match)
 }
 
+// swapContractKey includes the contract data so batched swaps sharing a
+// transaction ID can still use distinct contracts.
+func swapContractKey(coinID, contract []byte) string {
+	return fmt.Sprintf("%x:%x", coinID, contract)
+}
+
+func secretHashKey(secretHash []byte) string {
+	return fmt.Sprintf("%x", secretHash)
+}
+
+// checkSwapContractDedup rejects contracts or maker secret hashes already used
+// by another active match.
+func (s *Swapper) checkSwapContractDedup(matchID order.MatchID, coinID, contract, secretHash []byte, maker bool) error {
+	s.activeCoinsMtx.Lock()
+	defer s.activeCoinsMtx.Unlock()
+	dedupKey := swapContractKey(coinID, contract)
+	if existingMatch, exists := s.activeCoinIDs[dedupKey]; exists && existingMatch != matchID {
+		return errSwapContractInUse
+	}
+	// Reusing a maker secret hash could make the counterparty reject the swap
+	// and be penalized for failing to proceed.
+	if maker && len(secretHash) > 0 {
+		secretHashHex := secretHashKey(secretHash)
+		if existingMatch, exists := s.activeSecretHashes[secretHashHex]; exists && existingMatch != matchID {
+			return errSecretHashInUse
+		}
+	}
+	return nil
+}
+
+// registerSwapContractDedup records a match's contract and maker secret hash
+// so they cannot be reused by another active match.
+func (s *Swapper) registerSwapContractDedup(matchID order.MatchID, coinID, contract, secretHash []byte, maker bool) {
+	s.activeCoinsMtx.Lock()
+	defer s.activeCoinsMtx.Unlock()
+	dedupKey := swapContractKey(coinID, contract)
+	if _, already := s.activeCoinIDs[dedupKey]; !already {
+		s.matchCoinIDs[matchID] = append(s.matchCoinIDs[matchID], dedupKey)
+	}
+	s.activeCoinIDs[dedupKey] = matchID
+	if maker && len(secretHash) > 0 {
+		secretHashHex := secretHashKey(secretHash)
+		if _, already := s.activeSecretHashes[secretHashHex]; !already {
+			s.matchSecretHashes[matchID] = append(s.matchSecretHashes[matchID], secretHashHex)
+		}
+		s.activeSecretHashes[secretHashHex] = matchID
+	}
+}
+
 type fail struct {
 	match *matchTracker
 	fault bool
@@ -1656,8 +1709,18 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 // audited by the Swapper, the counter-party is informed with an 'audit'
 // request. This method is run as a coin waiter, hence the return value
 // indicates if future attempts should be made to check coin status.
-func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepInfo *stepInformation) wait.TryDirective {
+func (s *Swapper) processInit(ctx context.Context, completion *mesh.CommandCompletion, params *msgjson.Init, stepInfo *stepInformation) wait.TryDirective {
 	actor, counterParty := stepInfo.actor, stepInfo.counterParty
+	failMsg := func(msgErr *msgjson.Error) wait.TryDirective {
+		actor.status.endSwapSearch()
+		if err := completion.Fail(ctx, msgErr); err != nil {
+			log.Errorf("failed to send init command error for user %v: %v", actor.user, err)
+		}
+		return wait.DontTryAgain
+	}
+	fail := func(code int, format string, args ...any) wait.TryDirective {
+		return failMsg(msgjson.NewError(code, format, args...))
+	}
 
 	// Validate the swap contract
 	chain := stepInfo.asset.Backend
@@ -1670,10 +1733,7 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 		log.Warnf("Contract error encountered for match %s, actor %s using coin ID %v and contract %v: %v",
 			stepInfo.match.ID(), actor, params.CoinID, params.Contract, err)
 		actor.status.mtx.RUnlock()
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("contract error encountered: %v", err))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError, "contract error encountered: %v", err)
 	}
 
 	// Enforce the prescribed swap fee rate, but only if the swap is not already
@@ -1696,9 +1756,7 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 	if !chain.ValidateFeeRate(contract.Coin, reqFeeRate) {
 		confs := swapConfs()
 		if confs < 1 {
-			actor.status.endSwapSearch() // allow client retry even before notifying him
-			s.respondError(msg.ID, actor.user, msgjson.ContractError, "low tx fee")
-			return wait.DontTryAgain
+			return fail(msgjson.ContractError, "low tx fee")
 		}
 		log.Infof("Swap txn %v (%s) with low fee rate (%v required), accepted with %d confirmations.",
 			contract, stepInfo.asset.Symbol, reqFeeRate, confs)
@@ -1713,71 +1771,26 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 	}
 	stepInfo.match.mtx.RUnlock()
 	if expectedAddr == "" {
-		actor.status.endSwapSearch()
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("counterparty per-match address not yet received for match %v", stepInfo.match.ID()))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError,
+			"counterparty per-match address not yet received for match %v", stepInfo.match.ID())
 	}
 	if contract.SwapAddress != expectedAddr {
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("incorrect recipient. expected %s. got %s",
-				expectedAddr, contract.SwapAddress))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError,
+			"incorrect recipient. expected %s. got %s", expectedAddr, contract.SwapAddress)
 	}
 
-	// Swap contract dedup check and registration: atomically reject if this
-	// contract is already in use by another match, or register it.
-	// Registering early avoids a TOCTOU race; stale entries from later
-	// validation failures are harmless since deleteMatch cleans up.
-	// The composite key of CoinID and contract data is used so that EVM
-	// batched swaps (same txHash, different contract/locator) are not
-	// incorrectly rejected.
-	dedupKey := fmt.Sprintf("%x:%x", params.CoinID, params.Contract)
 	mid := stepInfo.match.ID()
-	s.activeCoinsMtx.Lock()
-	if existingMatch, exists := s.activeCoinIDs[dedupKey]; exists && existingMatch != mid {
-		s.activeCoinsMtx.Unlock()
-		actor.status.endSwapSearch()
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			"swap contract already in use by another match")
-		return wait.DontTryAgain
+	if err := s.checkSwapContractDedup(mid, params.CoinID, params.Contract, contract.SecretHash, actor.isMaker); err != nil {
+		return fail(msgjson.ContractError, "%v", err)
 	}
-	// Secret hash dedup: reject if the maker is reusing a secret hash
-	// from another match. This prevents a griefing attack where a maker
-	// reuses the same secret hash, causing the taker's client-side dedup
-	// to reject the audit and penalize the taker.
-	if actor.isMaker && len(contract.SecretHash) > 0 {
-		secretHashHex := fmt.Sprintf("%x", contract.SecretHash)
-		if existingMatch, exists := s.activeSecretHashes[secretHashHex]; exists && existingMatch != mid {
-			s.activeCoinsMtx.Unlock()
-			actor.status.endSwapSearch()
-			s.respondError(msg.ID, actor.user, msgjson.ContractError,
-				"secret hash already in use by another match")
-			return wait.DontTryAgain
-		}
-		if _, already := s.activeSecretHashes[secretHashHex]; !already {
-			s.matchSecretHashes[mid] = append(s.matchSecretHashes[mid], secretHashHex)
-		}
-		s.activeSecretHashes[secretHashHex] = mid
-	}
-	if _, already := s.activeCoinIDs[dedupKey]; !already {
-		s.matchCoinIDs[mid] = append(s.matchCoinIDs[mid], dedupKey)
-	}
-	s.activeCoinIDs[dedupKey] = mid
-	s.activeCoinsMtx.Unlock()
+
 	if contract.Value() != stepInfo.checkVal {
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("contract error. expected contract value to be %d, got %d", stepInfo.checkVal, contract.Value()))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError,
+			"contract error. expected contract value to be %d, got %d", stepInfo.checkVal, contract.Value())
 	}
 	if !actor.isMaker && !bytes.Equal(contract.SecretHash, counterParty.status.swap.SecretHash) {
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("incorrect secret hash. expected %x. got %x",
-				contract.SecretHash, counterParty.status.swap.SecretHash))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError,
+			"incorrect secret hash. expected %x. got %x", counterParty.status.swap.SecretHash, contract.SecretHash)
 	}
 
 	reqLockTime := encode.DropMilliseconds(stepInfo.match.matchTime.Add(s.lockTimeTaker))
@@ -1785,14 +1798,10 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 		reqLockTime = encode.DropMilliseconds(stepInfo.match.matchTime.Add(s.lockTimeMaker))
 	}
 	if contract.LockTime.Before(reqLockTime) {
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("contract error. expected lock time >= %s, got %s", reqLockTime, contract.LockTime))
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError,
+			"contract error. expected lock time >= %s, got %s", reqLockTime, contract.LockTime)
 	} else if remain := time.Until(contract.LockTime); remain < 0 {
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError,
-			fmt.Sprintf("contract is correct, but lock time passed %s ago", remain))
+		fail(msgjson.ContractError, "contract is correct, but lock time passed %s ago", remain)
 		// Revoke the match proactively before checkInaction gets to it.
 		s.matchMtx.Lock()
 		defer s.matchMtx.Unlock()
@@ -1807,97 +1816,82 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 	swapTime := unixMsNow()
 	matchID := stepInfo.match.Match.ID()
 
-	// Store the swap contract and the coinID (e.g. txid:vout) containing the
-	// contract script hash. Maker is party A, the initiator. Taker is party B,
-	// the participant.
-	//
-	// Failure to update match status is a fatal DB error. If we continue, the
-	// swap may succeed, but there will be no way to recover or retrospectively
-	// determine the swap outcome. Abort.
-	storFn := s.storage.SaveContractB
-	if stepInfo.actor.isMaker {
-		storFn = s.storage.SaveContractA
-	}
-	mktMatch := db.MatchID(stepInfo.match.Match)
-	swapTimeMs := swapTime.UnixMilli()
-	err = storFn(mktMatch, params.Contract, params.CoinID, swapTimeMs)
-	if err != nil {
-		log.Errorf("saving swap contract (match id=%v, maker=%v) failed: %v",
-			matchID, actor.isMaker, err)
-		s.respondError(msg.ID, actor.user, msgjson.RPCInternalError,
-			"internal server error")
-		// TODO: revoke the match without penalties instead of retrying forever?
-		return wait.TryAgain
-	}
-
-	// Modify the match's swapStatuses, but only if the match wasn't revoked
-	// while waiting for the txn.
-	s.matchMtx.RLock()
-	if _, found := s.matches[matchID]; !found {
-		s.matchMtx.RUnlock()
+	if !s.matchTracked(stepInfo.match) {
 		log.Errorf("Contract txn located after match was revoked (match id=%v, maker=%v)",
 			matchID, actor.isMaker)
-		actor.status.endSwapSearch() // allow client retry even before notifying him
-		s.respondError(msg.ID, actor.user, msgjson.ContractError, "match already revoked due to inaction")
-		return wait.DontTryAgain
+		return fail(msgjson.ContractError, "match already revoked due to inaction")
 	}
 
-	actor.status.mtx.Lock()
-	actor.status.swap = contract // swap should not be set already (handleInit should gate)
-	actor.status.swapTime = swapTime
-	actor.status.mtx.Unlock()
-
-	stepInfo.match.mtx.Lock()
-	stepInfo.match.Status = stepInfo.nextStep // handleInit (gate mechanism) won't allow backward progress
-	stepInfo.match.mtx.Unlock()
-
-	// Only unlock match map after the statuses and txn times are stored,
-	// ensuring that checkInaction will not revoke the match as we respond and
-	// request counterparty audit.
-	s.matchMtx.RUnlock()
-
-	// Contract now recorded and will be used to reject backward progress (duplicate
-	// or malicious requests client might still send after this point).
-	actor.status.endSwapSearch()
+	event, err := newSwapContractRecordedEvent(stepInfo, params, contract, swapTime)
+	if err != nil {
+		log.Errorf("error creating swap contract recorded event: %v", err)
+		return fail(msgjson.RPCInternalError, "internal server error")
+	}
+	if err := completion.Emit(ctx, event, func() any {
+		s.authMgr.Sign(params)
+		return &msgjson.Acknowledgement{
+			MatchID: matchID[:],
+			Sig:     params.Sig,
+		}
+	}); err != nil {
+		if errors.Is(err, errSwapContractInUse) || errors.Is(err, errSecretHashInUse) {
+			log.Errorf("error applying swap contract recorded event: %v", err)
+			return fail(msgjson.ContractError, "%v", err)
+		}
+		mesh.LogApplyFailure(log, err, "error applying swap contract recorded event for match %v: %v", matchID, err)
+		return failMsg(mesh.ClientError(err, msgjson.RPCInternalError, "internal server error"))
+	}
 
 	log.Debugf("processInit: valid contract %v (%s) received at %v from user %v (%s) for match %v, "+
 		"swapStatus %v => %v", contract, stepInfo.asset.Symbol, swapTime, actor.user,
 		makerTaker(actor.isMaker), matchID, stepInfo.step, stepInfo.nextStep)
 
-	// Issue a positive response to the actor.
-	s.authMgr.Sign(params)
-	s.respondSuccess(msg.ID, actor.user, &msgjson.Acknowledgement{
-		MatchID: matchID[:],
-		Sig:     params.Sig,
-	})
+	// Contract now recorded and will be used to reject backward progress
+	// (duplicate or malicious requests client might still send after this point).
+	actor.status.endSwapSearch()
+	s.requestAudit(stepInfo, params, contract, swapTime)
 
+	return wait.DontTryAgain
+}
+
+func (s *Swapper) requestAudit(stepInfo *stepInformation, params *msgjson.Init, contract *asset.Contract, swapTime time.Time) {
+	counterParty := stepInfo.counterParty
+	matchID := stepInfo.match.Match.ID()
 	// Prepare an 'audit' request for the counter-party.
 	auditParams := &msgjson.Audit{
 		OrderID:  idToBytes(counterParty.order.ID()),
 		MatchID:  matchID[:],
-		Time:     uint64(swapTimeMs),
+		Time:     uint64(swapTime.UnixMilli()),
 		CoinID:   params.CoinID,
 		Contract: params.Contract,
 		TxData:   contract.TxData,
 	}
+	s.sendAuditRequest(stepInfo.match, counterParty.user, counterParty.isMaker, auditParams)
+}
+
+// sendAuditRequest signs and sends a contract 'audit' request to the
+// recipient, registering the acknowledgement callback. The match mtx should
+// NOT be held.
+func (s *Swapper) sendAuditRequest(match *matchTracker, recipient account.AccountID, recipientIsMaker bool, auditParams *msgjson.Audit) {
 	s.authMgr.Sign(auditParams)
 	notification, err := msgjson.NewRequest(comms.NextID(), msgjson.AuditRoute, auditParams)
 	if err != nil {
 		// This is likely an impossible condition.
 		log.Errorf("error creating audit request: %v", err)
-		return wait.DontTryAgain
+		return
 	}
 
+	matchID := match.ID()
 	// Set up the acknowledgement for the callback.
 	ack := &messageAcker{
-		user:    counterParty.user,
-		match:   stepInfo.match,
+		user:    recipient,
+		match:   match,
 		params:  auditParams,
-		isMaker: counterParty.isMaker,
+		isMaker: recipientIsMaker,
 		isAudit: true,
 	}
 	// Send the 'audit' request to the counter-party.
-	log.Debugf("processInit: sending contract 'audit' request to counterparty %v (%s) "+
+	log.Debugf("sending contract 'audit' request to counterparty %v (%s) "+
 		"for match %v", ack.user, makerTaker(ack.isMaker), matchID)
 	// The counterparty will audit the contract by retrieving it, which may
 	// involve them waiting for up to the broadcast timeout before responding,
@@ -1909,10 +1903,9 @@ func (s *Swapper) processInit(msg *msgjson.Message, params *msgjson.Init, stepIn
 			ack.user, makerTaker(ack.isMaker), matchID)
 	})
 	if err != nil {
-		log.Debugf("Couldn't send 'audit' request to user %v (%s) for match %v", ack.user, makerTaker(ack.isMaker), matchID)
+		log.Debugf("Couldn't send 'audit' request to user %v (%s) for match %v: %v",
+			ack.user, makerTaker(ack.isMaker), matchID, err)
 	}
-
-	return wait.DontTryAgain
 }
 
 // processRedeem processes a 'redeem' request from a client. processRedeem does
@@ -2089,28 +2082,21 @@ func (s *Swapper) processRedeem(msg *msgjson.Message, params *msgjson.Redeem, st
 	return wait.DontTryAgain
 }
 
-// handleInit handles the 'init' request from a user, which is used to inform
-// the DEX of a newly broadcast swap transaction. The Init message includes the
-// swap contract script and the CoinID of contract. Most of the work is
-// performed by processInit, but the request is parsed and user is authenticated
-// first.
-func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgjson.Error {
+// executeInit handles the 'init' command, which is used to inform the DEX of a
+// newly broadcast swap transaction. The Init message includes the swap contract
+// script and the CoinID of the contract.
+func (s *Swapper) executeInit(cmdCtx *mesh.CommandContext) *msgjson.Error {
+	user, msg := cmdCtx.Request.User, cmdCtx.Request.Msg
 	s.handlerMtx.RLock()
 	defer s.handlerMtx.RUnlock() // block shutdown until registered with latencyQ
 	if s.stop {
-		return &msgjson.Error{
-			Code:    msgjson.TryAgainLaterError,
-			Message: "The swapper is stopping. Try again later.",
-		}
+		return msgjson.NewError(msgjson.TryAgainLaterError, "The swapper is stopping. Try again later.")
 	}
 
 	params := new(msgjson.Init)
 	err := msg.Unmarshal(&params)
 	if err != nil || params == nil {
-		return &msgjson.Error{
-			Code:    msgjson.RPCParseError,
-			Message: "Error decoding 'init' method params",
-		}
+		return msgjson.NewError(msgjson.RPCParseError, "Error decoding 'init' method params")
 	}
 
 	// Verify the user's signature of params.
@@ -2119,18 +2105,16 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 		return rpcErr
 	}
 
-	log.Debugf("handleInit: 'init' received from user %v for match %v, order %v",
+	log.Debugf("executeInit: 'init' received from user %v for match %v, order %v",
 		user, params.MatchID, params.OrderID)
 
 	if len(params.MatchID) != order.MatchIDSize {
-		return &msgjson.Error{
-			Code:    msgjson.RPCParseError,
-			Message: "Invalid 'matchid' in 'init' message",
-		}
+		return msgjson.NewError(msgjson.RPCParseError, "Invalid 'matchid' in 'init' message")
 	}
 
 	var matchID order.MatchID
 	copy(matchID[:], params.MatchID)
+
 	stepInfo, rpcErr := s.step(user, matchID)
 	if rpcErr != nil {
 		return rpcErr
@@ -2143,16 +2127,11 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 		// Ensure we only start one coin waiter for this swap. This is an atomic
 		// CAS, so it must ultimately be followed by endSwapSearch().
 		if !stepInfo.actor.status.startSwapSearch() {
-			return &msgjson.Error{
-				Code:    msgjson.DuplicateRequestError, // not really a sequence error since they are still the "actor"
-				Message: "already received a swap contract, search in progress",
-			}
+			// Not really a sequence error since they are still the "actor".
+			return msgjson.NewError(msgjson.DuplicateRequestError, "already received a swap contract, search in progress")
 		}
 	default:
-		return &msgjson.Error{
-			Code:    msgjson.SettlementSequenceError,
-			Message: "swap contract already provided",
-		}
+		return msgjson.NewError(msgjson.SettlementSequenceError, "swap contract already provided")
 	}
 
 	// Validate the coinID and contract script before starting a coin waiter.
@@ -2161,10 +2140,7 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 		stepInfo.actor.status.endSwapSearch() // not gonna start the search
 		// TODO: ensure Backends provide sanitized errors or type information to
 		// provide more details to the client.
-		return &msgjson.Error{
-			Code:    msgjson.ContractError,
-			Message: "invalid contract coinID or script",
-		}
+		return msgjson.NewError(msgjson.ContractError, "invalid contract coinID or script")
 	}
 	err = stepInfo.asset.Backend.ValidateContract(params.Contract)
 	if err != nil {
@@ -2172,10 +2148,7 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 		log.Debugf("ValidateContract (asset %v, coin %v) failure: %v", stepInfo.asset.Symbol, coinStr, err)
 		// TODO: ensure Backends provide sanitized errors or type information to
 		// provide more details to the client.
-		return &msgjson.Error{
-			Code:    msgjson.ContractError,
-			Message: "invalid swap contract",
-		}
+		return msgjson.NewError(msgjson.ContractError, "invalid swap contract")
 	}
 
 	// TODO: consider also checking recipient of contract here, but it is also
@@ -2194,18 +2167,32 @@ func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgj
 	s.latencyQ.Wait(&wait.Waiter{
 		Expiration: expireTime,
 		TryFunc: func() wait.TryDirective {
-			return s.processInit(msg, params, stepInfo)
+			return s.processInit(context.Background(), cmdCtx.Completion, params, stepInfo)
 		},
 		ExpireFunc: func() {
 			stepInfo.actor.status.endSwapSearch() // allow init retries
 			// NOTE: We may consider a shorter expire time so the client can
 			// receive warning that there may be node or wallet connectivity
 			// trouble while they still have a chance to fix it.
-			s.respondError(msg.ID, user, msgjson.TransactionUndiscovered,
-				fmt.Sprintf("failed to find contract coin %v", coinStr))
+			if err := cmdCtx.Completion.Fail(context.Background(),
+				msgjson.NewError(msgjson.TransactionUndiscovered, "failed to find contract coin %v", coinStr)); err != nil {
+				log.Errorf("failed to send init timeout error for user %v: %v", user, err)
+			}
 		},
 	})
 	return nil
+}
+
+// handleInit routes init requests through the mesh command service.
+func (s *Swapper) handleInit(user account.AccountID, msg *msgjson.Message) *msgjson.Error {
+	return s.mesh.ExecuteCommand(context.Background(), mesh.CommandRequest{
+		Kind: commandKindInit,
+		User: user,
+		Msg:  msg,
+		Respond: func(resp *msgjson.Message) error {
+			return s.authMgr.Send(user, resp)
+		},
+	})
 }
 
 // handleRedeem handles the 'redeem' request from a user. Most of the work is

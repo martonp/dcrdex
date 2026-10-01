@@ -504,6 +504,10 @@ func (ta *TArchivist) ApplyMatchAcksRecordedEvent(context.Context, *db.EventLogM
 	return new(db.EventLogEntry), nil
 }
 
+func (ta *TArchivist) ApplySwapContractRecordedEvent(context.Context, *db.EventLogMeta, *meshevents.SwapContractRecordedEvent) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+
 func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}

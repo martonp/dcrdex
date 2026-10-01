@@ -302,6 +302,8 @@ type TStorage struct {
 
 	matchAckEvents            []*meshevents.MatchAcksRecordedEvent
 	applyMatchAcksRecordedErr error
+	swapContracts             []*meshevents.SwapContractRecordedEvent
+	saveContractErr           error
 
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
@@ -380,6 +382,16 @@ func (ts *TStorage) ApplyMatchAcksRecordedEvent(_ context.Context, _ *db.EventLo
 	if ts.applyMatchAcksRecordedErr != nil {
 		return nil, ts.applyMatchAcksRecordedErr
 	}
+	return new(db.EventLogEntry), nil
+}
+
+func (ts *TStorage) ApplySwapContractRecordedEvent(_ context.Context, _ *db.EventLogMeta, contract *meshevents.SwapContractRecordedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if ts.saveContractErr != nil {
+		return nil, ts.saveContractErr
+	}
+	ts.swapContracts = append(ts.swapContracts, contract)
 	return new(db.EventLogEntry), nil
 }
 
@@ -608,7 +620,14 @@ type testRig struct {
 }
 
 type tSwapMesh struct {
-	events []*mesh.Event
+	commandErr *msgjson.Error
+	reqs       []mesh.CommandRequest
+	events     []*mesh.Event
+}
+
+func (m *tSwapMesh) ExecuteCommand(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
+	m.reqs = append(m.reqs, req)
+	return m.commandErr
 }
 
 func (m *tSwapMesh) ApplyEvent(_ context.Context, event *mesh.Event) (any, error) {
@@ -691,6 +710,7 @@ func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
 
 	swapperDone := make(chan struct{})
 	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		Commands:       swapper.Commands(),
 		Events:         swapper.Events(),
 		EventLogReader: storage,
 		OnHalt:         func(error) {},
@@ -867,7 +887,9 @@ func (rig *testRig) ensureSwapStatus(tag string, wantStatus order.MatchStatus, w
 		return err
 	}
 	tracker := rig.getTracker()
+	tracker.mtx.RLock()
 	status := tracker.Status
+	tracker.mtx.RUnlock()
 	if status != wantStatus {
 		return fmt.Errorf("unexpected swap status %d after maker swap notification, wanted: %s", status, wantStatus)
 	}
@@ -2209,6 +2231,7 @@ func TestMalformedSwap(t *testing.T) {
 
 	// Works with low fee, but now a confirmation.
 	tConfsSpoofer = 1
+	defer func() { tConfsSpoofer = 0 }()
 	ensureNilErr(rig.sendSwap_maker(true))
 }
 
@@ -2546,6 +2569,119 @@ func TestReackKeepsRecordedAddress(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplySwapContractRecordedEvent(t *testing.T) {
+	swapTime := time.UnixMilli(1670000000123).UTC()
+	storageErr := errors.New("storage error")
+	tests := []struct {
+		name       string
+		maker      bool
+		storageErr error
+	}{
+		{name: "maker", maker: true},
+		{name: "taker"},
+		{name: "storage error", maker: true, storageErr: storageErr},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			status, otherStatus := tracker.makerStatus, tracker.takerStatus
+			before, after := order.NewlyMatched, order.MakerSwapCast
+			if !tt.maker {
+				status, otherStatus = tracker.takerStatus, tracker.makerStatus
+				before, after = order.MakerSwapCast, order.TakerSwapCast
+			}
+			tracker.Status = before
+			rig.storage.saveContractErr = tt.storageErr
+
+			recorded := &meshevents.SwapContractRecordedEvent{
+				MatchID:     info.matchID,
+				Base:        info.match.Maker.BaseAsset,
+				Quote:       info.match.Maker.QuoteAsset,
+				Maker:       tt.maker,
+				Status:      after,
+				CoinID:      []byte("swap-coin"),
+				CoinTxID:    "swap-tx",
+				CoinString:  "swap-tx:0",
+				Value:       1e8,
+				FeeRate:     10,
+				Contract:    []byte("contract"),
+				SwapAddress: "recipient",
+				SecretHash:  []byte("secret-hash"),
+				LockTime:    swapTime.Add(time.Hour).UnixMilli(),
+				TxData:      []byte("transaction"),
+				SwapTime:    swapTime.UnixMilli(),
+			}
+			event, err := mesh.NewEvent(recorded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apply := rig.swapper.Events()[meshevents.EventKindSwapContractRecorded]
+			_, err = apply(&mesh.EventApplyContext{Context: context.Background()}, event)
+			if !errors.Is(err, tt.storageErr) {
+				t.Fatalf("apply error = %v, want %v", err, tt.storageErr)
+			}
+			if otherStatus.swap != nil || !otherStatus.swapTime.IsZero() {
+				t.Fatal("application changed the other party's swap")
+			}
+			contracts := storedSwapContracts(rig.storage)
+			if tt.storageErr != nil {
+				if len(contracts) != 0 || tracker.Status != before || status.swap != nil || !status.swapTime.IsZero() {
+					t.Fatal("failed storage write changed the recorded swap or match status")
+				}
+				if len(rig.swapper.activeCoinIDs) != 0 || len(rig.swapper.activeSecretHashes) != 0 ||
+					len(rig.swapper.matchCoinIDs) != 0 || len(rig.swapper.matchSecretHashes) != 0 {
+					t.Fatal("failed storage write registered contract reuse entries")
+				}
+				return
+			}
+
+			if !reflect.DeepEqual(contracts, []*meshevents.SwapContractRecordedEvent{recorded}) {
+				t.Fatalf("stored contracts = %+v, want %+v", contracts, recorded)
+			}
+			if tracker.Status != after || !status.swapTime.Equal(swapTime) {
+				t.Fatalf("status/time = %v/%v, want %v/%v", tracker.Status, status.swapTime, after, swapTime)
+			}
+			contract := status.swap
+			if contract == nil {
+				t.Fatal("swap contract was not recorded in memory")
+			}
+			if !bytes.Equal(contract.ID(), recorded.CoinID) || contract.TxID() != recorded.CoinTxID ||
+				contract.String() != recorded.CoinString || contract.Value() != recorded.Value || contract.FeeRate() != recorded.FeeRate {
+				t.Fatalf("wrong recorded coin: %+v", contract.Coin)
+			}
+			if !bytes.Equal(contract.ContractData, recorded.Contract) || !bytes.Equal(contract.SecretHash, recorded.SecretHash) ||
+				!bytes.Equal(contract.TxData, recorded.TxData) || contract.SwapAddress != recorded.SwapAddress ||
+				contract.LockTime.UnixMilli() != recorded.LockTime {
+				t.Fatalf("wrong recorded contract: %+v", contract)
+			}
+
+			otherMatch := info.matchID
+			otherMatch[0] ^= 1
+			if err := rig.swapper.checkSwapContractDedup(otherMatch, recorded.CoinID, recorded.Contract, nil, false); !errors.Is(err, errSwapContractInUse) {
+				t.Fatalf("contract reuse error = %v, want %v", err, errSwapContractInUse)
+			}
+			var wantSecretErr error
+			if tt.maker {
+				wantSecretErr = errSecretHashInUse
+			}
+			if err := rig.swapper.checkSwapContractDedup(otherMatch, []byte("other-coin"), recorded.Contract, recorded.SecretHash, true); !errors.Is(err, wantSecretErr) {
+				t.Fatalf("secret hash reuse error = %v, want %v", err, wantSecretErr)
+			}
+		})
+	}
+}
+
+func storedSwapContracts(storage *TStorage) []*meshevents.SwapContractRecordedEvent {
+	storage.mtx.Lock()
+	defer storage.mtx.Unlock()
+	return append([]*meshevents.SwapContractRecordedEvent(nil), storage.swapContracts...)
 }
 
 func TestApplyMatchAcksRecordedEvent(t *testing.T) {

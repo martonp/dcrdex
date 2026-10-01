@@ -1110,6 +1110,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	if err := mergeMeshCommands(commands, market.LifecycleCommands(markets)); err != nil {
 		return nil, err
 	}
+	if err := mergeMeshCommands(commands, swapper.Commands()); err != nil {
+		return nil, err
+	}
 	var dexMgr *DEX
 	lifecycleUpdated := newLifecycleUpdated(func() *DEX { return dexMgr })
 	events := authMgr.Events()
