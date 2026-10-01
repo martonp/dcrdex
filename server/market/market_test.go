@@ -520,6 +520,10 @@ func (ta *TArchivist) ApplyRedemptionAckRecordedEvent(context.Context, *db.Event
 	return new(db.EventLogEntry), nil
 }
 
+func (ta *TArchivist) ApplyMatchFailedEvent(context.Context, *db.EventLogMeta, *db.ReputationOutcomePolicy, *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+
 func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}

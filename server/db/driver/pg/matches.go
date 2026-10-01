@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
@@ -1013,4 +1014,111 @@ func (a *Archiver) ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *db
 		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
 		return a.updateMatchStmtWithExecutor(tx, mid, internal.SetParticipantRedeemAckSig, event.MatchID, event.Sig)
 	})
+}
+
+// ApplyMatchFailedEvent marks a match inactive, records any failure penalty,
+// revokes the faulted party's booked order, and completes eligible orders
+// belonging to a party that was not at fault.
+func (a *Archiver) ApplyMatchFailedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, event *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyRepEventTx(ctx, meta, event.Kind(), txData, policy, func(tx *sql.Tx, outcomes *reputationOutcomeBatch) error {
+		marketSchema, err := a.marketSchema(event.Base, event.Quote)
+		if err != nil {
+			return err
+		}
+		matchesTable := fullMatchesTableName(a.dbName, marketSchema)
+		match, err := matchByID(tx, matchesTable, event.MatchID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = db.ArchiveError{Code: db.ErrUnknownMatch}
+		}
+		if err != nil {
+			return err
+		}
+		if match.Status != event.Status {
+			return fmt.Errorf("match_failed requires status %v, found %v for match %v",
+				event.Status, match.Status, event.MatchID)
+		}
+
+		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+		stmt := internal.SetSwapDone
+		if event.Fault == meshevents.MatchFailureNoUserFault {
+			stmt = internal.SetSwapDoneForgiven
+		}
+		if err := a.updateMatchStmtWithExecutor(tx, mid, stmt, event.MatchID); err != nil {
+			return err
+		}
+
+		makerFault := event.Fault == meshevents.MatchFailureMakerFault
+		takerFault := event.Fault == meshevents.MatchFailureTakerFault
+		// Self-matches do not receive match-failure penalties.
+		if event.Fault != meshevents.MatchFailureNoUserFault && match.MakerAcct != match.TakerAcct {
+			faultedUser := match.TakerAcct
+			if makerFault {
+				faultedUser = match.MakerAcct
+			}
+			// The status and responsible party determine the missed action.
+			var outcome db.Outcome
+			switch event.Status {
+			case order.NewlyMatched:
+				outcome = db.OutcomeNoSwapAsMaker
+				if takerFault {
+					outcome = db.OutcomeNoAddrAsTaker
+				}
+			case order.MakerSwapCast:
+				outcome = db.OutcomeNoSwapAsTaker
+			case order.TakerSwapCast:
+				outcome = db.OutcomeNoRedeemAsMaker
+			case order.MakerRedeemed:
+				outcome = db.OutcomeNoRedeemAsTaker
+			}
+			outcomes.matches = append(outcomes.matches, &reputationMatchOutcome{
+				user:    faultedUser,
+				mid:     event.MatchID,
+				outcome: outcome,
+			})
+		}
+
+		// The maker's redemption already handled its order completion.
+		if event.Status != order.MakerRedeemed {
+			if err := a.updateOrderAfterMatchFailure(tx, matchesTable, outcomes, mid,
+				match.Maker, match.MakerAcct, makerFault, event.FailTime); err != nil {
+				return err
+			}
+		}
+
+		return a.updateOrderAfterMatchFailure(tx, matchesTable, outcomes, mid,
+			match.Taker, match.TakerAcct, takerFault, event.FailTime)
+	})
+}
+
+// updateOrderAfterMatchFailure checks for order completion when the owner was
+// not at fault. For an owner at fault, it revokes the order if still booked and
+// records the generated cancel as a non-penalized order reputation outcome.
+func (a *Archiver) updateOrderAfterMatchFailure(dbe sqlQueryExecutor, matchesTable string,
+	outcomes *reputationOutcomeBatch, mid db.MarketMatchID, oid order.OrderID,
+	user account.AccountID, ownerAtFault bool, failTimeMS int64) error {
+	if !ownerAtFault {
+		return a.completeOrderIfSettled(dbe, matchesTable, outcomes, mid, oid, user, failTimeMS)
+	}
+	status, _, _, err := a.orderStatusByID(dbe, oid, mid.Base, mid.Quote)
+	if err != nil {
+		return err
+	}
+	if status != orderStatusBooked {
+		return nil
+	}
+	cancelID, err := a.revokeBookedOrderByID(dbe, oid, user, mid.Base, mid.Quote, false, time.UnixMilli(failTimeMS).UTC())
+	if err != nil {
+		return err
+	}
+	// Record the revocation under the generated cancel's ID, not the original order's.
+	outcomes.orders = append(outcomes.orders, &reputationOrderOutcome{user: user, oid: cancelID})
+	return nil
 }

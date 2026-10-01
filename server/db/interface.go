@@ -660,6 +660,10 @@ type SwapArchiver interface {
 	// Maker redemption acknowledgements have no persistent state beyond the
 	// event-log row.
 	ApplyRedemptionAckRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.RedemptionAckRecordedEvent) (*EventLogEntry, error)
+
+	// ApplyMatchFailedEvent marks a match inactive and updates the affected
+	// orders and reputation outcomes.
+	ApplyMatchFailedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, event *meshevents.MatchFailedEvent) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified

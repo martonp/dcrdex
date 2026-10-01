@@ -435,6 +435,10 @@ func (ts *TStorage) ApplyRedemptionAckRecordedEvent(_ context.Context, _ *db.Eve
 	return new(db.EventLogEntry), nil
 }
 
+func (ts *TStorage) ApplyMatchFailedEvent(context.Context, *db.EventLogMeta, *db.ReputationOutcomePolicy, *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+
 type redeemKey struct {
 	redemptionCoin       string
 	counterpartySwapCoin string

@@ -55,4 +55,5 @@ const (
 	EventKindAuditAckRecorded       = "audit_ack_recorded"
 	EventKindSwapRedemptionRecorded = "swap_redemption_recorded"
 	EventKindRedemptionAckRecorded  = "redemption_ack_recorded"
+	EventKindMatchFailed            = "match_failed"
 )

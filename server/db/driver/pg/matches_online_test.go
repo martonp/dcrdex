@@ -835,6 +835,279 @@ func TestApplyRedemptionAckRecordedEvent(t *testing.T) {
 	}
 }
 
+func TestApplyMatchFailedEvent(t *testing.T) {
+	ctx := context.Background()
+	failTime := time.UnixMilli(1670000000123).UTC()
+	policy := &db.ReputationOutcomePolicy{MatchLimit: 10, OrderLimit: 10}
+	type orderResult struct {
+		status    order.OrderStatus
+		completed bool
+		penalty   db.Outcome
+	}
+	tests := []struct {
+		name                        string
+		status                      order.MatchStatus
+		fault                       meshevents.MatchFailureFault
+		wrongStatus                 bool
+		makerBooked                 bool
+		sameUser, forgiven, wantErr bool
+		maker, taker                orderResult
+	}{
+		{
+			name: "maker failure revokes booked order", status: order.NewlyMatched,
+			fault: meshevents.MatchFailureMakerFault, makerBooked: true,
+			maker: orderResult{status: order.OrderStatusRevoked, penalty: db.OutcomeNoSwapAsMaker},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "taker did not provide address", status: order.NewlyMatched,
+			fault: meshevents.MatchFailureTakerFault,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted, penalty: db.OutcomeNoAddrAsTaker},
+		},
+		{
+			name: "taker did not swap", status: order.MakerSwapCast,
+			fault: meshevents.MatchFailureTakerFault,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted, penalty: db.OutcomeNoSwapAsTaker},
+		},
+		{
+			name: "maker did not redeem", status: order.TakerSwapCast,
+			fault: meshevents.MatchFailureMakerFault,
+			maker: orderResult{status: order.OrderStatusExecuted, penalty: db.OutcomeNoRedeemAsMaker},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "taker did not redeem", status: order.MakerRedeemed,
+			fault: meshevents.MatchFailureTakerFault,
+			maker: orderResult{status: order.OrderStatusExecuted},
+			taker: orderResult{status: order.OrderStatusExecuted, penalty: db.OutcomeNoRedeemAsTaker},
+		},
+		{
+			name: "no fault before swaps", status: order.NewlyMatched,
+			fault: meshevents.MatchFailureNoUserFault, forgiven: true,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "no fault after maker swap", status: order.MakerSwapCast,
+			fault: meshevents.MatchFailureNoUserFault, forgiven: true,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "no fault after taker swap", status: order.TakerSwapCast,
+			fault: meshevents.MatchFailureNoUserFault, forgiven: true,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "no fault after maker redemption", status: order.MakerRedeemed,
+			fault: meshevents.MatchFailureNoUserFault, forgiven: true,
+			maker: orderResult{status: order.OrderStatusExecuted},
+			taker: orderResult{status: order.OrderStatusExecuted, completed: true},
+		},
+		{
+			name: "same account has no match penalty", status: order.MakerSwapCast,
+			fault: meshevents.MatchFailureTakerFault, sameUser: true,
+			maker: orderResult{status: order.OrderStatusExecuted, completed: true},
+			taker: orderResult{status: order.OrderStatusExecuted},
+		},
+		{
+			name: "invalid fault", status: order.NewlyMatched,
+			fault: 0, wantErr: true,
+			maker: orderResult{status: order.OrderStatusExecuted},
+			taker: orderResult{status: order.OrderStatusExecuted},
+		},
+		{
+			name: "status mismatch", status: order.NewlyMatched, wrongStatus: true,
+			fault: meshevents.MatchFailureTakerFault, wantErr: true,
+			maker: orderResult{status: order.OrderStatusExecuted},
+			taker: orderResult{status: order.OrderStatusExecuted},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatal(err)
+			}
+			maker, taker := randomAccountID(), randomAccountID()
+			if tt.sameUser {
+				taker = maker
+			}
+			makerStatus, takerStatus := order.OrderStatusExecuted, order.OrderStatusExecuted
+			if tt.makerBooked {
+				makerStatus = order.OrderStatusBooked
+			}
+			storedStatus := tt.status
+			if tt.wrongStatus {
+				storedStatus = order.MakerSwapCast
+			}
+			pair := generateMatchWithOrderStatuses(t, storedStatus, true, maker, taker, makerStatus, takerStatus)
+			mid := db.MatchID(pair.match)
+			event := &meshevents.MatchFailedEvent{
+				MatchID: mid.MatchID, Base: mid.Base, Quote: mid.Quote,
+				FailTime: failTime.UnixMilli(), Status: tt.status, Fault: tt.fault,
+			}
+			payload, err := event.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, err := archie.ApplyMatchFailedEvent(ctx, &db.EventLogMeta{Event: payload}, policy, event)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("apply error = %v, want error %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				assertEventLogFrontier(t, ctx, 0, nil)
+			} else {
+				tip := testEventApplyTip(t, nil, 1, event.Kind(), payload, event)
+				requireEventApplyLog(t, entry, 1, event.Kind(), payload, tip, event)
+			}
+			match, err := archie.MatchByID(mid.MatchID, mid.Base, mid.Quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if match.Active != tt.wantErr || match.Status != storedStatus {
+				t.Fatalf("match active/status = %v/%v, want %v/%v", match.Active, match.Status, tt.wantErr, storedStatus)
+			}
+			requireMatchForgiven(t, ctx, mid, tt.forgiven)
+
+			sides := []struct {
+				order order.Order
+				want  orderResult
+			}{{pair.match.Maker, tt.maker}, {pair.match.Taker, tt.taker}}
+			for _, side := range sides {
+				ord, want := side.order, side.want
+				_, status, err := archie.Order(ord.ID(), mid.Base, mid.Quote)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status != want.status {
+					t.Fatalf("order %v status = %v, want %v", ord.ID(), status, want.status)
+				}
+
+				// Both sides can belong to the same account. Gather that account's
+				// expected outcomes before checking its reputation and completions.
+				var wantPenalties []db.Outcome
+				var wantOrders, wantCompleted []order.OrderID
+				for _, other := range sides {
+					if other.order.User() != ord.User() {
+						continue
+					}
+					if other.want.penalty != db.OutcomeInvalid {
+						wantPenalties = append(wantPenalties, other.want.penalty)
+					}
+					if other.want.completed {
+						wantCompleted = append(wantCompleted, other.order.ID())
+						wantOrders = append(wantOrders, other.order.ID())
+					}
+					if other.want.status == order.OrderStatusRevoked {
+						cancel := makePseudoCancel(other.order.ID(), ord.User(), mid.Base, mid.Quote, failTime)
+						wantOrders = append(wantOrders, cancel.ID())
+					}
+				}
+				_, matches, orders, err := archie.GetUserReputationData(ctx, ord.User(), 10, 10, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(matches) != len(wantPenalties) {
+					t.Fatalf("account %v match outcomes = %+v, want %v", ord.User(), matches, wantPenalties)
+				}
+				for i, outcome := range matches {
+					if outcome.MatchOutcome != wantPenalties[i] || outcome.MatchID != mid.MatchID {
+						t.Fatalf("unexpected match outcome: %+v", outcome)
+					}
+				}
+				if len(orders) != len(wantOrders) {
+					t.Fatalf("account %v order outcomes = %+v, want %v", ord.User(), orders, wantOrders)
+				}
+				for _, outcome := range orders {
+					if !slices.Contains(wantOrders, outcome.OrderID) || outcome.Canceled {
+						t.Fatalf("unexpected order outcome: %+v", outcome)
+					}
+				}
+				completed, times, err := archie.CompletedUserOrders(ord.User(), 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(completed) != len(wantCompleted) {
+					t.Fatalf("account %v completed orders = %v, want %v", ord.User(), completed, wantCompleted)
+				}
+				for i, oid := range completed {
+					if !slices.Contains(wantCompleted, oid) || times[i] != failTime.UnixMilli() {
+						t.Fatalf("unexpected completion %v at %d", oid, times[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestMatchFailureCompletesOrderAfterLastMatch(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	failTime := time.UnixMilli(1670000000123).UTC()
+	policy := &db.ReputationOutcomePolicy{MatchLimit: 10, OrderLimit: 10}
+	epoch := order.EpochID{Idx: 132412341, Dur: 1000}
+	maker := newLimitOrder(false, 4500000, 2, order.StandingTiF, 0)
+	takers := []*order.LimitOrder{
+		newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10),
+		newLimitOrder(true, 4480000, 1, order.ImmediateTiF, 20),
+	}
+	for _, ord := range []*order.LimitOrder{maker, takers[0], takers[1]} {
+		ord.P.AccountID = randomAccountID()
+		if err := storeOrderForTest(archie, ord, int64(epoch.Idx), int64(epoch.Dur), order.OrderStatusExecuted); err != nil {
+			t.Fatal(err)
+		}
+	}
+	matches := make([]*order.Match, len(takers))
+	for i, taker := range takers {
+		matches[i] = newMatch(maker, taker, taker.Quantity, epoch)
+		matches[i].Status = order.MakerSwapCast
+		if err := archie.InsertMatch(matches[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, match := range matches {
+		at := failTime.Add(time.Duration(i) * time.Second)
+		event := &meshevents.MatchFailedEvent{
+			MatchID: match.ID(), Base: maker.Base(), Quote: maker.Quote(),
+			FailTime: at.UnixMilli(), Status: order.MakerSwapCast, Fault: meshevents.MatchFailureTakerFault,
+		}
+		payload, err := event.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archie.ApplyMatchFailedEvent(ctx, &db.EventLogMeta{Event: payload}, policy, event); err != nil {
+			t.Fatal(err)
+		}
+		completed, times, err := archie.CompletedUserOrders(maker.User(), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, outcomes, err := archie.GetUserReputationData(ctx, maker.User(), 10, 10, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if len(completed) != 0 || len(outcomes) != 0 {
+				t.Fatal("maker completed before its last match failed")
+			}
+		} else if len(completed) != 1 || completed[0] != maker.ID() || times[0] != at.UnixMilli() || len(outcomes) != 1 || outcomes[0].OrderID != maker.ID() || outcomes[0].Canceled {
+			t.Fatalf("maker completion = %v/%v, outcomes = %+v", completed, times, outcomes)
+		}
+		completed, _, err = archie.CompletedUserOrders(takers[i].User(), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(completed) != 0 {
+			t.Fatal("faulted taker received order completion")
+		}
+	}
+}
+
 func TestMatchByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
