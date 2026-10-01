@@ -529,23 +529,6 @@ func upsertMatch(dbe sqlExecutor, tableName string, match *order.Match) (int64, 
 		match.FeeRateBase, match.FeeRateQuote, int8(match.Status))
 }
 
-// InsertMatch updates an existing match.
-func (a *Archiver) InsertMatch(match *order.Match) error {
-	matchesTableName, err := a.matchTableName(match)
-	if err != nil {
-		return err
-	}
-	N, err := upsertMatch(a.db, matchesTableName, match)
-	if err != nil {
-		a.fatalBackendErr(err)
-		return err
-	}
-	if N != 1 {
-		return fmt.Errorf("upsertMatch: updated %d rows, expected 1", N)
-	}
-	return nil
-}
-
 // MatchByID retrieves the match for the given MatchID.
 func (a *Archiver) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchData, error) {
 	marketSchema, err := a.marketSchema(base, quote)
@@ -695,10 +678,6 @@ func (a *Archiver) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapDa
 	return order.MatchStatus(status), &sd, nil
 }
 
-func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...any) error {
-	return a.updateMatchStmtWithExecutor(a.db, mid, stmt, args...)
-}
-
 // updateMatchStmtWithExecutor executes stmt on the market's matches table.
 // It returns an error unless exactly one row is updated.
 func (a *Archiver) updateMatchStmtWithExecutor(dbe sqlExecutor, mid db.MarketMatchID, stmt string, args ...any) error {
@@ -718,105 +697,6 @@ func (a *Archiver) updateMatchStmtWithExecutor(dbe sqlExecutor, mid db.MarketMat
 		return fmt.Errorf("updateMatchStmt: updated %d match rows for match %v, expected 1", rowsAffected, mid)
 	}
 	return nil
-}
-
-// Match acknowledgement message signatures.
-
-// SaveMatchAckSigA records the match data acknowledgement signature from swap
-// party A (the initiator), which is the maker in the DEX.
-func (a *Archiver) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetMakerMatchAckSig,
-		mid.MatchID, sig)
-}
-
-// SaveMatchAckSigB records the match data acknowledgement signature from swap
-// party B (the participant), which is the taker in the DEX.
-func (a *Archiver) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetTakerMatchAckSig,
-		mid.MatchID, sig)
-}
-
-// SaveMatchAckAddrA records the per-match swap address from the maker's match
-// acknowledgement.
-func (a *Archiver) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error {
-	return a.updateMatchStmt(mid, internal.SetMakerSwapAddr,
-		mid.MatchID, addr)
-}
-
-// SaveMatchAckAddrB records the per-match swap address from the taker's match
-// acknowledgement.
-func (a *Archiver) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error {
-	return a.updateMatchStmt(mid, internal.SetTakerSwapAddr,
-		mid.MatchID, addr)
-}
-
-// Swap contracts, and counterparty audit acknowledgement signatures.
-
-// SaveContractA records party A's swap contract script and the coinID (e.g.
-// transaction output) containing the contract on chain X. Note that this
-// contract contains the secret hash.
-func (a *Archiver) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorSwapData,
-		mid.MatchID, uint8(order.MakerSwapCast), coinID, contract, timestamp)
-}
-
-// SaveAuditAckSigB records party B's signature acknowledging their audit of A's
-// swap contract.
-func (a *Archiver) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantContractAuditSig,
-		mid.MatchID, sig)
-}
-
-// SaveContractB records party B's swap contract script and the coinID (e.g.
-// transaction output) containing the contract on chain Y.
-func (a *Archiver) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantSwapData,
-		mid.MatchID, uint8(order.TakerSwapCast), coinID, contract, timestamp)
-}
-
-// SaveAuditAckSigA records party A's signature acknowledging their audit of B's
-// swap contract.
-func (a *Archiver) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorContractAuditSig,
-		mid.MatchID, sig)
-}
-
-// Redemption transactions, and counterparty acknowledgement signatures.
-
-// SaveRedeemA records party A's redemption coinID (e.g. transaction output),
-// which spends party B's swap contract on chain Y, and the secret revealed by
-// the signature script of the input spending the contract. Note that this
-// transaction will contain the secret, which party B extracts.
-func (a *Archiver) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetInitiatorRedeemData,
-		mid.MatchID, uint8(order.MakerRedeemed), coinID, secret, timestamp)
-}
-
-// SaveRedeemAckSigB records party B's signature acknowledging party A's
-// redemption, which spent their swap contract on chain Y and revealed the
-// secret. Since this may be the final step in match negotiation, the match is
-// also flagged as inactive (not the same as archival or even status of
-// MatchComplete, which is set by SaveRedeemB) if the initiators's redeem ack
-// signature is already set.
-func (a *Archiver) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantRedeemAckSig,
-		mid.MatchID, sig)
-}
-
-// SaveRedeemB records party B's redemption coinID (e.g. transaction output),
-// which spends party A's swap contract on chain X.
-func (a *Archiver) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-	return a.updateMatchStmt(mid, internal.SetParticipantRedeemData,
-		mid.MatchID, uint8(order.MatchComplete), coinID, timestamp)
-}
-
-// SetMatchInactive flags the match as done/inactive. This is not necessary if
-// SaveRedeemAckSigB is run for the match since it will flag the match as done.
-func (a *Archiver) SetMatchInactive(mid db.MarketMatchID, forgive bool) error {
-	if forgive {
-		return a.updateMatchStmt(mid, internal.SetSwapDoneForgiven, mid.MatchID)
-	} // else leave the forgiven column NULL
-	return a.updateMatchStmt(mid, internal.SetSwapDone, mid.MatchID)
 }
 
 // ApplyMatchAcksRecordedEvent records match acknowledgement signatures and swap

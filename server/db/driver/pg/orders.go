@@ -598,12 +598,6 @@ func (a *Archiver) ActiveOrderCoins(base, quote uint32) (baseCoins, quoteCoins m
 	return
 }
 
-// CancelOrder is a temporary stub for the legacy swapper. Remove it when
-// the swapper no longer calls it; market events now persist cancellations.
-func (a *Archiver) CancelOrder(*order.LimitOrder) error {
-	return nil
-}
-
 // RevokeOrder updates an Order with revoked status, which is used for
 // DEX-revoked orders rather than orders matched with a user's CancelOrder. If
 // the order does not exist in the Archiver, RevokeOrder returns

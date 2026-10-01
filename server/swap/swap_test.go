@@ -231,6 +231,7 @@ func (m *TAuthManager) Suspended(user account.AccountID) (found, suspended bool)
 	suspended = rule != account.NoRule
 	return // TODO: test suspended account handling (no trades, just cancels)
 }
+
 func (m *TAuthManager) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
 	return m.verifyErr
 }
@@ -239,11 +240,6 @@ func (m *TAuthManager) Route(string,
 	func(account.AccountID, *msgjson.Message) *msgjson.Error) {
 }
 
-func (m *TAuthManager) SwapSuccess(id account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
-}
-func (m *TAuthManager) Inaction(id account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-	m.penalize(id, account.FailureToAct)
-}
 func (m *TAuthManager) ReputationOutcomePolicy() *db.ReputationOutcomePolicy {
 	return &db.ReputationOutcomePolicy{PreimageLimit: 40, MatchLimit: 60, OrderLimit: 100, FreeCancelThreshold: 2}
 }
@@ -392,40 +388,12 @@ func (ts *TStorage) Order(oid order.OrderID, base, quote uint32) (order.Order, o
 	}
 	return nil, order.OrderStatusUnknown, nil // not loading swaps
 }
+
 func (ts *TStorage) ActiveSwaps() ([]*db.SwapDataFull, error) {
 	ts.mtx.Lock()
 	defer ts.mtx.Unlock()
 	return ts.activeSwaps, nil
 }
-func (ts *TStorage) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
-	return 0, nil, nil
-}
-func (ts *TStorage) SaveMatchAckSigA(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ts *TStorage) SaveMatchAckSigB(mid db.MarketMatchID, sig []byte) error   { return nil }
-func (ts *TStorage) SaveMatchAckAddrA(mid db.MarketMatchID, addr string) error { return nil }
-func (ts *TStorage) SaveMatchAckAddrB(mid db.MarketMatchID, addr string) error { return nil }
-
-// Contract data.
-func (ts *TStorage) SaveContractA(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ts *TStorage) SaveAuditAckSigB(mid db.MarketMatchID, sig []byte) error { return nil }
-func (ts *TStorage) SaveContractB(mid db.MarketMatchID, contract []byte, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ts *TStorage) SaveAuditAckSigA(mid db.MarketMatchID, sig []byte) error { return nil }
-
-// Redeem data.
-func (ts *TStorage) SaveRedeemA(mid db.MarketMatchID, coinID, secret []byte, timestamp int64) error {
-	return nil
-}
-func (ts *TStorage) SaveRedeemAckSigB(mid db.MarketMatchID, sig []byte) error {
-	return nil
-}
-func (ts *TStorage) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp int64) error {
-	return nil
-}
-func (ts *TStorage) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
 
 func (ts *TStorage) SwapDataFullByID(mid order.MatchID) (*db.SwapDataFull, error) {
 	ts.mtx.Lock()

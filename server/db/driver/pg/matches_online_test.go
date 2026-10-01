@@ -21,7 +21,56 @@ import (
 	"decred.org/dcrdex/server/meshevents"
 )
 
-func TestInsertMatch(t *testing.T) {
+// insertMatchForTest stores or updates a match row via the shared upsertMatch
+// helper, the same path the epoch_processed event applier takes.
+func insertMatchForTest(match *order.Match) error {
+	matchesTableName, err := archie.matchTableName(match)
+	if err != nil {
+		return err
+	}
+	N, err := upsertMatch(archie.db, matchesTableName, match)
+	if err != nil {
+		return err
+	}
+	if N != 1 {
+		return fmt.Errorf("upsertMatch: updated %d rows, expected 1", N)
+	}
+	return nil
+}
+
+// setMatchInactiveForTest marks a fixture match inactive.
+func setMatchInactiveForTest(mid db.MarketMatchID) error {
+	return archie.updateMatchStmtWithExecutor(archie.db, mid, internal.SetSwapDone, mid.MatchID)
+}
+
+// saveContractForTest records a swap contract with recordSwapContract.
+func saveContractForTest(mid db.MarketMatchID, maker bool, contract, coinID []byte, timestamp int64) error {
+	return archie.recordSwapContract(archie.db, &meshevents.SwapContractRecordedEvent{
+		MatchID:  mid.MatchID,
+		Base:     mid.Base,
+		Quote:    mid.Quote,
+		Maker:    maker,
+		Contract: contract,
+		CoinID:   coinID,
+		SwapTime: timestamp,
+	})
+}
+
+// saveRedeemForTest records a redemption via the shared recordRedeemData
+// helper used by the swap_redemption_recorded event applier.
+func saveRedeemForTest(mid db.MarketMatchID, maker bool, coinID, secret []byte, timestamp int64) error {
+	return archie.recordRedeemData(archie.db, &meshevents.SwapRedemptionRecordedEvent{
+		MatchID:    mid.MatchID,
+		Base:       mid.Base,
+		Quote:      mid.Quote,
+		Maker:      maker,
+		CoinID:     coinID,
+		Secret:     secret,
+		RedeemTime: timestamp,
+	})
+}
+
+func Test_upsertMatch(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
 	}
@@ -78,9 +127,9 @@ func TestInsertMatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := archie.InsertMatch(tt.match)
+			err := insertMatchForTest(tt.match)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("InsertMatch() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("insertMatchForTest() error = %v, wantErr %v", err, tt.wantErr)
 			}
 
 			if tt.wantErr {
@@ -168,9 +217,9 @@ func TestSetSwapData(t *testing.T) {
 		return nil
 	}
 
-	err := archie.InsertMatch(matchA)
+	err := insertMatchForTest(matchA)
 	if err != nil {
-		t.Errorf("InsertMatch() failed: %v", err)
+		t.Errorf("insertMatchForTest() failed: %v", err)
 	}
 
 	if err = checkMatch(order.NewlyMatched, true); err != nil {
@@ -185,7 +234,14 @@ func TestSetSwapData(t *testing.T) {
 
 	// Match Ack Sig A (maker's match ack sig)
 	sigMakerMatch := randomBytes(73)
-	err = archie.SaveMatchAckSigA(mid, sigMakerMatch)
+	err = archie.saveMatchAck(archie.db, meshevents.MatchAckRecord{
+		MatchID: mid.MatchID,
+		Base:    mid.Base,
+		Quote:   mid.Quote,
+		Maker:   true,
+		Sig:     sigMakerMatch,
+		Address: "maker-swap-addr",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +259,14 @@ func TestSetSwapData(t *testing.T) {
 
 	// Match Ack Sig B (taker's match ack sig)
 	sigTakerMatch := randomBytes(73)
-	err = archie.SaveMatchAckSigB(mid, sigTakerMatch)
+	err = archie.saveMatchAck(archie.db, meshevents.MatchAckRecord{
+		MatchID: mid.MatchID,
+		Base:    mid.Base,
+		Quote:   mid.Quote,
+		Maker:   false,
+		Sig:     sigTakerMatch,
+		Address: "taker-swap-addr",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +286,7 @@ func TestSetSwapData(t *testing.T) {
 	contractA := randomBytes(128)
 	coinIDA := randomBytes(36)
 	contractATime := int64(1234)
-	err = archie.SaveContractA(mid, contractA, coinIDA, contractATime)
+	err = saveContractForTest(mid, true, contractA, coinIDA, contractATime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +313,7 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party B's signature for acknowledgement of contract A
 	auditSigB := randomBytes(73)
-	if err = archie.SaveAuditAckSigB(mid, auditSigB); err != nil {
+	if err = archie.updateMatchStmtWithExecutor(archie.db, mid, internal.SetParticipantContractAuditSig, mid.MatchID, auditSigB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,7 +333,7 @@ func TestSetSwapData(t *testing.T) {
 	contractB := randomBytes(128)
 	coinIDB := randomBytes(36)
 	contractBTime := int64(1235)
-	err = archie.SaveContractB(mid, contractB, coinIDB, contractBTime)
+	err = saveContractForTest(mid, false, contractB, coinIDB, contractBTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +360,7 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party A's signature for acknowledgement of contract B
 	auditSigA := randomBytes(73)
-	if err = archie.SaveAuditAckSigA(mid, auditSigA); err != nil {
+	if err = archie.updateMatchStmtWithExecutor(archie.db, mid, internal.SetInitiatorContractAuditSig, mid.MatchID, auditSigA); err != nil {
 		t.Fatal(err)
 	}
 
@@ -317,7 +380,7 @@ func TestSetSwapData(t *testing.T) {
 	redeemCoinIDA := randomBytes(36)
 	secret := randomBytes(72)
 	redeemATime := int64(1234)
-	err = archie.SaveRedeemA(mid, redeemCoinIDA, secret, redeemATime)
+	err = saveRedeemForTest(mid, true, redeemCoinIDA, secret, redeemATime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,7 +406,7 @@ func TestSetSwapData(t *testing.T) {
 
 	// Party B's signature for acknowledgement of A's redemption
 	redeemAckSigB := randomBytes(73)
-	if err = archie.SaveRedeemAckSigB(mid, redeemAckSigB); err != nil {
+	if err = archie.updateMatchStmtWithExecutor(archie.db, mid, internal.SetParticipantRedeemAckSig, mid.MatchID, redeemAckSigB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -362,7 +425,7 @@ func TestSetSwapData(t *testing.T) {
 	// Redeem B
 	redeemCoinIDB := randomBytes(36)
 	redeemBTime := int64(1234)
-	err = archie.SaveRedeemB(mid, redeemCoinIDB, redeemBTime)
+	err = saveRedeemForTest(mid, false, redeemCoinIDB, nil, redeemBTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,11 +685,11 @@ func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
 		}
 		match := newMatch(makerOrder, takerOrder, pair.match.Quantity, pair.match.Epoch)
 		match.Status = status
-		if err := archie.InsertMatch(match); err != nil {
+		if err := insertMatchForTest(match); err != nil {
 			t.Fatalf("InsertMatch: %v", err)
 		}
 		if inactive {
-			if err := archie.SetMatchInactive(testMarketMatchID(match), false); err != nil {
+			if err := setMatchInactiveForTest(testMarketMatchID(match)); err != nil {
 				t.Fatalf("SetMatchInactive: %v", err)
 			}
 		}
@@ -1066,7 +1129,7 @@ func TestMatchFailureCompletesOrderAfterLastMatch(t *testing.T) {
 	for i, taker := range takers {
 		matches[i] = newMatch(maker, taker, taker.Quantity, epoch)
 		matches[i].Status = order.MakerSwapCast
-		if err := archie.InsertMatch(matches[i]); err != nil {
+		if err := insertMatchForTest(matches[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1122,9 +1185,9 @@ func TestMatchByID(t *testing.T) {
 	// Store it.
 	epochID := order.EpochID{132412341, 1000}
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	err := insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	tests := []struct {
@@ -1180,9 +1243,9 @@ func TestUserMatches(t *testing.T) {
 	// Store it.
 	epochID := order.EpochID{132412341, 1000}
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	err := insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	tests := []struct {
@@ -1287,9 +1350,9 @@ func TestMarketMatches(t *testing.T) {
 	// Store it.
 	epochID := order.EpochID{132412341, 1000}
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := archie.InsertMatch(match)
+	err := insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 	// Make another perfect 1 lot match.
 	limitBuyStanding = newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
@@ -1297,15 +1360,15 @@ func TestMarketMatches(t *testing.T) {
 
 	// Store it.
 	match = newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	archie.SetMatchInactive(db.MarketMatchID{
+	setMatchInactiveForTest(db.MarketMatchID{
 		MatchID: match.ID(),
 		Base:    base,
 		Quote:   quote,
-	}, false)
+	})
 
 	// This one has txns.
 	mktMatchID := db.MarketMatchID{
@@ -1315,21 +1378,21 @@ func TestMarketMatches(t *testing.T) {
 	}
 	midWithCoins := mktMatchID.MatchID
 	MakerSwap, MakerContract := encode.RandomBytes(36), encode.RandomBytes(50)
-	err = archie.SaveContractA(mktMatchID, MakerContract, MakerSwap, 0)
+	err = saveContractForTest(mktMatchID, true, MakerContract, MakerSwap, 0)
 	if err != nil {
-		t.Fatalf("SaveContractA error: %v", err)
+		t.Fatalf("saveContractForTest (maker) error: %v", err)
 	}
 
 	TakerSwap, TakerContract := encode.RandomBytes(36), encode.RandomBytes(50)
-	err = archie.SaveContractB(mktMatchID, TakerContract, TakerSwap, 0)
+	err = saveContractForTest(mktMatchID, false, TakerContract, TakerSwap, 0)
 	if err != nil {
-		t.Fatalf("SaveContractB error: %v", err)
+		t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 	}
 
 	MakerRedeem, Secret := encode.RandomBytes(36), encode.RandomBytes(32)
-	err = archie.SaveRedeemA(mktMatchID, MakerRedeem, Secret, 0)
+	err = saveRedeemForTest(mktMatchID, true, MakerRedeem, Secret, 0)
 	if err != nil {
-		t.Fatalf("SaveContractB error: %v", err)
+		t.Fatalf("saveContractForTest/saveRedeemForTest error: %v", err)
 	}
 	// TakerRedeem not stored.
 
@@ -1339,9 +1402,9 @@ func TestMarketMatches(t *testing.T) {
 
 	// Store it.
 	match = newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	// Only active.
@@ -1434,9 +1497,9 @@ func generateMatchWithOrderStatuses(t *testing.T, matchStatus order.MatchStatus,
 
 	match := newMatch(loBuy, loSell, loSell.Quantity, epochID)
 	match.Status = matchStatus
-	err = archie.InsertMatch(match)
+	err = insertMatchForTest(match)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 	matchID := match.ID()
 	mktMatchID := db.MarketMatchID{
@@ -1450,36 +1513,36 @@ func generateMatchWithOrderStatuses(t *testing.T, matchStatus order.MatchStatus,
 		Active: active,
 	}
 	if !active {
-		archie.SetMatchInactive(mktMatchID, false)
+		setMatchInactiveForTest(mktMatchID)
 	}
 	for iStatus := order.NewlyMatched; iStatus <= matchStatus; iStatus++ {
 		switch iStatus {
 		case order.MakerSwapCast:
 			status.MakerContract = encode.RandomBytes(50)
 			status.MakerSwap = encode.RandomBytes(36)
-			err := archie.SaveContractA(mktMatchID, status.MakerContract, status.MakerSwap, 0)
+			err := saveContractForTest(mktMatchID, true, status.MakerContract, status.MakerSwap, 0)
 			if err != nil {
-				t.Fatalf("SaveContractA error: %v", err)
+				t.Fatalf("saveContractForTest (maker) error: %v", err)
 			}
 		case order.TakerSwapCast:
 			status.TakerContract = encode.RandomBytes(50)
 			status.TakerSwap = encode.RandomBytes(36)
-			err := archie.SaveContractB(mktMatchID, status.TakerContract, status.TakerSwap, 0)
+			err := saveContractForTest(mktMatchID, false, status.TakerContract, status.TakerSwap, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("saveContractForTest (taker) error: %v", err)
 			}
 		case order.MakerRedeemed:
 			status.MakerRedeem = encode.RandomBytes(36)
 			status.Secret = encode.RandomBytes(32)
-			err := archie.SaveRedeemA(mktMatchID, status.MakerRedeem, status.Secret, 0)
+			err := saveRedeemForTest(mktMatchID, true, status.MakerRedeem, status.Secret, 0)
 			if err != nil {
-				t.Fatalf("SaveRedeemA error: %v", err)
+				t.Fatalf("saveRedeemForTest (maker) error: %v", err)
 			}
 		case order.MatchComplete:
 			status.TakerRedeem = encode.RandomBytes(36)
-			err := archie.SaveRedeemB(mktMatchID, status.TakerRedeem, 0)
+			err := saveRedeemForTest(mktMatchID, false, status.TakerRedeem, nil, 0)
 			if err != nil {
-				t.Fatalf("SaveRedeemB error: %v", err)
+				t.Fatalf("saveRedeemForTest (taker) error: %v", err)
 			}
 		}
 	}
@@ -1518,15 +1581,15 @@ func TestCompletedAndAtFaultMatchStats(t *testing.T) {
 	limitSell.AccountID = taker2
 	matchLTC := newMatch(limitBuy, limitSell, limitSell.Quantity, order.EpochID{nextIdx(), 1000})
 	matchLTC.Status = order.MatchComplete
-	err := archie.InsertMatch(matchLTC)
+	err := insertMatchForTest(matchLTC)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	archie.SetMatchInactive(db.MarketMatchID{
+	setMatchInactiveForTest(db.MarketMatchID{
 		MatchID: matchLTC.ID(),
 		Base:    limitBuy.Base(),
 		Quote:   limitBuy.Quote(),
-	}, false)
+	})
 	// 7: success
 	matches = append(matches, &matchPair{
 		match: matchLTC,
@@ -1658,9 +1721,9 @@ func TestUserMatchFails(t *testing.T) {
 	m4.match.Taker.Prefix().BaseAsset = AssetBTC
 	m4.match.Taker.Prefix().QuoteAsset = AssetLTC
 	for _, m := range matches {
-		err := archie.InsertMatch(m.match)
+		err := insertMatchForTest(m.match)
 		if err != nil {
-			t.Fatalf("InsertMatch() failed: %v", err)
+			t.Fatalf("insertMatchForTest() failed: %v", err)
 		}
 	}
 	fails, err := archie.UserMatchFails(user, 100)
@@ -1693,13 +1756,13 @@ func TestAllActiveUserMatches(t *testing.T) {
 	// maker buy (quote swap asset), taker sell (base swap asset)
 	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
 	match.Status = order.TakerSwapCast // failed here
-	err := archie.InsertMatch(match)   // active by default
+	err := insertMatchForTest(match)   // active by default
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
-	err = archie.SetMatchInactive(db.MatchID(match), false) // set inactive, not forgiven
+	err = setMatchInactiveForTest(db.MatchID(match)) // set inactive, not forgiven
 	if err != nil {
-		t.Fatalf("SetMatchInactive() failed: %v", err)
+		t.Fatalf("setMatchInactive() failed: %v", err)
 	}
 
 	// Make a perfect 1 lot match, same parties.
@@ -1712,9 +1775,9 @@ func TestAllActiveUserMatches(t *testing.T) {
 	epochID2 := order.EpochID{132412342, 1000}
 	// maker buy (quote swap asset), taker sell (base swap asset)
 	match2 := newMatch(limitBuyStanding2, limitSellImmediate2, limitSellImmediate2.Quantity, epochID2)
-	err = archie.InsertMatch(match2)
+	err = insertMatchForTest(match2)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	// Make a perfect 1 lot BTC-LTC match.
@@ -1730,9 +1793,9 @@ func TestAllActiveUserMatches(t *testing.T) {
 	// Store it.
 	epochID3 := order.EpochID{132412342, 1000}
 	match3 := newMatch(limitBuyStanding3, limitSellImmediate3, limitSellImmediate3.Quantity, epochID3)
-	err = archie.InsertMatch(match3)
+	err = insertMatchForTest(match3)
 	if err != nil {
-		t.Fatalf("InsertMatch() failed: %v", err)
+		t.Fatalf("insertMatchForTest() failed: %v", err)
 	}
 
 	tests := []struct {

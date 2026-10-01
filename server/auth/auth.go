@@ -897,12 +897,6 @@ func (auth *AuthManager) AcctRepStatus(user account.AccountID) (connected bool, 
 	return
 }
 
-func (auth *AuthManager) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, redeemTime time.Time) {
-}
-
-func (auth *AuthManager) Inaction(user account.AccountID, outcome Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-}
-
 func (auth *AuthManager) PreimageSuccess(user account.AccountID, epochEnd time.Time, oid order.OrderID) {
 }
 

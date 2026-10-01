@@ -67,12 +67,11 @@ type AuthManager interface {
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(user account.AccountID, req *msgjson.Message, handlerFunc func(comms.Link, *msgjson.Message),
 		expireTimeout time.Duration, expireFunc func()) error
-	SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time)
-	Inaction(user account.AccountID, misstep db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID)
 	ReputationOutcomePolicy() *db.ReputationOutcomePolicy
 }
 
-// Storage updates match data in what is presumably a database.
+// Storage is the swapper's DB and event-log reader. Match writes go
+// through event appliers, not this interface's callers.
 type Storage interface {
 	db.SwapArchiver
 	LastErr() error
@@ -1718,18 +1717,6 @@ func (s *Swapper) respondError(id uint64, user account.AccountID, code int, errM
 	if err := s.authMgr.Send(user, msg); err != nil {
 		log.Infof("Unable to send error response (code = %d, msg = %s) to disconnected user %v: %q",
 			code, errMsg, user, err)
-	}
-}
-
-// respondSuccess sends a successful response to a user.
-func (s *Swapper) respondSuccess(id uint64, user account.AccountID, result any) {
-	msg, err := msgjson.NewResponse(id, result, nil)
-	if err != nil {
-		log.Errorf("failed to send success: %v", err)
-		return // this should not be possible, but don't pass nil msg to Send
-	}
-	if err := s.authMgr.Send(user, msg); err != nil {
-		log.Infof("Unable to send success response to disconnected user %v: %v", user, err)
 	}
 }
 
