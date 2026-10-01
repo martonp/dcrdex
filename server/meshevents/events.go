@@ -51,4 +51,5 @@ const (
 	EventKindOrdersRevoked          = "orders_revoked"
 	EventKindReputationForgiven     = "reputation_forgiven"
 	EventKindMatchAcksRecorded      = "match_acks_recorded"
+	EventKindSwapContractRecorded   = "swap_contract_recorded"
 )

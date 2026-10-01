@@ -843,3 +843,28 @@ func (a *Archiver) saveMatchAck(dbe sqlExecutor, ack meshevents.MatchAckRecord) 
 	}
 	return nil
 }
+
+// ApplySwapContractRecordedEvent records a swap contract and advances
+// the match status in one transaction.
+func (a *Archiver) ApplySwapContractRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.SwapContractRecordedEvent) (*db.EventLogEntry, error) {
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindSwapContractRecorded, txData, func(tx *sql.Tx) error {
+		return a.recordSwapContract(tx, event)
+	})
+}
+
+// recordSwapContract stores the contract data and advances the match status.
+func (a *Archiver) recordSwapContract(dbe sqlExecutor, event *meshevents.SwapContractRecordedEvent) error {
+	stmt := internal.SetParticipantSwapData
+	status := order.TakerSwapCast
+	if event.Maker {
+		stmt = internal.SetInitiatorSwapData
+		status = order.MakerSwapCast
+	}
+	mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+	return a.updateMatchStmtWithExecutor(dbe, mid, stmt, event.MatchID,
+		uint8(status), event.CoinID, event.Contract, event.SwapTime)
+}

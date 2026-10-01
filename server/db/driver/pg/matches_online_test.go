@@ -477,6 +477,82 @@ func TestApplyMatchAcksRecordedEvent(t *testing.T) {
 	assertEventLogFrontier(t, ctx, 2, tip2)
 }
 
+func TestApplySwapContractRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	pair := generateMatch(t, order.NewlyMatched, true, randomAccountID(), randomAccountID())
+	mid := testMarketMatchID(pair.match)
+	makerContract := &meshevents.SwapContractRecordedEvent{
+		MatchID:  mid.MatchID,
+		Base:     mid.Base,
+		Quote:    mid.Quote,
+		Maker:    true,
+		Status:   order.MakerSwapCast,
+		Contract: []byte("maker-contract"),
+		CoinID:   []byte("maker-coin"),
+		SwapTime: 1670000000000,
+	}
+
+	event := []byte("swap-contract-maker-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindSwapContractRecorded, event, makerContract)
+	log, err := archie.ApplySwapContractRecordedEvent(ctx, &db.EventLogMeta{Event: event}, makerContract)
+	if err != nil {
+		t.Fatalf("ApplySwapContractRecordedEvent maker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindSwapContractRecorded, event, tip, makerContract)
+	status, swapData, err := archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData maker error: %v", err)
+	}
+	if status != order.MakerSwapCast {
+		t.Fatalf("match status = %v, want MakerSwapCast", status)
+	}
+	if !bytes.Equal(swapData.ContractA, makerContract.Contract) ||
+		!bytes.Equal(swapData.ContractACoinID, makerContract.CoinID) || swapData.ContractATime != makerContract.SwapTime {
+		t.Fatalf("maker swap data = %+v, want contract %+v", swapData, makerContract)
+	}
+
+	takerContract := &meshevents.SwapContractRecordedEvent{
+		Status:   order.TakerSwapCast,
+		MatchID:  mid.MatchID,
+		Base:     mid.Base,
+		Quote:    mid.Quote,
+		Contract: []byte("taker-contract"),
+		CoinID:   []byte("taker-coin"),
+		SwapTime: 1670000001111,
+	}
+
+	takerEvent := []byte("swap-contract-taker-event")
+	takerTip := testEventApplyTip(t, tip, 2, meshevents.EventKindSwapContractRecorded, takerEvent, takerContract)
+	log, err = archie.ApplySwapContractRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           takerEvent,
+		ExpectedTipHash: takerTip,
+	}, takerContract)
+	if err != nil {
+		t.Fatalf("ApplySwapContractRecordedEvent taker error: %v", err)
+	}
+	requireEventApplyLog(t, log, 2, meshevents.EventKindSwapContractRecorded, takerEvent, takerTip, takerContract)
+	status, swapData, err = archie.SwapData(mid)
+	if err != nil {
+		t.Fatalf("SwapData taker error: %v", err)
+	}
+	if status != order.TakerSwapCast {
+		t.Fatalf("match status = %v, want TakerSwapCast", status)
+	}
+	if !bytes.Equal(swapData.ContractB, takerContract.Contract) ||
+		!bytes.Equal(swapData.ContractBCoinID, takerContract.CoinID) || swapData.ContractBTime != takerContract.SwapTime {
+		t.Fatalf("taker swap data = %+v, want contract %+v", swapData, takerContract)
+	}
+	if !bytes.Equal(swapData.ContractA, makerContract.Contract) ||
+		!bytes.Equal(swapData.ContractACoinID, makerContract.CoinID) || swapData.ContractATime != makerContract.SwapTime {
+		t.Fatalf("recording taker contract changed maker data: %+v", swapData)
+	}
+}
+
 func TestMatchByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
