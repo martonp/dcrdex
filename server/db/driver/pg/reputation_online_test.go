@@ -237,7 +237,8 @@ func TestApplyRepEventTx(t *testing.T) {
 	calls := captureRepListener(t)
 	userA, userB := randomAccountID(), randomAccountID()
 	userBPreimage, userBOrder := randomReputationOrderID(), randomReputationOrderID()
-	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, OrderLimit: 1}
+	userBMatch := randomReputationMatchID()
+	policy := &db.ReputationOutcomePolicy{PreimageLimit: 1, MatchLimit: 1, OrderLimit: 1}
 
 	// A failed callback must not record the batch or notify listeners.
 	applyErr := errors.New("apply failed")
@@ -263,6 +264,9 @@ func TestApplyRepEventTx(t *testing.T) {
 				{user: userA, oid: randomReputationOrderID()},
 				{user: userB, oid: userBOrder},
 			}
+			batch.matches = []*reputationMatchOutcome{{
+				user: userB, mid: userBMatch, outcome: db.OutcomeNoSwapAsTaker,
+			}}
 			return nil
 		})
 	if err != nil {
@@ -305,7 +309,7 @@ func TestApplyRepEventTx(t *testing.T) {
 		{userB, userBPreimage, userBOrder},
 	} {
 		// Request more than the retention limit so read-side trimming cannot hide a failure to prune.
-		preimages, _, orders, err := archie.GetUserReputationData(ctx, want.user, 10, 10, 10)
+		preimages, matches, orders, err := archie.GetUserReputationData(ctx, want.user, 10, 10, 10)
 		if err != nil {
 			t.Fatalf("GetUserReputationData: %v", err)
 		}
@@ -314,6 +318,13 @@ func TestApplyRepEventTx(t *testing.T) {
 		}
 		if len(orders) != 1 || orders[0].OrderID != want.orderID || orders[0].Canceled {
 			t.Fatalf("user %v orders = %+v, want completion %v", want.user, orders, want.orderID)
+		}
+		if want.user == userB {
+			if len(matches) != 1 || matches[0].MatchID != userBMatch || matches[0].MatchOutcome != db.OutcomeNoSwapAsTaker {
+				t.Fatalf("userB match outcomes = %+v, want no-swap outcome for %v", matches, userBMatch)
+			}
+		} else if len(matches) != 0 {
+			t.Fatalf("userA match outcomes = %+v, want none", matches)
 		}
 	}
 

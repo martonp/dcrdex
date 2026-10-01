@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -604,6 +605,171 @@ func TestApplyAuditAckRecordedEvent(t *testing.T) {
 	}
 }
 
+func TestApplySwapRedemptionRecordedEvent(t *testing.T) {
+	ctx := context.Background()
+	policy := &db.ReputationOutcomePolicy{MatchLimit: 10, OrderLimit: 10}
+	const redeemTime = int64(1670000003333)
+
+	// Related matches only need the fields used by the unsettled-match query.
+	addRelatedMatch := func(t *testing.T, pair *matchPair, maker bool, status order.MatchStatus, inactive bool) {
+		t.Helper()
+		makerOrder, takerOrder := pair.match.Maker, pair.match.Taker
+		if maker {
+			takerOrder = newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
+		} else {
+			makerOrder = newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
+		}
+		match := newMatch(makerOrder, takerOrder, pair.match.Quantity, pair.match.Epoch)
+		match.Status = status
+		if err := archie.InsertMatch(match); err != nil {
+			t.Fatalf("InsertMatch: %v", err)
+		}
+		if inactive {
+			if err := archie.SetMatchInactive(testMarketMatchID(match), false); err != nil {
+				t.Fatalf("SetMatchInactive: %v", err)
+			}
+		}
+	}
+
+	tests := []struct {
+		name          string
+		maker         bool
+		status        order.MatchStatus
+		booked        bool
+		sameUser      bool
+		otherStatus   order.MatchStatus // Zero means no related match.
+		otherInactive bool
+		wantComplete  bool
+		wantErr       bool
+	}{
+		{name: "maker completes order", maker: true, status: order.TakerSwapCast, wantComplete: true},
+		{name: "taker completes order", status: order.MakerRedeemed, wantComplete: true},
+		{name: "maker requires taker swap", maker: true, status: order.MakerSwapCast, wantErr: true},
+		{name: "taker requires maker redemption", status: order.TakerSwapCast, wantErr: true},
+		{name: "booked maker order", maker: true, status: order.TakerSwapCast, booked: true},
+		{name: "unsettled maker match", maker: true, status: order.TakerSwapCast, otherStatus: order.TakerSwapCast},
+		{name: "unsettled taker match", status: order.MakerRedeemed, otherStatus: order.TakerSwapCast},
+		{name: "other taker still owes redemption", status: order.MakerRedeemed, otherStatus: order.MakerRedeemed},
+		{name: "other maker already redeemed", maker: true, status: order.TakerSwapCast, otherStatus: order.MakerRedeemed, wantComplete: true},
+		{name: "other taker already redeemed", status: order.MakerRedeemed, otherStatus: order.MatchComplete, otherInactive: true, wantComplete: true},
+		{name: "other match failed", maker: true, status: order.TakerSwapCast, otherStatus: order.TakerSwapCast, otherInactive: true, wantComplete: true},
+		{name: "self match has no match credit", maker: true, status: order.TakerSwapCast, sameUser: true, wantComplete: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatal(err)
+			}
+			maker, taker := randomAccountID(), randomAccountID()
+			if tt.sameUser {
+				taker = maker
+			}
+			makerStatus := order.OrderStatusExecuted
+			if tt.booked {
+				makerStatus = order.OrderStatusBooked
+			}
+			pair := generateMatchWithOrderStatuses(t, tt.status, true, maker, taker, makerStatus, order.OrderStatusExecuted)
+			if tt.otherStatus != 0 {
+				addRelatedMatch(t, pair, tt.maker, tt.otherStatus, tt.otherInactive)
+			}
+			mid := testMarketMatchID(pair.match)
+			actor, counterparty, actorOrder := taker, maker, pair.match.Taker.ID()
+			nextStatus := order.MatchComplete
+			if tt.maker {
+				actor, counterparty, actorOrder = maker, taker, pair.match.Maker.ID()
+				nextStatus = order.MakerRedeemed
+			}
+			event := &meshevents.SwapRedemptionRecordedEvent{
+				MatchID: mid.MatchID, Base: mid.Base, Quote: mid.Quote, Maker: tt.maker,
+				Status: nextStatus, CoinID: []byte("redeem coin"), RedeemTime: redeemTime,
+			}
+			if tt.maker {
+				event.Secret = []byte("secret")
+			}
+			payload, err := event.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeStatus, beforeData, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logEntry, err := archie.ApplySwapRedemptionRecordedEvent(ctx, &db.EventLogMeta{Event: payload}, policy, event)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("apply error = %v, want error %v", err, tt.wantErr)
+			}
+			status, data, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantErr {
+				if status != beforeStatus || !reflect.DeepEqual(data, beforeData) {
+					t.Fatalf("rejected event changed swap data: %v, %+v", status, data)
+				}
+				assertEventLogFrontier(t, ctx, 0, nil)
+			} else {
+				tip := testEventApplyTip(t, nil, 1, event.Kind(), payload, event)
+				requireEventApplyLog(t, logEntry, 1, event.Kind(), payload, tip, event)
+				if status != nextStatus {
+					t.Fatalf("status = %v, want %v", status, nextStatus)
+				}
+				if tt.maker {
+					if !bytes.Equal(data.RedeemACoinID, event.CoinID) || !bytes.Equal(data.RedeemASecret, event.Secret) || data.RedeemATime != redeemTime {
+						t.Fatalf("wrong maker redemption: %+v", data)
+					}
+				} else if !bytes.Equal(data.RedeemBCoinID, event.CoinID) || data.RedeemBTime != redeemTime {
+					t.Fatalf("wrong taker redemption: %+v", data)
+				}
+			}
+
+			matchData, err := archie.MatchByID(mid.MatchID, mid.Base, mid.Quote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantActive := tt.wantErr || tt.maker
+			if matchData.Active != wantActive {
+				t.Fatalf("match active = %v, want %v", matchData.Active, wantActive)
+			}
+
+			users := []account.AccountID{actor}
+			if actor != counterparty {
+				users = append(users, counterparty)
+			}
+			for _, user := range users {
+				wantMatches, wantOrders := 0, 0
+				if user == actor && !tt.wantErr {
+					if !tt.sameUser {
+						wantMatches = 1
+					}
+					if tt.wantComplete {
+						wantOrders = 1
+					}
+				}
+				completed, times, err := archie.CompletedUserOrders(user, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(completed) != wantOrders || (wantOrders == 1 && (completed[0] != actorOrder || times[0] != redeemTime)) {
+					t.Fatalf("user %v completed orders = %v/%v, want %d completion at %d", user, completed, times, wantOrders, redeemTime)
+				}
+				_, matches, orders, err := archie.GetUserReputationData(ctx, user, 10, 10, 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(matches) != wantMatches || len(orders) != wantOrders {
+					t.Fatalf("user %v reputation matches/orders = %d/%d, want %d/%d", user, len(matches), len(orders), wantMatches, wantOrders)
+				}
+				if wantMatches == 1 && (matches[0].MatchID != mid.MatchID || matches[0].MatchOutcome != db.OutcomeSwapSuccess) {
+					t.Fatalf("wrong match outcome: %+v", matches[0])
+				}
+				if wantOrders == 1 && (orders[0].OrderID != actorOrder || orders[0].Canceled) {
+					t.Fatalf("wrong order outcome: %+v", orders[0])
+				}
+			}
+		})
+	}
+}
+
 func TestMatchByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
@@ -853,6 +1019,11 @@ type matchPair struct {
 }
 
 func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, makerBuyer, takerSeller account.AccountID, epochIdx ...uint64) *matchPair {
+	return generateMatchWithOrderStatuses(t, matchStatus, active, makerBuyer, takerSeller,
+		order.OrderStatusExecuted, order.OrderStatusExecuted, epochIdx...)
+}
+
+func generateMatchWithOrderStatuses(t *testing.T, matchStatus order.MatchStatus, active bool, makerBuyer, takerSeller account.AccountID, makerStatus, takerStatus order.OrderStatus, epochIdx ...uint64) *matchPair {
 	t.Helper()
 	loBuy := newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
 	loBuy.P.AccountID = makerBuyer
@@ -865,11 +1036,11 @@ func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, mak
 	}
 	epochID := order.EpochID{epIdx, 1000}
 
-	err := storeOrderForTest(archie, loBuy, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted)
+	err := storeOrderForTest(archie, loBuy, int64(epochID.Idx), int64(epochID.Dur), makerStatus)
 	if err != nil {
 		t.Fatalf("failed to store order: %v", err)
 	}
-	err = storeOrderForTest(archie, loSell, int64(epochID.Idx), int64(epochID.Dur), order.OrderStatusExecuted)
+	err = storeOrderForTest(archie, loSell, int64(epochID.Idx), int64(epochID.Dur), takerStatus)
 	if err != nil {
 		t.Fatalf("failed to store order: %v", err)
 	}
@@ -915,13 +1086,13 @@ func generateMatch(t *testing.T, matchStatus order.MatchStatus, active bool, mak
 			status.Secret = encode.RandomBytes(32)
 			err := archie.SaveRedeemA(mktMatchID, status.MakerRedeem, status.Secret, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("SaveRedeemA error: %v", err)
 			}
 		case order.MatchComplete:
 			status.TakerRedeem = encode.RandomBytes(36)
 			err := archie.SaveRedeemB(mktMatchID, status.TakerRedeem, 0)
 			if err != nil {
-				t.Fatalf("SaveContractB error: %v", err)
+				t.Fatalf("SaveRedeemB error: %v", err)
 			}
 		}
 	}

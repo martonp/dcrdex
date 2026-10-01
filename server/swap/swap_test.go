@@ -306,6 +306,8 @@ type TStorage struct {
 	auditAcks                 []*meshevents.AuditAckRecordedEvent
 	saveContractErr           error
 	applyAuditAckRecordedErr  error
+	redemptions               []*meshevents.SwapRedemptionRecordedEvent
+	applyRedemptionErr        error
 
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
@@ -404,6 +406,16 @@ func (ts *TStorage) ApplyAuditAckRecordedEvent(_ context.Context, _ *db.EventLog
 		return nil, ts.applyAuditAckRecordedErr
 	}
 	ts.auditAcks = append(ts.auditAcks, ack)
+	return new(db.EventLogEntry), nil
+}
+
+func (ts *TStorage) ApplySwapRedemptionRecordedEvent(_ context.Context, _ *db.EventLogMeta, _ *db.ReputationOutcomePolicy, redemption *meshevents.SwapRedemptionRecordedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if ts.applyRedemptionErr != nil {
+		return nil, ts.applyRedemptionErr
+	}
+	ts.redemptions = append(ts.redemptions, redemption)
 	return new(db.EventLogEntry), nil
 }
 

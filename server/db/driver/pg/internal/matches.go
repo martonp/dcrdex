@@ -117,6 +117,14 @@ const (
 	FROM %s
 	WHERE takerAccount = $1 OR makerAccount = $1;`
 
+	UnsettledOrderMatchExists = `SELECT EXISTS (
+		SELECT 1 FROM %s
+		WHERE active AND makerOrder = $1 AND status < $2
+	) OR EXISTS (
+		SELECT 1 FROM %s
+		WHERE active AND takerOrder = $1
+	);`
+
 	RetrieveActiveUserMatches = `SELECT matchid, takerSell,
 		takerOrder, takerAccount, takerAddress,
 		makerOrder, makerAccount, makerAddress,

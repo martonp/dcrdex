@@ -560,7 +560,7 @@ func (a *Archiver) MatchByID(mid order.MatchID, base, quote uint32) (*db.MatchDa
 	return matchData, err
 }
 
-func matchByID(dbe *sql.DB, tableName string, mid order.MatchID) (*db.MatchData, error) {
+func matchByID(dbe sqlQueryer, tableName string, mid order.MatchID) (*db.MatchData, error) {
 	var m db.MatchData
 	var status uint8
 	var baseRate, quoteRate sql.NullInt64
@@ -884,4 +884,117 @@ func (a *Archiver) ApplyAuditAckRecordedEvent(ctx context.Context, meta *db.Even
 		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
 		return a.updateMatchStmtWithExecutor(tx, mid, stmt, event.MatchID, event.Sig)
 	})
+}
+
+// ApplySwapRedemptionRecordedEvent records a redemption, advances the match
+// status, and records the redeeming user's successful match outcome. It also
+// records order completion when the order is executed and has no unsettled
+// matches remaining.
+func (a *Archiver) ApplySwapRedemptionRecordedEvent(ctx context.Context, meta *db.EventLogMeta, policy *db.ReputationOutcomePolicy, event *meshevents.SwapRedemptionRecordedEvent) (*db.EventLogEntry, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyRepEventTx(ctx, meta, event.Kind(), txData, policy, func(tx *sql.Tx, outcomes *reputationOutcomeBatch) error {
+		marketSchema, err := a.marketSchema(event.Base, event.Quote)
+		if err != nil {
+			return err
+		}
+		matchesTable := fullMatchesTableName(a.dbName, marketSchema)
+		match, err := matchByID(tx, matchesTable, event.MatchID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = db.ArchiveError{Code: db.ErrUnknownMatch}
+		}
+		if err != nil {
+			return err
+		}
+		requiredStatus := order.MakerRedeemed
+		if event.Maker {
+			requiredStatus = order.TakerSwapCast
+		}
+		if match.Status != requiredStatus {
+			return fmt.Errorf("swap redemption recorded event requires status %v, found %v for match %v",
+				requiredStatus, match.Status, event.MatchID)
+		}
+		if err := a.recordRedeemData(tx, event); err != nil {
+			return err
+		}
+		actor, counterparty, actorOrder := match.TakerAcct, match.MakerAcct, match.Taker
+		if event.Maker {
+			actor, counterparty, actorOrder = match.MakerAcct, match.TakerAcct, match.Maker
+		}
+		if actor != counterparty {
+			outcomes.matches = append(outcomes.matches, &reputationMatchOutcome{
+				user:    actor,
+				mid:     event.MatchID,
+				outcome: db.OutcomeSwapSuccess,
+			})
+		}
+		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+		return a.completeOrderIfSettled(tx, matchesTable, outcomes, mid, actorOrder, actor, event.RedeemTime)
+	})
+}
+
+// recordRedeemData stores the redemption and advances the match status.
+func (a *Archiver) recordRedeemData(dbe sqlExecutor, event *meshevents.SwapRedemptionRecordedEvent) error {
+	mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+	if event.Maker {
+		return a.updateMatchStmtWithExecutor(dbe, mid, internal.SetInitiatorRedeemData,
+			event.MatchID, uint8(order.MakerRedeemed), event.CoinID, event.Secret, event.RedeemTime)
+	}
+	return a.updateMatchStmtWithExecutor(dbe, mid, internal.SetParticipantRedeemData,
+		event.MatchID, uint8(order.MatchComplete), event.CoinID, event.RedeemTime)
+}
+
+// orderHasUnsettledMatch reports whether an order still has swaps to finish.
+// A maker is finished once it redeems; a taker's redemption makes the match
+// inactive. Failed matches are inactive as well.
+func orderHasUnsettledMatch(dbe sqlQueryer, matchesTable string, oid order.OrderID) (bool, error) {
+	stmt := fmt.Sprintf(internal.UnsettledOrderMatchExists, matchesTable, matchesTable)
+	var exists bool
+	err := dbe.QueryRow(stmt, oid, uint8(order.MakerRedeemed)).Scan(&exists)
+	return exists, err
+}
+
+// completeOrderIfSettled records the completion time and adds an order reputation
+// outcome if the order is executed and none of its matches remain unsettled.
+func (a *Archiver) completeOrderIfSettled(dbe sqlQueryExecutor, matchesTable string, outcomes *reputationOutcomeBatch,
+	mid db.MarketMatchID, oid order.OrderID, user account.AccountID, completeTimeMS int64) error {
+	status, _, _, err := a.orderStatusByID(dbe, oid, mid.Base, mid.Quote)
+	if err != nil {
+		return err
+	}
+	if status != orderStatusExecuted {
+		return nil
+	}
+	unsettled, err := orderHasUnsettledMatch(dbe, matchesTable, oid)
+	if err != nil {
+		return err
+	}
+	if unsettled {
+		return nil
+	}
+	marketSchema, err := a.marketSchema(mid.Base, mid.Quote)
+	if err != nil {
+		return err
+	}
+	// Only executed trading orders can complete their swaps.
+	table := fullOrderTableName(a.dbName, marketSchema, false)
+	stmt := fmt.Sprintf(internal.SetOrderCompleteTime, table)
+	rows, err := sqlExec(dbe, stmt, completeTimeMS, oid)
+	if err != nil {
+		a.fatalBackendErr(err)
+		return fmt.Errorf("setting completion time for order %v: %w", oid, err)
+	}
+	if rows != 1 {
+		return db.ArchiveError{
+			Code:   db.ErrUnknownOrder,
+			Detail: fmt.Sprintf("update count = %d for order %v, expected 1", rows, oid),
+		}
+	}
+	outcomes.orders = append(outcomes.orders, &reputationOrderOutcome{user: user, oid: oid})
+	return nil
 }

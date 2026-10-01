@@ -651,6 +651,10 @@ type SwapArchiver interface {
 
 	// ApplyAuditAckRecordedEvent records a contract audit acknowledgement.
 	ApplyAuditAckRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AuditAckRecordedEvent) (*EventLogEntry, error)
+
+	// ApplySwapRedemptionRecordedEvent records a swap redemption and the
+	// resulting match and order reputation outcomes.
+	ApplySwapRedemptionRecordedEvent(ctx context.Context, meta *EventLogMeta, policy *ReputationOutcomePolicy, event *meshevents.SwapRedemptionRecordedEvent) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified
@@ -1023,6 +1027,7 @@ type OrdersRevokedUpdate struct {
 // per account and which successful cancellations count as penalties.
 type ReputationOutcomePolicy struct {
 	PreimageLimit int
+	MatchLimit    int
 	OrderLimit    int
 
 	// Successful cancellations with a nonnegative epoch gap below this
