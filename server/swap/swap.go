@@ -70,8 +70,6 @@ type Storage interface {
 	LastErr() error
 	Fatal() <-chan struct{}
 	Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error)
-	CancelOrder(*order.LimitOrder) error
-	InsertMatch(match *order.Match) error
 }
 
 // swapStatus is information related to the completion or incompletion of each
@@ -227,9 +225,8 @@ type SwapperAsset struct {
 	Locker coinlock.CoinLocker // should be *coinlock.AssetCoinLocker
 }
 
-// Swapper handles order matches by handling authentication and inter-party
-// communications between clients, or 'users'. The Swapper authenticates users
-// (vua AuthManager) and validates transactions as they are reported.
+// Swapper tracks in-progress atomic swaps, coordinates client requests,
+// and monitors swap progress and deadlines.
 type Swapper struct {
 	// coins is a map to all the Asset information, including the asset backends,
 	// used by this Swapper.
@@ -283,9 +280,9 @@ type Swapper struct {
 	latencyQ *wait.TaperingTickerQueue
 
 	// handlerMtx should be read-locked for the duration of the comms route
-	// handlers (handleInit and handleRedeem) and Negotiate. This blocks
-	// shutdown until any coin waiters are registered with latencyQ. It should
-	// be write-locked before setting the stop flag.
+	// handlers (handleInit and handleRedeem). This blocks shutdown until any
+	// coin waiters are registered with latencyQ. It should be write-locked
+	// before setting the stop flag.
 	handlerMtx sync.RWMutex
 	// stop is used to prevent new handlers from starting coin waiters. It is
 	// set to true during shutdown of Run.
@@ -2755,31 +2752,20 @@ func readMatches(matchSets []*order.MatchSet) []*matchTracker {
 	return matches
 }
 
-// Negotiate takes ownership of the matches and begins swap negotiation. For
-// reliable identification of completed orders when redeem acks are received and
-// processed by processAck, BeginMatchAndNegotiate should be called prior to
-// matching and order status/amount updates, and EndMatchAndNegotiate should be
-// called after Negotiate. This locking sequence allows for orders that may
-// already be involved in active swaps to remain unmodified by the
-// Matcher/Market until new matches are recorded by the Swapper in Negotiate. If
-// this is not done, it is possible that an order may be flagged as completed if
-// a swap A completes after Matching and creation of swap B but before Negotiate
-// has a chance to record the new swap.
-func (s *Swapper) Negotiate(matchSets []*order.MatchSet) {
-	// If the Swapper is stopping, the Markets should also be stopping, but
-	// block this just in case.
+func idToBytes(id [order.OrderIDSize]byte) []byte {
+	return id[:]
+}
+
+// TrackMatches registers already-persisted matches in memory.
+func (s *Swapper) TrackMatches(matchSets []*order.MatchSet) {
 	s.handlerMtx.RLock()
 	defer s.handlerMtx.RUnlock()
 	if s.stop {
-		log.Errorf("Negotiate called on stopped swapper. Matches lost!")
-		return
+		log.Errorf("Tracking committed matches after the swapper stopped")
 	}
 
-	// Lock trade order coins, and get current optimal fee rates. Also filter
-	// out matches with unsupported assets, which should not happen if the
-	// Market is behaving, but be defensive.
-	supportedMatchSets := matchSets[:0]                    // same buffer, start empty
-	swapOrders := make([]order.Order, 0, 2*len(matchSets)) // size guess, with the single maker case
+	supportedMatchSets := matchSets[:0]
+	swapOrders := make([]order.Order, 0, 2*len(matchSets))
 	for _, match := range matchSets {
 		supportedMatchSets = append(supportedMatchSets, match)
 
@@ -2792,64 +2778,63 @@ func (s *Swapper) Negotiate(matchSets []*order.MatchSet) {
 			swapOrders = append(swapOrders, maker)
 		}
 	}
-	matchSets = supportedMatchSets
-
 	s.LockOrdersCoins(swapOrders)
 
-	// Set up the matchTrackers, which includes a slice of Matches.
-	matches := readMatches(matchSets)
+	s.trackMatches(readMatches(supportedMatchSets))
+}
 
-	// Record the matches. If any DB updates fail, no swaps proceed. We could
-	// let the others proceed, but that could seem selective trickery to the
-	// clients.
+func (s *Swapper) trackMatches(matches []*matchTracker) {
+	toMonitor := make([]*matchTracker, 0, len(matches))
 	for _, match := range matches {
-		// Note that matches where the taker order is a cancel will be stored
-		// with status MatchComplete, and without the maker or taker swap
-		// addresses. The match will also be flagged as inactive since there is
-		// no associated swap negotiation.
-
-		// TODO: Initially store cancel matches lacking ack sigs as active, only
-		// flagging as inactive when both maker and taker match ack sigs have
-		// been received. The client will need a mechanism to provide the ack,
-		// perhaps having the server resend missing match ack requests on client
-		// connect.
-		if err := s.storage.InsertMatch(match.Match); err != nil {
-			log.Errorf("InsertMatch (match id=%v) failed: %v", match.ID(), err)
-			// TODO: notify clients (notification or response to what?)
-			// abortAll()
-			return
+		if match.Taker.Type() == order.CancelOrderType {
+			continue
 		}
+		toMonitor = append(toMonitor, match)
+	}
+
+	// Add the matches to the matches/userMatches maps.
+	s.matchMtx.Lock()
+	for _, match := range toMonitor {
+		s.addMatch(match)
+	}
+	s.matchMtx.Unlock()
+}
+
+// RequestMatchAcks sends match requests on the emitting master. TrackMatches
+// must already have registered non-cancel matches.
+func (s *Swapper) RequestMatchAcks(matchSets []*order.MatchSet) {
+	s.handlerMtx.RLock()
+	defer s.handlerMtx.RUnlock()
+	if s.stop {
+		log.Errorf("RequestMatchAcks called on stopped swapper. Match requests not sent.")
+		return
 	}
 
 	userMatches := make(map[account.AccountID][]*messageAcker)
-	// addUserMatch signs a match notification message, and add the data
+	// addUserMatch signs a match notification message, and adds the data
 	// required to process the acknowledgment to the userMatches map.
 	addUserMatch := func(acker *messageAcker) {
 		s.authMgr.Sign(acker.params)
 		userMatches[acker.user] = append(userMatches[acker.user], acker)
 	}
 
-	// Setting length to max possible, which is over-allocating by the number of
-	// cancels.
-	toMonitor := make([]*matchTracker, 0, len(matches))
+	matches := readMatches(matchSets)
+	ackMatches := make([]*matchTracker, 0, len(matches))
+	s.matchMtx.RLock()
 	for _, match := range matches {
-		if match.Taker.Type() == order.CancelOrderType {
-			// If this is a cancellation, there is nothing to track. Just cancel
-			// the target order by removing it from the DB. It is already
-			// removed from book by the Market.
-			err := s.storage.CancelOrder(match.Maker) // TODO: do this in Market?
-			if err != nil {
-				log.Errorf("Failed to cancel order %v", match.Maker)
-				// If the DB update failed, the target order status was not
-				// updated, but removed from the in-memory book. This is
-				// potentially a critical failure since the dex will restore the
-				// book from the DB. TODO: Notify clients.
-				return
+		if match.Taker.Type() != order.CancelOrderType {
+			tracked := s.matches[match.ID()]
+			if tracked == nil {
+				log.Errorf("RequestMatchAcks: match %v was not registered", match.ID())
+				continue
 			}
-		} else {
-			toMonitor = append(toMonitor, match)
+			match = tracked
 		}
+		ackMatches = append(ackMatches, match)
+	}
+	s.matchMtx.RUnlock()
 
+	for _, match := range ackMatches {
 		// Create an acker for maker and taker, sharing the same matchTracker.
 		makerMsg, takerMsg := matchNotifications(match) // msgjson.Match for each party
 		addUserMatch(&messageAcker{
@@ -2867,13 +2852,6 @@ func (s *Swapper) Negotiate(matchSets []*order.MatchSet) {
 			// isAudit: false,
 		})
 	}
-
-	// Add the matches to the matches/userMatches maps.
-	s.matchMtx.Lock()
-	for _, match := range toMonitor {
-		s.addMatch(match)
-	}
-	s.matchMtx.Unlock()
 
 	// Send the user match notifications.
 	for user, matches := range userMatches {
@@ -2895,7 +2873,7 @@ func (s *Swapper) Negotiate(matchSets []*order.MatchSet) {
 		// Copy the loop variables for capture by the match acknowledgement
 		// response handler.
 		u, m := user, matches
-		log.Debugf("Negotiate: sending 'match' ack request to user %v for %d matches",
+		log.Debugf("RequestMatchAcks: sending 'match' ack request to user %v for %d matches",
 			u, len(m))
 
 		// Send the request.
@@ -2908,13 +2886,3 @@ func (s *Swapper) Negotiate(matchSets []*order.MatchSet) {
 		}
 	}
 }
-
-func idToBytes(id [order.OrderIDSize]byte) []byte {
-	return id[:]
-}
-
-// TrackMatches is a temporary stub until swap processing is converted to mesh.
-func (s *Swapper) TrackMatches(matchSets []*order.MatchSet) {}
-
-// RequestMatchAcks is a temporary stub until swap processing is converted to mesh.
-func (s *Swapper) RequestMatchAcks(matchSets []*order.MatchSet) {}

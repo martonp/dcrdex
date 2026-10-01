@@ -324,9 +324,7 @@ func (ts *TStorage) fatalBackendErr(err error) {
 func (ts *TStorage) Order(oid order.OrderID, base, quote uint32) (order.Order, order.OrderStatus, error) {
 	return nil, order.OrderStatusUnknown, nil // not loading swaps
 }
-func (ts *TStorage) CancelOrder(*order.LimitOrder) error      { return nil }
 func (ts *TStorage) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
-func (ts *TStorage) InsertMatch(match *order.Match) error     { return nil }
 func (ts *TStorage) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
 	return 0, nil, nil
 }
@@ -635,6 +633,12 @@ func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
 		matchInfo:     matchInfo,
 		noResume:      noResume,
 	}, cleanup
+}
+
+func (rig *testRig) applyMatchesAndRequestAcks(t *testing.T, matchSets ...*order.MatchSet) {
+	t.Helper()
+	rig.swapper.TrackMatches(matchSets)
+	rig.swapper.RequestMatchAcks(matchSets)
 }
 
 func (rig *testRig) getTracker() *matchTracker {
@@ -1337,7 +1341,7 @@ func (set *tMatchSet) add(matchInfo *tMatch) *tMatchSet {
 	ms.Rates = append(ms.Rates, matchInfo.rate)
 	ms.Total += matchInfo.qty
 	// In practice, a MatchSet's fee rate is used to set the individual match
-	// fee rates via (*MatchSet).Matches in Negotiate > readMatches.
+	// fee rates via (*MatchSet).Matches in TrackMatches.
 	ms.FeeRateBase = matchInfo.match.FeeRateBase
 	ms.FeeRateQuote = matchInfo.match.FeeRateQuote
 	set.matchInfos = append(set.matchInfos, matchInfo)
@@ -1515,6 +1519,34 @@ func TestFatalStorageErr(t *testing.T) {
 	rig.swapperWaiter.WaitForShutdown()
 }
 
+func TestTrackMatchesAfterStop(t *testing.T) {
+	rig, cleanup := tNewTestRig(nil)
+	cleanup() // Stop the worker before registering committed matches.
+
+	set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+	match := set.matchInfos[0].match
+	rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+	rig.swapper.matchMtx.RLock()
+	tracked := rig.swapper.matches[match.ID()]
+	makerTracked := rig.swapper.userMatches[match.Maker.User()][match.ID()]
+	takerTracked := rig.swapper.userMatches[match.Taker.User()][match.ID()]
+	rig.swapper.matchMtx.RUnlock()
+	if tracked == nil || makerTracked != tracked || takerTracked != tracked {
+		t.Fatal("committed match was not tracked after worker stopped")
+	}
+	for _, ord := range []order.Order{match.Maker, match.Taker} {
+		assetID := ord.Quote()
+		if ord.Trade().Sell {
+			assetID = ord.Base()
+		}
+		for _, coin := range ord.Trade().Coins {
+			if !rig.swapper.coins[assetID].Locker.CoinLocked(coin) {
+				t.Fatalf("funding coin %x was not locked after worker stopped", coin)
+			}
+		}
+	}
+}
+
 func testSwap(t *testing.T, rig *testRig) {
 	t.Helper()
 	ensureNilErr := makeEnsureNilErr(t)
@@ -1571,23 +1603,23 @@ func TestSwaps(t *testing.T) {
 		}
 		t.Run("perfect limit-limit match"+sellStr, func(t *testing.T) {
 			rig.matches = tPerfectLimitLimit(uint64(1e8), uint64(1e8), makerSell)
-			rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("perfect limit-market match"+sellStr, func(t *testing.T) {
 			rig.matches = tPerfectLimitMarket(uint64(1e8), uint64(1e8), makerSell)
-			rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("imperfect limit-market match"+sellStr, func(t *testing.T) {
 			// only requirement is that maker val > taker val.
 			rig.matches = tMarketPair(uint64(10e8), uint64(2e8), uint64(5e8), makerSell)
-			rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		t.Run("imperfect limit-limit match"+sellStr, func(t *testing.T) {
 			rig.matches = tLimitPair(uint64(10e8), uint64(2e8), uint64(2e8), uint64(5e8), uint64(5e8), makerSell)
-			rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+			rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 			testSwap(t, rig)
 		})
 		for _, isMarket := range []bool{true, false} {
@@ -1601,7 +1633,7 @@ func TestSwaps(t *testing.T) {
 				// one taker, 3 makers => 4 'match' requests
 				rig.matches = tMultiMatchSet(matchQtys, rates, makerSell, isMarket)
 
-				rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+				rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 				testSwap(t, rig)
 			})
 		}
@@ -1616,7 +1648,7 @@ func TestInvalidFeeRate(t *testing.T) {
 
 	rig.auth.swapReceived = make(chan struct{}, 1)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	rig.abcNode.invalidFeeRate = true
 
@@ -1657,7 +1689,7 @@ func TestTxWaiters(t *testing.T) {
 		node.bChan <- &asset.BlockUpdate{Err: nil}
 	}
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	// Get the MatchNotifications that the swapper sent to the clients and check
 	// the match notification length, content, IDs, etc.
@@ -1905,7 +1937,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 		set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true) // same orders, different users
 		matchInfo := set.matchInfos[0]
 		rig.matchInfo = matchInfo
-		rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+		rig.applyMatchesAndRequestAcks(t, set.matchSet)
 		// Step through the negotiation process. No errors should be generated.
 		// TODO: timeout each match ack, not block based inaction.
 
@@ -1989,7 +2021,7 @@ func TestSigErrors(t *testing.T) {
 	rig.auth.redeemReceived = make(chan struct{}, 1)
 	rig.auth.swapReceived = make(chan struct{}, 1)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet}) // pushes a new req to m.reqs
+	rig.applyMatchesAndRequestAcks(t, set.matchSet) // pushes a new req to m.reqs
 	ensureNilErr := makeEnsureNilErr(t)
 
 	// We need a way to restore the state of the queue after testing an auth error.
@@ -2050,7 +2082,7 @@ func TestMalformedSwap(t *testing.T) {
 
 	rig.auth.swapReceived = make(chan struct{}, 1)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 	ensureNilErr := makeEnsureNilErr(t)
 
 	ensureNilErr(rig.ackMatch_maker(true))
@@ -2119,7 +2151,7 @@ func TestRetriesDuringSwap(t *testing.T) {
 	rig.auth.auditReq = make(chan struct{}, 1)
 	rig.auth.redeemReceived = make(chan struct{}, 1)
 	rig.auth.redemptionReq = make(chan struct{}, 1)
-	rig.swapper.Negotiate([]*order.MatchSet{rig.matches.matchSet})
+	rig.applyMatchesAndRequestAcks(t, rig.matches.matchSet)
 
 	ensureNilErr(rig.ackMatch_maker(true))
 	ensureNilErr(rig.ackMatch_taker(true))
@@ -2245,7 +2277,7 @@ func TestBadParams(t *testing.T) {
 	matchInfo := set.matchInfos[0]
 	rig, cleanup := tNewTestRig(matchInfo)
 	defer cleanup()
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 	swapper := rig.swapper
 	match := rig.getTracker()
 	user := matchInfo.maker
@@ -2285,7 +2317,7 @@ func TestCancel(t *testing.T) {
 	matchInfo := set.matchInfos[0]
 	rig, cleanup := tNewTestRig(matchInfo)
 	defer cleanup()
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 	// There should be no matchTracker
 	if rig.getTracker() != nil {
 		t.Fatalf("found matchTracker for a cancellation")
@@ -2354,7 +2386,7 @@ func TestAccountTracking(t *testing.T) {
 			taker.Trade().Sell = true
 			maker.Sell = false
 		}
-		rig.swapper.Negotiate([]*order.MatchSet{matchSet})
+		rig.applyMatchesAndRequestAcks(t, matchSet)
 	}
 
 	checkStats := func(addr string, expQty, expSwaps uint64, expRedeems int) {
@@ -2415,7 +2447,7 @@ func TestPerMatchSwapAddresses(t *testing.T) {
 
 	rig.auth.newNtfn = make(chan struct{}, 4)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	tracker := rig.getTracker()
 
@@ -2491,7 +2523,7 @@ func TestPerMatchAddressInProcessInit(t *testing.T) {
 	rig.auth.swapReceived = make(chan struct{}, 1)
 	rig.auth.auditReq = make(chan struct{}, 1)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	// Ack both sides. Per-match addresses are included automatically via the
 	// ack flow (tMatchInfo populates makerPerMatchAddr/takerPerMatchAddr).
@@ -2526,7 +2558,7 @@ func TestPerMatchAddressWrongAddr(t *testing.T) {
 
 	rig.auth.swapReceived = make(chan struct{}, 1)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	// Ack both sides with per-match addresses via the ack flow.
 	if err := rig.ackMatch_maker(true); err != nil {
@@ -2581,8 +2613,8 @@ func TestCoinIDDedup(t *testing.T) {
 	rig.auth.swapReceived = make(chan struct{}, 2)
 	rig.auth.auditReq = make(chan struct{}, 2)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set1.matchSet})
-	rig.swapper.Negotiate([]*order.MatchSet{set2.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set1.matchSet)
+	rig.applyMatchesAndRequestAcks(t, set2.matchSet)
 
 	// Ack both matches.
 	rig.matchInfo = matchInfo1
@@ -2664,7 +2696,7 @@ func TestCoinIDDedupSameMatch(t *testing.T) {
 	rig.auth.swapReceived = make(chan struct{}, 2)
 	rig.auth.auditReq = make(chan struct{}, 2)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	if err := rig.ackMatch_maker(true); err != nil {
 		t.Fatalf("maker ack: %v", err)
@@ -2716,7 +2748,7 @@ func TestUserConnectedResend(t *testing.T) {
 	rig, cleanup := tNewTestRig(matchInfo)
 	defer cleanup()
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	tracker := rig.getTracker()
 
@@ -2762,7 +2794,7 @@ func TestDeleteMatchCleansUpCoinIDs(t *testing.T) {
 	rig, cleanup := tNewTestRig(matchInfo)
 	defer cleanup()
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	tracker := rig.getTracker()
 
@@ -2831,8 +2863,8 @@ func TestSecretHashDedup(t *testing.T) {
 	rig.auth.swapReceived = make(chan struct{}, 2)
 	rig.auth.auditReq = make(chan struct{}, 2)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set1.matchSet})
-	rig.swapper.Negotiate([]*order.MatchSet{set2.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set1.matchSet)
+	rig.applyMatchesAndRequestAcks(t, set2.matchSet)
 
 	// Ack both matches.
 	rig.matchInfo = matchInfo1
@@ -2906,7 +2938,7 @@ func TestSecretHashDedupSameMatch(t *testing.T) {
 	rig.auth.swapReceived = make(chan struct{}, 2)
 	rig.auth.auditReq = make(chan struct{}, 2)
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	if err := rig.ackMatch_maker(true); err != nil {
 		t.Fatalf("maker ack: %v", err)
@@ -2954,7 +2986,7 @@ func TestDeleteMatchCleansUpSecretHashes(t *testing.T) {
 	rig, cleanup := tNewTestRig(matchInfo)
 	defer cleanup()
 
-	rig.swapper.Negotiate([]*order.MatchSet{set.matchSet})
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
 
 	tracker := rig.getTracker()
 	mid := matchInfo.matchID
