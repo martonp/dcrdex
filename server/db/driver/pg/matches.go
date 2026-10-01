@@ -15,6 +15,7 @@ import (
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/lib/pq"
 )
 
@@ -673,10 +674,13 @@ func (a *Archiver) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapDa
 	return order.MatchStatus(status), &sd, nil
 }
 
-// updateMatchStmt executes a SQL statement with the provided arguments,
-// choosing the market's matches table from the MarketMatchID. Exactly 1 table
-// row must be updated, otherwise an error is returned.
 func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...any) error {
+	return a.updateMatchStmtWithExecutor(a.db, mid, stmt, args...)
+}
+
+// updateMatchStmtWithExecutor executes stmt on the market's matches table.
+// It returns an error unless exactly one row is updated.
+func (a *Archiver) updateMatchStmtWithExecutor(dbe sqlExecutor, mid db.MarketMatchID, stmt string, args ...any) error {
 	marketSchema, err := a.marketSchema(mid.Base, mid.Quote)
 	if err != nil {
 		return err
@@ -684,13 +688,13 @@ func (a *Archiver) updateMatchStmt(mid db.MarketMatchID, stmt string, args ...an
 
 	matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
 	stmt = fmt.Sprintf(stmt, matchesTableName)
-	N, err := sqlExec(a.db, stmt, args...)
-	if err != nil { // not just no rows updated
+	rowsAffected, err := sqlExec(dbe, stmt, args...)
+	if err != nil {
 		a.fatalBackendErr(err)
 		return err
 	}
-	if N != 1 {
-		return fmt.Errorf("updateMatchStmt: updated %d match rows for match %v, expected 1", N, mid)
+	if rowsAffected != 1 {
+		return fmt.Errorf("updateMatchStmt: updated %d match rows for match %v, expected 1", rowsAffected, mid)
 	}
 	return nil
 }
@@ -792,4 +796,50 @@ func (a *Archiver) SetMatchInactive(mid db.MarketMatchID, forgive bool) error {
 		return a.updateMatchStmt(mid, internal.SetSwapDoneForgiven, mid.MatchID)
 	} // else leave the forgiven column NULL
 	return a.updateMatchStmt(mid, internal.SetSwapDone, mid.MatchID)
+}
+
+// ApplyMatchAcksRecordedEvent records match acknowledgement signatures and swap
+// addresses in one transaction, preserving any previously recorded addresses.
+func (a *Archiver) ApplyMatchAcksRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.MatchAcksRecordedEvent) (*db.EventLogEntry, error) {
+	if event == nil {
+		return nil, fmt.Errorf("nil match acks recorded event")
+	}
+	if len(event.Records) == 0 {
+		return nil, fmt.Errorf("match_acks_recorded event has no acks")
+	}
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+
+	return a.applyEventTx(ctx, meta, meshevents.EventKindMatchAcksRecorded, txData, func(tx *sql.Tx) error {
+		for _, ack := range event.Records {
+			if err := a.saveMatchAck(tx, ack); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (a *Archiver) saveMatchAck(dbe sqlExecutor, ack meshevents.MatchAckRecord) error {
+	mid := db.MarketMatchID{MatchID: ack.MatchID, Base: ack.Base, Quote: ack.Quote}
+	sigStmt := internal.SetTakerMatchAckSig
+	addrStmt := internal.SetTakerSwapAddr
+	if ack.Maker {
+		sigStmt = internal.SetMakerMatchAckSig
+		addrStmt = internal.SetMakerSwapAddr
+	}
+	if err := a.updateMatchStmtWithExecutor(dbe, mid, sigStmt, ack.MatchID, ack.Sig); err != nil {
+		return fmt.Errorf("saving match ack signature (match id=%v, maker=%v): %w",
+			ack.MatchID, ack.Maker, err)
+	}
+	if ack.Cancel {
+		return nil
+	}
+	if err := a.updateMatchStmtWithExecutor(dbe, mid, addrStmt, ack.MatchID, ack.Address); err != nil {
+		return fmt.Errorf("saving match ack address (match id=%v, maker=%v): %w",
+			ack.MatchID, ack.Maker, err)
+	}
+	return nil
 }

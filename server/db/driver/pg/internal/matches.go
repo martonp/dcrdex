@@ -221,8 +221,10 @@ const (
 	SetMakerMatchAckSig = `UPDATE %s SET sigMatchAckMaker = $2 WHERE matchid = $1;`
 	SetTakerMatchAckSig = `UPDATE %s SET sigMatchAckTaker = $2 WHERE matchid = $1;`
 
-	SetMakerSwapAddr = `UPDATE %s SET makerSwapAddr = $2 WHERE matchid = $1;`
-	SetTakerSwapAddr = `UPDATE %s SET takerSwapAddr = $2 WHERE matchid = $1;`
+	// Avoid overwriting an existing address because the counterparty may
+	// already have used it as the recipient in its swap contract.
+	SetMakerSwapAddr = `UPDATE %s SET makerSwapAddr = COALESCE(NULLIF(makerSwapAddr, ''), $2) WHERE matchid = $1;`
+	SetTakerSwapAddr = `UPDATE %s SET takerSwapAddr = COALESCE(NULLIF(takerSwapAddr, ''), $2) WHERE matchid = $1;`
 
 	SetInitiatorSwapData = `UPDATE %s SET status = $2,
 		aContractCoinID = $3, aContract = $4, aContractTime = $5

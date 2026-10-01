@@ -4,7 +4,11 @@
 // Package meshevents defines payloads for replicated DEX events.
 package meshevents
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"decred.org/dcrdex/dex/encode"
+)
 
 // EventSchemaVersion identifies the event schema shared by mesh peers.
 const EventSchemaVersion uint32 = 0
@@ -24,6 +28,13 @@ func decodeEvent[T any, PT interface {
 	return e, nil
 }
 
+func boolBytes(v bool) []byte {
+	if v {
+		return encode.ByteTrue
+	}
+	return encode.ByteFalse
+}
+
 const (
 	EventKindBondPosted          = "bond_posted"
 	EventKindPrepaidBondsCreated = "prepaid_bonds_created"
@@ -39,4 +50,5 @@ const (
 	EventKindSuspendedCancel        = "suspended_cancel"
 	EventKindOrdersRevoked          = "orders_revoked"
 	EventKindReputationForgiven     = "reputation_forgiven"
+	EventKindMatchAcksRecorded      = "match_acks_recorded"
 )

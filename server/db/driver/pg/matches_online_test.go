@@ -4,8 +4,10 @@ package pg
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"decred.org/dcrdex/dex/order"
 	"decred.org/dcrdex/server/account"
 	"decred.org/dcrdex/server/db"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 func TestInsertMatch(t *testing.T) {
@@ -382,6 +385,96 @@ func TestSetSwapData(t *testing.T) {
 	if err = checkMatch(order.MatchComplete, false); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestApplyMatchAcksRecordedEvent(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	ctx := context.Background()
+	sharedUser := randomAccountID()
+	makerAckPair := generateMatch(t, order.NewlyMatched, true, sharedUser, randomAccountID())
+	takerAckPair := generateMatch(t, order.NewlyMatched, true, randomAccountID(), sharedUser)
+	makerAckMID := testMarketMatchID(makerAckPair.match)
+	takerAckMID := testMarketMatchID(takerAckPair.match)
+	event := &meshevents.MatchAcksRecordedEvent{Records: []meshevents.MatchAckRecord{
+		{
+			MatchID: makerAckMID.MatchID,
+			Base:    makerAckMID.Base,
+			Quote:   makerAckMID.Quote,
+			Maker:   true,
+			Sig:     []byte("maker-match-sig"),
+			Address: "maker-swap-addr",
+		},
+		{
+			MatchID: takerAckMID.MatchID,
+			Base:    takerAckMID.Base,
+			Quote:   takerAckMID.Quote,
+			Maker:   false,
+			Sig:     []byte("taker-match-sig"),
+			Address: "taker-swap-addr",
+		},
+	}}
+
+	// Record one maker acknowledgement and one taker acknowledgement together.
+	payload := []byte("match-acks-event")
+	tip := testEventApplyTip(t, nil, 1, meshevents.EventKindMatchAcksRecorded, payload, event)
+	log, err := archie.ApplyMatchAcksRecordedEvent(ctx, &db.EventLogMeta{Event: payload}, event)
+	if err != nil {
+		t.Fatalf("ApplyMatchAcksRecordedEvent error: %v", err)
+	}
+	requireEventApplyLog(t, log, 1, meshevents.EventKindMatchAcksRecorded, payload, tip, event)
+	assertEventLogFrontier(t, ctx, 1, tip)
+
+	checkStored := func(wantRecords []meshevents.MatchAckRecord) {
+		t.Helper()
+		for _, want := range wantRecords {
+			mid := db.MarketMatchID{MatchID: want.MatchID, Base: want.Base, Quote: want.Quote}
+			_, data, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sig, address := data.SigMatchAckTaker, data.TakerSwapAddr
+			otherSig, otherAddress := data.SigMatchAckMaker, data.MakerSwapAddr
+			if want.Maker {
+				sig, address = data.SigMatchAckMaker, data.MakerSwapAddr
+				otherSig, otherAddress = data.SigMatchAckTaker, data.TakerSwapAddr
+			}
+			if !bytes.Equal(sig, want.Sig) || address != want.Address {
+				t.Fatalf("match %v maker=%v: stored ack = %x / %q, want %x / %q",
+					want.MatchID, want.Maker, sig, address, want.Sig, want.Address)
+			}
+			if len(otherSig) != 0 || otherAddress != "" {
+				t.Fatalf("match %v: acknowledgement changed the opposite side: %+v", want.MatchID, data)
+			}
+		}
+	}
+	checkStored(event.Records)
+
+	// Repeated acknowledgements refresh both signatures but retain the addresses.
+	reackEvent := &meshevents.MatchAcksRecordedEvent{Records: slices.Clone(event.Records)}
+	for i := range reackEvent.Records {
+		reackEvent.Records[i].Sig = []byte(fmt.Sprintf("replacement-sig-%d", i))
+		reackEvent.Records[i].Address = fmt.Sprintf("replacement-address-%d", i)
+	}
+	reackPayload := []byte("match-acks-reack-event")
+	tip2 := testEventApplyTip(t, tip, 2, meshevents.EventKindMatchAcksRecorded, reackPayload, reackEvent)
+	log2, err := archie.ApplyMatchAcksRecordedEvent(ctx, &db.EventLogMeta{
+		Seq:             2,
+		Event:           reackPayload,
+		ExpectedTipHash: tip2,
+	}, reackEvent)
+	if err != nil {
+		t.Fatalf("ApplyMatchAcksRecordedEvent re-ack error: %v", err)
+	}
+	requireEventApplyLog(t, log2, 2, meshevents.EventKindMatchAcksRecorded, reackPayload, tip2, reackEvent)
+	wantRecords := slices.Clone(event.Records)
+	for i := range wantRecords {
+		wantRecords[i].Sig = reackEvent.Records[i].Sig
+	}
+	checkStored(wantRecords)
+	assertEventLogFrontier(t, ctx, 2, tip2)
 }
 
 func TestMatchByID(t *testing.T) {
