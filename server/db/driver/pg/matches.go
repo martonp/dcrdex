@@ -868,3 +868,20 @@ func (a *Archiver) recordSwapContract(dbe sqlExecutor, event *meshevents.SwapCon
 	return a.updateMatchStmtWithExecutor(dbe, mid, stmt, event.MatchID,
 		uint8(status), event.CoinID, event.Contract, event.SwapTime)
 }
+
+// ApplyAuditAckRecordedEvent records a client's acknowledgement of its
+// counterparty's swap contract.
+func (a *Archiver) ApplyAuditAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.AuditAckRecordedEvent) (*db.EventLogEntry, error) {
+	txData, err := event.EventTxData()
+	if err != nil {
+		return nil, err
+	}
+	return a.applyEventTx(ctx, meta, meshevents.EventKindAuditAckRecorded, txData, func(tx *sql.Tx) error {
+		stmt := internal.SetParticipantContractAuditSig
+		if event.Maker {
+			stmt = internal.SetInitiatorContractAuditSig
+		}
+		mid := db.MarketMatchID{MatchID: event.MatchID, Base: event.Base, Quote: event.Quote}
+		return a.updateMatchStmtWithExecutor(tx, mid, stmt, event.MatchID, event.Sig)
+	})
+}

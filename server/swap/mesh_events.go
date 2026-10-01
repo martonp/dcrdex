@@ -45,6 +45,13 @@ func (s *Swapper) Events() map[string]mesh.EventApplier {
 			}
 			return s.applySwapContractRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
 		},
+		meshevents.EventKindAuditAckRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			recorded, err := meshevents.DecodeAuditAckRecordedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return s.applyAuditAckRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), recorded)
+		},
 	}
 }
 
@@ -205,6 +212,46 @@ func (s *Swapper) prepareSwapContractUpdate(event *meshevents.SwapContractRecord
 	}
 
 	return match, status, contract, nil
+}
+
+func newAuditAckRecordedEvent(match *matchTracker, maker bool, sig []byte) (*mesh.Event, error) {
+	event := &meshevents.AuditAckRecordedEvent{
+		MatchID: match.ID(),
+		Base:    match.Maker.BaseAsset,
+		Quote:   match.Maker.QuoteAsset,
+		Maker:   maker,
+		Sig:     sig,
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return mesh.NewEvent(event)
+}
+
+// applyAuditAckRecordedEvent stores an audit signature before updating the
+// tracked match's acknowledgements.
+func (s *Swapper) applyAuditAckRecordedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.AuditAckRecordedEvent) (*db.EventLogEntry, error) {
+	s.matchMtx.RLock()
+	match := s.matches[event.MatchID]
+	s.matchMtx.RUnlock()
+	if match == nil {
+		return nil, fmt.Errorf("audit ack recorded event for unknown match %v", event.MatchID)
+	}
+	if event.Base != match.Maker.BaseAsset || event.Quote != match.Maker.QuoteAsset {
+		return nil, fmt.Errorf("audit ack recorded market mismatch for match %v", event.MatchID)
+	}
+	logEntry, err := s.storage.ApplyAuditAckRecordedEvent(ctx, meta, event)
+	if err != nil {
+		return nil, fmt.Errorf("saving audit ack signature for match %v: %w", event.MatchID, err)
+	}
+	match.mtx.Lock()
+	if event.Maker {
+		match.Sigs.MakerAudit = event.Sig
+	} else {
+		match.Sigs.TakerAudit = event.Sig
+	}
+	match.mtx.Unlock()
+	return logEntry, nil
 }
 
 func newMatchAcksRecordedEvent(ackTime time.Time, records []meshevents.MatchAckRecord) (*mesh.Event, error) {

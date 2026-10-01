@@ -303,7 +303,9 @@ type TStorage struct {
 	matchAckEvents            []*meshevents.MatchAcksRecordedEvent
 	applyMatchAcksRecordedErr error
 	swapContracts             []*meshevents.SwapContractRecordedEvent
+	auditAcks                 []*meshevents.AuditAckRecordedEvent
 	saveContractErr           error
+	applyAuditAckRecordedErr  error
 
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
@@ -392,6 +394,16 @@ func (ts *TStorage) ApplySwapContractRecordedEvent(_ context.Context, _ *db.Even
 		return nil, ts.saveContractErr
 	}
 	ts.swapContracts = append(ts.swapContracts, contract)
+	return new(db.EventLogEntry), nil
+}
+
+func (ts *TStorage) ApplyAuditAckRecordedEvent(_ context.Context, _ *db.EventLogMeta, ack *meshevents.AuditAckRecordedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if ts.applyAuditAckRecordedErr != nil {
+		return nil, ts.applyAuditAckRecordedErr
+	}
+	ts.auditAcks = append(ts.auditAcks, ack)
 	return new(db.EventLogEntry), nil
 }
 
@@ -622,6 +634,7 @@ type testRig struct {
 type tSwapMesh struct {
 	commandErr *msgjson.Error
 	reqs       []mesh.CommandRequest
+	err        error
 	events     []*mesh.Event
 }
 
@@ -632,7 +645,7 @@ func (m *tSwapMesh) ExecuteCommand(_ context.Context, req mesh.CommandRequest) *
 
 func (m *tSwapMesh) ApplyEvent(_ context.Context, event *mesh.Event) (any, error) {
 	m.events = append(m.events, event)
-	return nil, nil
+	return nil, m.err
 }
 
 func matchAckEvents(storage *TStorage) []*meshevents.MatchAcksRecordedEvent {
@@ -2427,6 +2440,43 @@ func TestBadParams(t *testing.T) {
 	ensureNilErr(rig.checkServerResponseFail(user, msgjson.AckCountError))
 }
 
+// TestAckMeshUnavailable checks that mesh unavailability while recording an
+// acknowledgement returns a retryable error to the client.
+func TestAckMeshUnavailable(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		params  msgjson.Signable
+		isAudit bool
+	}{
+		{name: "audit", params: &msgjson.Audit{}, isAudit: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			rig.swapper.SetMeshService(&tSwapMesh{err: fmt.Errorf("drain in progress: %w", mesh.ErrUnavailable)})
+			user := info.maker
+			acker := &messageAcker{
+				user:    user.acct,
+				match:   rig.getTracker(),
+				params:  tt.params,
+				isMaker: true,
+				isAudit: tt.isAudit,
+			}
+			ack := &msgjson.Acknowledgement{MatchID: info.matchID[:], Sig: user.sig}
+			msg, err := msgjson.NewResponse(1, ack, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rig.swapper.processAck(msg, acker)
+			if err := rig.checkServerResponseFail(user, msgjson.TryAgainLaterError); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func tMakerMatchAckRecord(matchInfo *tMatch) meshevents.MatchAckRecord {
 	return meshevents.MatchAckRecord{
 		MatchID: matchInfo.matchID,
@@ -2673,6 +2723,63 @@ func TestApplySwapContractRecordedEvent(t *testing.T) {
 			}
 			if err := rig.swapper.checkSwapContractDedup(otherMatch, []byte("other-coin"), recorded.Contract, recorded.SecretHash, true); !errors.Is(err, wantSecretErr) {
 				t.Fatalf("secret hash reuse error = %v, want %v", err, wantSecretErr)
+			}
+		})
+	}
+}
+
+func TestApplyAuditAckRecordedEvent(t *testing.T) {
+	storageErr := errors.New("storage error")
+	tests := []struct {
+		name       string
+		maker      bool
+		storageErr error
+	}{
+		{name: "maker", maker: true},
+		{name: "taker"},
+		{name: "storage error", maker: true, storageErr: storageErr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			makerSig, takerSig := []byte("previous maker ack"), []byte("previous taker ack")
+			tracker.Sigs.MakerAudit, tracker.Sigs.TakerAudit = makerSig, takerSig
+			rig.storage.applyAuditAckRecordedErr = tt.storageErr
+			recorded := &meshevents.AuditAckRecordedEvent{
+				MatchID: info.matchID,
+				Base:    info.match.Maker.BaseAsset,
+				Quote:   info.match.Maker.QuoteAsset,
+				Maker:   tt.maker,
+				Sig:     []byte("audit ack"),
+			}
+			event, err := mesh.NewEvent(recorded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			apply := rig.swapper.Events()[meshevents.EventKindAuditAckRecorded]
+			_, err = apply(&mesh.EventApplyContext{Context: context.Background()}, event)
+			if !errors.Is(err, tt.storageErr) {
+				t.Fatalf("apply error = %v, want %v", err, tt.storageErr)
+			}
+			var wantAcks []*meshevents.AuditAckRecordedEvent
+			if tt.storageErr == nil {
+				wantAcks = []*meshevents.AuditAckRecordedEvent{recorded}
+				if tt.maker {
+					makerSig = recorded.Sig
+				} else {
+					takerSig = recorded.Sig
+				}
+			}
+			if !reflect.DeepEqual(rig.storage.auditAcks, wantAcks) {
+				t.Fatalf("stored audit acks = %+v, want %+v", rig.storage.auditAcks, wantAcks)
+			}
+			if !bytes.Equal(tracker.Sigs.MakerAudit, makerSig) || !bytes.Equal(tracker.Sigs.TakerAudit, takerSig) {
+				t.Fatalf("maker/taker audit signatures = %x/%x, want %x/%x",
+					tracker.Sigs.MakerAudit, tracker.Sigs.TakerAudit, makerSig, takerSig)
 			}
 		})
 	}

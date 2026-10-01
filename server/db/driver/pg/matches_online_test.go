@@ -553,6 +553,57 @@ func TestApplySwapContractRecordedEvent(t *testing.T) {
 	}
 }
 
+func TestApplyAuditAckRecordedEvent(t *testing.T) {
+	tests := []struct {
+		name  string
+		maker bool
+	}{
+		{name: "maker", maker: true},
+		{name: "taker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := cleanTables(archie.db); err != nil {
+				t.Fatalf("cleanTables: %v", err)
+			}
+			pair := generateMatch(t, order.TakerSwapCast, true, randomAccountID(), randomAccountID())
+			mid := testMarketMatchID(pair.match)
+			event := &meshevents.AuditAckRecordedEvent{
+				MatchID: mid.MatchID,
+				Base:    mid.Base,
+				Quote:   mid.Quote,
+				Maker:   tt.maker,
+				Sig:     []byte("audit ack"),
+			}
+			payload, err := event.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			tip := testEventApplyTip(t, nil, 1, event.Kind(), payload, event)
+			logEntry, err := archie.ApplyAuditAckRecordedEvent(context.Background(), &db.EventLogMeta{Event: payload}, event)
+			if err != nil {
+				t.Fatalf("ApplyAuditAckRecordedEvent: %v", err)
+			}
+			requireEventApplyLog(t, logEntry, 1, event.Kind(), payload, tip, event)
+			_, swapData, err := archie.SwapData(mid)
+			if err != nil {
+				t.Fatalf("SwapData: %v", err)
+			}
+			// The maker acknowledges contract B; the taker acknowledges contract A.
+			var wantAckA, wantAckB []byte
+			if tt.maker {
+				wantAckB = event.Sig
+			} else {
+				wantAckA = event.Sig
+			}
+			if !bytes.Equal(swapData.ContractAAckSig, wantAckA) || !bytes.Equal(swapData.ContractBAckSig, wantAckB) {
+				t.Fatalf("contract A/B audit signatures = %x/%x, want %x/%x",
+					swapData.ContractAAckSig, swapData.ContractBAckSig, wantAckA, wantAckB)
+			}
+		})
+	}
+}
+
 func TestMatchByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)

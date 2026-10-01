@@ -648,6 +648,9 @@ type SwapArchiver interface {
 	// ApplySwapContractRecordedEvent records a swap contract and advances
 	// the match status.
 	ApplySwapContractRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.SwapContractRecordedEvent) (*EventLogEntry, error)
+
+	// ApplyAuditAckRecordedEvent records a contract audit acknowledgement.
+	ApplyAuditAckRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.AuditAckRecordedEvent) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified

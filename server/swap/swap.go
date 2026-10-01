@@ -1649,6 +1649,28 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 		log.Warnf("unrecognized ack type %T", acker.params)
 		return
 	}
+	if acker.isAudit {
+		if !s.matchTracked(acker.match) {
+			log.Debugf("Ignoring acknowledgement from user %v for untracked match %v", acker.user, acker.match.ID())
+			return
+		}
+		log.Debugf("Received contract 'audit' acknowledgement from user %v (%s) for match %v",
+			acker.user, makerTaker(acker.isMaker), acker.match.ID())
+		event, err := newAuditAckRecordedEvent(acker.match, acker.isMaker, ack.Sig)
+		if err != nil {
+			log.Errorf("error creating audit ack recorded event: %v", err)
+			s.respondError(msg.ID, acker.user, msgjson.RPCInternalError, "internal server error")
+			return
+		}
+		if _, err := s.mesh.ApplyEvent(context.Background(), event); err != nil {
+			mesh.LogApplyFailure(log, err, "error applying audit ack recorded event for match %v: %v",
+				acker.match.Match.ID(), err)
+			msgErr := mesh.ClientError(err, msgjson.RPCInternalError, "internal server error")
+			s.respondError(msg.ID, acker.user, msgErr.Code, msgErr.Message)
+			return
+		}
+		return
+	}
 
 	// Set and store the appropriate signature, based on the current step and
 	// actor.
@@ -1656,7 +1678,7 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 
 	// If this is the maker's (optional) redeem ack sig, we can stop tracking
 	// the match. Do it here to avoid lock order violation (a deadlock trap).
-	if acker.isMaker && !acker.isAudit { // getting Sigs.MakerRedeem
+	if acker.isMaker { // getting Sigs.MakerRedeem
 		log.Debugf("Deleting completed match %v", mktMatch)
 		s.matchMtx.Lock() // before locking matchTracker.mtx
 		s.deleteMatch(acker.match)
@@ -1665,21 +1687,6 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 
 	acker.match.mtx.Lock()
 	defer acker.match.mtx.Unlock()
-
-	// This is an ack of either contract audit or redemption receipt.
-	if acker.isAudit {
-		log.Debugf("Received contract 'audit' acknowledgement from user %v (%s) for match %v (%v)",
-			acker.user, makerTaker(acker.isMaker), acker.match.Match.ID(), acker.match.Status)
-		// It's a contract audit ack.
-		if acker.isMaker {
-			acker.match.Sigs.MakerAudit = ack.Sig         // i.e. audited taker's contract
-			s.storage.SaveAuditAckSigA(mktMatch, ack.Sig) // sql error makes backend go fatal
-		} else {
-			acker.match.Sigs.TakerAudit = ack.Sig
-			s.storage.SaveAuditAckSigB(mktMatch, ack.Sig)
-		}
-		return
-	}
 
 	// It's a redemption ack.
 	log.Debugf("Received 'redemption' acknowledgement from user %v (%s) for match %v (%s)",
