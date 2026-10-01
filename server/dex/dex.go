@@ -1116,6 +1116,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	if err := mergeMeshEvents(events, market.Events(markets, bookRouter, authMgr.SendIfLocal, lifecycleUpdated)); err != nil {
 		return nil, err
 	}
+	if err := mergeMeshEvents(events, swapper.Events()); err != nil {
+		return nil, err
+	}
 	// Restore markets before loading their order books and candle caches.
 	mktNames := make([]string, 0, len(markets))
 	for name := range markets {
@@ -1163,6 +1166,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	authMgr.SetMeshService(meshSvc)
 	orderRouter.SetMeshService(meshSvc)
+	swapper.SetMeshService(meshSvc)
 	for _, mkt := range markets {
 		mkt.SetMeshService(meshSvc)
 	}

@@ -25,6 +25,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 )
 
 var (
@@ -54,7 +56,7 @@ func makerTaker(isMaker bool) string {
 // communications.
 type AuthManager interface {
 	Route(string, func(account.AccountID, *msgjson.Message) *msgjson.Error)
-	Auth(user account.AccountID, msg, sig []byte) error
+	VerifyUserSig(user account.AccountID, msg, sig []byte) error
 	Sign(...msgjson.Signable)
 	Send(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
@@ -139,7 +141,7 @@ func (ss *swapStatus) redeemSeenTime() time.Time {
 // matchTracker embeds an order.Match and adds some data necessary for tracking
 // the match negotiation.
 type matchTracker struct {
-	mtx sync.RWMutex // Match.Sigs and Match.Status
+	mtx sync.RWMutex // Match.Sigs, Match.Status, and per-match addresses
 	*order.Match
 	time        time.Time // the match request time, not epoch close
 	matchTime   time.Time // epoch close time
@@ -235,6 +237,7 @@ type Swapper struct {
 	storage Storage
 	// authMgr is an AuthManager for client messaging and authentication.
 	authMgr AuthManager
+	mesh    MeshService
 	// swapDone is callback for reporting a swap outcome.
 	swapDone func(oid order.Order, match *order.Match, fail bool)
 
@@ -479,6 +482,13 @@ func (s *Swapper) deleteMatch(mt *matchTracker) {
 		deleteAcctMatch(acctMatches, mt.Maker.QuoteAccount(), mt)
 		deleteAcctMatch(acctMatches, mt.Taker.Trade().QuoteAccount(), mt)
 	}
+}
+
+// matchTracked reports whether match is the live tracker for its ID.
+func (s *Swapper) matchTracked(match *matchTracker) bool {
+	s.matchMtx.RLock()
+	defer s.matchMtx.RUnlock()
+	return s.matches[match.ID()] == match
 }
 
 // UnsettledQuantity sums up the settling quantity per market for a user. Part
@@ -1535,13 +1545,10 @@ func (s *Swapper) step(user account.AccountID, matchID order.MatchID) (*stepInfo
 	}, nil
 }
 
-// authUser verifies that the msgjson.Signable is signed by the user. This
-// method relies on the AuthManager to validate the signature of the serialized
-// data. nil is returned for successful signature verification.
+// authUser verifies that params is signed by the user.
 func (s *Swapper) authUser(user account.AccountID, params msgjson.Signable) *msgjson.Error {
-	// Authorize the user.
 	msg := params.Serialize()
-	err := s.authMgr.Auth(user, msg, params.SigBytes())
+	err := s.authMgr.VerifyUserSig(user, msg, params.SigBytes())
 	if err != nil {
 		return &msgjson.Error{
 			Code:    msgjson.SignatureError,
@@ -1576,7 +1583,7 @@ func (s *Swapper) processAck(msg *msgjson.Message, acker *messageAcker) {
 
 	// Check the signature.
 	sigMsg := acker.params.Serialize()
-	err = s.authMgr.Auth(acker.user, sigMsg, ack.Sig)
+	err = s.authMgr.VerifyUserSig(acker.user, sigMsg, ack.Sig)
 	if err != nil {
 		s.respondError(msg.ID, acker.user, msgjson.SignatureError,
 			fmt.Sprintf("signature validation error: %v", err))
@@ -2333,165 +2340,126 @@ func (s *Swapper) revoke(match *matchTracker) {
 	sendRev(mid, match.Maker)
 }
 
-// For the 'match' request, the user returns a msgjson.Acknowledgement array
-// with signatures for each match ID. The match acknowledgements were requested
-// from each matched user in Negotiate.
+// processMatchAcks validates a client's match acknowledgements and submits
+// them together in a match_acks_recorded event.
 func (s *Swapper) processMatchAcks(user account.AccountID, msg *msgjson.Message, matches []*messageAcker) {
+	records, msgErr := s.validateMatchAcks(user, msg, matches)
+	if msgErr != nil {
+		s.respondError(msg.ID, user, msgErr.Code, msgErr.Message)
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+	event, err := newMatchAcksRecordedEvent(unixMsNow(), records)
+	if err != nil {
+		log.Errorf("error creating match acks recorded event: %v", err)
+		s.respondError(msg.ID, user, msgjson.RPCInternalError, "internal server error")
+		return
+	}
+	if _, err := s.mesh.ApplyEvent(context.Background(), event); err != nil {
+		mesh.LogApplyFailure(log, err, "error applying match acks recorded event for user %v: %v", user, err)
+		msgErr := mesh.ClientError(err, msgjson.RPCInternalError, "internal server error")
+		s.respondError(msg.ID, user, msgErr.Code, msgErr.Message)
+	}
+}
+
+// validateMatchAcks verifies the response IDs, signatures, and swap addresses
+// without changing the tracked matches.
+func (s *Swapper) validateMatchAcks(user account.AccountID, msg *msgjson.Message, matches []*messageAcker) ([]meshevents.MatchAckRecord, *msgjson.Error) {
 	// NOTE: acks must be in same order as matches []*messageAcker.
 	var acks []msgjson.Acknowledgement
 	err := msg.UnmarshalResult(&acks)
 	if err != nil {
-		s.respondError(msg.ID, user, msgjson.RPCParseError,
-			fmt.Sprintf("error parsing match request acknowledgment: %v", err))
-		return
+		return nil, msgjson.NewError(msgjson.RPCParseError, "error parsing match request acknowledgment: %v", err)
 	}
 	if len(matches) != len(acks) {
-		s.respondError(msg.ID, user, msgjson.AckCountError,
-			fmt.Sprintf("expected %d acknowledgements, got %d", len(matches), len(acks)))
-		return
+		return nil, msgjson.NewError(msgjson.AckCountError, "expected %d acknowledgements, got %d", len(matches), len(acks))
 	}
 
 	log.Debugf("processMatchAcks: 'match' ack received from %v for %d matches",
 		user, len(matches))
 
-	// Verify the signature of each Acknowledgement, and store the signatures in
-	// the matchTracker of each match (messageAcker). The signature will be
-	// either a MakerMatch or TakerMatch signature depending on whether the
-	// responding user is the maker or taker. Counterparty address notifications
-	// are collected here but deferred until after DB persistence.
-	var addrNotifications []*matchTracker
+	records := make([]meshevents.MatchAckRecord, 0, len(matches))
 	for i, matchInfo := range matches {
 		ack := &acks[i]
 		match := matchInfo.match
 
+		// Cancel matches don't involve swaps, so they are never swap-tracked
+		// and cannot be revoked for inaction.
+		isCancelMatch := match.Taker.Type() == order.CancelOrderType
+
 		matchID := match.ID()
+		if !isCancelMatch && !s.matchTracked(match) {
+			return nil, msgjson.NewError(msgjson.RPCUnknownMatch, "match %v is no longer tracked", matchID)
+		}
 		if !bytes.Equal(ack.MatchID, matchID[:]) {
-			s.respondError(msg.ID, user, msgjson.IDMismatchError,
-				fmt.Sprintf("unexpected match ID at acknowledgment index %d", i))
-			return
+			return nil, msgjson.NewError(msgjson.IDMismatchError, "unexpected match ID at acknowledgment index %d", i)
 		}
 		sigMsg := matchInfo.params.Serialize()
-		err = s.authMgr.Auth(user, sigMsg, ack.Sig)
+		err = s.authMgr.VerifyUserSig(user, sigMsg, ack.Sig)
 		if err != nil {
 			log.Warnf("processMatchAcks: 'match' ack for match %v from user %v, "+
 				" failed sig verification: %v", matchID, user, err)
-			s.respondError(msg.ID, user, msgjson.SignatureError,
-				fmt.Sprintf("signature validation error: %v", err))
-			return
+			return nil, msgjson.NewError(msgjson.SignatureError, "signature validation error: %v", err)
 		}
 
-		// Cancel matches don't involve swaps, so no per-match address
-		// is needed. Only validate and store addresses for trade matches.
-		isCancelMatch := match.Taker.Type() == order.CancelOrderType
-		ackAddr := ack.Address
-
+		var ackAddr string
 		if !isCancelMatch {
-			// Validate the per-match swap address.
-			if ackAddr == "" {
-				s.respondError(msg.ID, user, msgjson.OrderParameterError,
-					fmt.Sprintf("missing per-match swap address for match %v", matchID))
-				return
-			}
-			// The user's swap address is on their redeem asset (the chain
-			// where the counterparty's contract pays them).
-			var redeemAssetID uint32
-			if matchInfo.isMaker {
-				redeemAssetID = match.makerStatus.redeemAsset
-			} else {
-				redeemAssetID = match.takerStatus.redeemAsset
-			}
-			swapperAsset := s.coins[redeemAssetID]
-			if swapperAsset == nil || !swapperAsset.Backend.CheckSwapAddress(ackAddr) {
-				s.respondError(msg.ID, user, msgjson.OrderParameterError,
-					fmt.Sprintf("invalid per-match swap address %q for asset %d", ackAddr, redeemAssetID))
-				return
+			var msgErr *msgjson.Error
+			ackAddr, msgErr = s.matchAckAddress(matchInfo, ack.Address)
+			if msgErr != nil {
+				return nil, msgErr
 			}
 		}
 
-		// Store the signature and per-match address in the matchTracker.
-		// These must be collected before the init steps begin and swap
-		// contracts are broadcasted.
-		match.mtx.Lock()
-		status := match.Status
-		if matchInfo.isMaker {
-			match.Sigs.MakerMatch = ack.Sig
-			if !isCancelMatch {
-				match.makerSwapAddr = ackAddr
-			}
-		} else {
-			match.Sigs.TakerMatch = ack.Sig
-			if !isCancelMatch {
-				match.takerSwapAddr = ackAddr
-			}
-		}
-		// Check if both sides have provided per-match addresses and we
-		// haven't already sent counterparty addresses. The flag prevents
-		// duplicate sends when maker and taker acks arrive simultaneously.
-		// The actual notification is deferred until after DB persistence.
-		if !isCancelMatch && match.makerSwapAddr != "" && match.takerSwapAddr != "" && !match.counterPartyAddrsSent {
-			match.counterPartyAddrsSent = true
-			addrNotifications = append(addrNotifications, match)
-			// Reset the match timer so the maker gets a full bTimeout
-			// from when both addresses are available. Without this, a
-			// slow taker could consume most of the bTimeout, leaving
-			// the maker insufficient time to broadcast.
-			match.time = time.Now().UTC()
-		}
-		match.mtx.Unlock()
-		log.Debugf("processMatchAcks: storing valid 'match' ack signature from %v (maker=%v) "+
-			"for match %v (status %v)", user, matchInfo.isMaker, matchID, status)
-	}
-
-	// Store the signatures and addresses in the DB. Counterparty address
-	// notifications are deferred until after persistence so that a crash
-	// between notification send and DB write doesn't leave the client
-	// acting on an address the server lost.
-	for i, matchInfo := range matches {
-		ackSig := acks[i].Sig
-		ackAddr := acks[i].Address
-		match := matchInfo.match
-
-		storFn := s.storage.SaveMatchAckSigB
-		storAddrFn := s.storage.SaveMatchAckAddrB
-		if matchInfo.isMaker {
-			storFn = s.storage.SaveMatchAckSigA
-			storAddrFn = s.storage.SaveMatchAckAddrA
-		}
-		matchID := match.ID()
-		mid := db.MarketMatchID{
+		records = append(records, meshevents.MatchAckRecord{
 			MatchID: matchID,
-			Base:    match.Maker.BaseAsset, // same for taker's redeem as BaseAsset refers to the market
+			Base:    match.Maker.BaseAsset,
 			Quote:   match.Maker.QuoteAsset,
-		}
-		err = storFn(mid, ackSig)
-		if err != nil {
-			log.Errorf("saving match ack signature (match id=%v, maker=%v) failed: %v",
-				matchID, matchInfo.isMaker, err)
-			s.respondError(msg.ID, matchInfo.user, msgjson.UnknownMarketError,
-				"internal server error")
-			// TODO: revoke the match without penalties?
-			return
-		}
-		// Cancel matches have no per-match address to store.
-		if match.Taker.Type() == order.CancelOrderType {
-			continue
-		}
-		err = storAddrFn(mid, ackAddr)
-		if err != nil {
-			log.Errorf("saving match ack address (match id=%v, maker=%v) failed: %v",
-				matchID, matchInfo.isMaker, err)
-			s.respondError(msg.ID, matchInfo.user, msgjson.UnknownMarketError,
-				"internal server error")
-			s.revoke(match)
-			return
-		}
+			Maker:   matchInfo.isMaker,
+			Cancel:  isCancelMatch,
+			Sig:     ack.Sig,
+			Address: ackAddr,
+		})
+		log.Debugf("validateMatchAcks: verified 'match' ack signature from %v (maker=%v) "+
+			"for match %v", user, matchInfo.isMaker, matchID)
 	}
 
-	// Now that all signatures and addresses are persisted, send
-	// counterparty address notifications.
-	for _, match := range addrNotifications {
-		s.sendCounterPartyAddresses(match)
+	return records, nil
+}
+
+// matchAckAddress returns the recorded swap address or validates a new one.
+// An existing address cannot change because the counterparty may already be
+// using it to construct a swap contract.
+func (s *Swapper) matchAckAddress(acker *messageAcker, address string) (string, *msgjson.Error) {
+	match := acker.match
+	match.mtx.RLock()
+	recorded := match.takerSwapAddr
+	if acker.isMaker {
+		recorded = match.makerSwapAddr
 	}
+	match.mtx.RUnlock()
+	if recorded != "" {
+		if address != recorded {
+			log.Warnf("validateMatchAcks: user %v (maker=%v) re-acked match %v with address %q, keeping recorded %q",
+				acker.user, acker.isMaker, match.ID(), address, recorded)
+		}
+		return recorded, nil
+	}
+	if address == "" {
+		return "", msgjson.NewError(msgjson.OrderParameterError, "missing per-match swap address for match %v", match.ID())
+	}
+	// The user's address receives the counterparty's contract on the redeem asset.
+	redeemAssetID := match.takerStatus.redeemAsset
+	if acker.isMaker {
+		redeemAssetID = match.makerStatus.redeemAsset
+	}
+	asset := s.coins[redeemAssetID]
+	if asset == nil || !asset.Backend.CheckSwapAddress(address) {
+		return "", msgjson.NewError(msgjson.OrderParameterError, "invalid per-match swap address %q for asset %d", address, redeemAssetID)
+	}
+	return address, nil
 }
 
 // sendCounterPartyAddresses sends a CounterPartyAddress notification to each

@@ -500,6 +500,10 @@ func (ta *TArchivist) MatchStatuses(aid account.AccountID, base, quote uint32, m
 	return nil, nil
 }
 
+func (ta *TArchivist) ApplyMatchAcksRecordedEvent(context.Context, *db.EventLogMeta, *meshevents.MatchAcksRecordedEvent) (*db.EventLogEntry, error) {
+	return new(db.EventLogEntry), nil
+}
+
 func (ta *TArchivist) LoadEpochStats(uint32, uint32, []*candles.Cache) error { return nil }
 
 type TCollector struct{}

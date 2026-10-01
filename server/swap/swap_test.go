@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,8 @@ import (
 	"decred.org/dcrdex/server/comms"
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/matcher"
+	"decred.org/dcrdex/server/mesh"
+	"decred.org/dcrdex/server/meshevents"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
@@ -109,7 +112,7 @@ type TRequest struct {
 // This stub satisfies AuthManager.
 type TAuthManager struct {
 	mtx         sync.Mutex
-	authErr     error
+	verifyErr   error
 	privkey     *secp256k1.PrivateKey
 	reqs        map[account.AccountID][]*TRequest
 	resps       map[account.AccountID][]*msgjson.Message
@@ -208,9 +211,10 @@ func (m *TAuthManager) Suspended(user account.AccountID) (found, suspended bool)
 	suspended = rule != account.NoRule
 	return // TODO: test suspended account handling (no trades, just cancels)
 }
-func (m *TAuthManager) Auth(user account.AccountID, msg, sig []byte) error {
-	return m.authErr
+func (m *TAuthManager) VerifyUserSig(user account.AccountID, msg, sig []byte) error {
+	return m.verifyErr
 }
+
 func (m *TAuthManager) Route(string,
 	func(account.AccountID, *msgjson.Message) *msgjson.Error) {
 }
@@ -294,6 +298,11 @@ func (m *TAuthManager) popResp(id account.AccountID) (msg *msgjson.Message, resp
 }
 
 type TStorage struct {
+	mtx sync.Mutex
+
+	matchAckEvents            []*meshevents.MatchAcksRecordedEvent
+	applyMatchAcksRecordedErr error
+
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
 	fatalErr error
@@ -355,6 +364,25 @@ func (ts *TStorage) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp i
 }
 func (ts *TStorage) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
 
+func (ts *TStorage) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
+	return &db.EventLogPosition{}, nil
+}
+
+func (ts *TStorage) EventLogEntriesAfter(context.Context, uint64, int) ([]*db.EventLogEntry, error) {
+	return nil, nil
+}
+
+func (ts *TStorage) ApplyMatchAcksRecordedEvent(_ context.Context, _ *db.EventLogMeta, update *meshevents.MatchAcksRecordedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+
+	ts.matchAckEvents = append(ts.matchAckEvents, update)
+	if ts.applyMatchAcksRecordedErr != nil {
+		return nil, ts.applyMatchAcksRecordedErr
+	}
+	return new(db.EventLogEntry), nil
+}
+
 type redeemKey struct {
 	redemptionCoin       string
 	counterpartySwapCoin string
@@ -362,15 +390,16 @@ type redeemKey struct {
 
 // This stub satisfies asset.Backend.
 type TBackend struct {
-	mtx            sync.RWMutex
-	contracts      map[string]*asset.Contract
-	contractErr    error
-	fundsErr       error
-	redemptions    map[redeemKey]asset.Coin
-	redemptionErr  error
-	bChan          chan *asset.BlockUpdate // to trigger processBlock and eventually (after up to BroadcastTimeout) checkInaction depending on block time
-	lbl            string
-	invalidFeeRate bool
+	mtx             sync.RWMutex
+	contracts       map[string]*asset.Contract
+	contractErr     error
+	fundsErr        error
+	redemptions     map[redeemKey]asset.Coin
+	redemptionErr   error
+	bChan           chan *asset.BlockUpdate // to trigger processBlock and eventually (after up to BroadcastTimeout) checkInaction depending on block time
+	lbl             string
+	invalidFeeRate  bool
+	rejectSwapAddrs bool
 }
 
 func newTBackend(lbl string) TBackend {
@@ -424,7 +453,7 @@ func (a *TBackend) ValidateContract(contract []byte) error {
 }
 func (a *TBackend) BlockChannel(size int) <-chan *asset.BlockUpdate  { return a.bChan }
 func (a *TBackend) FeeRate(context.Context) (uint64, error)          { return 10, nil }
-func (a *TBackend) CheckSwapAddress(string) bool                     { return true }
+func (a *TBackend) CheckSwapAddress(string) bool                     { return !a.rejectSwapAddrs }
 func (a *TBackend) Connect(context.Context) (*sync.WaitGroup, error) { return nil, nil }
 func (a *TBackend) ValidateSecret(secret, contract []byte) bool      { return true }
 func (a *TBackend) Synced() (bool, error)                            { return true, nil }
@@ -571,16 +600,45 @@ type testRig struct {
 	auth          *TAuthManager
 	swapper       *Swapper
 	swapperWaiter *dex.StartStopWaiter
+	swapperDone   chan struct{}
 	storage       *TStorage
 	matches       *tMatchSet
 	matchInfo     *tMatch
 	noResume      bool
 }
 
-func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
+type tSwapMesh struct {
+	events []*mesh.Event
+}
+
+func (m *tSwapMesh) ApplyEvent(_ context.Context, event *mesh.Event) (any, error) {
+	m.events = append(m.events, event)
+	return nil, nil
+}
+
+func matchAckEvents(storage *TStorage) []*meshevents.MatchAcksRecordedEvent {
+	storage.mtx.Lock()
+	defer storage.mtx.Unlock()
+	return append([]*meshevents.MatchAcksRecordedEvent(nil), storage.matchAckEvents...)
+}
+
+func notificationCount(auth *TAuthManager, route string) int {
+	auth.mtx.Lock()
+	defer auth.mtx.Unlock()
+	var n int
+	for _, msgs := range auth.ntfns {
+		for _, msg := range msgs {
+			if msg.Route == route {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+func tNewUnstartedRig(matchInfo *tMatch) *testRig {
 	storage := &TStorage{}
 	authMgr := newTAuthManager()
-	var noResume bool
 
 	abcBackend := newUTXOBackend("abc")
 	xyzBackend := newUTXOBackend("xyz")
@@ -606,33 +664,63 @@ func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
 		TxWaitExpiration: txWaitExpiration,
 		LockTimeTaker:    dex.LockTimeTaker(dex.Testnet),
 		LockTimeMaker:    dex.LockTimeMaker(dex.Testnet),
-		SwapDone:         func(ord order.Order, match *order.Match, fail bool) {},
+		SwapDone:         func(order.Order, *order.Match, bool) {},
 	})
 	if err != nil {
 		panic(err.Error())
 	}
 
-	ssw := dex.NewStartStopWaiter(swapper)
+	return &testRig{
+		abc:       abcAsset,
+		abcNode:   abcBackend,
+		xyz:       xyzAsset,
+		xyzNode:   xyzBackend,
+		acctAsset: acctAsset,
+		acctNode:  acctBackend,
+		auth:      authMgr,
+		swapper:   swapper,
+		storage:   storage,
+		matchInfo: matchInfo,
+	}
+}
+
+func tNewTestRig(matchInfo *tMatch) (*testRig, func()) {
+	rig := tNewUnstartedRig(matchInfo)
+	swapper := rig.swapper
+	storage := rig.storage
+
+	swapperDone := make(chan struct{})
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		Events:         swapper.Events(),
+		EventLogReader: storage,
+		OnHalt:         func(error) {},
+		MasterWorkers: []mesh.MasterWorker{{
+			Name: "Swapper",
+			Run: func(ctx context.Context, reportReady func(error)) {
+				defer close(swapperDone)
+				reportReady(nil)
+				swapper.Run(ctx)
+			},
+		}},
+		Logger: dex.Disabled,
+	})
+	if err != nil {
+		panic(err.Error())
+	}
+	swapper.SetMeshService(meshSvc)
+	ssw := dex.NewStartStopWaiter(meshSvc)
 	ssw.Start(testCtx)
+	if err := meshSvc.WaitUntilReadyForComms(testCtx); err != nil {
+		panic(err.Error())
+	}
 	cleanup := func() {
 		ssw.Stop()
 		ssw.WaitForShutdown()
 	}
 
-	return &testRig{
-		abc:           abcAsset,
-		abcNode:       abcBackend,
-		xyz:           xyzAsset,
-		xyzNode:       xyzBackend,
-		acctAsset:     acctAsset,
-		acctNode:      acctBackend,
-		auth:          authMgr,
-		swapper:       swapper,
-		swapperWaiter: ssw,
-		storage:       storage,
-		matchInfo:     matchInfo,
-		noResume:      noResume,
-	}, cleanup
+	rig.swapperWaiter = ssw
+	rig.swapperDone = swapperDone
+	return rig, cleanup
 }
 
 func (rig *testRig) applyMatchesAndRequestAcks(t *testing.T, matchSets ...*order.MatchSet) {
@@ -1516,7 +1604,11 @@ func TestFatalStorageErr(t *testing.T) {
 	// first, the anomalous shutdown route.
 	rig.storage.fatalBackendErr(errors.New("backend error"))
 
-	rig.swapperWaiter.WaitForShutdown()
+	select {
+	case <-rig.swapperDone:
+	case <-time.After(time.Second):
+		t.Fatalf("swapper worker did not stop after fatal storage error")
+	}
 }
 
 func TestTrackMatchesAfterStop(t *testing.T) {
@@ -2043,7 +2135,7 @@ func TestSigErrors(t *testing.T) {
 	testAction := func(stepFunc func(bool) error, user *tUser, failChans ...chan struct{}) {
 		t.Helper()
 		// First do it with an auth error.
-		rig.auth.authErr = dummyError
+		rig.auth.verifyErr = dummyError
 		stash(user) // make a copy of this user's next req/resp pair
 		// The error will be pulled from the auth manager.
 		_ = stepFunc(false) // popReq => req.respFunc(..., tNewResponse()) => send error to client (m.resps)
@@ -2054,7 +2146,7 @@ func TestSigErrors(t *testing.T) {
 		// response from the swapper.
 		ensureNilErr(rig.checkServerResponseFail(user, msgjson.SignatureError))
 		// Again with no auth error to go to the next step.
-		rig.auth.authErr = nil
+		rig.auth.verifyErr = nil
 		apply(user) // restore the initial live request
 		ensureNilErr(stepFunc(true))
 	}
@@ -2312,6 +2404,306 @@ func TestBadParams(t *testing.T) {
 	ensureNilErr(rig.checkServerResponseFail(user, msgjson.AckCountError))
 }
 
+func tMakerMatchAckRecord(matchInfo *tMatch) meshevents.MatchAckRecord {
+	return meshevents.MatchAckRecord{
+		MatchID: matchInfo.matchID,
+		Base:    matchInfo.match.Maker.BaseAsset,
+		Quote:   matchInfo.match.Maker.QuoteAsset,
+		Maker:   true,
+		Sig:     matchInfo.maker.sig,
+		Address: matchInfo.makerPerMatchAddr,
+	}
+}
+
+func tTakerMatchAckRecord(matchInfo *tMatch) meshevents.MatchAckRecord {
+	return meshevents.MatchAckRecord{
+		MatchID: matchInfo.matchID,
+		Base:    matchInfo.match.Maker.BaseAsset,
+		Quote:   matchInfo.match.Maker.QuoteAsset,
+		Sig:     matchInfo.taker.sig,
+		Address: matchInfo.takerPerMatchAddr,
+	}
+}
+
+func TestProcessMatchAcksEmitsEvent(t *testing.T) {
+	set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+	matchInfo := set.matchInfos[0]
+	rig := tNewUnstartedRig(matchInfo)
+	tMesh := new(tSwapMesh)
+	rig.swapper.SetMeshService(tMesh)
+	rig.applyMatchesAndRequestAcks(t, set.matchSet)
+	tracker := rig.getTracker()
+	initialTime := tracker.time
+
+	req := rig.auth.popReq(matchInfo.maker.acct)
+	if req == nil {
+		t.Fatalf("no match request sent")
+	}
+	resp := tNewResponse(req.req.ID, tAckArrWithAddrs(matchInfo.maker, matchInfo.maker.matchIDs,
+		map[order.MatchID]string{matchInfo.matchID: matchInfo.makerPerMatchAddr}))
+	req.respFunc(nil, resp)
+
+	if len(tMesh.events) != 1 {
+		t.Fatalf("expected 1 emitted event, got %d", len(tMesh.events))
+	}
+	if tMesh.events[0].Kind != meshevents.EventKindMatchAcksRecorded {
+		t.Fatalf("event kind = %q, want %q", tMesh.events[0].Kind, meshevents.EventKindMatchAcksRecorded)
+	}
+	event, err := meshevents.DecodeMatchAcksRecordedEvent(tMesh.events[0].Payload)
+	if err != nil {
+		t.Fatalf("DecodeMatchAcksRecordedEvent error: %v", err)
+	}
+	if event.AckTime == 0 {
+		t.Fatalf("empty event ack time")
+	}
+	wantRecords := []meshevents.MatchAckRecord{tMakerMatchAckRecord(matchInfo)}
+	if !reflect.DeepEqual(event.Records, wantRecords) {
+		t.Fatalf("wrong match ack event records.\nwant: %#v\n got: %#v", wantRecords, event.Records)
+	}
+	if msg, _ := rig.auth.popResp(matchInfo.maker.acct); msg != nil {
+		t.Fatalf("unexpected error response: %v", msg)
+	}
+	if got := len(matchAckEvents(rig.storage)); got != 0 {
+		t.Fatalf("storage writes before event application = %d, want 0", got)
+	}
+	if len(tracker.Sigs.MakerMatch) != 0 || len(tracker.Sigs.TakerMatch) != 0 ||
+		tracker.makerSwapAddr != "" || tracker.takerSwapAddr != "" ||
+		!tracker.time.Equal(initialTime) || tracker.counterPartyAddrsSent {
+		t.Fatal("match state changed before event application")
+	}
+	if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 0 {
+		t.Fatalf("address notifications before event application = %d, want 0", got)
+	}
+}
+
+// TestReackKeepsRecordedAddress checks that a re-ack with any other
+// address — divergent, empty, or backend-rejected — keeps the recorded
+// address in memory and in the stored event, without validating the
+// submitted one.
+func TestReackKeepsRecordedAddress(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		reack  string
+		reject bool // backend rejects all addresses; coercion must skip validation
+	}{
+		{name: "divergent", reack: "divergent-taker-addr"},
+		{name: "empty", reack: ""},
+		{name: "invalid", reack: "backend-rejected-addr", reject: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			matchInfo := set.matchInfos[0]
+			rig := tNewUnstartedRig(matchInfo)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tMesh := new(tSwapMesh)
+			rig.swapper.SetMeshService(tMesh)
+			tracker := rig.getTracker()
+			taker := matchInfo.taker
+
+			tracker.mtx.Lock()
+			tracker.makerSwapAddr = matchInfo.makerPerMatchAddr
+			tracker.takerSwapAddr = matchInfo.takerPerMatchAddr
+			tracker.Sigs.MakerMatch = matchInfo.maker.sig
+			tracker.Sigs.TakerMatch = taker.sig
+			tracker.counterPartyAddrsSent = true
+			tracker.mtx.Unlock()
+
+			if tt.reject {
+				rig.abcNode.rejectSwapAddrs = true
+				rig.xyzNode.rejectSwapAddrs = true
+			}
+
+			rig.swapper.RequestMatchAcks([]*order.MatchSet{set.matchSet})
+			req := rig.auth.popReq(taker.acct)
+			if req == nil || req.req.Route != msgjson.MatchRoute {
+				t.Fatal("no match re-request")
+			}
+			req.respFunc(nil, tNewResponse(req.req.ID, tAckArrWithAddrs(taker,
+				[]order.MatchID{matchInfo.matchID},
+				map[order.MatchID]string{matchInfo.matchID: tt.reack})))
+			if msg, resp := rig.auth.popResp(taker.acct); msg != nil {
+				t.Fatalf("unexpected error response: %+v", resp)
+			}
+
+			if len(tMesh.events) != 1 {
+				t.Fatalf("match ack events = %d, want 1", len(tMesh.events))
+			}
+			apply := rig.swapper.Events()[meshevents.EventKindMatchAcksRecorded]
+			if _, err := apply(&mesh.EventApplyContext{Context: context.Background()}, tMesh.events[0]); err != nil {
+				t.Fatal(err)
+			}
+
+			tracker.mtx.RLock()
+			got := tracker.takerSwapAddr
+			tracker.mtx.RUnlock()
+			if got != matchInfo.takerPerMatchAddr {
+				t.Fatalf("taker addr = %q, want %q", got, matchInfo.takerPerMatchAddr)
+			}
+			updates := matchAckEvents(rig.storage)
+			if len(updates) != 1 || len(updates[0].Records) != 1 ||
+				updates[0].Records[0].Address != matchInfo.takerPerMatchAddr {
+				t.Fatalf("stored re-ack = %+v, want %q", updates, matchInfo.takerPerMatchAddr)
+			}
+		})
+	}
+}
+
+func TestApplyMatchAcksRecordedEvent(t *testing.T) {
+	ackTime := time.UnixMilli(1670000000123).UTC()
+	storageErr := errors.New("storage error")
+
+	applyEvent := func(t *testing.T, rig *testRig, at time.Time, records ...meshevents.MatchAckRecord) error {
+		t.Helper()
+		event, err := newMatchAcksRecordedEvent(at, records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applier := rig.swapper.Events()[meshevents.EventKindMatchAcksRecorded]
+		before := len(matchAckEvents(rig.storage))
+		_, err = applier(&mesh.EventApplyContext{Context: context.Background()}, event)
+		events := matchAckEvents(rig.storage)
+		want := &meshevents.MatchAcksRecordedEvent{AckTime: at.UnixMilli(), Records: records}
+		if len(events) != before+1 || !reflect.DeepEqual(events[len(events)-1], want) {
+			t.Fatalf("storage events = %+v, want last event %+v", events, want)
+		}
+		return err
+	}
+
+	requireAckState := func(t *testing.T, tracker *matchTracker, makerSig []byte, makerAddr string, takerSig []byte, takerAddr string) {
+		t.Helper()
+		if tracker == nil {
+			t.Fatal("missing match tracker")
+		}
+		tracker.mtx.RLock()
+		defer tracker.mtx.RUnlock()
+		if !bytes.Equal(tracker.Sigs.MakerMatch, makerSig) || tracker.makerSwapAddr != makerAddr {
+			t.Fatalf("maker ack = %x / %q, want %x / %q", tracker.Sigs.MakerMatch, tracker.makerSwapAddr, makerSig, makerAddr)
+		}
+		if !bytes.Equal(tracker.Sigs.TakerMatch, takerSig) || tracker.takerSwapAddr != takerAddr {
+			t.Fatalf("taker ack = %x / %q, want %x / %q", tracker.Sigs.TakerMatch, tracker.takerSwapAddr, takerSig, takerAddr)
+		}
+	}
+
+	for _, tt := range []struct {
+		name  string
+		maker bool
+	}{
+		{name: "maker", maker: true},
+		{name: "taker"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			info := set.matchInfos[0]
+			rig := tNewUnstartedRig(info)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			record := tTakerMatchAckRecord(info)
+			var makerSig, takerSig []byte
+			var makerAddr, takerAddr string
+			if tt.maker {
+				record = tMakerMatchAckRecord(info)
+				makerSig, makerAddr = record.Sig, record.Address
+			} else {
+				takerSig, takerAddr = record.Sig, record.Address
+			}
+			tracker := rig.getTracker()
+			initialTime := tracker.time
+			if err := applyEvent(t, rig, ackTime, record); err != nil {
+				t.Fatal(err)
+			}
+			requireAckState(t, tracker, makerSig, makerAddr, takerSig, takerAddr)
+			if !tracker.time.Equal(initialTime) || tracker.counterPartyAddrsSent {
+				t.Fatal("started maker deadline before both addresses were available")
+			}
+			if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 0 {
+				t.Fatalf("address notifications = %d, want 0", got)
+			}
+		})
+	}
+
+	t.Run("storage error", func(t *testing.T) {
+		set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+		info := set.matchInfos[0]
+		rig := tNewUnstartedRig(info)
+		rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+		rig.storage.applyMatchAcksRecordedErr = storageErr
+		tracker := rig.getTracker()
+		initialTime := tracker.time
+		if err := applyEvent(t, rig, ackTime, tMakerMatchAckRecord(info), tTakerMatchAckRecord(info)); !errors.Is(err, storageErr) {
+			t.Fatalf("apply error = %v, want %v", err, storageErr)
+		}
+		requireAckState(t, tracker, nil, "", nil, "")
+		if !tracker.time.Equal(initialTime) || tracker.counterPartyAddrsSent {
+			t.Fatal("started maker deadline after storage failure")
+		}
+		if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 0 {
+			t.Fatalf("address notifications = %d, want 0", got)
+		}
+	})
+
+	t.Run("both sides and repeated acknowledgement", func(t *testing.T) {
+		set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+		info := set.matchInfos[0]
+		rig := tNewUnstartedRig(info)
+		rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+		maker, taker := tMakerMatchAckRecord(info), tTakerMatchAckRecord(info)
+		if err := applyEvent(t, rig, ackTime, maker); err != nil {
+			t.Fatal(err)
+		}
+		secondAckTime := ackTime.Add(time.Second)
+		if err := applyEvent(t, rig, secondAckTime, taker); err != nil {
+			t.Fatal(err)
+		}
+		tracker := rig.getTracker()
+		requireAckState(t, tracker, maker.Sig, maker.Address, taker.Sig, taker.Address)
+		if !tracker.time.Equal(secondAckTime) || !tracker.counterPartyAddrsSent {
+			t.Fatal("second acknowledgement did not start the maker deadline")
+		}
+		if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 2 {
+			t.Fatalf("address notifications = %d, want 2", got)
+		}
+
+		// Refresh the signature, but keep the address already sent to the counterparty.
+		reack := taker
+		reack.Sig = []byte("new-signature")
+		reack.Address = "different-address"
+		if err := applyEvent(t, rig, secondAckTime.Add(time.Second), reack); err != nil {
+			t.Fatal(err)
+		}
+		requireAckState(t, tracker, maker.Sig, maker.Address, reack.Sig, taker.Address)
+		if !tracker.time.Equal(secondAckTime) {
+			t.Fatal("repeated acknowledgement reset maker deadline")
+		}
+		if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 2 {
+			t.Fatalf("address notifications after repeated acknowledgement = %d, want 2", got)
+		}
+	})
+
+	t.Run("trade and cancel matches", func(t *testing.T) {
+		makerSet := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+		takerSet := tPerfectLimitLimit(uint64(2e8), uint64(1e8), true)
+		cancelSet := tCancelPair()
+		cancelInfo := cancelSet.matchInfos[0]
+		makerInfo, takerInfo := makerSet.matchInfos[0], takerSet.matchInfos[0]
+		rig := tNewUnstartedRig(makerInfo)
+		rig.swapper.TrackMatches([]*order.MatchSet{makerSet.matchSet, takerSet.matchSet, cancelSet.matchSet})
+		maker, taker := tMakerMatchAckRecord(makerInfo), tTakerMatchAckRecord(takerInfo)
+		cancelMaker, cancelTaker := tMakerMatchAckRecord(cancelInfo), tTakerMatchAckRecord(cancelInfo)
+		cancelMaker.Cancel, cancelMaker.Address = true, ""
+		cancelTaker.Cancel, cancelTaker.Address = true, ""
+		if err := applyEvent(t, rig, ackTime, cancelMaker, maker, cancelTaker, taker); err != nil {
+			t.Fatal(err)
+		}
+		requireAckState(t, rig.swapper.matches[maker.MatchID], maker.Sig, maker.Address, nil, "")
+		requireAckState(t, rig.swapper.matches[taker.MatchID], nil, "", taker.Sig, taker.Address)
+		if rig.swapper.matches[cancelInfo.matchID] != nil {
+			t.Fatal("cancel match gained a tracker")
+		}
+		if got := notificationCount(rig.auth, msgjson.CounterPartyAddressRoute); got != 0 {
+			t.Fatalf("address notifications = %d, want 0", got)
+		}
+	})
+}
+
 func TestCancel(t *testing.T) {
 	set := tCancelPair()
 	matchInfo := set.matchInfos[0]
@@ -2326,7 +2718,7 @@ func TestCancel(t *testing.T) {
 	user := matchInfo.maker
 	req := rig.auth.popReq(user.acct)
 	if req == nil {
-		t.Fatalf("no request sent from Negotiate")
+		t.Fatalf("no match request sent")
 	}
 	matchNotes := make([]*msgjson.Match, 0)
 	err := json.Unmarshal(req.req.Payload, &matchNotes)
@@ -2350,6 +2742,38 @@ func TestCancel(t *testing.T) {
 	}
 	if makerNote.MatchID.String() != takerNote.MatchID.String() {
 		t.Fatalf("match ID mismatch. %s != %s", makerNote.MatchID, takerNote.MatchID)
+	}
+
+	// Ack both notifications. Cancel matches are never swap-tracked, but the
+	// ack sigs must still be recorded.
+	resp := tNewResponse(req.req.ID,
+		tAckArrWithAddrs(user, []order.MatchID{matchInfo.matchID, matchInfo.matchID}, nil))
+	req.respFunc(nil, resp)
+	if msg, r := rig.auth.popResp(user.acct); msg != nil {
+		t.Fatalf("unexpected error response to cancel acks: %+v", r.Error)
+	}
+	updates := matchAckEvents(rig.storage)
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 match acks storage update, got %d", len(updates))
+	}
+	acks := updates[0].Records
+	if len(acks) != 2 {
+		t.Fatalf("expected 2 recorded acks, got %d", len(acks))
+	}
+	for i, wantMaker := range []bool{true, false} {
+		ack := acks[i]
+		if !ack.Cancel || ack.Maker != wantMaker {
+			t.Fatalf("ack %d: Cancel = %v, Maker = %v, want true, %v", i, ack.Cancel, ack.Maker, wantMaker)
+		}
+		if !bytes.Equal(ack.Sig, user.sig) {
+			t.Fatalf("ack %d: wrong sig", i)
+		}
+		if ack.Address != "" {
+			t.Fatalf("ack %d: unexpected address %q", i, ack.Address)
+		}
+	}
+	if rig.getTracker() != nil {
+		t.Fatalf("cancel match gained a tracker after acks")
 	}
 }
 

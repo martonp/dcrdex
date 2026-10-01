@@ -640,6 +640,10 @@ type SwapArchiver interface {
 	// true so the outcome will not count against the user who would have the
 	// next action in the swap.
 	SetMatchInactive(mid MarketMatchID, forgive bool) error
+
+	// ApplyMatchAcksRecordedEvent records match acknowledgement signatures
+	// and swap addresses.
+	ApplyMatchAcksRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.MatchAcksRecordedEvent) (*EventLogEntry, error)
 }
 
 // ValidateOrder ensures that the order with the given status for the specified
