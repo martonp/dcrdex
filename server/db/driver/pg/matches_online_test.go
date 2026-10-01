@@ -1224,6 +1224,55 @@ func TestUserMatches(t *testing.T) {
 	}
 }
 
+func TestSwapDataFullByID(t *testing.T) {
+	if err := cleanTables(archie.db); err != nil {
+		t.Fatalf("cleanTables: %v", err)
+	}
+
+	got, err := archie.SwapDataFullByID(order.MatchID{})
+	if !db.IsErrMatchUnknown(err) || got != nil {
+		t.Fatalf("missing match = %+v, %v; want nil, ErrUnknownMatch", got, err)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		status order.MatchStatus
+		active bool
+	}{
+		{"active swap", order.MakerSwapCast, true},
+		{"completed swap", order.MatchComplete, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mp := generateMatch(t, tt.status, tt.active, randomAccountID(), randomAccountID())
+			mid := mp.match.ID()
+			got, err := archie.SwapDataFullByID(mid)
+			if err != nil {
+				t.Fatalf("SwapDataFullByID: %v", err)
+			}
+			if got == nil {
+				t.Fatal("SwapDataFullByID returned nil")
+			}
+			if got.ID != mid || got.Base != mp.match.Maker.Base() || got.Quote != mp.match.Maker.Quote() ||
+				got.Status != tt.status || got.Active != tt.active {
+				t.Fatalf("unexpected match data: %+v", got)
+			}
+			if got.Maker != mp.match.Maker.ID() || got.MakerAcct != mp.match.Maker.User() ||
+				got.Taker != mp.match.Taker.ID() || got.TakerAcct != mp.match.Taker.User() {
+				t.Fatalf("unexpected match parties: %+v", got.MatchData)
+			}
+			wantSwap := &db.SwapData{
+				ContractACoinID: mp.status.MakerSwap, ContractA: mp.status.MakerContract,
+				ContractBCoinID: mp.status.TakerSwap, ContractB: mp.status.TakerContract,
+				RedeemACoinID: mp.status.MakerRedeem, RedeemBCoinID: mp.status.TakerRedeem,
+				RedeemASecret: mp.status.Secret,
+			}
+			if !reflect.DeepEqual(got.SwapData, wantSwap) {
+				t.Fatalf("swap data = %+v, want %+v", got.SwapData, wantSwap)
+			}
+		})
+	}
+}
+
 func TestMarketMatches(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)

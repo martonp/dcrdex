@@ -641,6 +641,11 @@ type SwapArchiver interface {
 	// next action in the swap.
 	SetMatchInactive(mid MarketMatchID, forgive bool) error
 
+	// SwapDataFullByID loads a match's row and swap data by match ID,
+	// searching configured markets for active or inactive matches. It returns
+	// ErrUnknownMatch when no match is found.
+	SwapDataFullByID(mid order.MatchID) (*SwapDataFull, error)
+
 	// ApplyMatchAcksRecordedEvent records match acknowledgement signatures
 	// and swap addresses.
 	ApplyMatchAcksRecordedEvent(ctx context.Context, meta *EventLogMeta, event *meshevents.MatchAcksRecordedEvent) (*EventLogEntry, error)

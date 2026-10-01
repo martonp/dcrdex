@@ -488,6 +488,10 @@ func (ta *TArchivist) BookOrder(lo *order.LimitOrder) error {
 	return nil
 }
 
+func (ta *TArchivist) SwapDataFullByID(order.MatchID) (*db.SwapDataFull, error) {
+	return nil, db.ArchiveError{Code: db.ErrUnknownMatch}
+}
+
 // SwapArchiver for Swapper
 func (ta *TArchivist) ActiveSwaps() ([]*db.SwapDataFull, error) { return nil, nil }
 func (ta *TArchivist) CompletedAndAtFaultMatchStats(aid account.AccountID, lastN int) ([]*db.MatchOutcome, error) {

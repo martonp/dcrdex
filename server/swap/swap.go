@@ -209,8 +209,7 @@ func (a stepActor) String() string {
 }
 
 // stepInformation holds information about the current state of the swap
-// negotiation. A new stepInformation should be generated with (Swapper).step at
-// every step of the negotiation process.
+// negotiation, captured by beginSettlement when it claims the request's search.
 type stepInformation struct {
 	match *matchTracker
 	// The actor is the user info for the user who is expected to be broadcasting
@@ -1402,14 +1401,15 @@ func (s *Swapper) respondSuccess(id uint64, user account.AccountID, result any) 
 	}
 }
 
-// step creates a stepInformation structure for the specified match. A new
-// stepInformation should be created for every client communication. The user
-// is also validated as the actor. An error is returned if the user has not
-// acknowledged their previous DEX requests.
-func (s *Swapper) step(user account.AccountID, matchID order.MatchID) (*stepInformation, *msgjson.Error) {
+// beginSettlement validates the request's account, order, and action against
+// the current match step and claims its search. On success, the caller must
+// release the search flag. Errors leave search flags unchanged.
+func (s *Swapper) beginSettlement(user account.AccountID, matchID order.MatchID, orderID []byte, route string) (*stepInformation, *msgjson.Error) {
+	// Hold both match locks until the search is claimed so the match cannot
+	// advance or disappear between checking its state and claiming the search.
 	s.matchMtx.RLock()
+	defer s.matchMtx.RUnlock()
 	match, found := s.matches[matchID]
-	s.matchMtx.RUnlock()
 	if !found {
 		return nil, &msgjson.Error{
 			Code:    msgjson.RPCUnknownMatch,
@@ -1492,12 +1492,32 @@ func (s *Swapper) step(user account.AccountID, matchID order.MatchID) (*stepInfo
 		}
 	}
 
-	// Verify that the user specified is the actor for this step.
-	if actor.user != user { // NOTE: self-trade slips past this
+	// The order ID distinguishes the parties when an account trades with itself.
+	actorOrderID := actor.order.ID()
+	if actor.user != user || !bytes.Equal(orderID, actorOrderID[:]) {
 		return nil, &msgjson.Error{
 			Code:    msgjson.SettlementSequenceError,
 			Message: "expected other party to act",
 		}
+	}
+
+	switch route {
+	case msgjson.InitRoute:
+		if match.Status != order.NewlyMatched && match.Status != order.MakerSwapCast {
+			return nil, msgjson.NewError(msgjson.SettlementSequenceError, "swap contract already provided")
+		}
+		if !actor.status.startSwapSearch() {
+			return nil, msgjson.NewError(msgjson.DuplicateRequestError, "already received a swap contract, search in progress")
+		}
+	case msgjson.RedeemRoute:
+		if match.Status != order.TakerSwapCast && match.Status != order.MakerRedeemed {
+			return nil, msgjson.NewError(msgjson.SettlementSequenceError, "swap contracts not yet received")
+		}
+		if !actor.status.startRedeemSearch() {
+			return nil, msgjson.NewError(msgjson.DuplicateRequestError, "already received a redeem transaction, search in progress")
+		}
+	default:
+		return nil, msgjson.NewError(msgjson.InvalidRequestError, "unknown settlement action %q", route)
 	}
 
 	// Set the actors' swapAsset and the swap contract checkVal.
@@ -1963,6 +1983,89 @@ func (s *Swapper) sendRedemptionRequest(match *matchTracker, recipient account.A
 	}
 }
 
+// loadSettlementForUser loads settlement data when the account and order ID
+// identify the same party in the match. It also reports whether that party is
+// the maker. A missing match or mismatched account/order returns nil data.
+func (s *Swapper) loadSettlementForUser(user account.AccountID, matchID order.MatchID,
+	orderID msgjson.Bytes) (*db.SwapDataFull, bool, error) {
+	sd, err := s.storage.SwapDataFullByID(matchID)
+	if db.IsErrMatchUnknown(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		log.Errorf("Resend lookup for match %v failed: %v", matchID, err)
+		return nil, false, err
+	}
+	switch {
+	case user == sd.MakerAcct && bytes.Equal(orderID, sd.Maker[:]):
+		return sd, true, nil
+	case user == sd.TakerAcct && bytes.Equal(orderID, sd.Taker[:]):
+		return sd, false, nil
+	}
+	return nil, false, nil
+}
+
+// sendSettlementAck signs the request and completes the command with an acknowledgement.
+func (s *Swapper) sendSettlementAck(cmdCtx *mesh.CommandContext, matchID order.MatchID, params msgjson.Signable) {
+	s.authMgr.Sign(params)
+	if err := cmdCtx.Completion.Complete(cmdCtx.Context, &msgjson.Acknowledgement{
+		MatchID: matchID[:],
+		Sig:     params.SigBytes(),
+	}); err != nil {
+		// The settlement is already recorded; a delivery failure can be retried.
+		log.Errorf("failed to deliver settlement re-ack for match %v: %v", matchID, err)
+	}
+}
+
+// ackRecordedInit acknowledges a request that matches the user's recorded contract.
+// It returns false if no matching contract is recorded.
+func (s *Swapper) ackRecordedInit(cmdCtx *mesh.CommandContext, user account.AccountID,
+	matchID order.MatchID, params *msgjson.Init) (bool, *msgjson.Error) {
+	sd, isMaker, err := s.loadSettlementForUser(user, matchID, params.OrderID)
+	if err != nil {
+		return false, msgjson.NewError(msgjson.TryAgainLaterError,
+			"settlement resend lookup unavailable; retry the request")
+	}
+	if sd == nil {
+		return false, nil
+	}
+	coinID, contract := sd.ContractACoinID, sd.ContractA
+	if !isMaker {
+		coinID, contract = sd.ContractBCoinID, sd.ContractB
+	}
+	if len(coinID) == 0 || !bytes.Equal(coinID, params.CoinID) || !bytes.Equal(contract, params.Contract) {
+		return false, nil
+	}
+	log.Debugf("Re-acking recorded contract for match %v (%s)", matchID, makerTaker(isMaker))
+	s.sendSettlementAck(cmdCtx, matchID, params)
+	return true, nil
+}
+
+// ackRecordedRedeem acknowledges a request that matches the user's recorded
+// redemption. Both parties use the maker's secret. It returns false if no
+// matching redemption is recorded.
+func (s *Swapper) ackRecordedRedeem(cmdCtx *mesh.CommandContext, user account.AccountID,
+	matchID order.MatchID, params *msgjson.Redeem) (bool, *msgjson.Error) {
+	sd, isMaker, err := s.loadSettlementForUser(user, matchID, params.OrderID)
+	if err != nil {
+		return false, msgjson.NewError(msgjson.TryAgainLaterError,
+			"settlement resend lookup unavailable; retry the request")
+	}
+	if sd == nil {
+		return false, nil
+	}
+	coinID := sd.RedeemACoinID
+	if !isMaker {
+		coinID = sd.RedeemBCoinID
+	}
+	if len(coinID) == 0 || !bytes.Equal(coinID, params.CoinID) || !bytes.Equal(sd.RedeemASecret, params.Secret) {
+		return false, nil
+	}
+	log.Debugf("Re-acking recorded redeem for match %v (%s)", matchID, makerTaker(isMaker))
+	s.sendSettlementAck(cmdCtx, matchID, params)
+	return true, nil
+}
+
 // executeInit handles the 'init' command, which is used to inform the DEX of a
 // newly broadcast swap transaction. The Init message includes the swap contract
 // script and the CoinID of the contract.
@@ -1996,23 +2099,17 @@ func (s *Swapper) executeInit(cmdCtx *mesh.CommandContext) *msgjson.Error {
 	var matchID order.MatchID
 	copy(matchID[:], params.MatchID)
 
-	stepInfo, rpcErr := s.step(user, matchID)
+	stepInfo, rpcErr := s.beginSettlement(user, matchID, params.OrderID, msgjson.InitRoute)
 	if rpcErr != nil {
-		return rpcErr
-	}
-
-	// init requests should only be sent when contracts are still required, in
-	// the correct sequence, and by the correct party.
-	switch stepInfo.step {
-	case order.NewlyMatched, order.MakerSwapCast:
-		// Ensure we only start one coin waiter for this swap. This is an atomic
-		// CAS, so it must ultimately be followed by endSwapSearch().
-		if !stepInfo.actor.status.startSwapSearch() {
-			// Not really a sequence error since they are still the "actor".
-			return msgjson.NewError(msgjson.DuplicateRequestError, "already received a swap contract, search in progress")
+		// A request that cannot proceed may already have been recorded.
+		acked, lookupErr := s.ackRecordedInit(cmdCtx, user, matchID, params)
+		if lookupErr != nil {
+			return lookupErr
 		}
-	default:
-		return msgjson.NewError(msgjson.SettlementSequenceError, "swap contract already provided")
+		if acked {
+			return nil
+		}
+		return rpcErr
 	}
 
 	// Validate the coinID and contract script before starting a coin waiter.
@@ -2107,24 +2204,17 @@ func (s *Swapper) executeRedeem(cmdCtx *mesh.CommandContext) *msgjson.Error {
 	var matchID order.MatchID
 	copy(matchID[:], params.MatchID)
 
-	stepInfo, rpcErr := s.step(user, matchID)
+	stepInfo, rpcErr := s.beginSettlement(user, matchID, params.OrderID, msgjson.RedeemRoute)
 	if rpcErr != nil {
-		return rpcErr
-	}
-
-	// redeem requests should only be sent when all contracts have been
-	// received, in the correct sequence, and by the correct party.
-	switch stepInfo.step {
-	case order.TakerSwapCast, order.MakerRedeemed:
-		// Ensure we only start one coin waiter for this redeem. This is an
-		// atomic CAS, so it must ultimately be followed by endRedeemSearch().
-		if !stepInfo.actor.status.startRedeemSearch() {
-			return msgjson.NewError(msgjson.DuplicateRequestError, "already received a redeem transaction, search in progress")
+		// A request that cannot proceed may already have been recorded.
+		acked, lookupErr := s.ackRecordedRedeem(cmdCtx, user, matchID, params)
+		if lookupErr != nil {
+			return lookupErr
 		}
-	default:
-		// Too early to redeem (e.g. contracts not both in yet). A finished
-		// match is already off the map, so a retry fails earlier as unknown.
-		return msgjson.NewError(msgjson.SettlementSequenceError, "swap contracts not yet received")
+		if acked {
+			return nil
+		}
+		return rpcErr
 	}
 
 	// Validate the redeem coin ID before starting a wait. This does not

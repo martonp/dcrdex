@@ -639,6 +639,26 @@ func matchStatusesByID(ctx context.Context, dbe *sql.DB, aid account.AccountID, 
 // The methods for saving this data are defined below in the order in which the
 // data is expected from the parties.
 
+// SwapDataFullByID loads an active or inactive match and its settlement data
+// from the configured markets. It returns ErrUnknownMatch when no match is found.
+func (a *Archiver) SwapDataFullByID(mid order.MatchID) (*db.SwapDataFull, error) {
+	for _, mkt := range a.markets {
+		md, err := a.MatchByID(mid, mkt.Base, mkt.Quote)
+		if err != nil {
+			if db.IsErrMatchUnknown(err) {
+				continue
+			}
+			return nil, err
+		}
+		_, sd, err := a.SwapData(db.MarketMatchID{MatchID: mid, Base: mkt.Base, Quote: mkt.Quote})
+		if err != nil {
+			return nil, err
+		}
+		return &db.SwapDataFull{Base: mkt.Base, Quote: mkt.Quote, MatchData: md, SwapData: sd}, nil
+	}
+	return nil, db.ArchiveError{Code: db.ErrUnknownMatch}
+}
+
 // SwapData retrieves the match status and all the SwapData for a match.
 func (a *Archiver) SwapData(mid db.MarketMatchID) (order.MatchStatus, *db.SwapData, error) {
 	marketSchema, err := a.marketSchema(mid.Base, mid.Quote)

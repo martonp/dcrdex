@@ -327,6 +327,8 @@ func (m *TAuthManager) popResp(id account.AccountID) (msg *msgjson.Message, resp
 type TStorage struct {
 	mtx sync.Mutex
 
+	swapDataByID map[order.MatchID]*db.SwapDataFull
+
 	matchAckEvents            []*meshevents.MatchAcksRecordedEvent
 	applyMatchAcksRecordedErr error
 	swapContracts             []*meshevents.SwapContractRecordedEvent
@@ -400,6 +402,15 @@ func (ts *TStorage) SaveRedeemB(mid db.MarketMatchID, coinID []byte, timestamp i
 	return nil
 }
 func (ts *TStorage) SetMatchInactive(mid db.MarketMatchID, forgive bool) error { return nil }
+
+func (ts *TStorage) SwapDataFullByID(mid order.MatchID) (*db.SwapDataFull, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	if data := ts.swapDataByID[mid]; data != nil {
+		return data, nil
+	}
+	return nil, db.ArchiveError{Code: db.ErrUnknownMatch}
+}
 
 func (ts *TStorage) EventLogFrontier(context.Context) (*db.EventLogPosition, error) {
 	return &db.EventLogPosition{}, nil
@@ -1921,16 +1932,11 @@ func TestTxWaiters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Duplicate init request should get rejected.
+	// Until recorded, an overlapping request remains in progress.
 	dupSwapReq := *matchInfo.db.makerSwap.req
-	dupSwapReq.ID = nextID() // same content but new request ID
-	rpcErr := rig.swapper.handleInit(matchInfo.maker.acct, &dupSwapReq)
-	if rpcErr == nil {
-		t.Fatal("should have rejected the duplicate init request")
-	}
-	if rpcErr.Code != msgjson.DuplicateRequestError {
-		t.Errorf("duplicate init request expected code %d, got %d",
-			msgjson.DuplicateRequestError, rpcErr.Code)
+	dupSwapReq.ID = nextID()
+	if rpcErr := rig.swapper.handleInit(matchInfo.maker.acct, &dupSwapReq); rpcErr == nil || rpcErr.Code != msgjson.DuplicateRequestError {
+		t.Fatalf("pending init retry error = %v, want DuplicateRequestError", rpcErr)
 	}
 
 	// Now timeout the initial search.
@@ -2005,6 +2011,11 @@ func TestTxWaiters(t *testing.T) {
 	rig.xyzNode.setRedemptionErr(asset.CoinNotFoundError)
 
 	ensureNilErr(rig.redeem_maker(false))
+	dupRedeemReq := *matchInfo.db.makerRedeem.req
+	dupRedeemReq.ID = nextID()
+	if rpcErr := rig.swapper.handleRedeem(matchInfo.maker.acct, &dupRedeemReq); rpcErr == nil || rpcErr.Code != msgjson.DuplicateRequestError {
+		t.Fatalf("pending redeem retry error = %v, want DuplicateRequestError", rpcErr)
+	}
 	tickMempool()
 	tickMempool()
 	msg, _ = rig.auth.popResp(matchInfo.maker.acct)
@@ -2472,7 +2483,9 @@ func TestRetriesDuringSwap(t *testing.T) {
 	tracker := rig.getTracker()
 	// We're "rewinding time" back NewlyMatched status to be able to retry sending
 	// the same init request again.
+	tracker.mtx.Lock()
 	tracker.Status = order.NewlyMatched
+	tracker.mtx.Unlock()
 	retryUntilSuccess(func() error {
 		// We might get a couple of duplicate init request errors here, in that case
 		// we simply retry request later.
@@ -2499,7 +2512,9 @@ func TestRetriesDuringSwap(t *testing.T) {
 	tracker = rig.getTracker()
 	// We're "rewinding time" back MakerSwapCast status to be able to retry sending
 	// the same init request again.
+	tracker.mtx.Lock()
 	tracker.Status = order.MakerSwapCast
+	tracker.mtx.Unlock()
 	retryUntilSuccess(func() error {
 		// We might get a couple of duplicate init request errors here, in that case
 		// we simply retry request later.
@@ -2527,7 +2542,9 @@ func TestRetriesDuringSwap(t *testing.T) {
 	tracker = rig.getTracker()
 	// We're "rewinding time" back TakerSwapCast status to be able to retry sending
 	// the same redeem request again.
+	tracker.mtx.Lock()
 	tracker.Status = order.TakerSwapCast
+	tracker.mtx.Unlock()
 	retryUntilSuccess(func() error {
 		// We might get a couple of duplicate redeem request errors here, in that case
 		// we simply retry request later.
@@ -2548,24 +2565,57 @@ func TestRetriesDuringSwap(t *testing.T) {
 	})
 
 	ensureNilErr(rig.redeem_taker(true))
-	// Retry after success: match is gone.
-	err := rig.redeem_taker(false)
-	if err == nil {
-		t.Fatalf("expected 2nd redeem request to fail after 1st one succeeded")
+	// Retry the original requests after the match has left memory.
+	info := rig.matchInfo
+	init := new(msgjson.Init)
+	ensureNilErr(info.db.makerSwap.req.Unmarshal(init))
+	redeem := new(msgjson.Redeem)
+	ensureNilErr(info.db.takerRedeem.req.Unmarshal(redeem))
+	rig.storage.mtx.Lock()
+	contracts, redemptions := len(rig.storage.swapContracts), len(rig.storage.redemptions)
+	rig.storage.swapDataByID = map[order.MatchID]*db.SwapDataFull{
+		info.matchID: {
+			MatchData: &db.MatchData{
+				ID: info.matchID, Maker: info.makerOID, MakerAcct: info.maker.acct,
+				Taker: info.takerOID, TakerAcct: info.taker.acct,
+			},
+			SwapData: &db.SwapData{
+				ContractACoinID: init.CoinID, ContractA: init.Contract,
+				RedeemBCoinID: redeem.CoinID, RedeemASecret: redeem.Secret,
+			},
+		},
 	}
-	ensureNilErr(rig.waitChans("server received our redeem", rig.auth.redeemReceived))
-	ensureNilErr(rig.checkServerResponseFail(rig.matchInfo.taker, msgjson.RPCUnknownMatch))
+	rig.storage.mtx.Unlock()
+
+	redeemRetry := *info.db.takerRedeem.req
+	redeemRetry.ID = nextID()
+	if rpcErr := rig.swapper.handleRedeem(info.taker.acct, &redeemRetry); rpcErr != nil {
+		t.Fatalf("completed redeem retry failed: %v", rpcErr)
+	}
+	ensureNilErr(rig.checkServerResponseSuccess(info.taker))
 
 	tickMempool()
 	tickMempool()
 	ensureNilErr(rig.ackRedemption_maker(true)) // no-op; match already removed
 
-	err = rig.redeem_taker(false)
-	if err == nil {
-		t.Fatalf("expected 2nd redeem request to fail after 1st one succeeded")
+	redeemRetry.ID = nextID()
+	if rpcErr := rig.swapper.handleRedeem(info.taker.acct, &redeemRetry); rpcErr != nil {
+		t.Fatalf("completed redeem retry failed: %v", rpcErr)
 	}
+	ensureNilErr(rig.checkServerResponseSuccess(info.taker))
 
-	ensureNilErr(rig.checkServerResponseFail(rig.matchInfo.taker, msgjson.RPCUnknownMatch))
+	initRetry := *info.db.makerSwap.req
+	initRetry.ID = nextID()
+	if rpcErr := rig.swapper.handleInit(info.maker.acct, &initRetry); rpcErr != nil {
+		t.Fatalf("completed init retry failed: %v", rpcErr)
+	}
+	ensureNilErr(rig.checkServerResponseSuccess(info.maker))
+
+	rig.storage.mtx.Lock()
+	defer rig.storage.mtx.Unlock()
+	if len(rig.storage.swapContracts) != contracts || len(rig.storage.redemptions) != redemptions {
+		t.Fatal("retry emitted another settlement event")
+	}
 }
 
 func TestBadParams(t *testing.T) {
