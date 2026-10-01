@@ -308,6 +308,9 @@ type Swapper struct {
 	// master is true while Run is active on the acting master.
 	master atomic.Bool
 
+	// inactionChecksEnabled enables inactivity checks after market startup.
+	inactionChecksEnabled atomic.Bool
+
 	// handlerMtx should be read-locked for the duration of the comms route
 	// handlers (handleInit and handleRedeem). This blocks shutdown until any
 	// coin waiters are registered with latencyQ. It should be write-locked
@@ -338,15 +341,9 @@ type Config struct {
 	LockTimeTaker time.Duration
 	// LockTimeMaker is the locktime Swapper will use for auditing maker swaps.
 	LockTimeMaker time.Duration
-	// NoResume indicates that the swapper should not resume active swaps.
-	NoResume bool
-	// AllowPartialRestore indicates if it is acceptable to load only some of
-	// the active swaps if the Swapper's asset configuration lacks assets
-	// required to load them all.
-	AllowPartialRestore bool
-	// SwapDone registers a match with the DEX manager (or other consumer) for a
-	// given order as being finished.
-	SwapDone func(oid order.Order, match *order.Match, fail bool)
+	// SwapDone updates market state when an order's side of a match completes
+	// or fails. The bool indicates whether this order's user was at fault.
+	SwapDone func(order.Order, *order.Match, bool)
 }
 
 // NewSwapper is a constructor for a Swapper.
@@ -355,6 +352,9 @@ func NewSwapper(cfg *Config) (*Swapper, error) {
 		if asset.MaxFeeRate == 0 {
 			return nil, fmt.Errorf("max fee rate of 0 is invalid for asset %q", asset.Symbol)
 		}
+	}
+	if cfg.SwapDone == nil {
+		return nil, fmt.Errorf("swap-done applier is not configured")
 	}
 
 	acctMatches := make(map[uint32]map[string]map[order.MatchID]*matchTracker)
@@ -383,19 +383,10 @@ func NewSwapper(cfg *Config) (*Swapper, error) {
 		lockTimeTaker:      cfg.LockTimeTaker,
 		lockTimeMaker:      cfg.LockTimeMaker,
 	}
-
 	// Ensure txWaitExpiration is not greater than broadcast timeout setting.
 	if swapper.txWaitExpiration > swapper.bTimeout {
 		swapper.txWaitExpiration = swapper.bTimeout
 	}
-
-	if !cfg.NoResume {
-		err := swapper.RestoreActiveSwaps(cfg.AllowPartialRestore)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	// The swapper is only concerned with two types of client-originating
 	// method requests.
 	authMgr.Route(msgjson.InitRoute, swapper.handleInit)
@@ -646,8 +637,7 @@ func (s *Swapper) ChainsSynced(base, quote uint32) (bool, error) {
 // RestoreActiveSwaps restores active matches and their funding locks from the
 // database. If allowPartial is true, matches requiring unavailable assets are
 // skipped. Other load errors fail the restore.
-// It must run at most once, before processing requests or events. NewSwapper
-// calls it unless NoResume is set.
+// It must run at most once, before processing requests or events.
 func (s *Swapper) RestoreActiveSwaps(allowPartial bool) error {
 	// Load active swap data from DB.
 	swapData, err := s.storage.ActiveSwaps()
@@ -1131,6 +1121,13 @@ func (s *Swapper) resendRedemptionRequest(match *matchTracker) {
 	s.sendRedemptionRequest(match, match.Taker.User(), false, redemptionParams, s.bTimeout)
 }
 
+// EnableInactionChecks gives pending swaps a fresh response window and
+// enables inactivity checks. Call it after all markets finish starting.
+func (s *Swapper) EnableInactionChecks() {
+	s.extendInactionDeadlines(time.Now().UTC())
+	s.inactionChecksEnabled.Store(true)
+}
+
 // extendInactionDeadlines gives clients at least one broadcast timeout
 // from now to respond, without changing recorded redemption times.
 func (s *Swapper) extendInactionDeadlines(now time.Time) {
@@ -1161,11 +1158,28 @@ func (s *Swapper) extendInactionDeadlines(now time.Time) {
 	}
 }
 
-// Run is the main Swapper loop. It's primary purpose is to update transaction
-// confirmations when new blocks are mined, and to trigger inaction checks.
-func (s *Swapper) Run(ctx context.Context) {
+// Run monitors swap confirmations and retries pending requests.
+// It reports readiness once its processing loops are running.
+// Inactivity checks remain disabled until EnableInactionChecks is called.
+// Call SetMeshService before Run.
+func (s *Swapper) Run(ctx context.Context, reportReady func(error)) {
+	if reportReady == nil {
+		reportReady = func(error) {}
+	}
+	if s.mesh == nil {
+		reportReady(fmt.Errorf("swapper startup requires SetMeshService before Run"))
+		return
+	}
+
 	s.master.Store(true)
 	defer s.master.Store(false)
+	s.inactionChecksEnabled.Store(false)
+
+	if err := s.resumePendingRequests(ctx); err != nil {
+		reportReady(fmt.Errorf("swapper startup repair failed: %w", err))
+		return
+	}
+
 	// Permit internal cancel on anomaly such as storage failure.
 	ctxMaster, cancel := context.WithCancel(ctx)
 
@@ -1268,12 +1282,6 @@ func (s *Swapper) Run(ctx context.Context) {
 		})
 	}
 
-	// On startup, schedule an inaction check for each asset. Ideally these
-	// would start bTimeout after the best block times.
-	for assetID := range s.coins {
-		scheduleInactionCheck(assetID)
-	}
-
 	// Event-based action checks are started with a single ticker. Each of the
 	// events, e.g. match request, could start a timer, but this is simpler and
 	// allows batching the match checks.
@@ -1291,6 +1299,7 @@ func (s *Swapper) Run(ctx context.Context) {
 	go func() {
 		defer wgMain.Done()
 		defer cancel() // ctxMaster for anomalous return
+		startupChecksScheduled := false
 		for {
 			select {
 			case <-s.storage.Fatal():
@@ -1321,6 +1330,14 @@ func (s *Swapper) Run(ctx context.Context) {
 				s.checkInactionBlockBased(assetID)
 
 			case <-bcastEventTrigger:
+				if !startupChecksScheduled && s.inactionChecksEnabled.Load() {
+					// Wait until startup extends the response windows before
+					// scheduling checks for already-confirmed swaps.
+					for assetID := range s.coins {
+						scheduleInactionCheck(assetID)
+					}
+					startupChecksScheduled = true
+				}
 				s.checkInactionEventBased()
 				s.resendStaleRequests()
 
@@ -1329,6 +1346,8 @@ func (s *Swapper) Run(ctx context.Context) {
 			}
 		}
 	}()
+
+	reportReady(nil)
 
 	// Wait for caller cancel or anomalous return from main loop.
 	<-ctxMaster.Done()
@@ -1521,6 +1540,9 @@ type matchFailure struct {
 // maker, since the maker cannot broadcast their swap without the taker's
 // address.
 func (s *Swapper) checkInactionEventBased() {
+	if !s.inactionChecksEnabled.Load() {
+		return
+	}
 	// If the DB is failing, do not penalize or attempt to start revocations.
 	if err := s.storage.LastErr(); err != nil {
 		log.Errorf("DB in failing state.")
@@ -1620,6 +1642,9 @@ func (s *Swapper) checkInactionEventBased() {
 // that have not received a maker redeem after the taker's swap reaches the
 // required confirmation count.
 func (s *Swapper) checkInactionBlockBased(assetID uint32) {
+	if !s.inactionChecksEnabled.Load() {
+		return
+	}
 	// If the DB is failing, do not penalize or attempt to start revocations.
 	if err := s.storage.LastErr(); err != nil {
 		log.Errorf("DB in failing state.")

@@ -731,7 +731,6 @@ type testRig struct {
 	storage       *TStorage
 	matches       *tMatchSet
 	matchInfo     *tMatch
-	noResume      bool
 }
 
 type tSwapMesh struct {
@@ -801,7 +800,6 @@ func tNewUnstartedRig(matchInfo *tMatch) *testRig {
 	acctAsset := TNewAsset(acctBackend, ACCTID)
 
 	swapper, err := NewSwapper(&Config{
-		NoResume: true,
 		Assets: map[uint32]*SwapperAsset{
 			ABCID:  {abcAsset, abcCoinLocker},
 			XYZID:  {xyzAsset, xyzCoinLocker},
@@ -852,8 +850,16 @@ func (rig *testRig) start() func() {
 			Name: "Swapper",
 			Run: func(ctx context.Context, reportReady func(error)) {
 				defer close(swapperDone)
+				swapper.Run(ctx, reportReady)
+			},
+		}, {
+			// Mirrors the production sentinel that enables the inaction
+			// checks once the last market has reported ready.
+			Name: "Swap inactivity checks",
+			Run: func(ctx context.Context, reportReady func(error)) {
+				swapper.EnableInactionChecks()
 				reportReady(nil)
-				swapper.Run(ctx)
+				<-ctx.Done()
 			},
 		}},
 		Logger: dex.Disabled,
@@ -875,6 +881,17 @@ func (rig *testRig) start() func() {
 	rig.swapperWaiter = ssw
 	rig.swapperDone = swapperDone
 	return cleanup
+}
+
+func TestNewSwapper(t *testing.T) {
+	cfg := &Config{AuthManager: newTAuthManager()}
+	if _, err := NewSwapper(cfg); err == nil || !strings.Contains(err.Error(), "swap-done applier is not configured") {
+		t.Fatalf("expected missing SwapDone error, got %v", err)
+	}
+	cfg.SwapDone = func(order.Order, *order.Match, bool) {}
+	if _, err := NewSwapper(cfg); err != nil {
+		t.Fatalf("NewSwapper: %v", err)
+	}
 }
 
 func (rig *testRig) applyMatchesAndRequestAcks(t *testing.T, matchSets ...*order.MatchSet) {
@@ -4099,6 +4116,7 @@ func TestMatchFailureDetection(t *testing.T) {
 			s := rig.swapper
 			s.SetMeshService(&tSwapMesh{applier: s.Events()})
 			s.TrackMatches([]*order.MatchSet{set.matchSet})
+			s.EnableInactionChecks()
 			tracker := rig.getTracker()
 			now := time.Now()
 			overdue := now.Add(-2 * s.bTimeout)
@@ -4305,6 +4323,133 @@ func TestResumePendingRequests(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnableInactionChecks checks that startup delays cannot cause inactivity
+// penalties and that each settlement step gets a fresh response window afterward.
+func TestEnableInactionChecks(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		status    order.MatchStatus
+		wantFault meshevents.MatchFailureFault
+	}{
+		{"maker swap", order.NewlyMatched, meshevents.MatchFailureMakerFault},
+		{"taker swap", order.MakerSwapCast, meshevents.MatchFailureTakerFault},
+		{"maker redemption", order.TakerSwapCast, meshevents.MatchFailureMakerFault},
+		{"taker redemption", order.MakerRedeemed, meshevents.MatchFailureTakerFault},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig, tracker, _ := newStaleRig(tt.status, "maker-addr", "taker-addr")
+			s := rig.swapper
+			s.bTimeout = time.Hour
+			tMesh := &tSwapMesh{applier: s.Events()}
+			s.SetMeshService(tMesh)
+
+			// Keep contract expiry separate from the inactivity timeout.
+			for _, status := range []*swapStatus{tracker.makerStatus, tracker.takerStatus} {
+				if status.swap != nil {
+					status.swap.LockTime = time.Now().Add(24 * time.Hour)
+				}
+			}
+			check := s.checkInactionEventBased
+			var responseStart *time.Time
+			switch tt.status {
+			case order.NewlyMatched:
+				responseStart = &tracker.time
+			case order.MakerRedeemed:
+				responseStart = &tracker.makerStatus.redeemGraceStart
+				tracker.makerStatus.redeemTime = time.Now().Add(-2 * s.bTimeout)
+			case order.MakerSwapCast, order.TakerSwapCast:
+				status := tracker.makerStatus
+				if tt.status == order.TakerSwapCast {
+					status = tracker.takerStatus
+				}
+				responseStart = &status.swapConfirmed
+				check = func() { s.checkInactionBlockBased(status.swapAsset) }
+			}
+			*responseStart = time.Now().Add(-2 * s.bTimeout)
+			recordedRedemption := tracker.makerStatus.redeemTime
+
+			check()
+			if len(tMesh.events) != 0 {
+				t.Fatal("match failed before markets were ready")
+			}
+
+			s.EnableInactionChecks()
+			check()
+			if len(tMesh.events) != 0 {
+				t.Fatal("match failed during the startup response window")
+			}
+
+			*responseStart = time.Now().Add(-2 * s.bTimeout)
+			check()
+			if len(tMesh.events) != 1 || len(rig.storage.matchFailures) != 1 {
+				t.Fatalf("after timeout: emitted %d events, stored %d failures, want one of each",
+					len(tMesh.events), len(rig.storage.matchFailures))
+			}
+			failed := rig.storage.matchFailures[0]
+			if failed.MatchID != tracker.ID() || failed.Status != tt.status || failed.Fault != tt.wantFault {
+				t.Fatalf("failure = %+v, want match %v status %v fault %v", failed, tracker.ID(), tt.status, tt.wantFault)
+			}
+			if !tracker.makerStatus.redeemTime.Equal(recordedRedemption) {
+				t.Fatal("recorded redemption time changed")
+			}
+		})
+	}
+
+	t.Run("worker checks confirmed swaps without new blocks", func(t *testing.T) {
+		rig, tracker, _ := newStaleRig(order.MakerSwapCast, "maker-addr", "taker-addr")
+		s := rig.swapper
+		s.bTimeout = 100 * time.Millisecond
+		tracker.makerStatus.swapConfirmed = time.Now().Add(-time.Hour)
+		tracker.makerStatus.swap.LockTime = time.Now().Add(time.Hour)
+		s.SetMeshService(&tSwapMesh{applier: s.Events()})
+		failed := make(chan struct{}, 2) // one callback for each side of the match
+		s.swapDone = func(order.Order, *order.Match, bool) { failed <- struct{}{} }
+
+		ctx, cancel := context.WithCancel(testCtx)
+		ready := make(chan error, 1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.Run(ctx, func(err error) { ready <- err })
+		}()
+		defer func() {
+			cancel()
+			<-done
+		}()
+		select {
+		case err := <-ready:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("worker did not report ready")
+		}
+
+		// Keep checks disabled past the old startup timer, then start a fresh
+		// response window. No block notification will trigger another check.
+		select {
+		case <-failed:
+			t.Fatal("match failed before inactivity checks were enabled")
+		case <-time.After(2 * s.bTimeout):
+		}
+		enabledAt := time.Now()
+		s.EnableInactionChecks()
+		select {
+		case <-failed:
+			if time.Since(enabledAt) < s.bTimeout {
+				t.Fatal("match failed before its response window expired")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("confirmed swap was not checked after startup")
+		}
+		rig.storage.mtx.Lock()
+		defer rig.storage.mtx.Unlock()
+		if len(rig.storage.matchFailures) != 1 || rig.storage.matchFailures[0].Fault != meshevents.MatchFailureTakerFault {
+			t.Fatalf("expected one taker inactivity failure, got %+v", rig.storage.matchFailures)
+		}
+	})
 }
 
 func TestFailMatch(t *testing.T) {

@@ -593,15 +593,20 @@ func newSwapperAsset(ba *asset.BackedAsset, master *coinlock.MasterCoinLocker) *
 
 // NewDEX creates the dex manager and starts all subsystems. Use Stop to
 // shutdown cleanly. The Context is used to abort setup.
+//
 //  1. Validate each specified asset.
 //  2. Create CoinLockers for each asset.
 //  3. Create and start asset backends.
 //  4. Create the archivist and connect to the storage backend.
 //  5. Create the authentication manager.
-//  6. Create and start the Swapper.
-//  7. Create and start the markets.
+//  6. Create the Swapper.
+//  7. Create the markets (their Run loops start as mesh master workers in
+//     step 10; state loads via the mesh state loaders).
 //  8. Create and start the book router, and create the order router.
-//  9. Create and start the comms server.
+//  9. Create the mesh node.
+//  10. Start the mesh subsystem, which starts master workers when this node
+//     is master.
+//  11. Start the comms server.
 func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	if cfg.RequestShutdown == nil {
 		return nil, fmt.Errorf("shutdown callback is required")
@@ -957,9 +962,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		}
 		mkt := markets[name]
 		if mkt == nil {
-			// markets are populated after the Swapper is created, so
-			// this is expected for matches revoked during startup.
-			log.Warnf("swapDone: no market %q for order %v (match may have been revoked during initialization)", name, ord.ID())
+			log.Errorf("swapDone: no market %q for order %v", name, ord.ID())
 			return
 		}
 		if removed := mkt.SwapDone(ord, match, fail); removed != nil {
@@ -977,9 +980,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		LockTimeTaker:    dex.LockTimeTaker(cfg.Network),
 		LockTimeMaker:    dex.LockTimeMaker(cfg.Network),
 		SwapDone:         swapDone,
-		NoResume:         cfg.NoResumeSwaps,
-		// TODO: set the AllowPartialRestore bool to allow startup with a
-		// missing asset backend if necessary in an emergency.
 	}
 
 	swapper, err := swap.NewSwapper(swapperCfg)
@@ -1070,9 +1070,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	// Book router
 	bookRouter = market.NewBookRouter(bookSources, feeMgr, server.Route)
-	// The swapper may report order removals as soon as it starts.
 	startSubSys("Auth manager", authMgr)
-	startSubSys("Swapper", swapper)
 	startSubSys("BookRouter", bookRouter)
 
 	// Register the MM snapshot subscription handler once for all markets.
@@ -1137,19 +1135,24 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	sort.Strings(mktNames)
 	var stateLoaders []mesh.StateLoader
-	var masterWorkers []mesh.MasterWorker
+	masterWorkers := newMasterWorkers(swapper.Run, swapper.EnableInactionChecks, markets)
 	for _, name := range mktNames {
 		mkt := markets[name]
 		stateLoaders = append(stateLoaders, mesh.StateLoader{
 			Name: "market " + name,
 			Load: func(context.Context) error { return mkt.LoadState() },
 		})
-		masterWorkers = append(masterWorkers, mesh.MasterWorker{
-			Name: "market " + name,
-			Run:  mkt.Run,
-		})
 	}
 	stateLoaders = append(stateLoaders,
+		mesh.StateLoader{
+			Name: "Swapper",
+			Load: func(context.Context) error {
+				if cfg.NoResumeSwaps {
+					return nil
+				}
+				return swapper.RestoreActiveSwaps(false)
+			},
+		},
 		mesh.StateLoader{
 			Name: "BookRouter",
 			Load: func(context.Context) error {
@@ -1162,7 +1165,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			Load: func(context.Context) error { return dataAPI.LoadCaches() },
 		},
 	)
-	// Auth and market use mesh in single-server mode until swap is converted.
 	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
 		Commands:       commands,
 		Events:         events,

@@ -642,7 +642,7 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		preimagesByOrdID: make(map[string]order.Preimage),
 	}
 
-	var swapDone func(ord order.Order, match *order.Match, fail bool)
+	var mkt *Market
 	swapperCfg := &swap.Config{
 		Assets: map[uint32]*swap.SwapperAsset{
 			assetDCR.ID:   {BackedAsset: assetDCR, Locker: swapLockerBase},
@@ -656,8 +656,8 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		TxWaitExpiration: 5 * time.Second,
 		LockTimeTaker:    dex.LockTimeTaker(dex.Testnet),
 		LockTimeMaker:    dex.LockTimeMaker(dex.Testnet),
-		SwapDone: func(ord order.Order, match *order.Match, fail bool) {
-			swapDone(ord, match, fail)
+		SwapDone: func(ord order.Order, match *order.Match, faulted bool) {
+			mkt.SwapDone(ord, match, faulted)
 		},
 	}
 	swapper, err := swap.NewSwapper(swapperCfg)
@@ -672,7 +672,7 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 		return nil, nil, nil, func() {}, fmt.Errorf("dex.NewMarketInfo() failure: %w", err)
 	}
 
-	mkt, err := NewMarket(&Config{
+	mkt, err = NewMarket(&Config{
 		MarketInfo:      mktInfo,
 		Storage:         storage,
 		Swapper:         swapper,
@@ -696,16 +696,32 @@ func newTestMarket(opts ...any) (*Market, *TArchivist, *TAuth, func(), error) {
 	}
 	mkt.SetMeshService(newTMesh(mkt, authMgr))
 
-	swapDone = func(ord order.Order, match *order.Match, fail bool) {
-		mkt.SwapDone(ord, match, fail)
+	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
+		Commands:       swapper.Commands(),
+		Events:         swapper.Events(),
+		EventLogReader: storage,
+		OnHalt:         func(error) {},
+		MasterWorkers: []mesh.MasterWorker{{
+			Name: "Swapper",
+			Run:  swapper.Run,
+		}},
+		Logger: dex.Disabled,
+	})
+	if err != nil {
+		return nil, nil, nil, func() {}, fmt.Errorf("mesh.NewService: %w", err)
 	}
-
-	ssw := dex.NewStartStopWaiter(swapper)
+	swapper.SetMeshService(meshSvc)
+	ssw := dex.NewStartStopWaiter(meshSvc)
 	ssw.Start(testCtx)
 	cleanup := func() {
 		ssw.Stop()
 		ssw.WaitForShutdown()
 	}
+	if err := meshSvc.WaitUntilReadyForComms(testCtx); err != nil {
+		cleanup()
+		return nil, nil, nil, func() {}, err
+	}
+	swapper.EnableInactionChecks()
 
 	return mkt, storage, authMgr, cleanup, nil
 }
