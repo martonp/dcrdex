@@ -130,6 +130,8 @@ type TAuthManager struct {
 	// requests.
 	redeemReceived chan struct{}
 	redemptionReq  chan struct{}
+	// ntfnLocal records whether the last notification used SendIfLocal.
+	ntfnLocal map[account.AccountID]map[string]bool
 }
 
 func newTAuthManager() *TAuthManager {
@@ -143,30 +145,40 @@ func newTAuthManager() *TAuthManager {
 		ntfns:       make(map[account.AccountID][]*msgjson.Message),
 		resps:       make(map[account.AccountID][]*msgjson.Message),
 		suspensions: make(map[account.AccountID]account.Rule),
+		ntfnLocal:   make(map[account.AccountID]map[string]bool),
 	}
 }
 
 func (m *TAuthManager) Send(user account.AccountID, msg *msgjson.Message) error {
+	return m.recordSend(user, msg, false)
+}
+
+func (m *TAuthManager) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {
+	return m.recordSend(user, msg, true)
+}
+
+func (m *TAuthManager) recordSend(user account.AccountID, msg *msgjson.Message, local bool) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
-	l := m.resps[user]
-	if l == nil {
-		l = make([]*msgjson.Message, 0, 1)
-	}
 	if msg.Route == "" {
-		// response
-		m.resps[user] = append(l, msg)
+		m.resps[user] = append(m.resps[user], msg)
 		if m.redeemReceived != nil && msg.ID == m.redeemID {
 			m.redeemReceived <- struct{}{}
 		}
 		if m.swapReceived != nil && msg.ID == m.swapID {
 			m.swapReceived <- struct{}{}
 		}
-	} else {
-		// notification
-		m.ntfns[user] = append(l, msg)
-		if m.newNtfn != nil {
-			m.newNtfn <- struct{}{}
+		return nil
+	}
+	if m.ntfnLocal[user] == nil {
+		m.ntfnLocal[user] = make(map[string]bool)
+	}
+	m.ntfnLocal[user][msg.Route] = local
+	m.ntfns[user] = append(m.ntfns[user], msg)
+	if m.newNtfn != nil {
+		select {
+		case m.newNtfn <- struct{}{}:
+		default:
 		}
 	}
 	return nil
@@ -314,6 +326,8 @@ type TStorage struct {
 	redemptions               []*meshevents.SwapRedemptionRecordedEvent
 	applyRedemptionAckErr     error
 	applyRedemptionErr        error
+	matchFailures             []*meshevents.MatchFailedEvent
+	applyMatchFailedErr       error
 
 	fatalMtx sync.RWMutex
 	fatal    chan struct{}
@@ -435,7 +449,13 @@ func (ts *TStorage) ApplyRedemptionAckRecordedEvent(_ context.Context, _ *db.Eve
 	return new(db.EventLogEntry), nil
 }
 
-func (ts *TStorage) ApplyMatchFailedEvent(context.Context, *db.EventLogMeta, *db.ReputationOutcomePolicy, *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+func (ts *TStorage) ApplyMatchFailedEvent(_ context.Context, _ *db.EventLogMeta, _ *db.ReputationOutcomePolicy, event *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+	ts.mtx.Lock()
+	defer ts.mtx.Unlock()
+	ts.matchFailures = append(ts.matchFailures, event)
+	if ts.applyMatchFailedErr != nil {
+		return nil, ts.applyMatchFailedErr
+	}
 	return new(db.EventLogEntry), nil
 }
 
@@ -3785,6 +3805,153 @@ func TestCoinIDDedupSameMatch(t *testing.T) {
 type swapDoneCall struct {
 	oid  order.OrderID
 	fail bool
+}
+
+func TestApplyMatchFailedEvent(t *testing.T) {
+	storageErr := errors.New("storage error")
+	type doneCall struct{ maker, faulted bool }
+	type addressState struct{ maker, taker bool }
+	tests := []struct {
+		name                              string
+		status                            order.MatchStatus
+		fault                             meshevents.MatchFailureFault
+		captured, current                 addressState
+		missing, wrongMarket, wrongStatus bool
+		storageErr                        error
+		wantErr                           string
+		wantDone                          []doneCall
+	}{
+		{name: "maker did not swap", fault: meshevents.MatchFailureMakerFault,
+			captured: addressState{maker: true, taker: true}, current: addressState{maker: true, taker: true},
+			wantDone: []doneCall{{maker: true, faulted: true}, {maker: false, faulted: false}}},
+		{name: "taker did not provide address", fault: meshevents.MatchFailureTakerFault,
+			captured: addressState{maker: true}, current: addressState{maker: true},
+			wantDone: []doneCall{{maker: true, faulted: false}, {maker: false, faulted: true}}},
+		{name: "taker did not swap", status: order.MakerSwapCast, fault: meshevents.MatchFailureTakerFault,
+			current:  addressState{maker: true, taker: true},
+			wantDone: []doneCall{{maker: true, faulted: false}, {maker: false, faulted: true}}},
+		{name: "maker did not redeem", status: order.TakerSwapCast, fault: meshevents.MatchFailureMakerFault, wantDone: []doneCall{{maker: true, faulted: true}, {maker: false, faulted: false}}},
+		{name: "taker did not redeem", status: order.MakerRedeemed, fault: meshevents.MatchFailureTakerFault, wantDone: []doneCall{{maker: false, faulted: true}}},
+		{name: "no fault", status: order.MakerSwapCast, fault: meshevents.MatchFailureNoUserFault, wantDone: []doneCall{{maker: true, faulted: false}, {maker: false, faulted: false}}},
+		{name: "storage error", fault: meshevents.MatchFailureMakerFault, storageErr: storageErr, wantErr: "storage error"},
+		{name: "missing match", fault: meshevents.MatchFailureMakerFault, missing: true, wantErr: "unknown match"},
+		{name: "wrong market", fault: meshevents.MatchFailureMakerFault, wrongMarket: true, wantErr: "market mismatch"},
+		{name: "stale status", fault: meshevents.MatchFailureMakerFault, wrongStatus: true, wantErr: "requires status"},
+		{name: "taker address arrived", fault: meshevents.MatchFailureTakerFault,
+			captured: addressState{maker: true}, current: addressState{maker: true, taker: true}, wantErr: "swap addresses changed"},
+		{name: "maker address arrived", fault: meshevents.MatchFailureMakerFault,
+			captured: addressState{taker: true}, current: addressState{maker: true, taker: true}, wantErr: "swap addresses changed"},
+		{name: "taker address arrived first", fault: meshevents.MatchFailureTakerFault,
+			current: addressState{taker: true}, wantErr: "swap addresses changed"},
+		{name: "maker address arrived first", fault: meshevents.MatchFailureTakerFault,
+			current: addressState{maker: true}, wantErr: "swap addresses changed"},
+		{name: "no fault ignores address changes", fault: meshevents.MatchFailureNoUserFault,
+			captured: addressState{taker: true}, current: addressState{maker: true, taker: true},
+			wantDone: []doneCall{{maker: true, faulted: false}, {maker: false, faulted: false}}},
+	}
+	for _, mode := range []struct {
+		name     string
+		position *db.EventLogPosition
+	}{
+		{name: "original"},
+		{name: "replicated", position: &db.EventLogPosition{Seq: 2}},
+	} {
+		for _, tt := range tests {
+			t.Run(mode.name+"/"+tt.name, func(t *testing.T) {
+				set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+				info := set.matchInfos[0]
+				rig := tNewUnstartedRig(info)
+				failTime := time.UnixMilli(1670000000123).UTC()
+				if !tt.missing {
+					rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+					tracker := rig.getTracker()
+					tracker.Status = tt.status
+					// Restored timeout estimates must not affect event application.
+					tracker.time = failTime.Add(time.Hour)
+					if tt.current.maker {
+						tracker.makerSwapAddr = "maker address"
+					}
+					if tt.current.taker {
+						tracker.takerSwapAddr = "taker address"
+					}
+					if tt.wrongStatus {
+						tracker.Status = order.MakerSwapCast
+					}
+				}
+				rig.storage.applyMatchFailedErr = tt.storageErr
+				var done []swapDoneCall
+				rig.swapper.swapDone = func(ord order.Order, _ *order.Match, faulted bool) {
+					done = append(done, swapDoneCall{ord.ID(), faulted})
+				}
+				failed := &meshevents.MatchFailedEvent{
+					MatchID: info.matchID, Base: info.match.Maker.Base(), Quote: info.match.Maker.Quote(),
+					FailTime: failTime.UnixMilli(), Status: tt.status, Fault: tt.fault,
+					MakerAddressKnown: tt.captured.maker, TakerAddressKnown: tt.captured.taker,
+				}
+				if tt.wrongMarket {
+					failed.Base++
+				}
+				event, err := mesh.NewEvent(failed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				applyCtx := &mesh.EventApplyContext{Context: context.Background(), Position: mode.position}
+				_, err = rig.swapper.Events()[event.Kind](applyCtx, event)
+				if tt.wantErr == "" {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				if tt.storageErr != nil && !errors.Is(err, tt.storageErr) {
+					t.Fatal("storage error not preserved")
+				}
+				if (tt.missing || tt.wrongStatus || tt.wantErr == "swap addresses changed") && !errors.Is(err, errMatchFailureSuperseded) {
+					t.Fatal("stale decision not classified as superseded")
+				}
+				var wantEvents []*meshevents.MatchFailedEvent
+				if tt.wantErr == "" || tt.storageErr != nil {
+					wantEvents = []*meshevents.MatchFailedEvent{failed}
+				}
+				if !reflect.DeepEqual(rig.storage.matchFailures, wantEvents) {
+					t.Fatalf("stored events = %+v, want %+v", rig.storage.matchFailures, wantEvents)
+				}
+				wantTracked := !tt.missing && tt.wantErr != ""
+				if tracked := rig.getTracker() != nil; tracked != wantTracked {
+					t.Fatalf("match tracked = %v, want %v", tracked, wantTracked)
+				}
+				var wantDone []swapDoneCall
+				for _, call := range tt.wantDone {
+					oid := info.takerOID
+					if call.maker {
+						oid = info.makerOID
+					}
+					wantDone = append(wantDone, swapDoneCall{oid, call.faulted})
+				}
+				if !reflect.DeepEqual(done, wantDone) {
+					t.Fatalf("swapDone calls = %v, want %v", done, wantDone)
+				}
+				wantNotes := 0
+				if tt.wantErr == "" {
+					wantNotes = 2
+				}
+				if got := notificationCount(rig.auth, msgjson.RevokeMatchRoute); got != wantNotes {
+					t.Fatalf("revocations = %d, want %d", got, wantNotes)
+				}
+				if tt.wantErr == "" {
+					for _, user := range []account.AccountID{info.maker.acct, info.taker.acct} {
+						if !rig.auth.ntfnLocal[user][msgjson.RevokeMatchRoute] {
+							t.Fatal("revocation notification was not local")
+						}
+					}
+				}
+				if len(rig.auth.suspensions) != 0 {
+					t.Fatal("applier called legacy Penalize")
+				}
+			})
+		}
+	}
 }
 
 func TestUserConnectedResend(t *testing.T) {

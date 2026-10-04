@@ -5,6 +5,7 @@ package swap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,6 +38,13 @@ func (s *Swapper) Events() map[string]mesh.EventApplier {
 				return nil, err
 			}
 			return s.applyMatchAcksRecordedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), acks)
+		},
+		meshevents.EventKindMatchFailed: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
+			failed, err := meshevents.DecodeMatchFailedEvent(event.Payload)
+			if err != nil {
+				return nil, err
+			}
+			return s.applyMatchFailedEvent(applyCtx, dbEventLogMeta(applyCtx.Position, event), failed)
 		},
 		meshevents.EventKindSwapContractRecorded: func(applyCtx *mesh.EventApplyContext, event *mesh.Event) (*db.EventLogEntry, error) {
 			recorded, err := meshevents.DecodeSwapContractRecordedEvent(event.Payload)
@@ -442,6 +450,66 @@ func (s *Swapper) applyRedemptionAckRecordedEvent(ctx context.Context, meta *db.
 		match.Sigs.TakerRedeem = append([]byte(nil), event.Sig...)
 	}
 	match.mtx.Unlock()
+	return entry, nil
+}
+
+// errMatchFailureSuperseded indicates that a match changed after a failure
+// was detected, so the old decision no longer applies.
+var errMatchFailureSuperseded = errors.New("match failure superseded")
+
+// applyMatchFailedEvent records a failure, removes the tracked match, updates
+// the affected orders in memory, and notifies the clients.
+func (s *Swapper) applyMatchFailedEvent(ctx context.Context, meta *db.EventLogMeta, event *meshevents.MatchFailedEvent) (*db.EventLogEntry, error) {
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	s.matchMtx.RLock()
+	match := s.matches[event.MatchID]
+	s.matchMtx.RUnlock()
+	if match == nil {
+		return nil, fmt.Errorf("%w: unknown match %v", errMatchFailureSuperseded, event.MatchID)
+	}
+	if match.Taker.Type() == order.CancelOrderType {
+		return nil, fmt.Errorf("match_failed event for cancel match %v", event.MatchID)
+	}
+	if event.Base != match.Maker.BaseAsset || event.Quote != match.Maker.QuoteAsset {
+		return nil, fmt.Errorf("match_failed market mismatch for match %v", event.MatchID)
+	}
+
+	match.mtx.RLock()
+	status := match.Status
+	makerAddressKnown := match.makerSwapAddr != ""
+	takerAddressKnown := match.takerSwapAddr != ""
+	match.mtx.RUnlock()
+	if status != event.Status {
+		return nil, fmt.Errorf("%w: failure requires status %v, found %v for match %v",
+			errMatchFailureSuperseded, event.Status, status, event.MatchID)
+	}
+	// An acknowledgement can supply an address and restart the maker's timeout
+	// without changing NewlyMatched status. The failure must still refer to
+	// the address state captured when the timeout was detected.
+	if event.Status == order.NewlyMatched && event.Fault != meshevents.MatchFailureNoUserFault {
+		if makerAddressKnown != event.MakerAddressKnown || takerAddressKnown != event.TakerAddressKnown {
+			return nil, fmt.Errorf("%w: swap addresses changed for match %v", errMatchFailureSuperseded, event.MatchID)
+		}
+	}
+
+	entry, err := s.storage.ApplyMatchFailedEvent(ctx, meta, s.authMgr.ReputationOutcomePolicy(), event)
+	if err != nil {
+		return nil, fmt.Errorf("applying match_failed event for match %v: %w", event.MatchID, err)
+	}
+	s.matchMtx.Lock()
+	if s.matches[event.MatchID] == match {
+		s.deleteMatch(match)
+	}
+	s.matchMtx.Unlock()
+
+	// The maker's redemption already handled its order completion.
+	if event.Status != order.MakerRedeemed {
+		s.swapDone(match.Maker, match.Match, event.Fault == meshevents.MatchFailureMakerFault)
+	}
+	s.swapDone(match.Taker, match.Match, event.Fault == meshevents.MatchFailureTakerFault)
+	s.revoke(match)
 	return entry, nil
 }
 

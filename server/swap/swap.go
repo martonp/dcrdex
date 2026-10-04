@@ -63,6 +63,7 @@ type AuthManager interface {
 	VerifyUserSig(user account.AccountID, msg, sig []byte) error
 	Sign(...msgjson.Signable)
 	Send(account.AccountID, *msgjson.Message) error
+	SendIfLocal(account.AccountID, *msgjson.Message) error
 	Request(account.AccountID, *msgjson.Message, func(comms.Link, *msgjson.Message)) error
 	RequestWithTimeout(user account.AccountID, req *msgjson.Message, handlerFunc func(comms.Link, *msgjson.Message),
 		expireTimeout time.Duration, expireFunc func()) error
@@ -2250,8 +2251,7 @@ func (s *Swapper) handleRedeem(user account.AccountID, msg *msgjson.Message) *ms
 	})
 }
 
-// revoke revokes the match, sending the 'revoke_match' request to each client
-// and processing the acknowledgement. Match Sigs and Status are not accessed.
+// revoke sends the 'revoke_match' notification to locally connected clients.
 func (s *Swapper) revoke(match *matchTracker) {
 	route := msgjson.RevokeMatchRoute
 	log.Infof("Sending a '%s' notification to each client for match %v",
@@ -2269,7 +2269,7 @@ func (s *Swapper) revoke(match *matchTracker) {
 				route, ord.User(), mid, err)
 			return
 		}
-		if err = s.authMgr.Send(ord.User(), ntfn); err != nil {
+		if err = s.authMgr.SendIfLocal(ord.User(), ntfn); err != nil {
 			log.Debugf("Failed to send '%s' notification to user %v, match %v: %v",
 				route, ord.User(), mid, err)
 		}
