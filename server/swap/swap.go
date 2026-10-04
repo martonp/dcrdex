@@ -247,8 +247,9 @@ type Swapper struct {
 	// authMgr is an AuthManager for client messaging and authentication.
 	authMgr AuthManager
 	mesh    MeshService
-	// swapDone is callback for reporting a swap outcome.
-	swapDone func(oid order.Order, match *order.Match, fail bool)
+	// swapDone updates market state after the database changes commit.
+	// The bool is true when the order's owner caused the failure.
+	swapDone func(order.Order, *order.Match, bool)
 
 	// The matches maps and the contained matches are protected by the matchMtx.
 	matchMtx    sync.RWMutex
@@ -850,33 +851,6 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		}
 	}
 
-	// Revoke pre-upgrade matches that lack per-match swap addresses
-	// introduced in PerMatchAddrVersion. Matches at NewlyMatched or
-	// MakerSwapCast cannot proceed without addresses, so revoke them
-	// without fault. Matches at TakerSwapCast or later already have both
-	// contracts on-chain and don't need the addresses to finish.
-	//
-	// NOTE: For EVM assets, surviving TakerSwapCast+ matches may still
-	// have v0 contract data. The server's ETH backend only binds one
-	// contract version, so verifying their redeem coins will fail unless
-	// the operator uses evm-protocol-overrides.json to keep v0 active
-	// until those swaps complete. See server/asset/eth/eth.go.
-	var toRevoke []*matchTracker
-	for _, mt := range s.matches {
-		if mt.makerSwapAddr != "" || mt.takerSwapAddr != "" {
-			continue
-		}
-		if mt.Status != order.NewlyMatched && mt.Status != order.MakerSwapCast {
-			continue
-		}
-		toRevoke = append(toRevoke, mt)
-	}
-	for _, mt := range toRevoke {
-		log.Infof("Revoking pre-upgrade match %v (status %v): no per-match swap addresses", mt.ID(), mt.Status)
-		s.deleteMatch(mt)
-		s.failMatch(mt, false, false) // no fault
-	}
-
 	// Live coin waiters are abandoned on Swapper shutdown. When a client
 	// reconnects or their init request times out, they will resend it.
 
@@ -1141,70 +1115,31 @@ func (s *Swapper) confirmMatchForBlock(ctx context.Context, match *matchTracker,
 	s.tryConfirmSwap(ctx, status, block.time)
 }
 
-// failMatch revokes the match and marks the swap as done for accounting
-// purposes. If userFault is false, there will be no penalty, such as if the
-// failure is because a swap tx lock time expired before required confirmations
-// were reached.
-func (s *Swapper) failMatch(match *matchTracker, userFault bool, takerAddrFault bool) {
-	// From the match status, determine maker/taker fault and the corresponding
-	// auth.NoActionStep.
-	var makerFault bool
-	var outcome db.Outcome
-	var refTime time.Time // a reference time found in the DB for reproducibly sorting outcomes
-	switch match.Status {
-	case order.NewlyMatched:
-		if takerAddrFault {
-			// The taker failed to provide their per-match swap address
-			// in time, preventing the maker from swapping.
-			outcome = db.OutcomeNoAddrAsTaker
-			refTime = match.Epoch.End()
-			makerFault = false
-		} else {
-			outcome = db.OutcomeNoSwapAsMaker
-			refTime = match.Epoch.End()
-			makerFault = true
+// failMatch submits a failure captured when a timeout or expired contract
+// was detected.
+func (s *Swapper) failMatch(failure matchFailure) {
+	if err := s.submitMatchFailed(context.Background(), failure); err != nil {
+		if errors.Is(err, errMatchFailureSuperseded) {
+			log.Debugf("match_failed proposal for match %v was superseded: %v", failure.match.ID(), err)
+			return
 		}
-	case order.MakerSwapCast:
-		outcome = db.OutcomeNoSwapAsTaker
-		refTime = match.makerStatus.swapTime // swapConfirmed time is not in the DB
-	case order.TakerSwapCast:
-		outcome = db.OutcomeNoRedeemAsMaker
-		refTime = match.takerStatus.swapTime // swapConfirmed time is not in the DB
-		makerFault = true
-	case order.MakerRedeemed:
-		outcome = db.OutcomeNoRedeemAsTaker
-		refTime = match.makerStatus.redeemTime
-	default:
-		log.Errorf("Invalid failMatch status %v for match %v", match.Status, match.ID())
-		return
+		log.Warnf("failed to apply match_failed event for match %v: %v", failure.match.ID(), err)
 	}
+}
 
-	orderAtFault, otherOrder := match.Taker, order.Order(match.Maker) // an order.Order
-	if makerFault {
-		orderAtFault, otherOrder = match.Maker, match.Taker
+func (s *Swapper) submitMatchFailed(ctx context.Context, failure matchFailure) error {
+	if s.mesh == nil {
+		return fmt.Errorf("swapper mesh service is not configured")
 	}
-	log.Debugf("failMatch: swap %v failing at %v (%v), user fault = %v",
-		match.ID(), match.Status, outcome, userFault)
-
-	// Record the end of this match's processing.
-	s.storage.SetMatchInactive(db.MatchID(match.Match), !userFault)
-
-	// Cancellation rate accounting
-	s.swapDone(orderAtFault, match.Match, userFault) // will also unbook/revoke order if needed
-
-	// Accounting for the maker has already taken place if they have redeemed.
-	if match.Status != order.MakerRedeemed {
-		s.swapDone(otherOrder, match.Match, false)
+	if !s.matchTracked(failure.match) {
+		return errMatchFailureSuperseded
 	}
-
-	// Register the failure to act violation, adjusting the user's score.
-	if userFault && (match.Maker.User() != match.Taker.User()) {
-		s.authMgr.Inaction(orderAtFault.User(), outcome, db.MatchID(match.Match),
-			match.Quantity, refTime, orderAtFault.ID())
+	event, err := newMatchFailedEvent(failure)
+	if err != nil {
+		return err
 	}
-
-	// Send the revoke_match messages, and solicit acks.
-	s.revoke(match)
+	_, err = s.mesh.ApplyEvent(ctx, event)
+	return err
 }
 
 // swapContractKey includes the contract data so batched swaps sharing a
@@ -1256,14 +1191,15 @@ func (s *Swapper) registerSwapContractDedup(matchID order.MatchID, coinID, contr
 	}
 }
 
-type fail struct {
-	match *matchTracker
-	fault bool
-	// takerAddrFault overrides the default fault attribution for
-	// NewlyMatched timeouts. When true, the taker is blamed instead of
-	// the maker because the taker failed to provide their per-match
-	// swap address in time.
-	takerAddrFault bool
+// matchFailure holds the decision and state captured when a failure is detected.
+type matchFailure struct {
+	match  *matchTracker
+	status order.MatchStatus
+	fault  meshevents.MatchFailureFault
+	// Address presence is captured with status under match.mtx for NewlyMatched
+	// timeouts; submission must not replace it with newer match state.
+	makerAddressKnown bool
+	takerAddressKnown bool
 }
 
 // checkInactionEventBased scans the swapStatus structures, checking for actions
@@ -1285,7 +1221,7 @@ func (s *Swapper) checkInactionEventBased() {
 		return
 	}
 
-	var failures []fail
+	var failures []matchFailure
 
 	// Do time.Since(event) with the same now time for each match.
 	now := time.Now()
@@ -1301,9 +1237,12 @@ func (s *Swapper) checkInactionEventBased() {
 
 		log.Tracef("checkInactionEventBased: match %v (%v)", match.ID(), match.Status)
 
-		deleteMatch := func(fault bool) {
-			s.deleteMatch(match)
-			failures = append(failures, fail{match: match, fault: fault})
+		recordFailure := func(fault meshevents.MatchFailureFault) {
+			failures = append(failures, matchFailure{
+				match: match, status: match.Status, fault: fault,
+				makerAddressKnown: match.makerSwapAddr != "",
+				takerAddressKnown: match.takerSwapAddr != "",
+			})
 		}
 
 		switch match.Status {
@@ -1316,10 +1255,9 @@ func (s *Swapper) checkInactionEventBased() {
 					// address in time, preventing the maker from
 					// swapping. Fault the taker, not the maker.
 					log.Infof("Revoking match %v at NewlyMatched: taker did not provide per-match address in time", match.ID())
-					s.deleteMatch(match)
-					failures = append(failures, fail{match: match, fault: true, takerAddrFault: true})
+					recordFailure(meshevents.MatchFailureTakerFault)
 				} else {
-					deleteMatch(true)
+					recordFailure(meshevents.MatchFailureMakerFault)
 				}
 			}
 		case order.MakerSwapCast:
@@ -1329,13 +1267,13 @@ func (s *Swapper) checkInactionEventBased() {
 			if expectedTakerLockTime.Before(now) {
 				log.Infof("Revoking match %v at %v because the expected taker swap locktime would be in the past (%v).",
 					match.ID(), match.Status, expectedTakerLockTime)
-				deleteMatch(false)
+				recordFailure(meshevents.MatchFailureNoUserFault)
 			} else if match.expiredBy(now) {
 				// The taker's contract should expire first, but also check the
 				// lock time of the maker's known swap.
 				log.Warnf("Revoking match %v at %v because maker's published contract has expired.",
 					match.ID(), match.Status) // WRN because taker's should expire first
-				deleteMatch(false)
+				recordFailure(meshevents.MatchFailureNoUserFault)
 			}
 		case order.TakerSwapCast:
 			// If either published contract's lock time is already passed,
@@ -1343,37 +1281,28 @@ func (s *Swapper) checkInactionEventBased() {
 			if match.expiredBy(now) {
 				log.Infof("Revoking match %v at %v because at least one published contract has expired.",
 					match.ID(), match.Status)
-				deleteMatch(false)
+				recordFailure(meshevents.MatchFailureNoUserFault)
 			}
 		case order.MakerRedeemed:
 			// If the maker has redeemed, the taker can redeem immediately, so
 			// check the timeout against the time the Swapper received the
 			// maker's `redeem` request (and sent the taker's 'redemption').
 			if tooOld(match.makerStatus.redeemSeenTime()) { // rlocks swapStatus.mtx
-				deleteMatch(true)
-			}
-		case order.MatchComplete:
-			// If we got an ack from the redemption request sent to maker
-			// (detailing the taker's redeem), or it has been a while since
-			// taker redeemed, delete the match. Former should have deleted it.
-			if len(match.Sigs.MakerRedeem) > 0 || tooOld(match.takerStatus.redeemSeenTime()) {
-				log.Debugf("Deleting completed match %v", match.ID())
-				s.deleteMatch(match) // no fail or revoke, just remove from map
+				recordFailure(meshevents.MatchFailureTakerFault)
 			}
 		}
 	}
 
-	// Check and delete atomically
-	s.matchMtx.Lock()
+	// Collect failures while match state is stable.
+	s.matchMtx.RLock()
 	for _, match := range s.matches {
 		checkMatch(match)
 	}
-	s.matchMtx.Unlock()
+	s.matchMtx.RUnlock()
 
-	// Record failed matches in the DB and auth mgr, unlock coins, and send
-	// revoke_match messages.
-	for _, fail := range failures {
-		s.failMatch(fail.match, fail.fault, fail.takerAddrFault)
+	// Release the locks before submitting failures; application removes matches.
+	for _, failure := range failures {
+		s.failMatch(failure)
 	}
 }
 
@@ -1391,7 +1320,7 @@ func (s *Swapper) checkInactionBlockBased(assetID uint32) {
 		return
 	}
 
-	var failures []fail
+	var failures []matchFailure
 	// Do time.Since(event) with the same now time for each match.
 	now := time.Now()
 	tooOld := func(evt time.Time) bool {
@@ -1412,35 +1341,35 @@ func (s *Swapper) checkInactionBlockBased(assetID uint32) {
 		log.Tracef("checkInactionBlockBased: asset %d, match %v (%v)",
 			assetID, match.ID(), match.Status)
 
-		deleteMatch := func() {
-			// Fail the match, and assign fault if lock times are not passed.
-			s.deleteMatch(match)
-			failures = append(failures, fail{match: match, fault: !match.expiredBy(now)})
+		recordFailure := func(fault meshevents.MatchFailureFault) {
+			if match.expiredBy(now) {
+				fault = meshevents.MatchFailureNoUserFault
+			}
+			failures = append(failures, matchFailure{match: match, status: match.Status, fault: fault})
 		}
 
 		switch match.Status {
 		case order.MakerSwapCast:
 			if tooOld(match.makerStatus.swapConfTime()) { // rlocks swapStatus.mtx
-				deleteMatch()
+				recordFailure(meshevents.MatchFailureTakerFault)
 			}
 		case order.TakerSwapCast:
 			if tooOld(match.takerStatus.swapConfTime()) {
-				deleteMatch()
+				recordFailure(meshevents.MatchFailureMakerFault)
 			}
 		}
 	}
 
-	// Check and delete atomically.
-	s.matchMtx.Lock()
+	// Collect failures while match state is stable.
+	s.matchMtx.RLock()
 	for _, match := range s.matches {
 		checkMatch(match)
 	}
-	s.matchMtx.Unlock()
+	s.matchMtx.RUnlock()
 
-	// Record failed matches in the DB and auth mgr, unlock coins, and send
-	// revoke_match messages.
-	for _, fail := range failures {
-		s.failMatch(fail.match, fail.fault, fail.takerAddrFault)
+	// Release the locks before submitting failures; application removes matches.
+	for _, failure := range failures {
+		s.failMatch(failure)
 	}
 }
 
@@ -1790,11 +1719,8 @@ func (s *Swapper) processInit(ctx context.Context, completion *mesh.CommandCompl
 	} else if remain := time.Until(contract.LockTime); remain < 0 {
 		fail(msgjson.ContractError, "contract is correct, but lock time passed %s ago", remain)
 		// Revoke the match proactively before checkInaction gets to it.
-		s.matchMtx.Lock()
-		defer s.matchMtx.Unlock()
-		if _, found := s.matches[stepInfo.match.ID()]; found {
-			s.failMatch(stepInfo.match, false, false) // no fault
-			s.deleteMatch(stepInfo.match)
+		if s.matchTracked(stepInfo.match) {
+			s.failMatch(matchFailure{match: stepInfo.match, status: stepInfo.step, fault: meshevents.MatchFailureNoUserFault})
 		} // else it's already revoked
 		return wait.DontTryAgain // and don't tell counterparty of expired contract they should not redeem
 	}

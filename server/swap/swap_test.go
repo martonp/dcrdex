@@ -292,6 +292,17 @@ func (m *TAuthManager) getNtfn(id account.AccountID, route string, payload any) 
 	return fmt.Errorf("no %s notification", route)
 }
 
+func (m *TAuthManager) hasNtfn(id account.AccountID, route string) bool {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	for _, msg := range m.ntfns[id] {
+		if msg.Route == route {
+			return true
+		}
+	}
+	return false
+}
+
 // push front
 func (m *TAuthManager) pushResp(id account.AccountID, msg *msgjson.Message) {
 	m.mtx.Lock()
@@ -688,6 +699,7 @@ type tSwapMesh struct {
 	reqs       []mesh.CommandRequest
 	err        error
 	events     []*mesh.Event
+	applier    map[string]mesh.EventApplier
 }
 
 func (m *tSwapMesh) ExecuteCommand(_ context.Context, req mesh.CommandRequest) *msgjson.Error {
@@ -695,9 +707,21 @@ func (m *tSwapMesh) ExecuteCommand(_ context.Context, req mesh.CommandRequest) *
 	return m.commandErr
 }
 
-func (m *tSwapMesh) ApplyEvent(_ context.Context, event *mesh.Event) (any, error) {
+func (m *tSwapMesh) ApplyEvent(ctx context.Context, event *mesh.Event) (any, error) {
 	m.events = append(m.events, event)
-	return nil, m.err
+	if m.err != nil {
+		return nil, m.err
+	}
+	if m.applier == nil {
+		return nil, nil
+	}
+	applier := m.applier[event.Kind]
+	if applier == nil {
+		return nil, fmt.Errorf("unsupported test swap event %q", event.Kind)
+	}
+	applyCtx := &mesh.EventApplyContext{Context: ctx}
+	_, err := applier(applyCtx, event)
+	return applyCtx.Result(), err
 }
 
 func matchAckEvents(storage *TStorage) []*meshevents.MatchAcksRecordedEvent {
@@ -2147,9 +2171,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 	rig.auth.newSuspend = make(chan struct{}, 1)
 	rig.auth.auditReq = make(chan struct{}, 1)
 	rig.auth.redemptionReq = make(chan struct{}, 1)
-	// Buffer must be large enough for revoke_match notifications (2 per
-	// timeout iteration) plus counterparty_address notifications (2 per
-	// ack cycle, one per side).
+	// Buffered; Send is non-blocking if this fills.
 	rig.auth.newNtfn = make(chan struct{}, 20)
 
 	ensureNilErr := makeEnsureNilErr(t)
@@ -2184,10 +2206,9 @@ func TestBroadcastTimeouts(t *testing.T) {
 		// TODO: expect revoke order for at-fault user
 	}
 
-	// tryExpire will sleep for the duration of a BroadcastTimeout, and then
-	// check that a penalty was assigned to the appropriate user, and that a
+	// tryExpire waits for a BroadcastTimeout failure and then checks that a
 	// revoke_match message is sent to both users.
-	tryExpire := func(i, j int, step order.MatchStatus, jerk, victim *tUser, node *TBackend) bool {
+	tryExpire := func(i, j int, jerk, victim *tUser, node *TBackend) bool {
 		t.Helper()
 		if i != j {
 			return false
@@ -2195,23 +2216,30 @@ func TestBroadcastTimeouts(t *testing.T) {
 		// Sending a block through should schedule an inaction check after duration
 		// BroadcastTimeout.
 		sendBlock(node)
-		select {
-		case <-rig.auth.newSuspend:
-		case <-time.After(rig.swapper.bTimeout * 2):
-			t.Fatalf("no penalization happened")
+		deadline := time.After(rig.swapper.bTimeout * 3)
+		for !rig.auth.hasNtfn(jerk.acct, msgjson.RevokeMatchRoute) ||
+			!rig.auth.hasNtfn(victim.acct, msgjson.RevokeMatchRoute) {
+			select {
+			case <-rig.auth.newNtfn:
+			case <-deadline:
+				t.Fatalf("no revoke_match notification")
+			}
 		}
-		found, rule := rig.auth.flushPenalty(jerk.acct)
-		if !found {
-			t.Fatalf("failed to penalize user at step %d", i)
-		}
-		if rule == account.NoRule {
-			t.Fatalf("no penalty at step %d (status %v)", i, step)
-		}
-		// Make sure the specified user has a cancellation for this order
-		ntfnWait(rig.swapper.bTimeout * 3) // wait for both revoke requests, no particular order
-		ntfnWait(rig.swapper.bTimeout * 3)
 		checkRevokeMatch(jerk, i)
 		checkRevokeMatch(victim, i)
+		rig.storage.mtx.Lock()
+		failures := append([]*meshevents.MatchFailedEvent(nil), rig.storage.matchFailures...)
+		rig.storage.mtx.Unlock()
+		if len(failures) == 0 {
+			t.Fatal("timeout did not record a failure")
+		}
+		failed := failures[len(failures)-1]
+		wantStatus := []order.MatchStatus{order.NewlyMatched, order.MakerSwapCast, order.TakerSwapCast, order.MakerRedeemed}[i]
+		wantFault := []meshevents.MatchFailureFault{meshevents.MatchFailureMakerFault, meshevents.MatchFailureTakerFault,
+			meshevents.MatchFailureMakerFault, meshevents.MatchFailureTakerFault}[i]
+		if failed.MatchID != rig.matchInfo.matchID || failed.Status != wantStatus || failed.Fault != wantFault {
+			t.Fatalf("timeout recorded wrong failure: %+v", failed)
+		}
 		return true
 	}
 	// Run a timeout test after every important step.
@@ -2231,7 +2259,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 		ntfnWait(time.Second)
 
 		// Timeout waiting for maker swap.
-		if tryExpire(i, 0, order.NewlyMatched, matchInfo.maker, matchInfo.taker, &rig.abcNode.TBackend) {
+		if tryExpire(i, 0, matchInfo.maker, matchInfo.taker, &rig.abcNode.TBackend) {
 			continue
 		}
 
@@ -2250,7 +2278,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 		sendBlock(&rig.abcNode.TBackend) // tryConfirmSwap
 		// With maker swap confirmed, inaction happens bTimeout after
 		// swapConfirmed time.
-		if tryExpire(i, 1, order.MakerSwapCast, matchInfo.taker, matchInfo.maker, &rig.xyzNode.TBackend) {
+		if tryExpire(i, 1, matchInfo.taker, matchInfo.maker, &rig.xyzNode.TBackend) {
 			continue
 		}
 
@@ -2269,7 +2297,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 		sendBlock(&rig.xyzNode.TBackend)
 		// With taker swap confirmed, inaction happens bTimeout after
 		// swapConfirmed time.
-		if tryExpire(i, 2, order.TakerSwapCast, matchInfo.maker, matchInfo.taker, &rig.xyzNode.TBackend) {
+		if tryExpire(i, 2, matchInfo.maker, matchInfo.taker, &rig.xyzNode.TBackend) {
 			continue
 		}
 
@@ -2281,7 +2309,7 @@ func TestBroadcastTimeouts(t *testing.T) {
 		// Maker's redeem reaches swapConf. Not necessary for taker redeem.
 		// matchInfo.db.makerRedeem.coin.setConfs(int64(rig.xyz.SwapConf))
 		// sendBlock(rig.xyzNode)
-		if tryExpire(i, 3, order.MakerRedeemed, matchInfo.taker, matchInfo.maker, &rig.abcNode.TBackend) {
+		if tryExpire(i, 3, matchInfo.taker, matchInfo.maker, &rig.abcNode.TBackend) {
 			continue
 		}
 
@@ -3951,6 +3979,153 @@ func TestApplyMatchFailedEvent(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestMatchFailureDetection(t *testing.T) {
+	for _, tt := range []struct {
+		name                           string
+		status                         order.MatchStatus
+		block, missingAddress, expired bool
+		wantFault                      meshevents.MatchFailureFault
+	}{
+		{name: "missing taker address", status: order.NewlyMatched, missingAddress: true, wantFault: meshevents.MatchFailureTakerFault},
+		{name: "maker swap timeout", status: order.NewlyMatched, wantFault: meshevents.MatchFailureMakerFault},
+		{name: "taker redemption timeout", status: order.MakerRedeemed, wantFault: meshevents.MatchFailureTakerFault},
+		{name: "expired maker contract", status: order.MakerSwapCast, expired: true, wantFault: meshevents.MatchFailureNoUserFault},
+		{name: "expired contract after taker swap", status: order.TakerSwapCast, expired: true, wantFault: meshevents.MatchFailureNoUserFault},
+		{name: "taker swap timeout", status: order.MakerSwapCast, block: true, wantFault: meshevents.MatchFailureTakerFault},
+		{name: "maker redemption timeout", status: order.TakerSwapCast, block: true, wantFault: meshevents.MatchFailureMakerFault},
+		{name: "expired contract at taker timeout", status: order.MakerSwapCast, block: true, expired: true, wantFault: meshevents.MatchFailureNoUserFault},
+		{name: "expired contract at maker timeout", status: order.TakerSwapCast, block: true, expired: true, wantFault: meshevents.MatchFailureNoUserFault},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			rig := tNewUnstartedRig(set.matchInfos[0])
+			s := rig.swapper
+			s.SetMeshService(&tSwapMesh{applier: s.Events()})
+			s.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			now := time.Now()
+			overdue := now.Add(-2 * s.bTimeout)
+			tracker.Status = tt.status
+			tracker.time = overdue
+			tracker.matchTime = now
+			tracker.makerSwapAddr = "maker address"
+			tracker.makerStatus.swapConfirmed = overdue
+			tracker.takerStatus.swapConfirmed = overdue
+			tracker.makerStatus.redeemTime = overdue
+			if !tt.missingAddress {
+				tracker.takerSwapAddr = "taker address"
+			}
+			if tt.expired {
+				tracker.makerStatus.swap = &asset.Contract{LockTime: now.Add(-time.Hour)}
+			}
+			if tt.block {
+				s.checkInactionBlockBased(ABCID)
+			} else {
+				s.checkInactionEventBased()
+			}
+			if len(rig.storage.matchFailures) != 1 {
+				t.Fatalf("stored failures = %d, want 1", len(rig.storage.matchFailures))
+			}
+			event := rig.storage.matchFailures[0]
+			if !tt.block && (!event.MakerAddressKnown || event.TakerAddressKnown == tt.missingAddress) {
+				t.Fatalf("captured addresses = %v/%v, want true/%v", event.MakerAddressKnown, event.TakerAddressKnown, !tt.missingAddress)
+			}
+			if event.Status != tt.status || event.Fault != tt.wantFault {
+				t.Fatalf("failure = %v/%v, want %v/%v", event.Status, event.Fault, tt.status, tt.wantFault)
+			}
+		})
+	}
+}
+
+func TestFailMatch(t *testing.T) {
+	tests := []struct {
+		name           string
+		applyErr       error
+		callTwice      bool
+		advanceTo      order.MatchStatus // status move between decision and propose
+		addressArrived bool
+		wantEvents     int
+	}{
+		{
+			name:       "emits and applies",
+			wantEvents: 1,
+		},
+		{
+			name:       "apply error leaves match tracked",
+			applyErr:   errors.New("apply failed"),
+			callTwice:  true,
+			wantEvents: 2,
+		},
+		{
+			name:       "duplicate after apply does not emit",
+			callTwice:  true,
+			wantEvents: 1,
+		},
+		{
+			name:       "stale decision status is rejected, not repurposed",
+			advanceTo:  order.MakerRedeemed,
+			wantEvents: 1,
+		},
+		{
+			name:           "submission preserves captured address state",
+			addressArrived: true,
+			wantEvents:     1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			matchInfo := set.matchInfos[0]
+			rig := tNewUnstartedRig(matchInfo)
+			rig.swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			tracker := rig.getTracker()
+			tracker.mtx.Lock()
+			tracker.Status = order.TakerSwapCast
+			if tt.addressArrived {
+				tracker.Status = order.NewlyMatched
+			}
+			tracker.mtx.Unlock()
+
+			failure := matchFailure{match: tracker, status: tracker.Status, fault: meshevents.MatchFailureMakerFault}
+			if tt.addressArrived {
+				failure.fault = meshevents.MatchFailureTakerFault
+				tracker.takerSwapAddr = "taker address"
+			}
+			tMesh := &tSwapMesh{err: tt.applyErr, applier: rig.swapper.Events()}
+			rig.swapper.SetMeshService(tMesh)
+			if tt.advanceTo != 0 {
+				tracker.mtx.Lock()
+				tracker.Status = tt.advanceTo
+				tracker.mtx.Unlock()
+			}
+			rig.swapper.failMatch(failure)
+			if tt.callTwice {
+				rig.swapper.failMatch(failure)
+			}
+
+			if len(tMesh.events) != tt.wantEvents {
+				t.Fatalf("match_failed events = %d, want %d", len(tMesh.events), tt.wantEvents)
+			}
+			event, err := meshevents.DecodeMatchFailedEvent(tMesh.events[0].Payload)
+			if err != nil {
+				t.Fatalf("DecodeMatchFailedEvent error: %v", err)
+			}
+			if event.MatchID != matchInfo.matchID || event.Status != failure.status || event.Fault != failure.fault || event.MakerAddressKnown || event.TakerAddressKnown {
+				t.Fatalf("match_failed event = %#v, want captured decision %+v", event, failure)
+			}
+			applied := tt.applyErr == nil && tt.advanceTo == 0 && !tt.addressArrived
+			tracked := rig.swapper.matches[matchInfo.matchID] != nil
+			if applied && tracked {
+				t.Fatalf("failed match still tracked")
+			}
+			if !applied && !tracked {
+				t.Fatalf("live match was untracked")
+			}
+		})
 	}
 }
 

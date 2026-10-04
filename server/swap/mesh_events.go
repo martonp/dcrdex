@@ -453,6 +453,25 @@ func (s *Swapper) applyRedemptionAckRecordedEvent(ctx context.Context, meta *db.
 	return entry, nil
 }
 
+// newMatchFailedEvent encodes a failure using the state captured at detection.
+func newMatchFailedEvent(failure matchFailure) (*mesh.Event, error) {
+	match := failure.match
+	event := &meshevents.MatchFailedEvent{
+		MatchID:           match.ID(),
+		Base:              match.Maker.BaseAsset,
+		Quote:             match.Maker.QuoteAsset,
+		FailTime:          time.Now().UnixMilli(),
+		Status:            failure.status,
+		Fault:             failure.fault,
+		MakerAddressKnown: failure.makerAddressKnown,
+		TakerAddressKnown: failure.takerAddressKnown,
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return mesh.NewEvent(event)
+}
+
 // errMatchFailureSuperseded indicates that a match changed after a failure
 // was detected, so the old decision no longer applies.
 var errMatchFailureSuperseded = errors.New("match failure superseded")
