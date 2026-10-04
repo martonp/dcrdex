@@ -1073,15 +1073,13 @@ func bufferedTicker(ctx context.Context, dur time.Duration) chan struct{} {
 	return buffered
 }
 
-func (s *Swapper) tryConfirmSwap(ctx context.Context, status *swapStatus, confTime time.Time) (final bool) {
-	if known, confirmed := status.contractState(); !known {
-		return // no swap yet to confirm
-	} else if confirmed {
-		return true // already confirmed
+// tryConfirmSwap records confTime when a swap first reaches the required
+// confirmations.
+func (s *Swapper) tryConfirmSwap(ctx context.Context, status *swapStatus, confTime time.Time) {
+	if known, confirmed := status.contractState(); !known || confirmed {
+		return
 	}
 
-	// Swap known means status.swap is set, and that it will not be replaced
-	// because we are gating processInit with the swapSearching semaphore.
 	confs, err := status.swap.Confirmations(ctx)
 	if err != nil {
 		log.Warnf("Unable to get confirmations for swap tx %v: %v", status.swap.TxID(), err)
@@ -1091,7 +1089,7 @@ func (s *Swapper) tryConfirmSwap(ctx context.Context, status *swapStatus, confTi
 	status.mtx.Lock()
 	defer status.mtx.Unlock()
 	if !status.swapConfirmed.IsZero() { // in case a concurrent check already marked it
-		return true
+		return
 	}
 
 	swapConf := s.coins[status.swapAsset].SwapConf // swapStatus exists, therefore swapAsset is in the map
@@ -1099,9 +1097,7 @@ func (s *Swapper) tryConfirmSwap(ctx context.Context, status *swapStatus, confTi
 		log.Debugf("Swap %v (%s) has reached %d confirmations (%d required)",
 			status.swap, dex.BipIDSymbol(status.swapAsset), confs, swapConf)
 		status.swapConfirmed = confTime.UTC()
-		final = true
 	}
-	return
 }
 
 func (s *Swapper) matchSlice() []*matchTracker {
@@ -1114,48 +1110,34 @@ func (s *Swapper) matchSlice() []*matchTracker {
 	return matches
 }
 
-// processBlock scans the matches and updates a swapConfirmed time if the
-// required confirmations are reached. Once a relevant transaction has the
-// requisite number of confirmations, the next-to-act has only duration
-// (Swapper).bTimeout to broadcast the next transaction in the settlement
-// sequence. The timeout is not evaluated here, but in (Swapper).checkInaction.
-// This method simply sets swapConfirmed in the last actor's swapStatus.
+// processBlock checks pending swap confirmations for the block's asset.
+// Reaching the required confirmations starts the counterparty's action timeout.
 func (s *Swapper) processBlock(ctx context.Context, block *blockNotification) {
 	for _, match := range s.matchSlice() {
-		// If it's neither of the match assets, nothing to do.
-		if match.makerStatus.swapAsset != block.assetID &&
-			match.takerStatus.swapAsset != block.assetID {
-			return
-		}
-
-		// Lock the matchTracker so the following checks and updates are atomic
-		// with respect to Status.
-		match.mtx.RLock()
-		defer match.mtx.RUnlock()
-
-		switch match.Status {
-		case order.MakerSwapCast:
-			if match.makerStatus.swapAsset != block.assetID {
-				break
-			}
-			// If the maker has broadcast their transaction, the taker's
-			// broadcast timeout starts once the maker's swap has SwapConf
-			// confs.
-			if s.tryConfirmSwap(ctx, match.makerStatus, block.time) {
-				s.unlockOrderCoins(match.Maker)
-			}
-		case order.TakerSwapCast:
-			if match.takerStatus.swapAsset != block.assetID {
-				break
-			}
-			// If the taker has broadcast their transaction, the maker's
-			// broadcast timeout (for redemption) starts once the taker's swap
-			// has SwapConf confs.
-			if s.tryConfirmSwap(ctx, match.takerStatus, block.time) {
-				s.unlockOrderCoins(match.Taker)
-			}
-		}
+		s.confirmMatchForBlock(ctx, match, block)
 	}
+}
+
+// confirmMatchForBlock checks the maker's or taker's swap confirmations,
+// according to the match's current status.
+func (s *Swapper) confirmMatchForBlock(ctx context.Context, match *matchTracker, block *blockNotification) {
+	// Keep the match status unchanged throughout the confirmation check.
+	match.mtx.RLock()
+	defer match.mtx.RUnlock()
+
+	var status *swapStatus
+	switch match.Status {
+	case order.MakerSwapCast:
+		status = match.makerStatus
+	case order.TakerSwapCast:
+		status = match.takerStatus
+	default:
+		return
+	}
+	if status.swapAsset != block.assetID {
+		return
+	}
+	s.tryConfirmSwap(ctx, status, block.time)
 }
 
 // failMatch revokes the match and marks the swap as done for accounting
@@ -2570,8 +2552,7 @@ func (s *Swapper) LockCoins(asset uint32, coins map[order.OrderID][]order.CoinID
 	}
 }
 
-// unlockOrderCoins is not exported since only the Swapper knows when to unlock
-// coins (when funding coins are spent in a fully-confirmed contract).
+// unlockOrderCoins releases the swapper's locks on an order's funding coins.
 func (s *Swapper) unlockOrderCoins(ord order.Order) {
 	assetID := ord.Quote()
 	if ord.Trade().Sell {

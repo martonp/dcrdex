@@ -2016,6 +2016,110 @@ func TestTxWaiters(t *testing.T) {
 	}
 }
 
+// TestProcessBlockScansAllMatches verifies that a block notification updates
+// every match on the block asset even when the scan also holds matches on
+// unrelated assets. Map iteration is unordered, so an aborted scan can escape
+// detection if all confirmable matches happen to be visited first.
+func TestProcessBlockScansAllMatches(t *testing.T) {
+	set := tMultiMatchSet([]uint64{1e8, 2e8, 3e8}, []uint64{5e7, 5e7, 5e7}, true, false)
+	rig := tNewUnstartedRig(set.matchInfos[0])
+	swapper := rig.swapper
+	now := time.Now().UTC()
+
+	// Confirmable maker swaps on the block's asset.
+	swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+	trackers := swapper.matchSlice()
+	for _, mt := range trackers {
+		mt.Status = order.MakerSwapCast
+		mt.makerStatus.swap = &asset.Contract{Coin: &TCoin{id: randBytes(36), confs: int64(rig.abc.SwapConf)}}
+		mt.makerStatus.swapTime = now
+	}
+
+	// Decoy matches touching neither side of the block asset.
+	base := set.matchInfos[0].match
+	for i := 0; i < 12; i++ {
+		decoy := &order.Match{
+			Maker:    base.Maker,
+			Taker:    base.Taker,
+			Quantity: base.Quantity + uint64(i+1),
+			Rate:     base.Rate,
+			Epoch:    base.Epoch,
+			Status:   order.NewlyMatched,
+		}
+		swapper.addMatch(&matchTracker{
+			Match:       decoy,
+			time:        now,
+			matchTime:   now,
+			makerStatus: &swapStatus{swapAsset: XYZID, redeemAsset: ACCTID},
+			takerStatus: &swapStatus{swapAsset: ACCTID, redeemAsset: XYZID},
+		})
+	}
+
+	swapper.processBlock(context.Background(), &blockNotification{time: now, assetID: ABCID})
+
+	for i, mt := range trackers {
+		if mt.makerStatus.swapConfTime().IsZero() {
+			t.Fatalf("match %d not confirmed by the block scan", i)
+		}
+	}
+}
+
+func TestSwapConfirmationRetainsFundingLocks(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  order.MatchStatus
+		assetID uint32
+	}{
+		{name: "maker", status: order.MakerSwapCast, assetID: ABCID},
+		{name: "taker", status: order.TakerSwapCast, assetID: XYZID},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			set := tPerfectLimitLimit(uint64(1e8), uint64(1e8), true)
+			mi := set.matchInfos[0]
+			rig := tNewUnstartedRig(mi)
+			swapper := rig.swapper
+			now := time.Now().UTC()
+
+			var ord order.Order = mi.match.Maker
+			if tt.status == order.TakerSwapCast {
+				ord = mi.match.Taker
+			}
+			coin := order.CoinID(randBytes(36))
+			ord.Trade().Coins = []order.CoinID{coin}
+			swapperAsset := swapper.coins[tt.assetID]
+			locker := swapperAsset.Locker
+			swapper.TrackMatches([]*order.MatchSet{set.matchSet})
+			if !locker.CoinLocked(coin) {
+				t.Fatal("funding coin not locked after tracking match")
+			}
+
+			mt := rig.getTracker()
+			mt.Status = tt.status
+			status := mt.makerStatus
+			if tt.status == order.TakerSwapCast {
+				status = mt.takerStatus
+			}
+			status.swap = &asset.Contract{Coin: &TCoin{id: randBytes(36), confs: int64(swapperAsset.SwapConf)}}
+			status.swapTime = now
+
+			swapper.processBlock(context.Background(), &blockNotification{time: now, assetID: tt.assetID})
+			if got := status.swapConfTime(); !got.Equal(now) {
+				t.Fatalf("confirmation time = %v, want %v", got, now)
+			}
+			if !locker.CoinLocked(coin) {
+				t.Fatal("swap confirmation unlocked funding coin")
+			}
+
+			swapper.matchMtx.Lock()
+			swapper.deleteMatch(mt)
+			swapper.matchMtx.Unlock()
+			if locker.CoinLocked(coin) {
+				t.Fatal("match deletion did not unlock funding coin")
+			}
+		})
+	}
+}
+
 func TestBroadcastTimeouts(t *testing.T) {
 	rig, cleanup := tNewTestRig(nil)
 	defer cleanup()
