@@ -575,6 +575,22 @@ type Bonder interface {
 		bondPubKeyHash []byte, lockTime int64, acct account.AccountID, err error)
 }
 
+// lockersForBackend returns book and swap lockers for OutputTracker backends.
+func lockersForBackend(be asset.Backend, master *coinlock.MasterCoinLocker) (book, swap coinlock.CoinLocker) {
+	if be == nil {
+		return nil, nil
+	}
+	if _, ok := be.(asset.OutputTracker); !ok {
+		return nil, nil
+	}
+	return master.Book(), master.Swap()
+}
+
+func newSwapperAsset(ba *asset.BackedAsset, master *coinlock.MasterCoinLocker) *swap.SwapperAsset {
+	_, swapLocker := lockersForBackend(ba.Backend, master)
+	return &swap.SwapperAsset{BackedAsset: ba, Locker: swapLocker}
+}
+
 // NewDEX creates the dex manager and starts all subsystems. Use Stop to
 // shutdown cleanly. The Context is used to abort setup.
 //  1. Validate each specified asset.
@@ -808,11 +824,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			return err
 		}
 
-		var coinLocker coinlock.CoinLocker
-		if _, isAccountRedeemer := be.(asset.AccountBalancer); isAccountRedeemer {
-			coinLocker = dexCoinLocker.AssetLocker(assetID).Swap()
-		}
-
 		ba := &asset.BackedAsset{
 			Asset: dex.Asset{
 				ID:         assetID,
@@ -826,10 +837,12 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		}
 
 		backedAssets[assetID] = ba
-		lockableAssets[assetID] = &swap.SwapperAsset{
-			BackedAsset: ba,
-			Locker:      coinLocker,
+		lockableAssets[assetID] = newSwapperAsset(ba, dexCoinLocker.AssetLocker(assetID))
+		swapLockerKind := "nil"
+		if lockableAssets[assetID].Locker != nil {
+			swapLockerKind = "utxo"
 		}
+		log.Infof("asset %s (%d) swap_locker=%s", symbol, assetID, swapLockerKind)
 		feeMgr.AddFetcher(ba)
 
 		// Prepare assets portion of config response.
@@ -993,14 +1006,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	var orderRouter *market.OrderRouter
 	for _, mktInf := range cfg.Markets {
 		// nilness of the coin locker signals account-based asset.
-		var baseCoinLocker, quoteCoinLocker coinlock.CoinLocker
 		b, q := backedAssets[mktInf.Base], backedAssets[mktInf.Quote]
-		if _, ok := b.Backend.(asset.OutputTracker); ok {
-			baseCoinLocker = dexCoinLocker.AssetLocker(mktInf.Base).Book()
-		}
-		if _, ok := q.Backend.(asset.OutputTracker); ok {
-			quoteCoinLocker = dexCoinLocker.AssetLocker(mktInf.Quote).Book()
-		}
+		baseCoinLocker, _ := lockersForBackend(b.Backend, dexCoinLocker.AssetLocker(mktInf.Base))
+		quoteCoinLocker, _ := lockersForBackend(q.Backend, dexCoinLocker.AssetLocker(mktInf.Quote))
 
 		// Calculate a minimum market rate that avoids dust.
 		// quote_dust = base_lot * min_rate / rate_encoding_factor
