@@ -232,7 +232,7 @@ type stepInformation struct {
 // SwapperAsset is a BackedAsset with an optional CoinLocker.
 type SwapperAsset struct {
 	*asset.BackedAsset
-	Locker coinlock.CoinLocker // should be *coinlock.AssetCoinLocker
+	Locker coinlock.CoinLocker // nil for account-based assets
 }
 
 // Swapper tracks in-progress atomic swaps, coordinates client requests,
@@ -769,18 +769,10 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 			continue
 		}
 
-		// Check and skip matches for missing assets.
+		// Identify which asset each party swaps and redeems.
 		makerSwapAsset, makerRedeemAsset := sd.Base, sd.Quote // maker selling -> their swap asset is base
 		if sd.TakerSell {                                     // maker buying -> their swap asset is quote
 			makerSwapAsset, makerRedeemAsset = sd.Quote, sd.Base
-		}
-		if missingAssets[makerSwapAsset] {
-			log.Infof("Skipping match %v with missing asset %d backend", mid, makerSwapAsset)
-			continue
-		}
-		if missingAssets[makerRedeemAsset] {
-			log.Infof("Skipping match %v with missing asset %d backend", mid, makerRedeemAsset)
-			continue
 		}
 
 		epochCloseTime := match.Epoch.End()
@@ -826,27 +818,11 @@ func (s *Swapper) restoreActiveSwaps(allowPartial bool) error {
 		log.Infof("Resuming swap %v in status %v", mid, mt.Status)
 		s.addMatch(mt)
 
-		// Register swap contracts in the dedup maps using composite
-		// keys of CoinID and contract data.
-		for _, cs := range []struct {
-			coinOut  []byte
-			contract []byte
-		}{
-			{makerStatus.ContractCoinOut, makerStatus.ContractScript},
-			{takerStatus.ContractCoinOut, takerStatus.ContractScript},
-		} {
-			if len(cs.coinOut) > 0 {
-				dedupKey := fmt.Sprintf("%x:%x", cs.coinOut, cs.contract)
-				s.activeCoinIDs[dedupKey] = mid
-				s.matchCoinIDs[mid] = append(s.matchCoinIDs[mid], dedupKey)
-			}
+		if len(makerStatus.ContractCoinOut) > 0 {
+			s.registerSwapContractDedup(mid, makerStatus.ContractCoinOut, makerStatus.ContractScript, mt.makerStatus.swap.SecretHash, true)
 		}
-
-		// Register the maker's secret hash in the dedup maps.
-		if mt.makerStatus.swap != nil && len(mt.makerStatus.swap.SecretHash) > 0 {
-			secretHashHex := fmt.Sprintf("%x", mt.makerStatus.swap.SecretHash)
-			s.activeSecretHashes[secretHashHex] = mid
-			s.matchSecretHashes[mid] = append(s.matchSecretHashes[mid], secretHashHex)
+		if len(takerStatus.ContractCoinOut) > 0 {
+			s.registerSwapContractDedup(mid, takerStatus.ContractCoinOut, takerStatus.ContractScript, nil, false)
 		}
 	}
 
