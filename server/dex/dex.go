@@ -1537,6 +1537,11 @@ func (dm *DEX) ResumeMarket(name string, asSoonAs time.Time) (startEpoch int64, 
 	return market.ExecuteScheduleResume(context.Background(), dm.meshSvc, name, asSoonAs)
 }
 
+// MeshStatus reports the mesh status.
+func (dm *DEX) MeshStatus() mesh.Status {
+	return dm.meshSvc.Status()
+}
+
 // AccountInfo returns data for an account.
 func (dm *DEX) AccountInfo(aid account.AccountID) (*db.Account, error) {
 	// TODO: consider asking the auth manager for account info, including tier.

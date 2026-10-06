@@ -32,6 +32,7 @@ import (
 	"decred.org/dcrdex/server/db"
 	dexsrv "decred.org/dcrdex/server/dex"
 	"decred.org/dcrdex/server/market"
+	"decred.org/dcrdex/server/mesh"
 	"github.com/decred/dcrd/certgen"
 	"github.com/decred/slog"
 	"github.com/go-chi/chi/v5"
@@ -74,6 +75,7 @@ type TCore struct {
 }
 
 func (c *TCore) ConfigMsg() json.RawMessage { return nil }
+func (c *TCore) MeshStatus() mesh.Status    { return mesh.Status{Mode: "single_server"} }
 
 func (c *TCore) Suspend(tSusp time.Time, persistBooks bool) map[string]*market.SuspendEpoch {
 	return nil

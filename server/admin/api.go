@@ -59,6 +59,11 @@ func apiPing(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, pongStr)
 }
 
+// apiMesh returns the mesh status.
+func (s *Server) apiMesh(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, s.core.MeshStatus())
+}
+
 // apiConfig is the handler for the '/config' API request.
 func (s *Server) apiConfig(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, s.core.ConfigMsg())
