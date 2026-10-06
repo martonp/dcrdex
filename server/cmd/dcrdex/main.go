@@ -156,6 +156,14 @@ func mainCore(ctx context.Context) error {
 		NodeRelayAddr:   cfg.NodeRelayAddr,
 		RequestShutdown: requestShutdown,
 	}
+	if cfg.MeshPeerAddr != "" {
+		dexConf.MeshCfg = &dexsrv.MeshConfig{
+			PeerAddr:   cfg.MeshPeerAddr,
+			ListenAddr: cfg.MeshListen,
+			PeerCert:   cfg.MeshPeerCert,
+			ClientAddr: cfg.ClientAddr,
+		}
+	}
 	dexMan, err := dexsrv.NewDEX(ctx, dexConf) // ctx cancel just aborts setup; Stop does normal shutdown
 	if err != nil {
 		return err

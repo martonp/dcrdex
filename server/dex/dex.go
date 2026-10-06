@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -537,6 +538,33 @@ func newConfigResponse(cfg *DexConf, bondAssets map[string]*msgjson.BondAsset,
 	}, nil
 }
 
+// meshClientEndpoint returns the advertised client address and its TLS certificate.
+// Empty addresses, plaintext connections, and onion hosts omit the certificate.
+func meshClientEndpoint(clientAddr string, noTLS bool, certPath string) (string, []byte, error) {
+	address := strings.TrimSpace(clientAddr)
+	if address == "" || noTLS {
+		return address, nil, nil
+	}
+
+	endpointURL := address
+	if !strings.Contains(endpointURL, "://") {
+		endpointURL = "wss://" + endpointURL
+	}
+	endpoint, err := url.Parse(endpointURL)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse mesh client endpoint: %w", err)
+	}
+	if strings.HasSuffix(strings.ToLower(endpoint.Hostname()), ".onion") {
+		return address, nil, nil
+	}
+
+	cert, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read RPC cert for mesh client endpoint: %w", err)
+	}
+	return address, cert, nil
+}
+
 func (cr *configResponse) remarshal() {
 	encResult, err := json.Marshal(cr.configMsg)
 	if err != nil {
@@ -936,10 +964,27 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		cfg.PenaltyThreshold = auth.DefaultPenaltyThreshold
 	}
 
+	var meshCompat *mesh.CompatSnapshot
+	if cfg.MeshCfg != nil {
+		if meshCompat, err = buildMeshCompatSnapshot(cfg); err != nil {
+			return nil, fmt.Errorf("buildMeshCompatSnapshot: %w", err)
+		}
+	}
+
 	// Client comms RPC server.
 	server, err := comms.NewServer(cfg.CommsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("NewServer failed: %w", err)
+	}
+
+	// NewServer creates the RPC certificate if it does not already exist.
+	var ownClientHost string
+	var ownClientCert []byte
+	if cfg.MeshCfg != nil {
+		ownClientHost, ownClientCert, err = meshClientEndpoint(cfg.MeshCfg.ClientAddr, cfg.CommsCfg.NoTLS, cfg.CommsCfg.RPCCert)
+		if err != nil {
+			return nil, fmt.Errorf("mesh client endpoint: %w", err)
+		}
 	}
 
 	dataAPI := apidata.NewDataAPI(storage, server.RegisterHTTP)
@@ -1128,23 +1173,26 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 
 	commands := authMgr.Commands()
 	if err := mergeMeshCommands(commands, orderRouter.Commands()); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("market mesh commands: %w", err)
 	}
 	if err := mergeMeshCommands(commands, market.LifecycleCommands(markets)); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("market lifecycle mesh commands: %w", err)
 	}
 	if err := mergeMeshCommands(commands, swapper.Commands()); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("swap mesh commands: %w", err)
 	}
+
 	var dexMgr *DEX
 	lifecycleUpdated := newLifecycleUpdated(func() *DEX { return dexMgr })
+
 	events := authMgr.Events()
 	if err := mergeMeshEvents(events, market.Events(markets, bookRouter, authMgr.SendIfLocal, lifecycleUpdated)); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("market mesh events: %w", err)
 	}
 	if err := mergeMeshEvents(events, swapper.Events()); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("swap mesh events: %w", err)
 	}
+
 	// Restore markets before loading their order books and candle caches.
 	mktNames := make([]string, 0, len(markets))
 	for name := range markets {
@@ -1182,11 +1230,19 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			Load: func(context.Context) error { return dataAPI.LoadCaches() },
 		},
 	)
-	meshSvc, err := mesh.NewService(&mesh.ServiceConfig{
-		Commands:       commands,
-		Events:         events,
-		StateLoaders:   stateLoaders,
-		MasterWorkers:  masterWorkers,
+
+	meshCfg := &mesh.ServiceConfig{
+		Commands:      commands,
+		Events:        events,
+		MasterWorkers: masterWorkers,
+		StateLoaders:  stateLoaders,
+		ClientProxyHandler: func(ctx context.Context, msg *mesh.ClientProxyMessage) error {
+			if msg.Broadcast {
+				server.Broadcast(msg.Msg)
+				return nil
+			}
+			return authMgr.HandleProxiedClientMessage(ctx, msg)
+		},
 		EventLogReader: storage,
 		Logger:         cfg.LogBackend.NewLogger("MSH", log.Level()),
 		OnHalt: func(err error) {
@@ -1196,9 +1252,26 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			log.Warnf("Mesh subsystem halted: %v. Requesting DEX shutdown.", err)
 			cfg.RequestShutdown(fmt.Sprintf("mesh halted: %v", err))
 		},
-	})
+	}
+	if cfg.MeshCfg != nil {
+		meshCfg.DataDir = cfg.DataDir
+		meshCfg.ListenAddr = cfg.MeshCfg.ListenAddr
+		meshCfg.PeerAddr = cfg.MeshCfg.PeerAddr
+		meshCfg.PeerCert = cfg.MeshCfg.PeerCert
+		meshCfg.ClientHost = ownClientHost
+		meshCfg.ClientCert = ownClientCert
+		meshCfg.Compat = meshCompat
+		meshCfg.DEXPrivKey = cfg.DEXPrivKey
+		meshCfg.RPCKey = cfg.CommsCfg.RPCKey
+		meshCfg.RPCCert = cfg.CommsCfg.RPCCert
+		meshCfg.NoTLS = cfg.CommsCfg.NoTLS
+		// Snapshot seeding: a fresh node (empty event log) seeds its database
+		// from the peer's snapshot before the state loaders run.
+		meshCfg.SnapshotStore = storage
+	}
+	meshSvc, err := mesh.NewService(meshCfg)
 	if err != nil {
-		return nil, fmt.Errorf("create mesh service: %w", err)
+		return nil, fmt.Errorf("mesh.NewService: %w", err)
 	}
 	authMgr.SetMeshService(meshSvc)
 	orderRouter.SetMeshService(meshSvc)
@@ -1251,16 +1324,18 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	})
 
 	if err := startSubSys("Mesh", meshSvc); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error starting mesh: %w", err)
 	}
 	if err := meshSvc.WaitUntilReadyForComms(ctx); err != nil {
 		return nil, err
 	}
+
+	// Update the client configuration from the restored market state.
 	for _, mkt := range markets {
 		dexMgr.updateConfigMarketStatus(mkt.Status())
 	}
-	startSubSys("Comms Server", server)
 
+	startSubSys("Comms Server", server)
 	dexMgr.subsystems = subsystems
 
 	ready = true // don't shut down on return
