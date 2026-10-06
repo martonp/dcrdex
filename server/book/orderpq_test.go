@@ -575,6 +575,11 @@ func TestOrderPQ_UserOrders(t *testing.T) {
 			}
 		}
 	}
+	counts := map[account.AccountID]int{user0: 1}
+	pq.collectUsers(counts)
+	if len(counts) != 2 || counts[user0] != 3 || counts[user1] != 1 {
+		t.Fatalf("accumulated user counts = %v, want 3 and 1", counts)
+	}
 }
 
 func TestOrderPQMin_Worst(t *testing.T) {

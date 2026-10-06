@@ -1286,6 +1286,12 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		return nil, fmt.Errorf("swap mesh events: %w", err)
 	}
 
+	masterWorkers := newMasterWorkers(swapper.Run, swapper.EnableInactionChecks, markets)
+
+	// Start revocation checks after market startup order cleanup.
+	unbooker := newPresenceUnbooker(cfg.LogBackend.NewLogger("PRES", log.Level()), markets, authMgr, cfg.BroadcastTimeout)
+	masterWorkers = append(masterWorkers, unbooker.masterWorker())
+
 	// Restore markets before loading their order books and candle caches.
 	mktNames := make([]string, 0, len(markets))
 	for name := range markets {
@@ -1293,7 +1299,6 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	}
 	sort.Strings(mktNames)
 	var stateLoaders []mesh.StateLoader
-	masterWorkers := newMasterWorkers(swapper.Run, swapper.EnableInactionChecks, markets)
 	for _, name := range mktNames {
 		mkt := markets[name]
 		stateLoaders = append(stateLoaders, mesh.StateLoader{
@@ -1336,8 +1341,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 			}
 			return authMgr.HandleProxiedClientMessage(ctx, msg)
 		},
-		EventLogReader: storage,
-		Logger:         cfg.LogBackend.NewLogger("MSH", log.Level()),
+		ClientConnectedHandler: authMgr.ConnectedAmong,
+		EventLogReader:         storage,
+		Logger:                 cfg.LogBackend.NewLogger("MSH", log.Level()),
 		PeerClientEndpointChanged: func(host string, cert []byte) {
 			dexMgr.publishMeshClientEndpoints(ownClientHost, ownClientCert, host, cert)
 		},
@@ -1372,6 +1378,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	authMgr.SetMeshService(meshSvc)
 	orderRouter.SetMeshService(meshSvc)
 	swapper.SetMeshService(meshSvc)
+	unbooker.mesh = meshSvc
 	for _, mkt := range markets {
 		mkt.SetMeshService(meshSvc)
 	}
