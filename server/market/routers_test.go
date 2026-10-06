@@ -136,8 +136,6 @@ func nowMs() time.Time {
 // The AuthManager handles client-related actions, including authorization and
 // communications.
 type TAuth struct {
-	canceledOrder      order.OrderID
-	cancelOrder        order.OrderID
 	authErr            error
 	sendsMtx           sync.Mutex
 	sends              []*msgjson.Message
@@ -2394,28 +2392,4 @@ func TestParcelLimits(t *testing.T) {
 
 	lo.Quantity += lotSize
 	ensureErr()
-}
-
-func (a *TAuth) PreimageSuccess(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-
-func (a *TAuth) MissedPreimage(user account.AccountID, refTime time.Time, oid order.OrderID) {}
-
-func (a *TAuth) SwapSuccess(user account.AccountID, mmid db.MarketMatchID, value uint64, refTime time.Time) {
-}
-
-func (a *TAuth) Inaction(user account.AccountID, step db.Outcome, mmid db.MarketMatchID, matchValue uint64, refTime time.Time, oid order.OrderID) {
-}
-
-func (a *TAuth) UserReputation(user account.AccountID) (tier int64, score, maxScore int32, err error) {
-	if a.rep.maxScore == 0 {
-		return 1, 30, 60, a.rep.err
-	}
-	return a.rep.tier, a.rep.score, a.rep.maxScore, a.rep.err
-}
-
-func (a *TAuth) RecordCompletedOrder(account.AccountID, order.OrderID, time.Time) {}
-
-func (a *TAuth) RecordCancel(aid account.AccountID, coid, oid order.OrderID, epochGap int32, t time.Time) {
-	a.cancelOrder = coid
-	a.canceledOrder = oid
 }

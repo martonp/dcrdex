@@ -1229,64 +1229,6 @@ func TestMatchByID(t *testing.T) {
 	}
 }
 
-func TestUserMatches(t *testing.T) {
-	if err := cleanTables(archie.db); err != nil {
-		t.Fatalf("cleanTables: %v", err)
-	}
-
-	// Make a perfect 1 lot match.
-	limitBuyStanding := newLimitOrder(false, 4500000, 1, order.StandingTiF, 0)
-	limitSellImmediate := newLimitOrder(true, 4490000, 1, order.ImmediateTiF, 10)
-
-	base, quote := limitBuyStanding.Base(), limitBuyStanding.Quote()
-
-	// Store it.
-	epochID := order.EpochID{132412341, 1000}
-	match := newMatch(limitBuyStanding, limitSellImmediate, limitSellImmediate.Quantity, epochID)
-	err := insertMatchForTest(match)
-	if err != nil {
-		t.Fatalf("insertMatchForTest() failed: %v", err)
-	}
-
-	tests := []struct {
-		name        string
-		acctID      account.AccountID
-		numExpected int
-		wantedErr   error
-	}{
-		{
-			"ok maker",
-			limitBuyStanding.User(),
-			1,
-			nil,
-		},
-		{
-			"ok taker",
-			limitSellImmediate.User(),
-			1,
-			nil,
-		},
-		{
-			"nope",
-			randomAccountID(),
-			0,
-			nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			matchData, err := archie.UserMatches(tt.acctID, base, quote)
-			if err != tt.wantedErr {
-				t.Fatal(err)
-			}
-			if len(matchData) != tt.numExpected {
-				t.Errorf("Retrieved %d matches for user %v, expected %d.", len(matchData), tt.acctID, tt.numExpected)
-			}
-		})
-	}
-}
-
 func TestSwapDataFullByID(t *testing.T) {
 	if err := cleanTables(archie.db); err != nil {
 		t.Fatalf("cleanTables: %v", err)
@@ -2095,7 +2037,7 @@ func TestEpochReport(t *testing.T) {
 	}
 
 	var epochIdx, epochDur int64 = 13245678, 6000
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx,
@@ -2136,7 +2078,7 @@ func TestEpochReport(t *testing.T) {
 	}
 
 	// Trying for the same epoch should violate a primary key constraint.
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:  42,
 		MktQuote: 0,
 		Idx:      epochIdx,
@@ -2146,7 +2088,7 @@ func TestEpochReport(t *testing.T) {
 		t.Fatalf("no error for duplicate epoch")
 	}
 
-	err = archie.InsertEpoch(&db.EpochResults{
+	err = archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx + 1,
@@ -2184,7 +2126,7 @@ func TestEpochReport(t *testing.T) {
 		t.Fatalf("wrong second-to-last epoch last rate. expected 15, got %d", lastRate)
 	}
 
-	archie.InsertEpoch(&db.EpochResults{
+	if err := archie.insertEpoch(archie.db, &db.EpochResults{
 		MktBase:     42,
 		MktQuote:    0,
 		Idx:         epochIdx + 2,
@@ -2195,7 +2137,9 @@ func TestEpochReport(t *testing.T) {
 		StartRate:   100,
 		EndRate:     100,
 		QuoteVolume: 100,
-	})
+	}); err != nil {
+		t.Fatalf("insertEpoch: %v", err)
+	}
 
 	startStamp = uint64((epochIdx + 2) * epochDur)
 	endStamp = startStamp + uint64(epochDur)

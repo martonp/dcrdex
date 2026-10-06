@@ -927,44 +927,6 @@ func completedUserOrders(ctx context.Context, dbe sqlQueryer, tableName string, 
 	return
 }
 
-// PreimageStats retrieves results of the N most recent preimage requests for
-// the user across all markets.
-func (a *Archiver) PreimageStats(user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
-	var outcomes []*db.PreimageResult
-
-	queryOutcomes := func(stmt string) error {
-		ctx, cancel := context.WithTimeout(a.ctx, a.queryTimeout)
-		defer cancel()
-
-		results, err := preimageStats(ctx, a.db, stmt, user, lastN)
-		outcomes = append(outcomes, results...)
-		return err
-	}
-
-	for schema := range a.markets {
-		// archived trade orders
-		stmt := fmt.Sprintf(internal.PreimageResultsLastN, fullOrderTableName(a.dbName, schema, false))
-		if err := queryOutcomes(stmt); err != nil {
-			return nil, err
-		}
-
-		// archived cancel orders
-		stmt = fmt.Sprintf(internal.CancelPreimageResultsLastN, fullCancelOrderTableName(a.dbName, schema, false))
-		if err := queryOutcomes(stmt); err != nil {
-			return nil, err
-		}
-	}
-
-	sort.Slice(outcomes, func(i, j int) bool {
-		return outcomes[i].Time < outcomes[j].Time // ascending
-	})
-	if len(outcomes) > lastN {
-		outcomes = outcomes[len(outcomes)-lastN:]
-	}
-
-	return outcomes, nil
-}
-
 // preimageStats reads preimage results from one order table.
 func preimageStats(ctx context.Context, dbe sqlQueryer, stmt string, user account.AccountID, lastN int) ([]*db.PreimageResult, error) {
 	rows, err := dbe.QueryContext(ctx, stmt, user, lastN, orderStatusRevoked)
@@ -1358,12 +1320,6 @@ func archivedOrderIDsForCommitSince(ctx context.Context, dbe sqlQueryer, dbName,
 		oids = append(oids, ids...)
 	}
 	return oids, nil
-}
-
-// OrderWithCommit searches all markets' active trade and cancel orders for
-// the given commitment.
-func (a *Archiver) OrderWithCommit(ctx context.Context, commit order.Commitment) (found bool, oid order.OrderID, err error) {
-	return a.orderWithCommit(ctx, a.db, commit)
 }
 
 // orderWithCommit searches all markets' active trade and cancel orders for

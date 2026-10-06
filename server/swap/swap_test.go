@@ -1568,8 +1568,7 @@ func (set *tMatchSet) add(matchInfo *tMatch) *tMatchSet {
 	ms.Amounts = append(ms.Amounts, matchInfo.qty)
 	ms.Rates = append(ms.Rates, matchInfo.rate)
 	ms.Total += matchInfo.qty
-	// In practice, a MatchSet's fee rate is used to set the individual match
-	// fee rates via (*MatchSet).Matches in TrackMatches.
+	// MatchSet.Matches assigns these fee rates to each match.
 	ms.FeeRateBase = matchInfo.match.FeeRateBase
 	ms.FeeRateQuote = matchInfo.match.FeeRateQuote
 	set.matchInfos = append(set.matchInfos, matchInfo)

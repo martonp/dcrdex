@@ -28,25 +28,6 @@ func (a *Archiver) matchTableName(match *order.Match) (string, error) {
 	return fullMatchesTableName(a.dbName, marketSchema), nil
 }
 
-// ForgiveMatchFail marks the specified match as forgiven. Since this is an
-// administrative function, the burden is on the operator to ensure the match
-// can actually be forgiven (inactive, not already forgiven, and not in
-// MatchComplete status).
-func (a *Archiver) ForgiveMatchFail(mid order.MatchID) (bool, error) {
-	for schema := range a.markets {
-		stmt := fmt.Sprintf(internal.ForgiveMatchFail, fullMatchesTableName(a.dbName, schema))
-		N, err := sqlExec(a.db, stmt, mid)
-		if err != nil { // not just no rows updated
-			return false, err
-		}
-		if N == 1 {
-			return true, nil
-		} // N > 1 cannot happen since matchid is the primary key
-		// N==0 could also mean it was not eligible to forgive, but just keep going
-	}
-	return false, nil
-}
-
 // ActiveSwaps loads the full details for all active swaps across all markets.
 func (a *Archiver) ActiveSwaps() ([]*db.SwapDataFull, error) {
 	var sd []*db.SwapDataFull
@@ -274,42 +255,17 @@ func atFaultMatches(ctx context.Context, dbe *sql.DB, tableName string, aid acco
 	return
 }
 
-// UserMatches retrieves all matches involving a user on the given market.
-// TODO: consider a time limited version of this to retrieve recent matches.
-func (a *Archiver) UserMatches(aid account.AccountID, base, quote uint32) ([]*db.MatchData, error) {
-	marketSchema, err := a.marketSchema(base, quote)
-	if err != nil {
-		return nil, err
-	}
-
-	matchesTableName := fullMatchesTableName(a.dbName, marketSchema)
-
-	ctx, cancel := context.WithTimeout(a.ctx, a.queryTimeout)
-	defer cancel()
-
-	return userMatches(ctx, a.db, matchesTableName, aid, true)
-}
-
-func userMatches(ctx context.Context, dbe *sql.DB, tableName string, aid account.AccountID, includeInactive bool) ([]*db.MatchData, error) {
-	query := internal.RetrieveActiveUserMatches
-	if includeInactive {
-		query = internal.RetrieveUserMatches
-	}
-	stmt := fmt.Sprintf(query, tableName)
+// activeUserMatches retrieves all active matches involving a user on the given
+// market.
+func activeUserMatches(ctx context.Context, dbe *sql.DB, tableName string, aid account.AccountID) ([]*db.MatchData, error) {
+	stmt := fmt.Sprintf(internal.RetrieveActiveUserMatches, tableName)
 	rows, err := dbe.QueryContext(ctx, stmt, aid)
 	if err != nil {
 		return nil, err
 	}
-	return rowsToMatchData(rows, includeInactive)
-}
-
-func rowsToMatchData(rows *sql.Rows, includeInactive bool) ([]*db.MatchData, error) {
 	defer rows.Close()
 
-	var (
-		ms  []*db.MatchData
-		err error
-	)
+	var matches []*db.MatchData
 	for rows.Next() {
 		var m db.MatchData
 		var status uint8
@@ -317,31 +273,16 @@ func rowsToMatchData(rows *sql.Rows, includeInactive bool) ([]*db.MatchData, err
 		var takerSell sql.NullBool
 		var takerAddr, makerAddr sql.NullString
 		var makerSwapAddr, takerSwapAddr sql.NullString
-		if includeInactive {
-			// "active" column SELECTed.
-			err = rows.Scan(&m.ID, &m.Active, &takerSell,
-				&m.Taker, &m.TakerAcct, &takerAddr,
-				&m.Maker, &m.MakerAcct, &makerAddr,
-				&m.Epoch.Idx, &m.Epoch.Dur, &m.Quantity, &m.Rate,
-				&baseRate, &quoteRate, &status,
-				&makerSwapAddr, &takerSwapAddr)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// "active" column not SELECTed.
-			err = rows.Scan(&m.ID, &takerSell,
-				&m.Taker, &m.TakerAcct, &takerAddr,
-				&m.Maker, &m.MakerAcct, &makerAddr,
-				&m.Epoch.Idx, &m.Epoch.Dur, &m.Quantity, &m.Rate,
-				&baseRate, &quoteRate, &status,
-				&makerSwapAddr, &takerSwapAddr)
-			if err != nil {
-				return nil, err
-			}
-			// All are active.
-			m.Active = true
+		err = rows.Scan(&m.ID, &takerSell,
+			&m.Taker, &m.TakerAcct, &takerAddr,
+			&m.Maker, &m.MakerAcct, &makerAddr,
+			&m.Epoch.Idx, &m.Epoch.Dur, &m.Quantity, &m.Rate,
+			&baseRate, &quoteRate, &status,
+			&makerSwapAddr, &takerSwapAddr)
+		if err != nil {
+			return nil, err
 		}
+		m.Active = true
 		m.Status = order.MatchStatus(status)
 		m.TakerSell = takerSell.Bool
 		m.TakerAddr = takerAddr.String
@@ -351,14 +292,14 @@ func rowsToMatchData(rows *sql.Rows, includeInactive bool) ([]*db.MatchData, err
 		m.BaseRate = uint64(baseRate.Int64)
 		m.QuoteRate = uint64(quoteRate.Int64)
 
-		ms = append(ms, &m)
+		matches = append(matches, &m)
 	}
 
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
 
-	return ms, nil
+	return matches, nil
 }
 
 func (a *Archiver) marketMatches(base, quote uint32, includeInactive bool, N int64, f func(*db.MatchDataWithCoins) error) (int, error) {
@@ -472,7 +413,7 @@ func (a *Archiver) AllActiveUserMatches(aid account.AccountID) ([]*db.MatchData,
 	var matches []*db.MatchData
 	for schema := range a.markets {
 		matchesTableName := fullMatchesTableName(a.dbName, schema)
-		mdM, err := userMatches(ctx, a.db, matchesTableName, aid, false)
+		mdM, err := activeUserMatches(ctx, a.db, matchesTableName, aid)
 		if err != nil {
 			return nil, err
 		}

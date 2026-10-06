@@ -85,8 +85,6 @@ func (a *Archiver) insertEpoch(dbe sqlExecutor, ed *db.EpochResults) error {
 	return err
 }
 
-func (a *Archiver) InsertEpoch(ed *db.EpochResults) error { return a.insertEpoch(a.db, ed) }
-
 // LastEpochRate gets the EndRate of the last EpochResults inserted for the
 // market. If the database is empty, no error and a rate of zero are returned.
 func (a *Archiver) LastEpochRate(base, quote uint32) (rate uint64, err error) {

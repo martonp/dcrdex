@@ -15,7 +15,6 @@ import (
 	"decred.org/dcrdex/server/db"
 	"decred.org/dcrdex/server/db/driver/pg/internal"
 	"decred.org/dcrdex/server/meshevents"
-	"github.com/decred/dcrd/dcrutil/v4" // TODO: consider a move to "crypto/sha256" instead of dcrutil.Hash160
 )
 
 // Account returns the account and bonds whose lock time is at least
@@ -170,106 +169,8 @@ func (a *Archiver) AccountInfo(aid account.AccountID) (*db.Account, error) {
 	return acct, nil
 }
 
-// CreateAccountWithBond creates a new account with a fidelity bond.
-func (a *Archiver) CreateAccountWithBond(acct *account.Account, bond *db.Bond) error {
-	dbTx, err := a.db.BeginTx(a.ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err == nil || errors.Is(err, sql.ErrTxDone) {
-			return
-		}
-		if errR := dbTx.Rollback(); errR != nil {
-			log.Errorf("Rollback failed: %v", errR)
-		}
-	}()
-
-	err = createAccountForBond(dbTx, a.tables.accounts, acct)
-	if err != nil {
-		return err
-	}
-	err = addBond(dbTx, a.tables.bonds, acct.ID, bond)
-	if err != nil {
-		return err
-	}
-
-	err = dbTx.Commit() // for the defer
-	return err
-}
-
-// AddBond stores a new Bond for an existing account.
-func (a *Archiver) AddBond(aid account.AccountID, bond *db.Bond) error {
-	return addBond(a.db, a.tables.bonds, aid, bond)
-}
-
-func (a *Archiver) DeleteBond(assetID uint32, coinID []byte) error {
-	return deleteBond(a.db, a.tables.bonds, assetID, coinID)
-}
-
 func (a *Archiver) FetchPrepaidBond(coinID []byte) (strength uint32, lockTime int64, err error) {
 	return getPrepaidBond(a.db, a.tables.prepaidBonds, coinID)
-}
-
-func (a *Archiver) DeletePrepaidBond(coinID []byte) (err error) {
-	stmt := fmt.Sprintf(internal.DeletePrepaidBond, prepaidBondsTableName)
-	_, err = a.db.ExecContext(a.ctx, stmt, coinID)
-	return
-}
-
-func (a *Archiver) StorePrepaidBonds(coinIDs [][]byte, strength uint32, lockTime int64) error {
-	stmt := fmt.Sprintf(internal.InsertPrepaidBond, prepaidBondsTableName)
-	for i := range coinIDs {
-		if _, err := a.db.ExecContext(a.ctx, stmt, coinIDs[i], strength, lockTime); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// KeyIndex returns the current child index for the an xpub. If it is not
-// known, this creates a new entry with index zero.
-func (a *Archiver) KeyIndex(xpub string) (uint32, error) {
-	keyHash := dcrutil.Hash160([]byte(xpub))
-
-	var child uint32
-	stmt := fmt.Sprintf(internal.CurrentKeyIndex, feeKeysTableName)
-	err := a.db.QueryRow(stmt, keyHash).Scan(&child)
-	switch {
-	case errors.Is(err, sql.ErrNoRows): // continue to create new entry
-	case err == nil:
-		return child, nil
-	default:
-		return 0, err
-	}
-
-	log.Debugf("Inserting key entry for xpub %.40s..., hash160 = %x", xpub, keyHash)
-	stmt = fmt.Sprintf(internal.InsertKeyIfMissing, feeKeysTableName)
-	err = a.db.QueryRow(stmt, keyHash).Scan(&child)
-	if err != nil {
-		return 0, err
-	}
-	return child, nil
-}
-
-// SetKeyIndex records the child index for an xpub. An error is returned
-// unless exactly 1 row is updated or created.
-func (a *Archiver) SetKeyIndex(idx uint32, xpub string) error {
-	keyHash := dcrutil.Hash160([]byte(xpub))
-	log.Debugf("Recording new index %d for xpub %.40s... (%x)", idx, xpub, keyHash)
-	stmt := fmt.Sprintf(internal.UpsertKeyIndex, feeKeysTableName)
-	res, err := a.db.Exec(stmt, idx, keyHash)
-	if err != nil {
-		return err
-	}
-	N, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if N != 1 {
-		return fmt.Errorf("updated %d rows, expected 1", N)
-	}
-	return nil
 }
 
 // createAccountTables creates the account-related tables.
@@ -320,12 +221,6 @@ func addBond(dbe sqlExecutor, tableName string, aid account.AccountID, bond *db.
 	stmt := fmt.Sprintf(internal.AddBond, tableName)
 	_, err := dbe.Exec(stmt, bond.Version, bond.CoinID, bond.AssetID, aid,
 		bond.Amount, bond.Strength, bond.LockTime)
-	return err
-}
-
-func deleteBond(dbe sqlExecutor, tableName string, assetID uint32, coinID []byte) error {
-	stmt := fmt.Sprintf(internal.DeleteBond, tableName)
-	_, err := dbe.Exec(stmt, coinID, assetID)
 	return err
 }
 

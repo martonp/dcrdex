@@ -109,14 +109,6 @@ const (
 		epochIdx, epochDur, quantity, rate, baseRate, quoteRate, status
 	FROM %s WHERE matchid = $1;`
 
-	RetrieveUserMatches = `SELECT matchid, active, takerSell,
-		takerOrder, takerAccount, takerAddress,
-		makerOrder, makerAccount, makerAddress,
-		epochIdx, epochDur, quantity, rate, baseRate, quoteRate, status,
-		makerSwapAddr, takerSwapAddr
-	FROM %s
-	WHERE takerAccount = $1 OR makerAccount = $1;`
-
 	UnsettledOrderMatchExists = `SELECT EXISTS (
 		SELECT 1 FROM %s
 		WHERE active AND makerOrder = $1 AND status < $2

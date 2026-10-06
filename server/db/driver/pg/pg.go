@@ -56,7 +56,6 @@ type Config struct {
 
 // Some frequently used long-form table names.
 type archiverTables struct {
-	feeKeys         string
 	accounts        string
 	bonds           string
 	prepaidBonds    string
@@ -162,7 +161,6 @@ func NewArchiverForRead(ctx context.Context, cfg *Config) (*Archiver, error) {
 		queryTimeout: queryTimeout,
 		markets:      mktMap,
 		tables: archiverTables{
-			feeKeys:         fullTableName(cfg.DBName, publicSchema, feeKeysTableName),
 			accounts:        fullTableName(cfg.DBName, publicSchema, accountsTableName),
 			bonds:           fullTableName(cfg.DBName, publicSchema, bondsTableName),
 			prepaidBonds:    fullTableName(cfg.DBName, publicSchema, prepaidBondsTableName),
