@@ -4,6 +4,7 @@
 package dex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -490,6 +491,7 @@ type DEX struct {
 	bookRouter  *market.BookRouter
 	subsystems  []subsystem
 	server      *comms.Server
+	broadcast   func(*msgjson.Message)
 	stopping    atomic.Bool
 
 	configRespMtx sync.RWMutex
@@ -563,6 +565,53 @@ func meshClientEndpoint(clientAddr string, noTLS bool, certPath string) (string,
 		return "", nil, fmt.Errorf("read RPC cert for mesh client endpoint: %w", err)
 	}
 	return address, cert, nil
+}
+
+// publishMeshClientEndpoints updates the client endpoints in the config
+// response and notifies connected clients when they change.
+func (dm *DEX) publishMeshClientEndpoints(ownHost string, ownCert []byte, peerHost string, peerCert []byte) {
+	endpoints := []*msgjson.MeshEndpoint{{
+		Host: ownHost,
+		Cert: ownCert,
+	}}
+	if peerHost != "" && peerHost != ownHost {
+		endpoints = append(endpoints, &msgjson.MeshEndpoint{
+			Host: peerHost,
+			Cert: peerCert,
+		})
+	}
+
+	dm.configRespMtx.Lock()
+	if meshEndpointsEqual(dm.configResp.configMsg.MeshEndpoints, endpoints) {
+		dm.configRespMtx.Unlock()
+		return
+	}
+	dm.configResp.configMsg.MeshEndpoints = endpoints
+	dm.configResp.remarshal()
+	dm.configRespMtx.Unlock()
+
+	note, err := msgjson.NewNotification(msgjson.MeshEndpointsRoute, &msgjson.MeshEndpointsNotification{
+		MeshEndpoints: endpoints,
+	})
+	if err != nil {
+		log.Errorf("Failed to create mesh endpoints notification: %v", err)
+		return
+	}
+	dm.broadcast(note)
+}
+
+// meshEndpointsEqual compares two advertised mesh endpoint lists by host and
+// certificate.
+func meshEndpointsEqual(a, b []*msgjson.MeshEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Host != b[i].Host || !bytes.Equal(a[i].Cert, b[i].Cert) {
+			return false
+		}
+	}
+	return true
 }
 
 func (cr *configResponse) remarshal() {
@@ -1245,6 +1294,9 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		},
 		EventLogReader: storage,
 		Logger:         cfg.LogBackend.NewLogger("MSH", log.Level()),
+		PeerClientEndpointChanged: func(host string, cert []byte) {
+			dexMgr.publishMeshClientEndpoints(ownClientHost, ownClientCert, host, cert)
+		},
 		OnHalt: func(err error) {
 			if dexMgr.stopping.Load() {
 				return
@@ -1301,6 +1353,7 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		bookRouter:  bookRouter,
 		subsystems:  subsystems,
 		server:      server,
+		broadcast:   server.Broadcast,
 		configResp:  cfgResp,
 	}
 

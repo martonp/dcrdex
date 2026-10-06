@@ -5,9 +5,13 @@ package dex
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+
+	"decred.org/dcrdex/dex/msgjson"
 )
 
 func TestMeshClientEndpoint(t *testing.T) {
@@ -63,6 +67,89 @@ func TestMeshClientEndpoint(t *testing.T) {
 			}
 			if host != tt.wantHost || !bytes.Equal(gotCert, tt.wantCert) {
 				t.Fatalf("endpoint = %q/%x, want %q/%x", host, gotCert, tt.wantHost, tt.wantCert)
+			}
+		})
+	}
+}
+
+func TestPublishMeshClientEndpoints(t *testing.T) {
+	own := &msgjson.MeshEndpoint{Host: "self.example:7232", Cert: []byte{4, 5, 6}}
+	peer := &msgjson.MeshEndpoint{Host: "peer.example:7232", Cert: []byte{1, 2, 3}}
+	changedPeer := &msgjson.MeshEndpoint{Host: peer.Host, Cert: []byte{7, 8, 9}}
+	both := []*msgjson.MeshEndpoint{own, peer}
+	tests := []struct {
+		name       string
+		previous   []*msgjson.MeshEndpoint
+		peer       *msgjson.MeshEndpoint
+		want       []*msgjson.MeshEndpoint
+		wantNotify bool
+	}{
+		{
+			name: "publish both endpoints", peer: peer,
+			want: both, wantNotify: true,
+		},
+		{
+			name: "unchanged endpoints", previous: both, peer: peer,
+			want: both,
+		},
+		{
+			name: "changed peer certificate", previous: both, peer: changedPeer,
+			want: []*msgjson.MeshEndpoint{own, changedPeer}, wantNotify: true,
+		},
+		{
+			name: "duplicate peer address", previous: both, peer: own,
+			want: []*msgjson.MeshEndpoint{own}, wantNotify: true,
+		},
+		{
+			name: "peer removed", previous: both, peer: &msgjson.MeshEndpoint{},
+			want: []*msgjson.MeshEndpoint{own}, wantNotify: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var broadcasts []*msgjson.Message
+			dm := &DEX{
+				configResp: &configResponse{
+					configMsg: &msgjson.ConfigResult{MeshEndpoints: tt.previous},
+				},
+				broadcast: func(msg *msgjson.Message) {
+					broadcasts = append(broadcasts, msg)
+				},
+			}
+			dm.configResp.remarshal()
+			dm.publishMeshClientEndpoints(own.Host, own.Cert, tt.peer.Host, tt.peer.Cert)
+
+			if got := dm.configResp.configMsg.MeshEndpoints; !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("stored endpoints = %+v, want %+v", got, tt.want)
+			}
+			var config msgjson.ConfigResult
+			if err := json.Unmarshal(dm.configResp.configEnc, &config); err != nil {
+				t.Fatalf("config unmarshal error: %v", err)
+			}
+			if !reflect.DeepEqual(config.MeshEndpoints, tt.want) {
+				t.Fatalf("encoded endpoints = %+v, want %+v", config.MeshEndpoints, tt.want)
+			}
+
+			wantBroadcasts := 0
+			if tt.wantNotify {
+				wantBroadcasts = 1
+			}
+			if len(broadcasts) != wantBroadcasts {
+				t.Fatalf("broadcast count = %d, want %d", len(broadcasts), wantBroadcasts)
+			}
+			if !tt.wantNotify {
+				return
+			}
+			msg := broadcasts[0]
+			if msg.Type != msgjson.Notification || msg.Route != msgjson.MeshEndpointsRoute {
+				t.Fatalf("broadcast type/route = %d/%q, want notification/%q", msg.Type, msg.Route, msgjson.MeshEndpointsRoute)
+			}
+			var note msgjson.MeshEndpointsNotification
+			if err := msg.Unmarshal(&note); err != nil {
+				t.Fatalf("notification unmarshal error: %v", err)
+			}
+			if !reflect.DeepEqual(note.MeshEndpoints, tt.want) {
+				t.Fatalf("notification endpoints = %+v, want %+v", note.MeshEndpoints, tt.want)
 			}
 		})
 	}
