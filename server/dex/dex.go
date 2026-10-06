@@ -450,6 +450,9 @@ type DexConf struct {
 	NoResumeSwaps    bool
 	NodeRelayAddr    string
 	MeshCfg          *MeshConfig
+	// MeshForkReset confirms clearing this node's event-sourced state
+	// after a fork, using the token from the halt error.
+	MeshForkReset string
 }
 
 type signer struct {
@@ -669,6 +672,43 @@ type Bonder interface {
 		bondPubKeyHash []byte, lockTime int64, acct account.AccountID, err error)
 }
 
+// meshStartupMaintenance checks event-log consistency and handles a requested
+// fork reset before loading state.
+func meshStartupMaintenance(ctx context.Context, cfg *DexConf, storage db.DEXArchivist) error {
+	frontier, err := storage.EventLogFrontier(ctx)
+	if err != nil {
+		return fmt.Errorf("event log frontier: %w", err)
+	}
+	// A database with event-sourced state must have an event log.
+	if frontier.Seq == 0 {
+		empty, err := storage.HasNoEventSourcedState(ctx)
+		if err != nil {
+			return fmt.Errorf("event-sourced state check: %w", err)
+		}
+		if !empty {
+			return fmt.Errorf("this database holds event-sourced state but its event log is empty; refusing to start")
+		}
+	}
+
+	if cfg.MeshForkReset == "" {
+		return nil
+	}
+	if cfg.MeshCfg == nil || cfg.MeshCfg.PeerAddr == "" {
+		return fmt.Errorf("--meshforkreset requires a configured mesh peer to reseed from")
+	}
+	if err := mesh.ValidateForkResetToken(cfg.MeshForkReset, frontier); err != nil {
+		return fmt.Errorf("mesh fork reset refused: %w", err)
+	}
+	log.Warnf("MESH FORK RESET: clearing the event log and all event-sourced state (token %s, frontier %s).",
+		cfg.MeshForkReset, frontier)
+	if err := storage.WipeEventSourcedState(ctx); err != nil {
+		return fmt.Errorf("mesh fork reset: wipe failed: %w", err)
+	}
+	log.Warnf("Mesh fork reset complete: event log and event-sourced state cleared. " +
+		"Continuing startup to attempt loading state from the peer.")
+	return nil
+}
+
 // lockersForBackend returns book and swap lockers for OutputTracker backends.
 func lockersForBackend(be asset.Backend, master *coinlock.MasterCoinLocker) (book, swap coinlock.CoinLocker) {
 	if be == nil {
@@ -803,6 +843,10 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 	storage, err := db.Open(ctxDB, "pg", pgCfg)
 	if err != nil {
 		return nil, fmt.Errorf("db.Open: %w", err)
+	}
+
+	if err := meshStartupMaintenance(ctx, cfg, storage); err != nil {
+		return nil, err
 	}
 
 	relayAddrs := make(map[string]string, len(nodeRelayIDs))

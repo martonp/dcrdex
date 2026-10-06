@@ -114,6 +114,11 @@ func Test_validateMeshOptions(t *testing.T) {
 			errWant: "meshpeercert set but meshpeer is not",
 		},
 		{
+			name:    "meshforkreset without meshpeer",
+			cfg:     flagsData{MeshForkReset: "41:deadbeef"},
+			errWant: "meshforkreset set but meshpeer is not",
+		},
+		{
 			name: "listen and clientaddr without meshpeer",
 			cfg: flagsData{
 				MeshListen: "127.0.0.1:7233",
@@ -125,6 +130,10 @@ func Test_validateMeshOptions(t *testing.T) {
 			name:    "whitespace-only meshpeer with meshlisten",
 			cfg:     flagsData{MeshPeerAddr: "  ", MeshListen: "127.0.0.1:7233"},
 			errWant: "meshlisten set but meshpeer is not",
+		},
+		{
+			name: "whitespace-only meshforkreset counts as unset",
+			cfg:  flagsData{MeshForkReset: "  "},
 		},
 		{
 			name: "blank certificate",

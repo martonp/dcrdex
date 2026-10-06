@@ -154,6 +154,7 @@ func mainCore(ctx context.Context) error {
 		},
 		NoResumeSwaps:   cfg.NoResumeSwaps,
 		NodeRelayAddr:   cfg.NodeRelayAddr,
+		MeshForkReset:   cfg.MeshForkReset,
 		RequestShutdown: requestShutdown,
 	}
 	if cfg.MeshPeerAddr != "" {

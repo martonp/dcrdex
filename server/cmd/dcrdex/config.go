@@ -102,6 +102,7 @@ type dexConf struct {
 	MeshPeerAddr      string
 	MeshPeerCert      []byte
 	MeshListen        string
+	MeshForkReset     string
 	ClientAddr        string
 	ValidateMarkets   bool
 	MaxClients        int
@@ -164,10 +165,11 @@ type flagsData struct {
 
 	NodeRelayAddr string `long:"noderelayaddr" description:"The public address by which node sources should connect to the node relay"`
 
-	MeshPeerAddr string `long:"meshpeer" description:"Address of the peer's mesh listener. Accepts host:port (TLS), ws://, or wss:// URLs."`
-	MeshPeerCert string `long:"meshpeercert" description:"Path to the peer's PEM TLS certificate file, required unless meshpeer uses ws://. Relative paths use appdata."`
-	MeshListen   string `long:"meshlisten" description:"Address on which the mesh websocket server should listen for incoming peer connections."`
-	ClientAddr   string `long:"clientaddr" description:"Public client-facing websocket RPC address or URL advertised to mesh peers for client failover."`
+	MeshPeerAddr  string `long:"meshpeer" description:"Address of the peer's mesh listener. Accepts host:port (TLS), ws://, or wss:// URLs."`
+	MeshPeerCert  string `long:"meshpeercert" description:"Path to the peer's PEM TLS certificate file, required unless meshpeer uses ws://. Relative paths use appdata."`
+	MeshListen    string `long:"meshlisten" description:"Address on which the mesh websocket server should listen for incoming peer connections."`
+	MeshForkReset string `long:"meshforkreset" description:"DANGER: clear this node's event log and event-sourced state so it can reload state from its peer. Only for a node halted with MESH FORK DETECTED; the value is the <seq>:<tiphash-prefix> token from the halt error. Back up the database first. Remove this option after use; a stale token prevents startup."`
+	ClientAddr    string `long:"clientaddr" description:"Public client-facing websocket RPC address or URL advertised to mesh peers for client failover."`
 
 	ValidateMarkets bool `long:"validate" description:"Validate the market configuration and quit"`
 
@@ -270,6 +272,7 @@ func validateMeshOptions(cfg *flagsData) error {
 	cfg.MeshListen = strings.TrimSpace(cfg.MeshListen)
 	cfg.ClientAddr = strings.TrimSpace(cfg.ClientAddr)
 	cfg.MeshPeerCert = strings.TrimSpace(cfg.MeshPeerCert)
+	cfg.MeshForkReset = strings.TrimSpace(cfg.MeshForkReset)
 
 	if cfg.MeshPeerAddr == "" {
 		var set []string
@@ -281,6 +284,9 @@ func validateMeshOptions(cfg *flagsData) error {
 		}
 		if cfg.MeshPeerCert != "" {
 			set = append(set, "meshpeercert")
+		}
+		if cfg.MeshForkReset != "" {
+			set = append(set, "meshforkreset")
 		}
 		if len(set) > 0 {
 			return fmt.Errorf("%s set but meshpeer is not; set meshpeer or remove the mesh options",
@@ -658,6 +664,7 @@ func loadConfig() (*dexConf, *procOpts, error) {
 		MeshPeerAddr:      cfg.MeshPeerAddr,
 		MeshPeerCert:      meshPeerCert,
 		MeshListen:        cfg.MeshListen,
+		MeshForkReset:     cfg.MeshForkReset,
 		ClientAddr:        cfg.ClientAddr,
 		ValidateMarkets:   cfg.ValidateMarkets,
 		MaxClients:        cfg.MaxClients,
