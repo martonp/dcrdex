@@ -414,6 +414,19 @@ func ValidateConfigFile(cfgPath string, net dex.Network, log dex.Logger) error {
 // RPCConfig is an alias for the comms Server's RPC config struct.
 type RPCConfig = comms.RPCConfig
 
+// MeshConfig contains mesh transport and client advertisement configuration.
+type MeshConfig struct {
+	// PeerAddr is the address of the peer's mesh listener.
+	PeerAddr string
+	// PeerCert contains the peer's PEM-encoded TLS certificate.
+	PeerCert []byte
+	// ListenAddr is the local mesh listen address.
+	ListenAddr string
+	// ClientAddr is this node's public client-facing address advertised to
+	// the peer so wallets can fail over.
+	ClientAddr string
+}
+
 // DexConf is the configuration data required to create a new DEX.
 type DexConf struct {
 	// RequestShutdown requests server shutdown if the mesh service halts.
@@ -433,6 +446,7 @@ type DexConf struct {
 	CommsCfg         *RPCConfig
 	NoResumeSwaps    bool
 	NodeRelayAddr    string
+	MeshCfg          *MeshConfig
 }
 
 type signer struct {
