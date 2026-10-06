@@ -100,7 +100,9 @@ type swapStatus struct {
 	// The time that the swap coordinator sees the user's redemption
 	// transaction.
 	redeemTime time.Time
-	redemption asset.Coin
+	// Local start of the taker's response window after resuming negotiation.
+	redeemGraceStart time.Time
+	redemption       asset.Coin
 	// secret is the maker's revealed secret, included in redemption requests
 	// sent to the taker.
 	secret []byte
@@ -141,9 +143,14 @@ func (ss *swapStatus) contractState() (known, confirmed bool) {
 	return ss.swap != nil, !ss.swapConfirmed.IsZero()
 }
 
-func (ss *swapStatus) redeemSeenTime() time.Time {
+// redeemInactionStart returns the later of the recorded redemption time and
+// the start of the local startup grace period.
+func (ss *swapStatus) redeemInactionStart() time.Time {
 	ss.mtx.RLock()
 	defer ss.mtx.RUnlock()
+	if ss.redeemGraceStart.After(ss.redeemTime) {
+		return ss.redeemGraceStart
+	}
 	return ss.redeemTime
 }
 
@@ -875,6 +882,24 @@ func (s *Swapper) RestoreActiveSwaps(allowPartial bool) error {
 	return nil
 }
 
+// resumePendingRequests resends unacknowledged match, audit, and redemption
+// requests, giving clients a full response window before inaction checks.
+func (s *Swapper) resumePendingRequests(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.extendInactionDeadlines(time.Now().UTC())
+
+	for _, mt := range s.matchSlice() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.resendPendingRequestsNow(mt, nil)
+	}
+	return nil
+}
+
 // pendingClientRequests identifies requests whose acknowledgements are still missing.
 type pendingClientRequests struct {
 	makerMatchAck  bool // 'match' request to the maker
@@ -1104,6 +1129,36 @@ func (s *Swapper) resendRedemptionRequest(match *matchTracker) {
 	}
 	// Give the recipient a full response timeout for the resent request.
 	s.sendRedemptionRequest(match, match.Taker.User(), false, redemptionParams, s.bTimeout)
+}
+
+// extendInactionDeadlines gives clients at least one broadcast timeout
+// from now to respond, without changing recorded redemption times.
+func (s *Swapper) extendInactionDeadlines(now time.Time) {
+	extendTime := func(t *time.Time) {
+		if !t.IsZero() && t.Before(now) {
+			*t = now
+		}
+	}
+	for _, mt := range s.matchSlice() {
+		mt.mtx.Lock()
+		if mt.time.Before(now) {
+			mt.time = now
+		}
+		mt.mtx.Unlock()
+
+		ms := mt.makerStatus
+		ms.mtx.Lock()
+		if !ms.redeemTime.IsZero() && ms.redeemGraceStart.Before(now) {
+			ms.redeemGraceStart = now
+		}
+		extendTime(&ms.swapConfirmed)
+		ms.mtx.Unlock()
+
+		ts := mt.takerStatus
+		ts.mtx.Lock()
+		extendTime(&ts.swapConfirmed)
+		ts.mtx.Unlock()
+	}
 }
 
 // Run is the main Swapper loop. It's primary purpose is to update transaction
@@ -1536,9 +1591,9 @@ func (s *Swapper) checkInactionEventBased() {
 			}
 		case order.MakerRedeemed:
 			// If the maker has redeemed, the taker can redeem immediately, so
-			// check the timeout against the time the Swapper received the
-			// maker's `redeem` request (and sent the taker's 'redemption').
-			if tooOld(match.makerStatus.redeemSeenTime()) { // rlocks swapStatus.mtx
+			// check the timeout from the recorded redemption or startup grace
+			// period, whichever started later.
+			if tooOld(match.makerStatus.redeemInactionStart()) { // rlocks swapStatus.mtx
 				recordFailure(meshevents.MatchFailureTakerFault)
 			}
 		}

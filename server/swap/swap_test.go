@@ -4134,6 +4134,179 @@ func TestMatchFailureDetection(t *testing.T) {
 	}
 }
 
+func TestResumePendingRequests(t *testing.T) {
+	for _, tt := range []struct {
+		name                             string
+		status                           order.MatchStatus
+		makerAuditAcked, takerAuditAcked bool
+		makerAddr, takerAddr             string
+		setup                            func(*matchTracker)
+		wantMaker, wantTaker             []string
+	}{
+
+		{
+			name:      "both match acknowledgements missing",
+			wantMaker: []string{msgjson.MatchRoute},
+			wantTaker: []string{msgjson.MatchRoute},
+		},
+		{
+			name:      "taker match acknowledgement missing",
+			makerAddr: "maker-addr",
+			wantTaker: []string{msgjson.MatchRoute},
+		},
+		{
+			name:      "maker match acknowledgement missing",
+			takerAddr: "taker-addr",
+			wantMaker: []string{msgjson.MatchRoute},
+		},
+		{
+			name:      "both match acknowledgements recorded",
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+		},
+		{
+			name:      "taker audit missing",
+			status:    order.MakerSwapCast,
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+			wantTaker: []string{msgjson.AuditRoute},
+		},
+		{
+			name:      "both audits missing",
+			status:    order.TakerSwapCast,
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+			wantMaker: []string{msgjson.AuditRoute},
+			wantTaker: []string{msgjson.AuditRoute},
+		},
+		{
+			name:            "maker audit missing",
+			status:          order.TakerSwapCast,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+			takerAuditAcked: true,
+			wantMaker:       []string{msgjson.AuditRoute},
+		},
+		{
+			name:            "both audits recorded",
+			makerAuditAcked: true,
+			takerAuditAcked: true,
+			status:          order.TakerSwapCast,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+		},
+		{
+			name:            "redemption acknowledgement missing",
+			makerAuditAcked: true,
+			takerAuditAcked: true,
+			status:          order.MakerRedeemed,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+			wantTaker:       []string{msgjson.RedemptionRoute},
+		},
+		{
+			name:            "redemption acknowledgement recorded",
+			makerAuditAcked: true,
+			takerAuditAcked: true,
+			status:          order.MakerRedeemed,
+			makerAddr:       "maker-addr",
+			takerAddr:       "taker-addr",
+			setup:           func(match *matchTracker) { match.Sigs.TakerRedeem = []byte("ack") },
+		},
+		{
+			name:      "complete",
+			status:    order.MatchComplete,
+			makerAddr: "maker-addr",
+			takerAddr: "taker-addr",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig, tracker, set := newStaleRig(tt.status, tt.makerAddr, tt.takerAddr)
+			info := set.matchInfos[0]
+			if tt.makerAuditAcked {
+				tracker.Sigs.MakerAudit = info.maker.sig
+			}
+			if tt.takerAuditAcked {
+				tracker.Sigs.TakerAudit = info.taker.sig
+			}
+			if tt.setup != nil {
+				tt.setup(tracker)
+			}
+			tMesh := &tSwapMesh{applier: rig.swapper.Events()}
+			rig.swapper.SetMeshService(tMesh)
+			redeemTime := tracker.makerStatus.redeemTime
+			started := time.Now()
+			if err := rig.swapper.resumePendingRequests(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if len(tMesh.events) != 0 || rig.getTracker() == nil {
+				t.Fatal("resuming requests emitted an event or removed the match")
+			}
+			if tracker.time.Before(started) {
+				t.Fatal("match timeout was not extended")
+			}
+			if !tracker.makerStatus.redeemTime.Equal(redeemTime) {
+				t.Fatal("recorded redemption time changed")
+			}
+			if !redeemTime.IsZero() && tracker.makerStatus.redeemInactionStart().Before(started) {
+				t.Fatal("redemption timeout was not extended")
+			}
+
+			for _, side := range []struct {
+				maker  bool
+				routes []string
+			}{{true, tt.wantMaker}, {false, tt.wantTaker}} {
+				user, oid, counterparty := info.taker.acct, info.takerOID, tracker.makerStatus
+				counterAddr := info.maker.addr
+				if side.maker {
+					user, oid, counterparty, counterAddr = info.maker.acct, info.makerOID, tracker.takerStatus, info.taker.addr
+				}
+				for _, route := range side.routes {
+					req := rig.auth.popReq(user)
+					if req == nil || req.req.Route != route {
+						t.Fatalf("user %v: expected %s request, got %v", user, route, req)
+					}
+					switch route {
+					case msgjson.MatchRoute:
+						if err := rig.checkMatchNotification(req.req, oid, counterAddr); err != nil {
+							t.Fatal(err)
+						}
+					case msgjson.AuditRoute:
+						var got msgjson.Audit
+						if err := req.req.Unmarshal(&got); err != nil {
+							t.Fatal(err)
+						}
+						want := msgjson.Audit{
+							OrderID: oid[:], MatchID: info.matchID[:], Time: uint64(counterparty.swapTime.UnixMilli()),
+							CoinID: counterparty.swap.ID(), Contract: counterparty.swap.ContractData, TxData: counterparty.swap.TxData,
+						}
+						want.Signature = got.Signature
+						if !reflect.DeepEqual(got, want) {
+							t.Fatalf("audit = %+v, want %+v", got, want)
+						}
+					case msgjson.RedemptionRoute:
+						var got msgjson.Redemption
+						if err := req.req.Unmarshal(&got); err != nil {
+							t.Fatal(err)
+						}
+						want := msgjson.Redemption{
+							Redeem: msgjson.Redeem{OrderID: oid[:], MatchID: info.matchID[:], CoinID: counterparty.redemption.ID(), Secret: counterparty.secret},
+							Time:   uint64(redeemTime.UnixMilli()),
+						}
+						want.Signature = got.Signature
+						if !reflect.DeepEqual(got, want) {
+							t.Fatalf("redemption = %+v, want %+v", got, want)
+						}
+					}
+				}
+				if routes := popRoutes(rig.auth, user); len(routes) != 0 {
+					t.Fatalf("user %v: unexpected requests %v", user, routes)
+				}
+			}
+		})
+	}
+}
+
 func TestFailMatch(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -4218,6 +4391,48 @@ func TestFailMatch(t *testing.T) {
 			}
 			if !applied && !tracked {
 				t.Fatalf("live match was untracked")
+			}
+		})
+	}
+}
+
+func TestExtendInactionDeadlines(t *testing.T) {
+	now := time.Now()
+	past, future := now.Add(-time.Hour), now.Add(time.Hour)
+	for _, tt := range []struct {
+		name                                     string
+		recorded, grace                          time.Time
+		wantMatch, wantConfirmed, wantRedemption time.Time
+	}{
+		{name: "unset timestamps", wantMatch: now},
+		{name: "past timestamps", recorded: past, wantMatch: now, wantConfirmed: now, wantRedemption: now},
+		{name: "future timestamps", recorded: future, wantMatch: future, wantConfirmed: future, wantRedemption: future},
+		{name: "existing later grace", recorded: past, grace: future, wantMatch: now, wantConfirmed: now, wantRedemption: future},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker := &matchTracker{
+				time: tt.recorded,
+				makerStatus: &swapStatus{
+					redeemTime:       tt.recorded,
+					redeemGraceStart: tt.grace,
+					swapConfirmed:    tt.recorded,
+				},
+				takerStatus: &swapStatus{swapConfirmed: tt.recorded},
+			}
+			s := &Swapper{matches: map[order.MatchID]*matchTracker{{}: tracker}}
+			s.extendInactionDeadlines(now)
+
+			if !tracker.time.Equal(tt.wantMatch) {
+				t.Fatalf("match response start = %v, want %v", tracker.time, tt.wantMatch)
+			}
+			if !tracker.makerStatus.swapConfirmed.Equal(tt.wantConfirmed) || !tracker.takerStatus.swapConfirmed.Equal(tt.wantConfirmed) {
+				t.Fatalf("swap confirmation times = %v/%v, want %v", tracker.makerStatus.swapConfirmed, tracker.takerStatus.swapConfirmed, tt.wantConfirmed)
+			}
+			if got := tracker.makerStatus.redeemInactionStart(); !got.Equal(tt.wantRedemption) {
+				t.Fatalf("redemption response start = %v, want %v", got, tt.wantRedemption)
+			}
+			if !tracker.makerStatus.redeemTime.Equal(tt.recorded) {
+				t.Fatal("recorded redemption time changed")
 			}
 		})
 	}
