@@ -1544,9 +1544,14 @@ func (dm *DEX) AccountInfo(aid account.AccountID) (*db.Account, error) {
 	return dm.storage.AccountInfo(aid)
 }
 
-// ForgiveMatchFail forgives a user for a specific match failure, potentially
-// allowing them to resume trading if their score becomes passing.
+// ForgiveMatchFail forgives a user's match failure in single-server mode.
+// Snapshots may omit the historical match needed for forgiveness, so applying
+// it on both nodes could produce different reputation changes. Use ForgiveUser
+// to forgive all penalties for an account instead.
 func (dm *DEX) ForgiveMatchFail(aid account.AccountID, mid order.MatchID) (forgiven, unbanned bool, err error) {
+	if !dm.meshSvc.IsSingleServer() {
+		return false, false, fmt.Errorf("forgive_match is not supported on a meshed node; use forgive_user")
+	}
 	return dm.authMgr.ForgiveMatchFail(aid, mid)
 }
 

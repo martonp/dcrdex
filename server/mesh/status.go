@@ -35,6 +35,12 @@ type Status struct {
 	Seeding                  bool      `json:"seeding,omitempty"`
 }
 
+// IsSingleServer reports whether the service is configured for single-server operation.
+func (s *Service) IsSingleServer() bool {
+	_, singleServer := s.transport.(*singleServerTransport)
+	return singleServer
+}
+
 // Status reports the mesh status for the admin API.
 func (s *Service) Status() Status {
 	st := Status{

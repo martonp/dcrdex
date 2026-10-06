@@ -14,6 +14,9 @@ import (
 
 func TestServiceStatusSingleServer(t *testing.T) {
 	svc := newTestService(t, nil, nil)
+	if !svc.IsSingleServer() {
+		t.Fatal("single-server service reported mesh operation")
+	}
 	st := svc.Status()
 	if st.Mode != "single_server" {
 		t.Fatalf("mode = %q, want single_server", st.Mode)
@@ -30,6 +33,9 @@ func TestServiceStatusSingleServer(t *testing.T) {
 
 func TestServiceStatusMeshTransport(t *testing.T) {
 	svc := newTestService(t, nil, &testTransport{master: true})
+	if svc.IsSingleServer() {
+		t.Fatal("mesh service reported single-server operation")
+	}
 	st := svc.Status()
 	if st.Mode != modeEstablishedMaster.String() {
 		t.Fatalf("mode = %q, want %s", st.Mode, modeEstablishedMaster)
