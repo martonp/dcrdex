@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"decred.org/dcrdex/dex"
@@ -488,6 +489,7 @@ type DEX struct {
 	bookRouter  *market.BookRouter
 	subsystems  []subsystem
 	server      *comms.Server
+	stopping    atomic.Bool
 
 	configRespMtx sync.RWMutex
 	configResp    *configResponse
@@ -547,6 +549,7 @@ func (cr *configResponse) remarshal() {
 // Stop shuts down the DEX. Stop returns only after all components have
 // completed their shutdown.
 func (dm *DEX) Stop() {
+	dm.stopping.Store(true)
 	log.Infof("Stopping all DEX subsystems.")
 	for _, ss := range dm.subsystems {
 		log.Infof("Stopping %s...", ss.name)
@@ -1186,7 +1189,13 @@ func NewDEX(ctx context.Context, cfg *DexConf) (*DEX, error) {
 		MasterWorkers:  masterWorkers,
 		EventLogReader: storage,
 		Logger:         cfg.LogBackend.NewLogger("MSH", log.Level()),
-		OnHalt:         func(err error) { cfg.RequestShutdown(fmt.Sprintf("mesh halted: %v", err)) },
+		OnHalt: func(err error) {
+			if dexMgr.stopping.Load() {
+				return
+			}
+			log.Warnf("Mesh subsystem halted: %v. Requesting DEX shutdown.", err)
+			cfg.RequestShutdown(fmt.Sprintf("mesh halted: %v", err))
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create mesh service: %w", err)
