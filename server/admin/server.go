@@ -59,7 +59,7 @@ var (
 type SvrCore interface {
 	AccountInfo(acctID account.AccountID) (*db.Account, error)
 	UserMatchFails(aid account.AccountID, n int) ([]*auth.MatchFail, error)
-	Notify(acctID account.AccountID, msg *msgjson.Message)
+	Notify(acctID account.AccountID, msg *msgjson.Message) error
 	NotifyAll(msg *msgjson.Message)
 	ConfigMsg() json.RawMessage
 	Asset(id uint32) (*asset.BackedAsset, error)

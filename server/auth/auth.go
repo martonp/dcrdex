@@ -530,12 +530,6 @@ func (auth *AuthManager) Send(user account.AccountID, msg *msgjson.Message) erro
 	return err
 }
 
-// Notify is identical to Send and remains only to keep existing callers compiling.
-// Remove it once all call sites use Send.
-func (auth *AuthManager) Notify(acctID account.AccountID, msg *msgjson.Message) error {
-	return auth.Send(acctID, msg)
-}
-
 // SendIfLocal sends a message to a locally connected user.
 // It returns nil if the user is not connected locally.
 func (auth *AuthManager) SendIfLocal(user account.AccountID, msg *msgjson.Message) error {

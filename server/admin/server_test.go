@@ -70,6 +70,7 @@ type TCore struct {
 	marketMatches    []*dexsrv.MatchData
 	marketMatchesErr error
 	dataEnabled      uint32
+	notifyErr        error
 }
 
 func (c *TCore) ConfigMsg() json.RawMessage { return nil }
@@ -232,9 +233,11 @@ func (c *TCore) CreatePrepaidBonds(n int, strength uint32, durSecs int64) ([][]b
 func (c *TCore) AccountMatchOutcomesN(user account.AccountID, n int) ([]*auth.MatchOutcome, error) {
 	return nil, nil
 }
-func (c *TCore) Notify(_ account.AccountID, _ *msgjson.Message) {}
-func (c *TCore) NotifyAll(_ *msgjson.Message)                   {}
-func (c *TCore) ForgiveUser(account.AccountID) error            { return nil }
+func (c *TCore) Notify(_ account.AccountID, _ *msgjson.Message) error {
+	return c.notifyErr
+}
+func (c *TCore) NotifyAll(_ *msgjson.Message)        {}
+func (c *TCore) ForgiveUser(account.AccountID) error { return nil }
 
 // genCertPair generates a key/cert pair to the paths provided.
 func genCertPair(certFile, keyFile string) error {
@@ -1330,12 +1333,31 @@ func TestNotify(t *testing.T) {
 	msgStr := "Hello world.\nAll your base are belong to us."
 	tests := []struct {
 		name, txt, acctID string
+		notifyErr         error
 		wantCode          int
 	}{{
 		name:     "ok",
 		acctID:   acctIDStr,
 		txt:      msgStr,
 		wantCode: http.StatusOK,
+	}, {
+		name:      "user not connected",
+		acctID:    acctIDStr,
+		txt:       msgStr,
+		notifyErr: auth.ErrUserNotConnected,
+		wantCode:  http.StatusNotFound,
+	}, {
+		name:      "wrapped user not connected",
+		acctID:    acctIDStr,
+		txt:       msgStr,
+		notifyErr: fmt.Errorf("delivery failed: %w", auth.ErrUserNotConnected),
+		wantCode:  http.StatusNotFound,
+	}, {
+		name:      "delivery error",
+		acctID:    acctIDStr,
+		txt:       msgStr,
+		notifyErr: errors.New("delivery failed"),
+		wantCode:  http.StatusInternalServerError,
 	}, {
 		name:     "ok at max size",
 		acctID:   acctIDStr,
@@ -1362,6 +1384,7 @@ func TestNotify(t *testing.T) {
 		wantCode: http.StatusBadRequest,
 	}}
 	for _, test := range tests {
+		core.notifyErr = test.notifyErr
 		w := httptest.NewRecorder()
 		br := bytes.NewReader([]byte(test.txt))
 		r, _ := http.NewRequest("POST", "https://localhost/account/"+test.acctID+"/notify", br)

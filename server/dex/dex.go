@@ -1562,14 +1562,23 @@ func (dm *DEX) UserMatchFails(aid account.AccountID, n int) ([]*auth.MatchFail, 
 	return dm.authMgr.UserMatchFails(aid, n)
 }
 
-// Notify sends a text notification to a connected client.
-func (dm *DEX) Notify(acctID account.AccountID, msg *msgjson.Message) {
-	dm.authMgr.Notify(acctID, msg)
+// Notify sends a text notification to a connected client on this node or
+// the mesh peer.
+func (dm *DEX) Notify(acctID account.AccountID, msg *msgjson.Message) error {
+	return dm.authMgr.Send(acctID, msg)
 }
 
-// NotifyAll sends a text notification to all connected clients.
+// NotifyAll broadcasts a text notification to clients connected to either node.
+// It logs an error if delivery to the peer cannot be confirmed.
 func (dm *DEX) NotifyAll(msg *msgjson.Message) {
 	dm.server.Broadcast(msg)
+	err := dm.meshSvc.ProxyClientMessage(context.Background(), &mesh.ClientProxyMessage{
+		Msg:       msg,
+		Broadcast: true,
+	})
+	if err != nil {
+		log.Errorf("Failed to confirm %q broadcast to the mesh peer: %v", msg.Route, err)
+	}
 }
 
 // BookOrders returns booked orders for market with base and quote.
