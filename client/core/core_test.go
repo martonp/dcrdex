@@ -182,6 +182,7 @@ type TWebsocket struct {
 	handlers       map[string][]func(*msgjson.Message, msgFunc) error
 	submittedBond  *msgjson.PostBond
 	liveBondExpiry uint64
+	down           atomic.Bool
 }
 
 func newTWebsocket() *TWebsocket {
@@ -347,7 +348,10 @@ func (conn *TWebsocket) RequestWithTimeout(msg *msgjson.Message, f func(*msgjson
 }
 func (conn *TWebsocket) MessageSource() <-chan *msgjson.Message { return conn.msgs } // use when Core.listen is running
 func (conn *TWebsocket) IsDown() bool {
-	return false
+	return conn.down.Load()
+}
+func (conn *TWebsocket) setDown(down bool) {
+	conn.down.Store(down)
 }
 func (conn *TWebsocket) Connect(context.Context) (*sync.WaitGroup, error) {
 	// NOTE: tCore's wsConstructor just returns a reused conn, so we can't close
@@ -369,7 +373,7 @@ func (conn *TWebsocket) SetFailoverEndpoints(endpoints []*comms.WsEndpoint) erro
 func (conn *TWebsocket) ActiveEndpoint() string {
 	conn.mtx.RLock()
 	defer conn.mtx.RUnlock()
-	if len(conn.endpoints) == 0 {
+	if conn.IsDown() || len(conn.endpoints) == 0 {
 		return ""
 	}
 	return conn.endpoints[0].URL
@@ -2253,7 +2257,24 @@ func TestHandleMeshEndpointsMsg(t *testing.T) {
 		endpointErr  error
 		persistErr   error
 		keepPrevious bool
+		unregistered bool
+		replaced     bool
 	}{
+		{
+			name:         "unchanged peers",
+			advertised:   []*msgjson.MeshEndpoint{previous},
+			keepPrevious: true,
+		},
+		{
+			name:         "unregistered connection",
+			advertised:   []*msgjson.MeshEndpoint{replacement},
+			unregistered: true,
+		},
+		{
+			name:       "replaced connection",
+			advertised: []*msgjson.MeshEndpoint{replacement},
+			replaced:   true,
+		},
 		{
 			name:       "replace peers",
 			advertised: []*msgjson.MeshEndpoint{replacement},
@@ -2294,6 +2315,13 @@ func TestHandleMeshEndpointsMsg(t *testing.T) {
 			dc := rig.dc
 			rig.db.acct = &db.AccountInfo{Host: dc.acct.host}
 			rig.core.configureMeshEndpoints(dc, []*msgjson.MeshEndpoint{previous})
+			feed := rig.core.NotificationFeed()
+			defer feed.ReturnFeed()
+			if test.unregistered {
+				delete(rig.core.conns, dc.acct.host)
+			} else if test.replaced {
+				rig.core.conns[dc.acct.host] = &dexConnection{acct: dc.acct}
+			}
 			rig.ws.endpointErr = test.endpointErr
 			rig.db.updateAccountErr = test.persistErr
 
@@ -2327,6 +2355,20 @@ func TestHandleMeshEndpointsMsg(t *testing.T) {
 			rig.ws.mtx.RUnlock()
 			if !reflect.DeepEqual(endpoints, wantEndpoints) {
 				t.Fatalf("websocket endpoints = %+v, want %+v", endpoints, wantEndpoints)
+			}
+
+			wantNote := !test.keepPrevious && !test.unregistered && !test.replaced
+			noteCount := len(feed.C)
+			if wantNote {
+				if noteCount != 1 {
+					t.Fatalf("got %d notes, want one endpoint update", noteCount)
+				}
+				note, ok := (<-feed.C).(*ServerEndpointsNote)
+				if !ok || note.Host != dc.acct.host || !reflect.DeepEqual(note.ServerEndpoints, []string{tDexHost, wantPeer.Host}) {
+					t.Fatalf("unexpected endpoint note: %+v", note)
+				}
+			} else if noteCount != 0 {
+				t.Fatalf("got %d unexpected notes", noteCount)
 			}
 
 			if test.persistErr != nil {
@@ -3085,6 +3127,13 @@ func TestConnectDEX(t *testing.T) {
 	if !bytes.Equal(endpoints[1].Cert, meshCert) {
 		t.Fatalf("advertised mesh endpoint cert not passed to websocket")
 	}
+	wantHosts := []string{"somedex.com:7232", "mesh.example:7232"}
+	if hosts := dc.endpointHostList(); !reflect.DeepEqual(hosts, wantHosts) {
+		t.Fatalf("endpoint hosts = %v, want %v", hosts, wantHosts)
+	}
+	if active := dc.activeEndpointHost(); active != "somedex.com:7232" {
+		t.Fatalf("active endpoint host = %q, want somedex.com:7232", active)
+	}
 	if len(ai.MeshEndpoints) != 1 || ai.MeshEndpoints[0].Host != "mesh.example:7232" ||
 		!bytes.Equal(ai.MeshEndpoints[0].Cert, meshCert) {
 		t.Fatalf("advertised mesh endpoint not persisted: %+v", ai.MeshEndpoints)
@@ -3175,6 +3224,67 @@ func TestConnectDEX(t *testing.T) {
 	dc.connMaster.Disconnect()
 
 	// TODO: test temporary, ensure listen isn't running, somehow
+}
+
+func TestHandleConnectEventEndpointSwitch(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc := rig.dc
+	atomic.StoreUint32(&dc.reportingConnects, 1)
+	var notes []*ConnEventNote
+	dc.notify = func(n Notification) {
+		if note, ok := n.(*ConnEventNote); ok {
+			notes = append(notes, note)
+		}
+	}
+
+	const peerHost = "[::1]:7232"
+	hosts := []string{tDexHost, peerHost}
+	dc.setEndpointHosts(hosts)
+	for _, test := range []struct {
+		name       string
+		activeHost string
+		wantSwitch bool
+	}{
+		{name: "first connection", activeHost: tDexHost},
+		{name: "disconnect"},
+		{name: "same endpoint", activeHost: tDexHost},
+		{name: "failover", activeHost: peerHost, wantSwitch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			notes = nil
+			status := comms.Disconnected
+			rig.ws.setDown(test.activeHost == "")
+			if test.activeHost != "" {
+				status = comms.Connected
+				if err := dc.SetFailoverEndpoints([]*comms.WsEndpoint{{URL: "wss://" + test.activeHost + "/ws"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rig.core.handleConnectEvent(dc, status)
+
+			var switches int
+			for _, note := range notes {
+				if note.Host != tDexHost || note.ActiveEndpoint != test.activeHost || note.ConnectionStatus != status {
+					t.Fatalf("unexpected connection note: %+v", note)
+				}
+				if note.Topic() == TopicServerEndpointSwitched {
+					switches++
+				}
+			}
+			wantSwitches := 0
+			if test.wantSwitch {
+				wantSwitches = 1
+			}
+			if switches != wantSwitches || len(notes) != 1+wantSwitches {
+				t.Fatalf("got %d connection notes with %d switches, want %d with %d switches", len(notes), switches, 1+wantSwitches, wantSwitches)
+			}
+			xc := rig.core.exchangeInfo(dc)
+			if xc.ActiveEndpoint != test.activeHost || !reflect.DeepEqual(xc.ServerEndpoints, hosts) {
+				t.Fatalf("exchange endpoints = %v, active = %q", xc.ServerEndpoints, xc.ActiveEndpoint)
+			}
+		})
+	}
 }
 
 func TestInitializeClient(t *testing.T) {

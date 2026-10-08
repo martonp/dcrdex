@@ -742,8 +742,13 @@ type ExchangeAuth struct {
 
 // Exchange represents a single DEX with any number of markets.
 type Exchange struct {
-	Host             string                 `json:"host"`
-	AcctID           string                 `json:"acctID"`
+	Host   string `json:"host"`
+	AcctID string `json:"acctID"`
+	// ServerEndpoints is the registered host plus advertised mesh peers.
+	ServerEndpoints []string `json:"serverEndpoints,omitempty"`
+	// ActiveEndpoint is the live endpoint host; may differ from Host after
+	// failover. Empty when disconnected.
+	ActiveEndpoint   string                 `json:"activeEndpoint,omitempty"`
 	DEXPubKey        dex.Bytes              `json:"dexPubKey,omitempty"`
 	Markets          map[string]*Market     `json:"markets"`
 	Assets           map[uint32]*dex.Asset  `json:"assets"`

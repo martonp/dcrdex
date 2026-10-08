@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -208,6 +209,11 @@ type dexConnection struct {
 	lastConnectMtx sync.RWMutex
 	lastConnect    time.Time
 
+	endpointsMtx  sync.RWMutex // endpointHosts, lastConnectedHost
+	endpointHosts []string     // registered host first, then mesh peers
+	// lastConnectedHost is used to detect failover between successful connects.
+	lastConnectedHost string
+
 	// mmSnapshotSubs tracks markets with active MM snapshot subscriptions,
 	// keyed by market name (e.g. "dcr_btc"), for re-subscription on
 	// reconnect.
@@ -274,6 +280,28 @@ func (dc *dexConnection) running(mkt string) bool {
 // status returns the status of the connection to the dex.
 func (dc *dexConnection) status() comms.ConnectionStatus {
 	return comms.ConnectionStatus(atomic.LoadUint32(&dc.connectionStatus))
+}
+
+func (dc *dexConnection) setEndpointHosts(hosts []string) bool {
+	dc.endpointsMtx.Lock()
+	defer dc.endpointsMtx.Unlock()
+	changed := !slices.Equal(dc.endpointHosts, hosts)
+	dc.endpointHosts = hosts
+	return changed
+}
+
+func (dc *dexConnection) endpointHostList() []string {
+	dc.endpointsMtx.RLock()
+	defer dc.endpointsMtx.RUnlock()
+	return append([]string(nil), dc.endpointHosts...)
+}
+
+func (dc *dexConnection) activeEndpointHost() string {
+	endpoint, err := url.Parse(dc.ActiveEndpoint())
+	if err != nil {
+		return ""
+	}
+	return endpoint.Host
 }
 
 func (dc *dexConnection) config() *msgjson.ConfigResult {
@@ -536,6 +564,8 @@ func (c *Core) exchangeInfo(dc *dexConnection) *Exchange {
 		return &Exchange{
 			Host:             dc.acct.host,
 			AcctID:           acctID,
+			ServerEndpoints:  dc.endpointHostList(),
+			ActiveEndpoint:   dc.activeEndpointHost(),
 			DEXPubKey:        dexPubKeyB,
 			ConnectionStatus: dc.status(),
 			Disabled:         dc.acct.isDisabled(),
@@ -568,6 +598,8 @@ func (c *Core) exchangeInfo(dc *dexConnection) *Exchange {
 	return &Exchange{
 		Host:             dc.acct.host,
 		AcctID:           acctID,
+		ServerEndpoints:  dc.endpointHostList(),
+		ActiveEndpoint:   dc.activeEndpointHost(),
 		DEXPubKey:        dexPubKeyB,
 		Markets:          dc.marketMap(),
 		Assets:           assets,
@@ -5539,7 +5571,7 @@ func (c *Core) initializeDEXConnection(dc *dexConnection, crypter encrypt.Crypte
 		c.log.Warnf("Connection to %v not available for authorization. "+
 			"It will automatically authorize when it connects.", dc.acct.host)
 		subject, details := c.formatDetails(TopicDEXDisconnected, dc.acct.host)
-		c.notify(newConnEventNote(TopicDEXDisconnected, subject, dc.acct.host, comms.Disconnected, details, db.ErrorLevel))
+		c.notify(newConnEventNote(TopicDEXDisconnected, subject, dc.acct.host, "", comms.Disconnected, details, db.ErrorLevel))
 		return
 	}
 
@@ -8966,16 +8998,30 @@ func (c *Core) applyMeshEndpoints(dc *dexConnection, advertised []*msgjson.MeshE
 	}
 
 	endpoints := make([]*comms.WsEndpoint, 0, len(candidates))
+	hosts := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		endpoint, err := c.wsEndpoint(candidate.Host, candidate.Cert)
 		if err != nil {
 			return nil, fmt.Errorf("mesh endpoint %q: %w", candidate.Host, err)
 		}
 		endpoints = append(endpoints, endpoint)
+		hosts = append(hosts, candidate.Host)
 	}
 
 	if err := dc.FailoverWsConn.SetFailoverEndpoints(endpoints); err != nil {
 		return nil, err
+	}
+	if dc.setEndpointHosts(hosts) {
+		c.connMtx.RLock()
+		current := c.conns[dc.acct.host] == dc
+		c.connMtx.RUnlock()
+		if current {
+			c.notify(&ServerEndpointsNote{
+				Notification:    db.NewNotification(NoteTypeServerEndpoints, TopicServerEndpointsUpdated, "", "", db.Data),
+				Host:            dc.acct.host,
+				ServerEndpoints: hosts,
+			})
+		}
 	}
 	return candidates[1:], nil
 }
@@ -9118,6 +9164,7 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 	// Seed failover from saved peers so the registered host need not be reachable.
 	// Skip peers with invalid addresses or unavailable proxy settings.
 	endpoints := []*comms.WsEndpoint{wsEndpoint}
+	hosts := []string{host}
 	seen := map[string]struct{}{host: {}}
 	for _, meshEndpoint := range acctInfo.MeshEndpoints {
 		peerHost, err := addrHost(meshEndpoint.Host)
@@ -9137,6 +9184,7 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 			continue
 		}
 		endpoints = append(endpoints, endpoint)
+		hosts = append(hosts, peerHost)
 	}
 
 	// Create a websocket "connection" to the server. (Don't actually connect.)
@@ -9147,6 +9195,7 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 
 	dc.FailoverWsConn = conn
 	dc.connMaster = dex.NewConnectionMaster(conn)
+	dc.setEndpointHosts(hosts)
 
 	return dc, nil
 }
@@ -9437,11 +9486,21 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 	atomic.StoreUint32(&dc.connectionStatus, uint32(status))
 
 	topic := TopicDEXDisconnected
+	var activeHost string
+	var endpointSwitched bool
 	if status == comms.Connected {
 		topic = TopicDEXConnected
 		dc.lastConnectMtx.Lock()
 		dc.lastConnect = time.Now()
 		dc.lastConnectMtx.Unlock()
+
+		activeHost = dc.activeEndpointHost()
+		dc.endpointsMtx.Lock()
+		if activeHost != "" {
+			endpointSwitched = dc.lastConnectedHost != "" && dc.lastConnectedHost != activeHost
+			dc.lastConnectedHost = activeHost
+		}
+		dc.endpointsMtx.Unlock()
 	} else {
 		dc.lastConnectMtx.RLock()
 		lastConnect := dc.lastConnect
@@ -9452,7 +9511,7 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 			if count%wsMaxAnomalyCount == 0 {
 				// Send notification to check connectivity.
 				subject, details := c.formatDetails(TopicDexConnectivity, dc.acct.host)
-				c.notify(newConnEventNote(TopicDexConnectivity, subject, dc.acct.host, dc.status(), details, db.Poke))
+				c.notify(newConnEventNote(TopicDexConnectivity, subject, dc.acct.host, dc.activeEndpointHost(), dc.status(), details, db.Poke))
 			}
 		} else {
 			atomic.StoreUint32(&dc.anomaliesCount, 0)
@@ -9478,7 +9537,11 @@ func (c *Core) handleConnectEvent(dc *dexConnection, status comms.ConnectionStat
 
 	if dc.broadcastingConnect() {
 		subject, details := c.formatDetails(topic, dc.acct.host)
-		dc.notify(newConnEventNote(topic, subject, dc.acct.host, status, details, db.Poke))
+		dc.notify(newConnEventNote(topic, subject, dc.acct.host, activeHost, status, details, db.Poke))
+		if endpointSwitched {
+			subject, details := c.formatDetails(TopicServerEndpointSwitched, dc.acct.host, activeHost)
+			dc.notify(newConnEventNote(TopicServerEndpointSwitched, subject, dc.acct.host, activeHost, status, details, db.Poke))
+		}
 	}
 }
 

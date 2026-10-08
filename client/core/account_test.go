@@ -8,6 +8,7 @@ import (
 	"errors"
 	"testing"
 
+	"decred.org/dcrdex/client/comms"
 	"decred.org/dcrdex/client/db"
 	"decred.org/dcrdex/dex/encode"
 	"decred.org/dcrdex/dex/msgjson"
@@ -132,6 +133,22 @@ func TestToggleAccountStatus(t *testing.T) {
 		}
 		tCore.connMtx.Unlock()
 
+		feed := tCore.NotificationFeed()
+		defer feed.ReturnFeed()
+		if !test.wantDisable {
+			rig.acct.toggleAccountStatus(true)
+			rig.db.acct.Host = test.host
+			rig.db.acct.Disabled = false
+			// Keep the disabled connection separate from the new live websocket.
+			oldWS := newTWebsocket()
+			oldWS.setDown(true)
+			rig.dc.FailoverWsConn = oldWS
+			rig.dc.notify = tCore.notify
+			// A view-only account needs no authentication to test the endpoint note.
+			rig.db.acct.EncKeyV2 = nil
+			rig.queueConfig()
+		}
+
 		err := tCore.ToggleAccountStatus(tPW, test.host, test.wantDisable, false)
 		if test.wantErr {
 			if err == nil {
@@ -157,8 +174,22 @@ func TestToggleAccountStatus(t *testing.T) {
 					" got: %v", test.host, *rig.db.disabledHost)
 			}
 		} else {
-			if dc, found := tCore.conns[test.host]; found && dc.acct.isDisabled() {
-				t.Fatal("expected enabled dex account")
+			dc := tCore.conns[test.host]
+			defer dc.connMaster.Disconnect()
+			if dc == rig.dc || dc.acct.isDisabled() {
+				t.Fatal("expected a new enabled dex account")
+			}
+			var enabledNotes int
+			for len(feed.C) > 0 {
+				if note, ok := (<-feed.C).(*ConnEventNote); ok && note.Topic() == TopicDEXEnabled {
+					enabledNotes++
+					if note.ActiveEndpoint != test.host || note.ConnectionStatus != comms.Connected {
+						t.Fatalf("incorrect enabled note: %+v", note)
+					}
+				}
+			}
+			if enabledNotes != 1 {
+				t.Fatalf("got %d enabled notes, want 1", enabledNotes)
 			}
 		}
 	}
