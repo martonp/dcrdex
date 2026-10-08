@@ -880,18 +880,50 @@ type serverMatches struct {
 	tracker    *trackedTrade
 	msgMatches []*msgjson.Match
 	cancel     *msgjson.Match
-	// perMatchAddrs maps match ID hex to the per-match swap address we
-	// generated and included in our ack.
+	// perMatchAddrs maps match ID hex to the new or reused swap address
+	// to store when negotiating the match.
 	perMatchAddrs map[string]string
 }
 
-// parseMatches sorts the list of matches and associates them with a trade. This
-// may be called from handleMatchRoute on receipt of a new 'match' request, or
+// parsedMatch holds a match message, its trade, and our acknowledgement signature.
+// Each entry keeps its trade so a self-trade acknowledges each order's own address.
+type parsedMatch struct {
+	msgMatch      *msgjson.Match
+	tracker       *trackedTrade
+	isCancelOrder bool
+	sig           []byte
+}
+
+// buildMatchAcks returns acknowledgements in request order using stored swap
+// addresses. Cancel matches have no address; a trade match without one fails
+// the batch.
+func buildMatchAcks(parsed []*parsedMatch) ([]msgjson.Acknowledgement, error) {
+	acks := make([]msgjson.Acknowledgement, 0, len(parsed))
+	for _, pm := range parsed {
+		ack := msgjson.Acknowledgement{MatchID: pm.msgMatch.MatchID, Sig: pm.sig}
+		if pm.isCancelOrder {
+			acks = append(acks, ack)
+			continue
+		}
+		var mid order.MatchID
+		copy(mid[:], pm.msgMatch.MatchID)
+		addr, isCancel := pm.tracker.matchAckAddress(mid)
+		if !isCancel && addr == "" {
+			return nil, fmt.Errorf("no stored swap address for match %v", mid)
+		}
+		ack.Address = addr
+		acks = append(acks, ack)
+	}
+	return acks, nil
+}
+
+// parseMatches associates reported matches with trades and obtains their swap
+// addresses. It is called from handleMatchRoute for a new 'match' request, or
 // by authDEX with the list of active matches returned by the 'connect' request.
 // The returned failed set identifies matches the server reported but the client
 // could not process, so reconnect reconciliation does not treat them as missing.
-func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []msgjson.Acknowledgement, map[order.MatchID]struct{}, error) {
-	var acks []msgjson.Acknowledgement
+func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []*parsedMatch, map[order.MatchID]struct{}, error) {
+	var accepted []*parsedMatch
 	matches := make(map[order.OrderID]*serverMatches)
 	var errs []string
 	failed := make(map[order.MatchID]struct{})
@@ -906,12 +938,6 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	// and must complete before phase 2's slow wallet RPCs, which could
 	// otherwise allow cancel orders to be retired by concurrent trade
 	// ticks before findOrder is called for them.
-	type parsedMatch struct {
-		msgMatch *msgjson.Match
-		tracker  *trackedTrade
-		isCancel bool
-		sig      []byte
-	}
 	var parsed []*parsedMatch
 	for _, msgMatch := range msgMatches {
 		var oid order.OrderID
@@ -957,14 +983,14 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 		}
 
 		parsed = append(parsed, &parsedMatch{
-			msgMatch: msgMatch,
-			tracker:  tracker,
-			isCancel: isCancel,
-			sig:      sig,
+			msgMatch:      msgMatch,
+			tracker:       tracker,
+			isCancelOrder: isCancel,
+			sig:           sig,
 		})
 	}
 
-	// Phase 2: Generate per-match swap addresses for non-cancel matches.
+	// Phase 2: Reuse stored swap addresses, or generate them for new matches.
 	// RedemptionAddress involves wallet RPCs that can be very slow under
 	// load, so generate them concurrently to avoid O(N) serial latency.
 	type addrResult struct {
@@ -974,8 +1000,20 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	}
 	addrCh := make(chan addrResult, len(parsed))
 	for i, pm := range parsed {
-		if pm.isCancel {
+		if pm.isCancelOrder {
 			addrCh <- addrResult{idx: i}
+			continue
+		}
+		// Reuse the address saved for this match and used to verify its contract.
+		var mid order.MatchID
+		copy(mid[:], pm.msgMatch.MatchID)
+		if addr, known := pm.tracker.storedSwapAddress(mid); known {
+			if addr == "" {
+				addrCh <- addrResult{idx: i, err: fmt.Sprintf(
+					"known match %v has no stored swap address", mid)}
+				continue
+			}
+			addrCh <- addrResult{idx: i, addr: addr}
 			continue
 		}
 		if pm.tracker.wallets == nil || pm.tracker.wallets.toWallet == nil {
@@ -1008,19 +1046,15 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 		addrs[res.idx] = res.addr
 	}
 
-	// Phase 3: Assemble matches and acks from the address results.
+	// Phase 3: Group successful matches by trade and retain their request order.
 	for i, pm := range parsed {
 		if addrFailed[i] {
 			continue
 		}
 		perMatchAddr := addrs[i]
 
-		// Success. Add the serverMatch and the Acknowledgement.
-		acks = append(acks, msgjson.Acknowledgement{
-			MatchID: pm.msgMatch.MatchID,
-			Sig:     pm.sig,
-			Address: perMatchAddr,
-		})
+		// Success. Add the serverMatch.
+		accepted = append(accepted, pm)
 
 		trackerID := pm.tracker.ID()
 		match := matches[trackerID]
@@ -1031,7 +1065,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			}
 			matches[trackerID] = match
 		}
-		if pm.isCancel {
+		if pm.isCancelOrder {
 			match.cancel = pm.msgMatch // taker match
 		} else {
 			match.msgMatches = append(match.msgMatches, pm.msgMatch)
@@ -1051,9 +1085,9 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	if len(errs) > 0 {
 		err = fmt.Errorf("parseMatches errors: %s", strings.Join(errs, ", "))
 	}
-	// A non-nil error only means that at least one match failed to parse, so we
-	// must return the successful matches and acks for further processing.
-	return matches, acks, failed, err
+	// A non-nil error only means that at least one match failed to parse, so
+	// we must return the successful matches for further processing.
+	return matches, accepted, failed, err
 }
 
 // matchDiscreps specifies a trackedTrades's missing and extra matches compared
@@ -10401,7 +10435,7 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	// request handling.
 
 	// Acknowledgements MUST be in the same orders as the msgjson.Matches.
-	matches, acks, _, err := dc.parseMatches(msgMatches, true)
+	matches, parsed, _, err := dc.parseMatches(msgMatches, true)
 	if err != nil {
 		// Even one failed match fails them all since the server requires acks
 		// for them all, and in the same order. TODO: consider lifting this
@@ -10427,7 +10461,32 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 		}
 	}
 
-	resp, err := msgjson.NewResponse(msg.ID, acks, nil)
+	// Store matches before acknowledging them, so the addresses we send agree
+	// with those saved locally and used to verify the counterparty's contracts.
+	var wg sync.WaitGroup
+	for oid, sm := range matches {
+		wg.Add(1)
+		dc.dispatchTradeWork(oid, func() {
+			defer wg.Done()
+			updatedAssets, err := c.negotiateMatches(sm)
+			if len(updatedAssets) > 0 {
+				c.updateBalances(updatedAssets)
+			}
+			if err != nil {
+				c.log.Errorf("negotiateMatches for order %v: %v", sm.tracker.ID(), err)
+			}
+		})
+	}
+	wg.Wait()
+
+	// Another delivery may have stored the match while this request was being
+	// processed. Acknowledge the saved address, not the one obtained above.
+	ackMsgs, err := buildMatchAcks(parsed)
+	if err != nil {
+		return err
+	}
+
+	resp, err := msgjson.NewResponse(msg.ID, ackMsgs, nil)
 	if err != nil {
 		return err
 	}
@@ -10437,23 +10496,6 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	if err != nil {
 		// Do not bail on the matches on error, just log it.
 		c.log.Errorf("Send match response: %v", err)
-	}
-
-	// Dispatch per-trade negotiate work to the per-trade message
-	// queues. Each trade's negotiate runs sequentially with other
-	// messages for that trade (e.g. audit, redemption), preserving
-	// the ordering the server sent while allowing different trades
-	// to be processed concurrently.
-	for oid, sm := range matches {
-		dc.dispatchTradeWork(oid, func() {
-			updatedAssets, err := c.negotiateMatches(sm)
-			if len(updatedAssets) > 0 {
-				c.updateBalances(updatedAssets)
-			}
-			if err != nil {
-				c.log.Errorf("negotiateMatches for order %v: %v", sm.tracker.ID(), err)
-			}
-		})
 	}
 
 	for mktID := range mktIDs {

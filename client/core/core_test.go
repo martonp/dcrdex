@@ -172,6 +172,7 @@ type TWebsocket struct {
 	id             uint64
 	sendErr        error
 	sendMsgErrChan chan *msgjson.Error
+	sentMsgs       []*msgjson.Message
 	reqErr         error
 	connectErr     error
 	msgs           <-chan *msgjson.Message
@@ -309,6 +310,9 @@ func (conn *TWebsocket) NextID() uint64 {
 	return conn.id
 }
 func (conn *TWebsocket) Send(msg *msgjson.Message) error {
+	conn.mtx.Lock()
+	conn.sentMsgs = append(conn.sentMsgs, msg)
+	conn.mtx.Unlock()
 	if conn.sendMsgErrChan != nil {
 		resp, err := msg.Response()
 		if err != nil {
@@ -325,6 +329,18 @@ func (conn *TWebsocket) Send(msg *msgjson.Message) error {
 
 func (conn *TWebsocket) SendRaw([]byte) error {
 	return conn.sendErr
+}
+
+// sentResponse finds the response sent for the request with the given ID.
+func (conn *TWebsocket) sentResponse(id uint64) *msgjson.Message {
+	conn.mtx.RLock()
+	defer conn.mtx.RUnlock()
+	for _, msg := range conn.sentMsgs {
+		if msg.Type == msgjson.Response && msg.ID == id {
+			return msg
+		}
+	}
+	return nil
 }
 func (conn *TWebsocket) Request(msg *msgjson.Message, f msgFunc) error {
 	return conn.RequestWithTimeout(msg, f, 0, func() {})
@@ -392,6 +408,7 @@ type TDB struct {
 	createAccountErr error
 	// updateMatchHook is called during UpdateMatch if non-nil.
 	updateMatchHook  func(m *db.MetaMatch)
+	updateMatchErr   error
 	addBondErr       error
 	updateOrderErr   error
 	activeDEXOrders  []*db.MetaOrder
@@ -592,6 +609,9 @@ func (tdb *TDB) LinkOrder(oid, linkedID order.OrderID) error {
 }
 
 func (tdb *TDB) UpdateMatch(m *db.MetaMatch) error {
+	if tdb.updateMatchErr != nil {
+		return tdb.updateMatchErr
+	}
 	if tdb.updateMatchHook != nil {
 		tdb.updateMatchHook(m)
 	}
@@ -13333,17 +13353,12 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, parsed, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
-	if len(acks) != 1 {
-		t.Fatalf("expected 1 ack, got %d", len(acks))
-	}
-
-	// The ack should contain the per-match address.
-	if acks[0].Address == "" {
-		t.Fatal("expected per-match address in ack, got empty")
+	if len(parsed) != 1 {
+		t.Fatalf("expected 1 parsed match, got %d", len(parsed))
 	}
 
 	// The serverMatches should have the per-match address stored.
@@ -13361,10 +13376,6 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 	// Test RedemptionAddress error.
 	tBtcWallet.addrErr = tErr
 	_, _, _, err = dc.parseMatches([]*msgjson.Match{msgMatch}, true)
-	// parseMatches returns errors as a joined string, not as an error return.
-	// But the match should be skipped and not appear in the acks.
-	// Actually, parseMatches returns the error string. Let me check the
-	// actual behavior.
 	if err == nil {
 		t.Fatal("expected error when RedemptionAddress fails")
 	}
@@ -13417,13 +13428,15 @@ func TestTradePerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, _, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
-	if acks[0].Address != "our-per-match-addr" {
-		t.Fatalf("expected per-match addr %q in ack, got %q",
-			"our-per-match-addr", acks[0].Address)
+	for _, sm := range matches {
+		if sm.perMatchAddrs[mid.String()] != "our-per-match-addr" {
+			t.Fatalf("expected per-match addr %q, got %q",
+				"our-per-match-addr", sm.perMatchAddrs[mid.String()])
+		}
 	}
 
 	// Step 2: Call negotiate to store the match with per-match address.
@@ -13521,5 +13534,139 @@ func TestConnectParseFailureNotMissing(t *testing.T) {
 	exceptions, _ := dc.compareServerMatches(srvMatches, failed)
 	if disc := exceptions[lo.ID()]; disc != nil {
 		t.Fatalf("failed match treated as discrepancy: %+v", disc)
+	}
+}
+
+// TestMatchAckAddresses checks that acknowledgements use the stored swap address,
+// including repeated deliveries and both sides of a self-trade.
+func TestMatchAckAddresses(t *testing.T) {
+	setup := func(t *testing.T, sells ...bool) (*testRig, *TXCWallet, []*trackedTrade, []*msgjson.Match) {
+		t.Helper()
+		rig := newTestRig()
+		t.Cleanup(rig.shutdown)
+		dc, c := rig.dc, rig.core
+		dcrWallet, dcr := newTWallet(tUTXOAssetA.ID)
+		btcWallet, btc := newTWallet(tUTXOAssetB.ID)
+		c.wallets[tUTXOAssetA.ID], c.wallets[tUTXOAssetB.ID] = dcrWallet, btcWallet
+		dcr.redemptionAddr, dcr.validAddr = "dcr-address", true
+		btc.redemptionAddr, btc.validAddr = "btc-address", true
+
+		mid := ordertest.RandomMatchID()
+		var trackers []*trackedTrade
+		var matches []*msgjson.Match
+		for _, sell := range sells {
+			lo, dbOrder, preImg, _ := makeLimitOrder(dc, sell, dcrBtcLotSize*3, dcrBtcRateStep*10)
+			wallets, _, _, err := c.walletSet(dc, tUTXOAssetA.ID, tUTXOAssetB.ID, sell)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tracker := newTrackedTrade(dbOrder, preImg, dc, c.lockTimeTaker, c.lockTimeMaker,
+				rig.db, rig.queue, wallets, nil, c.notify, c.formatDetails, &c.wg)
+			dc.trades[lo.ID()] = tracker
+			match := &msgjson.Match{
+				OrderID: lo.ID().Bytes(), MatchID: mid[:],
+				Quantity: dcrBtcLotSize, Rate: dcrBtcRateStep * 10,
+				Address: "counterparty", Side: uint8(order.Maker),
+				ServerTime: uint64(time.Now().UnixMilli()),
+			}
+			sign(tDexPriv, match)
+			trackers = append(trackers, tracker)
+			matches = append(matches, match)
+		}
+		return rig, btc, trackers, matches
+	}
+	sendMatches := func(t *testing.T, rig *testRig, matches []*msgjson.Match) (*msgjson.Message, error) {
+		t.Helper()
+		id := rig.ws.NextID()
+		req, err := msgjson.NewRequest(id, msgjson.MatchRoute, matches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = handleMatchRoute(rig.core, rig.dc, req)
+		return rig.ws.sentResponse(id), err
+	}
+	checkAcks := func(t *testing.T, response *msgjson.Message, trackers []*trackedTrade, want ...string) {
+		t.Helper()
+		if response == nil {
+			t.Fatal("no acknowledgement response")
+		}
+		var acks []msgjson.Acknowledgement
+		if err := response.UnmarshalResult(&acks); err != nil {
+			t.Fatal(err)
+		}
+		if len(acks) != len(want) {
+			t.Fatalf("got %d acknowledgements, want %d", len(acks), len(want))
+		}
+		for i, addr := range want {
+			var mid order.MatchID
+			copy(mid[:], acks[i].MatchID)
+			stored, known := trackers[i].storedSwapAddress(mid)
+			if acks[i].Address != addr || !known || stored != addr {
+				t.Fatalf("match %d: acknowledged %q, stored %q (known %v), want %q", i, acks[i].Address, stored, known, addr)
+			}
+		}
+	}
+
+	t.Run("new and repeated match", func(t *testing.T) {
+		rig, btc, trackers, matches := setup(t, true)
+		rig.db.updateMatchHook = func(*db.MetaMatch) {
+			rig.ws.mtx.RLock()
+			defer rig.ws.mtx.RUnlock()
+			if len(rig.ws.sentMsgs) != 0 {
+				t.Error("match acknowledged before it was saved")
+			}
+		}
+		response, err := sendMatches(t, rig, matches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkAcks(t, response, trackers, "btc-address")
+
+		btc.addrErr = tErr // Repeated matches must not ask the wallet for an address.
+		response, err = sendMatches(t, rig, matches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkAcks(t, response, trackers, "btc-address")
+	})
+
+	t.Run("self-trade", func(t *testing.T) {
+		rig, _, trackers, matches := setup(t, true, false)
+		matches[1].Side = uint8(order.Taker)
+		sign(tDexPriv, matches[1])
+		response, err := sendMatches(t, rig, matches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkAcks(t, response, trackers, "btc-address", "dcr-address")
+	})
+
+	for _, test := range []struct {
+		name        string
+		storedMatch bool
+	}{
+		{name: "storage failure"},
+		{name: "known match without an address", storedMatch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rig, _, trackers, matches := setup(t, true)
+			var mid order.MatchID
+			copy(mid[:], matches[0].MatchID)
+			if !test.storedMatch {
+				rig.db.updateMatchErr = tErr
+			} else {
+				trackers[0].matches[mid] = &matchTracker{MetaMatch: db.MetaMatch{
+					MetaData:  &db.MatchMetaData{},
+					UserMatch: &order.UserMatch{MatchID: mid},
+				}}
+			}
+			response, err := sendMatches(t, rig, matches)
+			if err == nil || response != nil {
+				t.Fatalf("expected an error and no response, got error %v, response %+v", err, response)
+			}
+			if addr, _ := trackers[0].storedSwapAddress(mid); addr != "" {
+				t.Fatalf("unexpected stored address %q", addr)
+			}
+		})
 	}
 }

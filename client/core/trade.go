@@ -899,12 +899,9 @@ func (t *trackedTrade) negotiate(msgMatches []*msgjson.Match, perMatchAddrs map[
 
 		var mid order.MatchID
 		copy(mid[:], msgMatch.MatchID)
-		// Do not process matches with existing matchTrackers. e.g. In case we
-		// start "extra" matches from the 'connect' response negotiating via
-		// authDEX>readConnectMatches, and a subsequent resent 'match' request
-		// leads us here again or vice versa. Or just duplicate match requests.
+		// Keep the original match and the swap address used to verify its contract.
 		if t.matches[mid] != nil {
-			t.dc.log.Warnf("Skipping match %v that is already negotiating.", mid)
+			t.dc.log.Debugf("Skipping match %v that is already negotiating.", mid)
 			continue
 		}
 
@@ -1093,6 +1090,36 @@ func (t *trackedTrade) negotiate(msgMatches []*msgjson.Match, perMatchAddrs map[
 		return fmt.Errorf("failed to update order in db: %w", err)
 	}
 	return nil
+}
+
+// storedSwapAddress returns the match's saved swap address and whether
+// the match is tracked.
+func (t *trackedTrade) storedSwapAddress(mid order.MatchID) (addr string, known bool) {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	match := t.matches[mid]
+	if match == nil {
+		return "", false
+	}
+	return match.MetaData.SwapAddr, true
+}
+
+// matchAckAddress returns the match's saved swap address. For a recorded
+// cancellation match, it returns an empty address and isCancel = true.
+func (t *trackedTrade) matchAckAddress(mid order.MatchID) (addr string, isCancel bool) {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	if match := t.matches[mid]; match != nil {
+		return match.MetaData.SwapAddr, false
+	}
+	if t.cancel != nil {
+		for _, mm := range []*msgjson.Match{t.cancel.matches.maker, t.cancel.matches.taker} {
+			if mm != nil && bytes.Equal(mm.MatchID, mid[:]) {
+				return "", true
+			}
+		}
+	}
+	return "", false
 }
 
 func (t *trackedTrade) recalcFilled() (matchFilled, canceled uint64) {
