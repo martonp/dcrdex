@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -214,6 +213,9 @@ func NewWsConn(cfg *WsCfg) (WsConn, error) {
 		respHandlers: make(map[uint64]*responseHandler),
 		reconnectCh:  make(chan struct{}, 1),
 	}
+	if conn.log == nil {
+		conn.log = dex.Disabled
+	}
 	conn.urlV.Store(cfg.URL)
 
 	return conn, nil
@@ -316,9 +318,9 @@ func (conn *wsConn) connect(ctx context.Context) error {
 	go func() {
 		defer conn.wg.Done()
 		if conn.cfg.RawHandler != nil {
-			conn.readRaw(ctx)
+			conn.readRaw(ctx, ws)
 		} else {
-			conn.read(ctx)
+			conn.read(ctx, ws)
 		}
 	}()
 
@@ -334,46 +336,20 @@ func (conn *wsConn) SetReadLimit(limit int64) {
 	}
 }
 
+// handleReadError expires pending requests before queuing a reconnect.
+// The reader must return immediately after this call.
 func (conn *wsConn) handleReadError(err error) {
-	reconnect := func() {
-		conn.setConnectionStatus(Disconnected)
-		if !conn.cfg.DisableAutoReconnect {
-			conn.reconnectCh <- struct{}{}
-		}
+	if !websocket.IsCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) &&
+		!errors.Is(err, websocket.ErrCloseSent) {
+		conn.log.Errorf("read error (%v), attempting reconnection", err)
 	}
 
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		conn.log.Errorf("Read timeout on connection to %s.", conn.url())
-		reconnect()
-		return
+	conn.setConnectionStatus(Disconnected)
+	// Abort pending requests now instead of waiting for their response timers.
+	conn.abortRequests()
+	if !conn.cfg.DisableAutoReconnect {
+		conn.scheduleReconnect()
 	}
-	// TODO: Now that wsConn goroutines have contexts that are canceled
-	// on shutdown, we do not have to infer the source and severity of
-	// the error; just reconnect in ALL other cases, and remove the
-	// following legacy checks.
-
-	// Expected close errors (1000 and 1001) ... but if the server
-	// closes we still want to reconnect. (???)
-	if websocket.IsCloseError(err, websocket.CloseGoingAway,
-		websocket.CloseNormalClosure) ||
-		strings.Contains(err.Error(), "websocket: close sent") {
-		reconnect()
-		return
-	}
-
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "read" {
-		if strings.Contains(opErr.Err.Error(), "use of closed network connection") {
-			conn.log.Errorf("read quitting: %v", err)
-			reconnect()
-			return
-		}
-	}
-
-	// Log all other errors and trigger a reconnection.
-	conn.log.Errorf("read error (%v), attempting reconnection", err)
-	reconnect()
 }
 
 func (conn *wsConn) close() {
@@ -385,13 +361,8 @@ func (conn *wsConn) close() {
 	conn.ws.Close()
 }
 
-func (conn *wsConn) readRaw(ctx context.Context) {
+func (conn *wsConn) readRaw(ctx context.Context, ws *websocket.Conn) {
 	for {
-		// Lock since conn.ws may be set by connect.
-		conn.wsMtx.Lock()
-		ws := conn.ws
-		conn.wsMtx.Unlock()
-
 		// Block until a message is received or an error occurs.
 		_, msgBytes, err := ws.ReadMessage()
 		// Drop the read error on context cancellation.
@@ -402,7 +373,6 @@ func (conn *wsConn) readRaw(ctx context.Context) {
 			conn.handleReadError(err)
 			return
 		}
-
 		conn.cfg.RawHandler(msgBytes)
 
 		err = ws.SetReadDeadline(time.Now().Add(conn.cfg.PingWait))
@@ -414,7 +384,7 @@ func (conn *wsConn) readRaw(ctx context.Context) {
 
 // read fetches and parses incoming messages for processing. This should be
 // run as a goroutine. Increment the wg before calling read.
-func (conn *wsConn) read(ctx context.Context) {
+func (conn *wsConn) read(ctx context.Context, ws *websocket.Conn) {
 	// overflow buffers messages when readCh is full, preventing the read loop
 	// from blocking. This is critical because pings are handled during ReadJSON
 	// calls - if the read loop blocks on a channel send, pings won't be
@@ -424,6 +394,9 @@ func (conn *wsConn) read(ctx context.Context) {
 	// drainOverflow attempts to send buffered messages to readCh without blocking.
 	drainOverflow := func() {
 		for len(overflow) > 0 {
+			if ctx.Err() != nil {
+				return
+			}
 			select {
 			case conn.readCh <- overflow[0]:
 				overflow = overflow[1:]
@@ -435,14 +408,12 @@ func (conn *wsConn) read(ctx context.Context) {
 
 	for {
 		// Try to drain any overflow before reading new messages.
+		if ctx.Err() != nil {
+			return
+		}
 		drainOverflow()
 
 		msg := new(msgjson.Message)
-
-		// Lock since conn.ws may be set by connect.
-		conn.wsMtx.Lock()
-		ws := conn.ws
-		conn.wsMtx.Unlock()
 
 		// The read itself does not require locking since only this goroutine
 		// uses read functions that are not safe for concurrent use.
@@ -466,8 +437,10 @@ func (conn *wsConn) read(ctx context.Context) {
 		if msg.Type == msgjson.Response {
 			handler := conn.respHandler(msg.ID)
 			if handler == nil {
+				// The request may have expired or its response may already have
+				// been handled.
 				b, _ := json.Marshal(msg)
-				conn.log.Errorf("No handler found for response: %v", string(b))
+				conn.log.Warnf("No handler found for response: %v", string(b))
 				continue
 			}
 			// Run handlers in a goroutine so that other messages can be
@@ -485,7 +458,6 @@ func (conn *wsConn) read(ctx context.Context) {
 		// message to avoid blocking the read loop.
 		select {
 		case conn.readCh <- msg:
-			// Message sent successfully.
 		default:
 			// Channel full - buffer the message and warn about backpressure.
 			overflow = append(overflow, msg)
@@ -518,9 +490,7 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 			if err != nil {
 				conn.log.Errorf("Reconnect failed. Scheduling reconnect to %s in %.1f seconds.",
 					conn.url(), rcInt.Seconds())
-				time.AfterFunc(rcInt, func() {
-					conn.reconnectCh <- struct{}{}
-				})
+				time.AfterFunc(rcInt, conn.scheduleReconnect)
 				// Increment the wait up to PingWait.
 				if rcInt < maxReconnectInterval {
 					rcInt += reconnectInterval
@@ -539,6 +509,31 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// scheduleReconnect queues a reconnect unless one is already pending.
+func (conn *wsConn) scheduleReconnect() {
+	select {
+	case conn.reconnectCh <- struct{}{}:
+	default:
+	}
+}
+
+// abortRequests removes pending requests and runs their expiration callbacks.
+func (conn *wsConn) abortRequests() {
+	conn.reqMtx.Lock()
+	callbacks := make([]func(), 0, len(conn.respHandlers))
+	for id, h := range conn.respHandlers {
+		delete(conn.respHandlers, id)
+		h.expiration.Stop()
+		callbacks = append(callbacks, h.abort)
+	}
+	conn.reqMtx.Unlock()
+
+	// Callbacks may register another request.
+	for _, abort := range callbacks {
+		abort()
 	}
 }
 
@@ -568,9 +563,7 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		// The read loop would normally trigger keepAlive, but it wasn't started
 		// on account of a connect error.
 		conn.log.Errorf("Initial connection failed, starting reconnect loop: %v", err)
-		time.AfterFunc(5*time.Second, func() {
-			conn.reconnectCh <- struct{}{}
-		})
+		time.AfterFunc(5*time.Second, conn.scheduleReconnect)
 	}
 
 	if !conn.cfg.DisableAutoReconnect {
@@ -590,19 +583,12 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 		if conn.ws != nil {
 			conn.log.Debug("Sending close 1000 (normal) message.")
 			conn.close()
+			conn.ws = nil
 		}
 		conn.wsMtx.Unlock()
 
 		// Run the expire funcs so request callers don't hang.
-		conn.reqMtx.Lock()
-		defer conn.reqMtx.Unlock()
-		for id, h := range conn.respHandlers {
-			delete(conn.respHandlers, id)
-			// Since we are holding reqMtx and deleting the handler, no need to
-			// check if expiration fired (see logReq), but good to stop it.
-			h.expiration.Stop()
-			h.abort()
-		}
+		conn.abortRequests()
 
 		close(conn.readCh) // signal to MessageSource receivers that the wsConn is dead
 	}()
@@ -645,9 +631,17 @@ func (conn *wsConn) SendRaw(b []byte) error {
 	conn.wsMtx.Lock()
 	ws := conn.ws
 	conn.wsMtx.Unlock()
+	if ws == nil {
+		return fmt.Errorf("cannot send on a broken connection")
+	}
 
 	conn.writeMtx.Lock()
 	defer conn.writeMtx.Unlock()
+
+	if conn.IsDown() {
+		return fmt.Errorf("cannot send on a broken connection")
+	}
+
 	err := ws.SetWriteDeadline(time.Now().Add(writeWait))
 	if err != nil {
 		conn.log.Errorf("Send: failed to set write deadline: %v", err)
@@ -718,7 +712,6 @@ func (conn *wsConn) RequestWithTimeout(msg *msgjson.Message, f func(*msgjson.Mes
 }
 
 func (conn *wsConn) RequestRawWithTimeout(msgID uint64, rawMsg []byte, f func(*msgjson.Message), expireTime time.Duration, expire func()) error {
-
 	// Register the response and expire handlers for this request.
 	conn.logReq(msgID, f, expireTime, expire)
 	err := conn.SendRaw(rawMsg)

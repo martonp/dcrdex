@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -29,7 +30,97 @@ func makeRequest(id uint64, route string, msg any) *msgjson.Message {
 	return req
 }
 
-// genCertPair generates a key/cert pair to the paths provided.
+func newTestWsConn(t *testing.T, cfg *WsCfg) *wsConn {
+	t.Helper()
+	ws, err := NewWsConn(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ws.(*wsConn)
+}
+
+func TestWsConnReadErrorAbortsRequests(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+	conn.setConnectionStatus(Connected)
+	t.Cleanup(func() {
+		conn.respHandler(1)
+		conn.respHandler(2)
+	})
+
+	var aborts, newRequestAborts atomic.Int32
+	var callbackLocked atomic.Bool
+	conn.logReq(1, func(*msgjson.Message) {}, time.Hour, func() {
+		aborts.Add(1)
+		// Fail without hanging if callbacks run under reqMtx.
+		if !conn.reqMtx.TryLock() {
+			callbackLocked.Store(true)
+			return
+		}
+		conn.reqMtx.Unlock()
+		conn.logReq(2, func(*msgjson.Message) {}, time.Hour, func() {
+			newRequestAborts.Add(1)
+		})
+	})
+
+	conn.handleReadError(io.EOF)
+	if !conn.IsDown() {
+		t.Fatal("read error did not mark the connection down")
+	}
+	if aborts.Load() != 1 {
+		t.Fatalf("abort count = %d, want 1", aborts.Load())
+	}
+	if callbackLocked.Load() {
+		t.Fatal("expiration callback ran under reqMtx")
+	}
+	if conn.respHandler(1) != nil {
+		t.Fatal("aborted request still registered")
+	}
+	if conn.respHandler(2) == nil {
+		t.Fatal("callback-created request not registered")
+	}
+	if newRequestAborts.Load() != 0 {
+		t.Fatal("aborted the callback-created request")
+	}
+	select {
+	case <-conn.reconnectCh:
+	default:
+		t.Fatal("read error did not queue a reconnect")
+	}
+}
+
+func TestWsConnRequestSendFailureOnlyUnregistersFailedRequest(t *testing.T) {
+	conn := newTestWsConn(t, &WsCfg{URL: "wss://one.example/ws"})
+	conn.setConnectionStatus(Connected)
+
+	t.Cleanup(func() {
+		conn.respHandler(1)
+		conn.respHandler(2)
+	})
+	conn.logReq(1, func(*msgjson.Message) {}, time.Hour, func() {})
+
+	var responses, expirations atomic.Int32
+	err := conn.RequestRawWithTimeout(2, []byte(`{"type":1}`), func(*msgjson.Message) {
+		responses.Add(1)
+	}, time.Hour, func() {
+		expirations.Add(1)
+	})
+	if err == nil {
+		t.Fatalf("expected write error with no websocket")
+	}
+	if conn.respHandler(1) == nil {
+		t.Fatalf("send failure removed existing response handler")
+	}
+	if conn.respHandler(2) != nil {
+		t.Fatalf("failed request response handler still registered")
+	}
+	if responses.Load() != 0 || expirations.Load() != 0 {
+		t.Fatal("send failure invoked a request callback")
+	}
+	if conn.IsDown() {
+		t.Fatalf("send failure marked connection down")
+	}
+}
+
 func genCertPair(certFile, keyFile string, altDNSNames []string) error {
 	tLogger.Infof("Generating TLS certificates...")
 
