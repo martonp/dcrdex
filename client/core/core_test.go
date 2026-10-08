@@ -175,6 +175,8 @@ type TWebsocket struct {
 	reqErr         error
 	connectErr     error
 	msgs           <-chan *msgjson.Message
+	endpoints      []*comms.WsEndpoint
+	endpointErr    error
 	// handlers simulates a peer (server) response for request, and handles the
 	// response with the msgFunc.
 	handlers       map[string][]func(*msgjson.Message, msgFunc) error
@@ -214,11 +216,11 @@ func testDexConnection(ctx context.Context, crypter *tCrypter) (*dexConnection, 
 	connMaster.Connect(ctx)
 	acct := tNewAccount(crypter)
 	return &dexConnection{
-		WsConn:     conn,
-		log:        tLogger,
-		connMaster: connMaster,
-		ticker:     newDexTicker(time.Millisecond * 1000 / 3),
-		acct:       acct,
+		FailoverWsConn: conn,
+		log:            tLogger,
+		connMaster:     connMaster,
+		ticker:         newDexTicker(time.Millisecond * 1000 / 3),
+		acct:           acct,
 		assets: map[uint32]*dex.Asset{
 			tUTXOAssetA.ID: tUTXOAssetA,
 			tUTXOAssetB.ID: tUTXOAssetB,
@@ -354,7 +356,30 @@ func (conn *TWebsocket) Connect(context.Context) (*sync.WaitGroup, error) {
 	return &sync.WaitGroup{}, conn.connectErr
 }
 
-func (conn *TWebsocket) UpdateURL(string) {}
+func (conn *TWebsocket) SetFailoverEndpoints(endpoints []*comms.WsEndpoint) error {
+	conn.mtx.Lock()
+	defer conn.mtx.Unlock()
+	if conn.endpointErr != nil {
+		return conn.endpointErr
+	}
+	conn.endpoints = append([]*comms.WsEndpoint(nil), endpoints...)
+	return nil
+}
+
+func (conn *TWebsocket) ActiveEndpoint() string {
+	conn.mtx.RLock()
+	defer conn.mtx.RUnlock()
+	if len(conn.endpoints) == 0 {
+		return ""
+	}
+	return conn.endpoints[0].URL
+}
+
+func (conn *TWebsocket) UpdateURL(uri string) {
+	conn.mtx.Lock()
+	defer conn.mtx.Unlock()
+	conn.endpoints = []*comms.WsEndpoint{{URL: uri}}
+}
 
 type TDB struct {
 	updateWalletErr  error
@@ -1516,11 +1541,11 @@ func newTestRig() *testRig {
 			wallets:       make(map[uint32]*xcWallet),
 			blockWaiters:  make(map[string]*blockWaiter),
 			sentCommits:   make(map[order.Commitment]chan struct{}),
-			wsConstructor: func(*comms.WsCfg) (comms.WsConn, error) {
+			wsConstructor: func(_ *comms.WsCfg, endpoints []*comms.WsEndpoint) (comms.FailoverWsConn, error) {
 				// This is not very realistic since it doesn't start a fresh
 				// one, and (*Core).connectDEX always gets the same TWebsocket,
 				// which may have been previously "disconnected".
-				return conn, nil
+				return conn, conn.SetFailoverEndpoints(endpoints)
 			},
 			newCrypter: func([]byte) encrypt.Crypter { return crypter },
 			reCrypter:  func([]byte, []byte) (encrypt.Crypter, error) { return crypter, crypter.recryptErr },
@@ -2164,6 +2189,211 @@ func TestGetFee(t *testing.T) {
 }
 */
 
+func TestHandleReconnect(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	tCore := rig.core
+	dc := rig.dc
+
+	// A temporary or replaced connection must not reconnect the registered one.
+	other := &dexConnection{acct: &dexAccount{host: dc.acct.host}}
+	atomic.StoreUint32(&dc.connectionStatus, uint32(comms.Connected))
+	rig.ws.reqErr = tErr
+	tCore.handleReconnect(other)
+	if dc.status() != comms.Connected {
+		t.Fatal("another connection's reconnect changed the registered connection status")
+	}
+	rig.ws.reqErr = nil
+
+	ai := &db.AccountInfo{Host: dc.acct.host}
+	rig.db.acct = ai // for mesh endpoint persistence
+
+	if dc.acct.authed() {
+		t.Fatalf("account unexpectedly authed before reconnect")
+	}
+
+	// The refreshed config advertises a fresh mesh endpoint.
+	endpoint := &msgjson.MeshEndpoint{Host: "mesh.example:7232"}
+	rig.ws.queueResponse(msgjson.ConfigRoute, func(msg *msgjson.Message, f msgFunc) error {
+		cfg := *rig.dc.cfg
+		cfg.MeshEndpoints = []*msgjson.MeshEndpoint{endpoint}
+		resp, _ := msgjson.NewResponse(msg.ID, cfg, nil)
+		f(resp)
+		return nil
+	})
+	rig.ws.queueResponse(msgjson.PriceFeedRoute, func(msg *msgjson.Message, f msgFunc) error {
+		resp, _ := msgjson.NewResponse(msg.ID, map[string]*msgjson.Spot{}, nil)
+		f(resp)
+		return nil
+	})
+	rig.queueConnect(nil, nil, nil) // re-auth on the new endpoint
+
+	tCore.handleReconnect(dc)
+
+	if !dc.acct.authed() {
+		t.Fatalf("account not re-authenticated after reconnect")
+	}
+	rig.ws.mtx.RLock()
+	endpointCount := len(rig.ws.endpoints)
+	rig.ws.mtx.RUnlock()
+	if endpointCount != 2 {
+		t.Fatalf("failover endpoint count after reconnect = %d, want 2", endpointCount)
+	}
+	if len(ai.MeshEndpoints) != 1 || ai.MeshEndpoints[0].Host != "mesh.example:7232" {
+		t.Fatalf("mesh endpoints not persisted on reconnect: %+v", ai.MeshEndpoints)
+	}
+}
+
+func TestHandleMeshEndpointsMsg(t *testing.T) {
+	previous := &msgjson.MeshEndpoint{Host: "previous.example:7232", Cert: []byte{0x1}}
+	replacement := &msgjson.MeshEndpoint{Host: "mesh.example:7232", Cert: []byte{0x2}}
+	tests := []struct {
+		name         string
+		advertised   []*msgjson.MeshEndpoint
+		endpointErr  error
+		persistErr   error
+		keepPrevious bool
+	}{
+		{
+			name:       "replace peers",
+			advertised: []*msgjson.MeshEndpoint{replacement},
+		},
+		{
+			name:         "ignore empty list",
+			keepPrevious: true,
+		},
+		{
+			name: "deduplicate peers and registered host",
+			advertised: []*msgjson.MeshEndpoint{
+				{Host: tDexHost, Cert: []byte{0x3}},
+				replacement,
+				{Host: replacement.Host, Cert: []byte{0x4}},
+			},
+		},
+		{
+			name:         "reject invalid address",
+			advertised:   []*msgjson.MeshEndpoint{{Host: tUnparseableHost}},
+			keepPrevious: true,
+		},
+		{
+			name:         "websocket rejects update",
+			advertised:   []*msgjson.MeshEndpoint{replacement},
+			endpointErr:  tErr,
+			keepPrevious: true,
+		},
+		{
+			name:       "persistence failure leaves update active",
+			advertised: []*msgjson.MeshEndpoint{replacement},
+			persistErr: tErr,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rig := newTestRig()
+			defer rig.shutdown()
+			dc := rig.dc
+			rig.db.acct = &db.AccountInfo{Host: dc.acct.host}
+			rig.core.configureMeshEndpoints(dc, []*msgjson.MeshEndpoint{previous})
+			rig.ws.endpointErr = test.endpointErr
+			rig.db.updateAccountErr = test.persistErr
+
+			note, err := msgjson.NewNotification(msgjson.MeshEndpointsRoute, &msgjson.MeshEndpointsNotification{
+				MeshEndpoints: test.advertised,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handleMeshEndpointsMsg(rig.core, dc, note); err != nil {
+				t.Fatal(err)
+			}
+
+			wantPeer, wantConfig := replacement, test.advertised
+			if test.keepPrevious {
+				wantPeer, wantConfig = previous, []*msgjson.MeshEndpoint{previous}
+			}
+			dc.cfgMtx.RLock()
+			configEndpoints := dc.cfg.MeshEndpoints
+			dc.cfgMtx.RUnlock()
+			if !reflect.DeepEqual(configEndpoints, wantConfig) {
+				t.Fatalf("configured endpoints = %+v, want %+v", configEndpoints, wantConfig)
+			}
+
+			wantEndpoints := []*comms.WsEndpoint{
+				{URL: "wss://" + tDexHost + "/ws", Cert: dc.acct.cert},
+				{URL: "wss://" + wantPeer.Host + "/ws", Cert: wantPeer.Cert},
+			}
+			rig.ws.mtx.RLock()
+			endpoints := rig.ws.endpoints
+			rig.ws.mtx.RUnlock()
+			if !reflect.DeepEqual(endpoints, wantEndpoints) {
+				t.Fatalf("websocket endpoints = %+v, want %+v", endpoints, wantEndpoints)
+			}
+
+			if test.persistErr != nil {
+				wantPeer = previous
+			}
+			wantStored := []*db.MeshEndpoint{{Host: wantPeer.Host, Cert: wantPeer.Cert}}
+			if !reflect.DeepEqual(rig.db.acct.MeshEndpoints, wantStored) {
+				t.Fatalf("stored endpoints = %+v, want %+v", rig.db.acct.MeshEndpoints, wantStored)
+			}
+		})
+	}
+}
+
+func TestPersistMeshEndpointsOnAccountCreate(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	tCore := rig.core
+
+	// Endpoints are learned before the account is saved.
+	rig.db.acct = nil
+
+	meshCert := []byte{0x2}
+	meshEndpoint := &msgjson.MeshEndpoint{
+		Host: "mesh.example:7232",
+		Cert: meshCert,
+	}
+	rig.ws.queueResponse(msgjson.ConfigRoute, func(msg *msgjson.Message, f msgFunc) error {
+		cfg := *rig.dc.cfg
+		cfg.MeshEndpoints = []*msgjson.MeshEndpoint{meshEndpoint}
+		resp, _ := msgjson.NewResponse(msg.ID, cfg, nil)
+		f(resp)
+		return nil
+	})
+
+	ai := &db.AccountInfo{
+		Host: "somedex.com",
+		Cert: []byte{0x1},
+	}
+	dc, err := tCore.connectDEX(ai)
+	if err != nil {
+		t.Fatalf("first-session connectDEX error: %v", err)
+	}
+	defer dc.connMaster.Disconnect()
+
+	if rig.db.acct != nil {
+		t.Fatalf("connecting unexpectedly saved an account")
+	}
+
+	err = tCore.dbCreateOrUpdateAccount(dc, &db.AccountInfo{
+		Host:      dc.acct.host,
+		Cert:      dc.acct.cert,
+		DEXPubKey: dc.acct.dexPubKey,
+	})
+	if err != nil {
+		t.Fatalf("dbCreateOrUpdateAccount error: %v", err)
+	}
+
+	stored := rig.db.acct
+	if stored == nil {
+		t.Fatal("account not saved")
+	}
+	if len(stored.MeshEndpoints) != 1 || stored.MeshEndpoints[0].Host != "mesh.example:7232" ||
+		!bytes.Equal(stored.MeshEndpoints[0].Cert, meshCert) {
+		t.Fatalf("mesh endpoints not persisted on account create: %+v", stored.MeshEndpoints)
+	}
+}
+
 func TestPostBond(t *testing.T) {
 	// This test takes a little longer because the key is decrypted every time
 	// Register is called.
@@ -2779,6 +3009,80 @@ func TestConnectDEX(t *testing.T) {
 	}
 	dc.connMaster.Disconnect()
 
+	meshCert := []byte{0x2}
+	rig.db.acct = ai // for mesh endpoint persistence
+	meshEndpoint := &msgjson.MeshEndpoint{
+		Host: "mesh.example:7232",
+		Cert: meshCert,
+	}
+	rig.ws.queueResponse(msgjson.ConfigRoute, func(msg *msgjson.Message, f msgFunc) error {
+		cfg := *rig.dc.cfg
+		cfg.MeshEndpoints = []*msgjson.MeshEndpoint{meshEndpoint}
+		resp, _ := msgjson.NewResponse(msg.ID, cfg, nil)
+		f(resp)
+		return nil
+	})
+	dc, err = tCore.connectDEX(ai)
+	if err != nil {
+		t.Fatalf("connectDEX with mesh endpoint error: %v", err)
+	}
+	rig.ws.mtx.RLock()
+	endpoints := append([]*comms.WsEndpoint(nil), rig.ws.endpoints...)
+	rig.ws.mtx.RUnlock()
+	wantURLs := []string{"wss://somedex.com:7232/ws", "wss://mesh.example:7232/ws"}
+	if len(endpoints) != len(wantURLs) {
+		t.Fatalf("mesh endpoint count = %d, want %d", len(endpoints), len(wantURLs))
+	}
+	for i, wantURL := range wantURLs {
+		if endpoints[i].URL != wantURL {
+			t.Fatalf("mesh endpoint %d URL = %q, want %q", i, endpoints[i].URL, wantURL)
+		}
+	}
+	if !bytes.Equal(endpoints[1].Cert, meshCert) {
+		t.Fatalf("advertised mesh endpoint cert not passed to websocket")
+	}
+	if len(ai.MeshEndpoints) != 1 || ai.MeshEndpoints[0].Host != "mesh.example:7232" ||
+		!bytes.Equal(ai.MeshEndpoints[0].Cert, meshCert) {
+		t.Fatalf("advertised mesh endpoint not persisted: %+v", ai.MeshEndpoints)
+	}
+	dc.connMaster.Disconnect()
+
+	// Persisted mesh endpoints seed the initial failover set, so the backup
+	// is reachable on restart even if the registered host is down.
+	var seededURLs []string
+	captureConstructor := tCore.wsConstructor
+	tCore.wsConstructor = func(cfg *comms.WsCfg, endpoints []*comms.WsEndpoint) (comms.FailoverWsConn, error) {
+		seededURLs = make([]string, 0, len(endpoints))
+		for _, endpoint := range endpoints {
+			seededURLs = append(seededURLs, endpoint.URL)
+		}
+		return captureConstructor(cfg, endpoints)
+	}
+	rig.queueConfig() // no advertised mesh endpoints this time
+	dc, err = tCore.connectDEX(ai)
+	if err != nil {
+		t.Fatalf("connectDEX with persisted mesh endpoint error: %v", err)
+	}
+	if !reflect.DeepEqual(seededURLs, wantURLs) {
+		t.Fatalf("seeded endpoint URLs = %v, want %v", seededURLs, wantURLs)
+	}
+	// A config without advertised endpoints leaves the saved peers unchanged.
+	if len(ai.MeshEndpoints) != 1 || ai.MeshEndpoints[0].Host != "mesh.example:7232" {
+		t.Fatalf("mesh endpoints changed after config without advertisements: %+v", ai.MeshEndpoints)
+	}
+	// Live failover set should still include the persisted peer after config apply.
+	rig.ws.mtx.RLock()
+	liveURLs := make([]string, 0, len(rig.ws.endpoints))
+	for _, endpoint := range rig.ws.endpoints {
+		liveURLs = append(liveURLs, endpoint.URL)
+	}
+	rig.ws.mtx.RUnlock()
+	if !reflect.DeepEqual(liveURLs, wantURLs) {
+		t.Fatalf("live endpoint URLs after empty config = %v, want %v", liveURLs, wantURLs)
+	}
+	tCore.wsConstructor = captureConstructor
+	dc.connMaster.Disconnect()
+
 	// Bad URL.
 	ai.Host = tUnparseableHost // Illegal ASCII control character
 	_, err = tCore.connectDEX(ai)
@@ -2789,7 +3093,7 @@ func TestConnectDEX(t *testing.T) {
 
 	// Constructor error.
 	ogConstructor := tCore.wsConstructor
-	tCore.wsConstructor = func(*comms.WsCfg) (comms.WsConn, error) {
+	tCore.wsConstructor = func(*comms.WsCfg, []*comms.WsEndpoint) (comms.FailoverWsConn, error) {
 		return nil, tErr
 	}
 	_, err = tCore.connectDEX(ai)
