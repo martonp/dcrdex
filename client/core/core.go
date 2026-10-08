@@ -4331,7 +4331,13 @@ func (c *Core) dbCreateOrUpdateAccount(dc *dexConnection, ai *db.AccountInfo) er
 		return c.db.CreateAccount(ai)
 	}
 
-	err := c.db.UpdateAccountInfo(ai)
+	err := c.db.UpdateAccount(ai.Host, func(stored *db.AccountInfo) bool {
+		// Keep advertised endpoints when replacing view-only account details.
+		endpoints := stored.MeshEndpoints
+		*stored = *ai
+		stored.MeshEndpoints = endpoints
+		return true
+	})
 	if err == nil {
 		dc.acct.viewOnly = false
 	}

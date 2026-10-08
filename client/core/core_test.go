@@ -389,7 +389,7 @@ type TDB struct {
 	existValues              map[string]bool
 	accountProofErr          error
 	verifyCreateAccount      bool
-	verifyUpdateAccountInfo  bool
+	verifyUpdateAccount      bool
 	disabledHost             *string
 	disableAccountErr        error
 	creds                    *db.PrimaryCredentials
@@ -400,7 +400,7 @@ type TDB struct {
 	archivedOrders           int
 	deleteInactiveMatchesErr error
 	archivedMatches          int
-	updateAccountInfoErr     error
+	updateAccountErr         error
 }
 
 func (tdb *TDB) Run(context.Context) {}
@@ -447,10 +447,19 @@ func (tdb *TDB) ToggleAccountStatus(host string, disable bool) error {
 	return tdb.disableAccountErr
 }
 
-func (tdb *TDB) UpdateAccountInfo(ai *db.AccountInfo) error {
-	tdb.verifyUpdateAccountInfo = true
-	tdb.acct = ai
-	return tdb.updateAccountInfoErr
+func (tdb *TDB) UpdateAccount(host string, update func(ai *db.AccountInfo) bool) error {
+	tdb.verifyUpdateAccount = true
+	if tdb.updateAccountErr != nil {
+		return tdb.updateAccountErr
+	}
+	if tdb.acct == nil {
+		return db.ErrAcctNotFound
+	}
+	ai := *tdb.acct
+	if update(&ai) {
+		*tdb.acct = ai
+	}
+	return nil
 }
 
 func (tdb *TDB) UpdateOrder(m *db.MetaOrder) error {
