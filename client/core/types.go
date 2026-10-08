@@ -870,6 +870,8 @@ type dexAccount struct {
 	bonds             []*db.Bond // confirmed, and not yet expired
 	expiredBonds      []*db.Bond // expired and needing refund
 	rep               account.Reputation
+	// bondExpiryPending records an expiry that still needs a notification.
+	bondExpiryPending bool
 	targetTier        uint64
 	maxBondedAmt      uint64
 	penaltyComps      uint16 // max penalties to compensate for

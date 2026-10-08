@@ -12237,6 +12237,158 @@ func TestUpdateBondOptions(t *testing.T) {
 	}
 }
 
+func TestUpdateReputationBondExpiry(t *testing.T) {
+	t.Run("server threshold", func(t *testing.T) {
+		rig := newTestRig()
+		defer rig.shutdown()
+
+		const now = int64(1_800_000_000)
+		bondCfg := rig.core.dexBondConfig(rig.dc, now)
+		localThreshold := bondCfg.lockTimeThresh
+		serverThreshold := localThreshold - 1
+		serverExpired := &db.Bond{Strength: 1, LockTime: uint64(serverThreshold - 1)}
+		// A bond at the server's threshold still contributes to its reported tier.
+		expiresLocally := &db.Bond{Strength: 2, LockTime: uint64(serverThreshold)}
+		stillActive := &db.Bond{Strength: 1, LockTime: uint64(serverThreshold + 100)}
+		rig.acct.bonds = []*db.Bond{serverExpired, expiresLocally, stillActive}
+
+		// The server has excluded serverExpired, leaving a bonded tier of 3.
+		rig.acct.authMtx.Lock()
+		rig.dc.updateReputation(&account.Reputation{
+			BondedTier:          3,
+			BondExpiryThreshold: serverThreshold,
+		})
+		rig.acct.authMtx.Unlock()
+
+		if len(rig.acct.bonds) != 2 || rig.acct.bonds[0] != expiresLocally || rig.acct.bonds[1] != stillActive {
+			t.Fatalf("live bonds after reputation update = %v, want expiresLocally and stillActive", rig.acct.bonds)
+		}
+		if len(rig.acct.expiredBonds) != 1 || rig.acct.expiredBonds[0] != serverExpired {
+			t.Fatalf("expired bonds after reputation update = %v, want only serverExpired", rig.acct.expiredBonds)
+		}
+
+		if !rig.acct.bondExpiryPending {
+			t.Fatal("server reconciliation did not retain the expiry notification")
+		}
+
+		// Local expiry removes expiresLocally's strength of 2, leaving tier 1.
+		state := rig.core.bondStateOfDEX(rig.dc, bondCfg)
+		if state.Rep.BondedTier != 1 {
+			t.Fatalf("BondedTier after local expiry = %d, want 1", state.Rep.BondedTier)
+		}
+		if !state.notifyBondExpiry {
+			t.Fatal("bond expiry notification not retained")
+		}
+		if len(rig.acct.bonds) != 1 || rig.acct.bonds[0] != stillActive {
+			t.Fatalf("live bonds after local expiry = %v, want only stillActive", rig.acct.bonds)
+		}
+
+		// Repeating the calculation must not subtract either expired bond again.
+		state = rig.core.bondStateOfDEX(rig.dc, bondCfg)
+		if state.Rep.BondedTier != 1 {
+			t.Fatalf("BondedTier after repeated state calculation = %d, want 1", state.Rep.BondedTier)
+		}
+	})
+
+	t.Run("missing server threshold", func(t *testing.T) {
+		rig := newTestRig()
+		defer rig.shutdown()
+
+		lockTimeThresh := time.Now().Unix() + int64(rig.dc.config().BondExpiry)
+		bond := &db.Bond{LockTime: uint64(lockTimeThresh - 1)}
+		rig.acct.bonds = []*db.Bond{bond}
+
+		rig.acct.authMtx.Lock()
+		rig.dc.updateReputation(&account.Reputation{})
+		rig.acct.authMtx.Unlock()
+		if len(rig.acct.bonds) != 0 {
+			t.Fatalf("live bonds = %v, want none", rig.acct.bonds)
+		}
+		if len(rig.acct.expiredBonds) != 1 || rig.acct.expiredBonds[0] != bond {
+			t.Fatalf("expired bonds = %v, want the bond excluded by the local threshold", rig.acct.expiredBonds)
+		}
+	})
+}
+
+func TestBondExpiryNotifications(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		serverFirst bool
+	}{
+		{name: "rotation before server notification"},
+		{name: "server notification before rotation", serverFirst: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newTestRig()
+			defer rig.shutdown()
+			if err := rig.core.Login(tPW); err != nil {
+				t.Fatal(err)
+			}
+			// Disable new bond posting while checking expiry notifications.
+			rig.acct.disabled = true
+			rig.acct.targetTier = 1
+			rig.acct.rep.BondedTier = 1
+			bond := &db.Bond{
+				AssetID:  dcrBondAsset.ID,
+				CoinID:   []byte{1},
+				Strength: 1,
+				LockTime: uint64(time.Now().Unix()) + rig.dc.config().BondExpiry - 1,
+			}
+			rig.acct.bonds = []*db.Bond{bond}
+			feed := rig.core.NotificationFeed()
+			defer feed.ReturnFeed()
+
+			// Reading account state expires the bond but leaves the warning pending.
+			rig.core.exchangeAuth(rig.dc)
+			if !rig.acct.bondExpiryPending {
+				t.Fatal("state query did not retain the expiry notification")
+			}
+			if !tt.serverFirst {
+				rig.core.rotateBonds(rig.core.ctx)
+			}
+			// Deliver the same server notice twice to check duplicate suppression.
+			for range 2 {
+				if err := rig.core.bondExpired(rig.dc, bond.AssetID, bond.CoinID,
+					&msgjson.BondExpiredNotification{Reputation: &account.Reputation{}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rig.core.rotateBonds(rig.core.ctx)
+			if rig.acct.bondExpiryPending {
+				t.Fatal("expiry notification is still pending")
+			}
+
+			var warnings int
+			for len(feed.C) > 0 {
+				note := <-feed.C
+				if note.Topic() != TopicBondExpired {
+					continue
+				}
+				warnings++
+				bondNote := note.(*BondPostNote)
+				if bondNote.BondedTier == nil {
+					t.Fatal("expiry warning has no bonded tier")
+				}
+				if *bondNote.BondedTier != 0 {
+					t.Fatalf("expiry warning bonded tier = %d, want 0", *bondNote.BondedTier)
+				}
+				if bondNote.Auth == nil {
+					t.Fatal("expiry warning has no account state")
+				}
+				if bondNote.Auth.EffectiveTier != 0 {
+					t.Fatalf("expiry warning effective tier = %d, want 0", bondNote.Auth.EffectiveTier)
+				}
+				if bondNote.Auth.TargetTier != 1 {
+					t.Fatalf("expiry warning target tier = %d, want 1", bondNote.Auth.TargetTier)
+				}
+			}
+			if warnings != 1 {
+				t.Fatalf("expiry warnings = %d, want 1", warnings)
+			}
+		})
+	}
+}
+
 func TestRotateBonds(t *testing.T) {
 	const feeRate = 50
 
@@ -12295,10 +12447,15 @@ func TestRotateBonds(t *testing.T) {
 	// should create another bond.
 	acct.bonds, acct.pendingBonds = acct.pendingBonds, nil
 	acct.bonds[0].LockTime = locktimeExpired
+	// Expiring this bond must preserve the tier from bonds not stored locally.
+	acct.rep.BondedTier = 2
 	rig.queuePrevalidateBond()
 	// The newly expired bond will be refunded in time to fund our next round,
 	// so we only need fees reserved.
 	run(1, 1, bondFeeBuffer)
+	if acct.rep.BondedTier != 1 {
+		t.Fatalf("BondedTier after DEX expiry = %d, want 1", acct.rep.BondedTier)
+	}
 
 	// If the live bond is closer to expiration, the expired bond won't be
 	// ready in time, so we'll need more reserves.
@@ -12343,6 +12500,22 @@ func TestRotateBonds(t *testing.T) {
 	unmergingBond := acct.pendingBonds[0]
 	if unmergingBond.LockTime == acct.bonds[0].LockTime {
 		t.Fatalf("Unmergeable bond was scheduled for merged")
+	}
+
+	// Pending-bond DEX expiry must not change BondedTier.
+	acct.targetTier = 0
+	acct.bonds = nil
+	acct.pendingBonds = []*db.Bond{{
+		AssetID:  bondAsset.ID,
+		Amount:   bondAsset.Amt,
+		Strength: 1,
+		LockTime: locktimeExpired,
+	}}
+	acct.expiredBonds = nil
+	acct.rep.BondedTier = 1
+	run(0, 1, 0)
+	if acct.rep.BondedTier != 1 {
+		t.Fatalf("BondedTier after pending expiry = %d, want 1", acct.rep.BondedTier)
 	}
 }
 

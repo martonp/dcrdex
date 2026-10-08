@@ -7471,12 +7471,33 @@ func bondKey(assetID uint32, coinID []byte) string {
 	return string(append(encode.Uint32Bytes(assetID), coinID...))
 }
 
-// updateReputation sets the account's reputation-related fields.
-// updateReputation must be called with the authMtx locked.
-func (dc *dexConnection) updateReputation(
-	newReputation *account.Reputation,
-) {
+// updateReputation installs the server's reputation and moves bonds excluded
+// by its expiry threshold to expiredBonds. The caller must hold authMtx.
+func (dc *dexConnection) updateReputation(newReputation *account.Reputation) {
 	dc.acct.rep = *newReputation
+
+	// Bonds excluded by the server's threshold must leave acct.bonds so local
+	// expiry does not subtract their strength from the reported tier again.
+	lockTimeThresh := newReputation.BondExpiryThreshold
+	if lockTimeThresh <= 0 { // Servers predating BondExpiryThreshold.
+		cfg := dc.config()
+		if cfg == nil {
+			return
+		}
+		lockTimeThresh = time.Now().Unix() + int64(cfg.BondExpiry)
+	}
+
+	liveBonds := make([]*db.Bond, 0, len(dc.acct.bonds))
+	for _, bond := range dc.acct.bonds {
+		if int64(bond.LockTime) >= lockTimeThresh {
+			liveBonds = append(liveBonds, bond)
+			continue
+		}
+		dc.acct.expiredBonds = append(dc.acct.expiredBonds, bond)
+		dc.acct.bondExpiryPending = true
+	}
+
+	dc.acct.bonds = liveBonds
 }
 
 // findBondKeyIdx will attempt to find the address index whose public key hashes
