@@ -159,6 +159,7 @@ type dexConnection struct {
 	connMaster *dex.ConnectionMaster
 	log        dex.Logger
 	acct       *dexAccount
+	ctx        context.Context
 	notify     func(Notification)
 	ticker     *dexTicker
 	// apiVer is an atomic. An uninitiated connection should be set to -1.
@@ -836,14 +837,50 @@ func (c *Core) tryCancelTrade(dc *dexConnection, tracker *trackedTrade) error {
 	return nil
 }
 
-// signAndRequest signs and sends the request, unmarshaling the response into
-// the provided interface.
+// requestRetryDelays allows time for recovery during failover. The delays total
+// 55 seconds, excluding time spent waiting for each request's response.
+var requestRetryDelays = []time.Duration{
+	time.Second, 2 * time.Second, 4 * time.Second,
+	8 * time.Second, 8 * time.Second, 8 * time.Second,
+	8 * time.Second, 8 * time.Second, 8 * time.Second,
+}
+
+// isRetryableSendErr identifies failures that signAndRequest retries.
+func isRetryableSendErr(err error) bool {
+	var msgErr *msgjson.Error
+	if errors.As(err, &msgErr) {
+		switch msgErr.Code {
+		case msgjson.TryAgainLaterError, msgjson.ResultUnavailableError, msgjson.UnauthorizedConnection:
+			return true
+		}
+		return false
+	}
+	return errors.Is(err, errTimeout) || strings.Contains(err.Error(), "broken connection")
+}
+
+// signAndRequest signs the request once and retries the same signed payload
+// after retryable failures, decoding a successful response into result.
+// Its routes must support repeated submissions of the same signed payload.
 func (dc *dexConnection) signAndRequest(signable msgjson.Signable, route string, result any, timeout time.Duration) error {
 	if dc.acct.locked() {
 		return fmt.Errorf("cannot sign: %s account locked", dc.acct.host)
 	}
 	sign(dc.acct.privKey, signable)
-	return sendRequest(dc.FailoverWsConn, route, signable, result, timeout)
+
+	for attempt := 0; ; attempt++ {
+		err := sendRequest(dc.FailoverWsConn, route, signable, result, timeout)
+		if err == nil || attempt >= len(requestRetryDelays) || !isRetryableSendErr(err) {
+			return err
+		}
+		delay := requestRetryDelays[attempt]
+		dc.log.Warnf("Request %q to %s failed; retrying in %s: %v",
+			route, dc.acct.host, delay, err)
+		select {
+		case <-time.After(delay):
+		case <-dc.ctx.Done():
+			return err
+		}
+	}
 }
 
 // ack sends an Acknowledgement for a match-related request.
@@ -7235,10 +7272,8 @@ func (c *Core) sendTradeRequest(tr *tradeRequest) (*Order, error) {
 	result := new(msgjson.OrderResult)
 	err := dc.signAndRequest(msgOrder, route, result, fundingTxWait+DefaultResponseTimeout)
 	if err != nil {
-		// At this point there is a possibility that the server got the request
-		// and created the trade order, but we lost the connection before
-		// receiving the response with the trade's order ID. Any preimage
-		// request will be unrecognized. This order is ABANDONED.
+		// The server may have accepted the order even though submission failed.
+		// Abandon it locally; without its preimage, the server cannot match it.
 		return nil, fmt.Errorf("new order request with DEX server %v market %v failed: %w", dc.acct.host, mktID, err)
 	}
 
@@ -9170,6 +9205,7 @@ func (c *Core) newDEXConnection(acctInfo *db.AccountInfo, flag connectDEXFlag) (
 
 	dc := &dexConnection{
 		log:                c.log,
+		ctx:                c.ctx,
 		acct:               newDEXAccount(acctInfo, viewOnly),
 		notify:             c.notify,
 		ticker:             newDexTicker(defaultTickInterval), // updated when server config obtained
@@ -10324,6 +10360,10 @@ func handlePreimageRequest(c *Core, dc *dexConnection, msg *msgjson.Message) err
 	// Go async while waiting.
 	go func() {
 		// Order request success OR fail closes the channel.
+		// TODO(mesh): Answer using the pending order's preimage without waiting
+		// for its submission result. A lost response can delay this past the
+		// server's preimage deadline. Once revealed, retain the order and its
+		// funding coins even if the submission result is still unknown.
 		<-commitSig
 		if err := processPreimageRequest(c, dc, msg.ID, oid, req.CommitChecksum); err != nil {
 			c.log.Errorf("async processPreimageRequest for %v failed: %v", oid, err)
@@ -11283,7 +11323,7 @@ func sendRequest(conn requestConn, route string, request, response any, timeout 
 	err = conn.RequestWithTimeout(reqMsg, func(msg *msgjson.Message) {
 		errChan <- msg.UnmarshalResult(response)
 	}, timeout, func() {
-		errChan <- fmt.Errorf("timed out waiting for %q response (%w)", route, errTimeout) // code this as a timeout! like today!!!
+		errChan <- fmt.Errorf("timed out waiting for %q response (%w)", route, errTimeout)
 	})
 	// Check the request error.
 	if err != nil {

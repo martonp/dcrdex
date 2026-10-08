@@ -184,6 +184,7 @@ type TWebsocket struct {
 	submittedBond  *msgjson.PostBond
 	liveBondExpiry uint64
 	down           atomic.Bool
+	expireFn       func()
 }
 
 func newTWebsocket() *TWebsocket {
@@ -218,6 +219,7 @@ func testDexConnection(ctx context.Context, crypter *tCrypter) (*dexConnection, 
 	connMaster.Connect(ctx)
 	acct := tNewAccount(crypter)
 	return &dexConnection{
+		ctx:            ctx,
 		FailoverWsConn: conn,
 		log:            tLogger,
 		connMaster:     connMaster,
@@ -348,19 +350,21 @@ func (conn *TWebsocket) Request(msg *msgjson.Message, f msgFunc) error {
 func (conn *TWebsocket) RequestRaw(msgID uint64, rawMsg []byte, respHandler func(*msgjson.Message)) error {
 	return nil
 }
-func (conn *TWebsocket) RequestWithTimeout(msg *msgjson.Message, f func(*msgjson.Message), _ time.Duration, _ func()) error {
+func (conn *TWebsocket) RequestWithTimeout(msg *msgjson.Message, f func(*msgjson.Message), _ time.Duration, expire func()) error {
 	if conn.reqErr != nil {
 		return conn.reqErr
 	}
 	conn.mtx.Lock()
-	defer conn.mtx.Unlock()
+	conn.expireFn = expire
 	handlers := conn.handlers[msg.Route]
-	if len(handlers) > 0 {
-		handler := handlers[0]
-		conn.handlers[msg.Route] = handlers[1:]
-		return handler(msg, f)
+	if len(handlers) == 0 {
+		conn.mtx.Unlock()
+		return fmt.Errorf("no handler for route %q", msg.Route)
 	}
-	return fmt.Errorf("no handler for route %q", msg.Route)
+	handler := handlers[0]
+	conn.handlers[msg.Route] = handlers[1:]
+	conn.mtx.Unlock()
+	return handler(msg, f)
 }
 func (conn *TWebsocket) MessageSource() <-chan *msgjson.Message { return conn.msgs } // use when Core.listen is running
 func (conn *TWebsocket) IsDown() bool {
@@ -368,6 +372,14 @@ func (conn *TWebsocket) IsDown() bool {
 }
 func (conn *TWebsocket) setDown(down bool) {
 	conn.down.Store(down)
+}
+func (conn *TWebsocket) fireExpire() {
+	conn.mtx.Lock()
+	expire := conn.expireFn
+	conn.mtx.Unlock()
+	if expire != nil {
+		expire()
+	}
 }
 func (conn *TWebsocket) Connect(context.Context) (*sync.WaitGroup, error) {
 	// NOTE: tCore's wsConstructor just returns a reused conn, so we can't close
@@ -2213,6 +2225,85 @@ func TestGetFee(t *testing.T) {
 }
 */
 
+func TestSignAndRequestRetries(t *testing.T) {
+	oldDelays := requestRetryDelays
+	requestRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { requestRetryDelays = oldDelays })
+
+	tryAgain := msgjson.NewError(msgjson.TryAgainLaterError, "try again")
+	for _, test := range []struct {
+		name     string
+		outcomes []error
+	}{
+		{"try again then success", []error{tryAgain, nil}},
+		{"retries exhausted", []error{tryAgain, tryAgain, tryAgain}},
+		{"server rejection", []error{msgjson.NewError(msgjson.AccountNotFoundError, "account not found")}},
+		{"transport error", []error{tErr}},
+		{"broken connection", []error{errors.New("cannot send on a broken connection"), nil}},
+		{"expired request", []error{errTimeout, nil}},
+		{"unknown outcome", []error{msgjson.NewError(msgjson.ResultUnavailableError, "outcome unknown"), nil}},
+		{"unauthorized connection", []error{msgjson.NewError(msgjson.UnauthorizedConnection, "not authenticated"), nil}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rig := newTestRig()
+			t.Cleanup(rig.shutdown)
+			var attempts int
+			var firstPayload []byte
+			for _, outcome := range test.outcomes {
+				rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+					attempts++
+					if attempts == 1 {
+						firstPayload = msg.Payload
+					} else if !bytes.Equal(msg.Payload, firstPayload) {
+						t.Error("signed payload changed between attempts")
+					}
+					if errors.Is(outcome, errTimeout) {
+						rig.ws.fireExpire()
+						return nil
+					}
+					var rpcErr *msgjson.Error
+					if outcome != nil && !errors.As(outcome, &rpcErr) {
+						return outcome
+					}
+					resp, err := msgjson.NewResponse(msg.ID, &msgjson.OrderResult{ServerTime: 123}, rpcErr)
+					if err != nil {
+						return err
+					}
+					f(resp)
+					return nil
+				})
+			}
+			rig.ws.queueResponse(msgjson.CancelRoute, func(*msgjson.Message, msgFunc) error {
+				attempts++
+				t.Error("unexpected extra request")
+				return tErr
+			})
+
+			co := new(msgjson.CancelOrder)
+			result := new(msgjson.OrderResult)
+			err := rig.dc.signAndRequest(co, msgjson.CancelRoute, result, time.Second)
+			wantErr := test.outcomes[len(test.outcomes)-1]
+			var wantRPC, gotRPC *msgjson.Error
+			if errors.As(wantErr, &wantRPC) {
+				if !errors.As(err, &gotRPC) || gotRPC.Code != wantRPC.Code {
+					t.Fatalf("got error %v, want RPC code %d", err, wantRPC.Code)
+				}
+			} else if !errors.Is(err, wantErr) {
+				t.Fatalf("got error %v, want %v", err, wantErr)
+			}
+			if attempts != len(test.outcomes) {
+				t.Fatalf("got %d attempts, want %d", attempts, len(test.outcomes))
+			}
+			if len(co.Sig) == 0 {
+				t.Fatal("request was not signed")
+			}
+			if wantErr == nil && result.ServerTime != 123 {
+				t.Fatalf("response server time = %d, want 123", result.ServerTime)
+			}
+		})
+	}
+}
+
 func TestIsActiveCancelInFlight(t *testing.T) {
 	// Keep an otherwise inactive trade tracked while cancel submission is pending.
 	tracker := &trackedTrade{
@@ -2224,6 +2315,37 @@ func TestIsActiveCancelInFlight(t *testing.T) {
 	tracker.cancelInFlight = true
 	if !tracker.isActive() {
 		t.Fatal("revoked trade with an in-flight cancel reported inactive")
+	}
+}
+
+func TestSignAndRequestCtxAbort(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc := rig.dc
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	dc.ctx = ctx
+
+	// Use a long delay to verify that cancellation interrupts the retry wait.
+	defer func(delays []time.Duration) { requestRetryDelays = delays }(requestRetryDelays)
+	requestRetryDelays = []time.Duration{time.Minute}
+
+	rig.ws.queueResponse(msgjson.CancelRoute, func(msg *msgjson.Message, f msgFunc) error {
+		resp, _ := msgjson.NewResponse(msg.ID, nil, msgjson.NewError(msgjson.TryAgainLaterError, "later"))
+		f(resp)
+		return nil
+	})
+
+	co := new(msgjson.CancelOrder)
+	start := time.Now()
+	err := dc.signAndRequest(co, msgjson.CancelRoute, &struct{}{}, time.Second)
+	var rpcErr *msgjson.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != msgjson.TryAgainLaterError {
+		t.Fatalf("got error %v, want the last TryAgainLater failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("canceled context did not interrupt the retry wait (took %v)", elapsed)
 	}
 }
 
@@ -5415,6 +5537,54 @@ func TestTradeTracking(t *testing.T) {
 		}
 	}
 
+	resendPending := func() {
+		tracker.mtx.RLock()
+		tCore.resendPendingRequests(tracker)
+		tracker.mtx.RUnlock()
+	}
+
+	// resendPendingTryAgain exhausts signAndRequest's in-call try-again
+	// schedule on route, then waits for resendPendingRequests to finish.
+	resendPendingTryAgain := func(route string) {
+		t.Helper()
+		oldDelays := requestRetryDelays
+		requestRetryDelays = []time.Duration{time.Millisecond}
+		defer func() { requestRetryDelays = oldDelays }()
+		tryAgainErr := msgjson.NewError(msgjson.TryAgainLaterError,
+			"mesh command waiting for established master or slave state")
+		for i := 0; i < len(requestRetryDelays)+1; i++ {
+			rig.ws.queueResponse(route, func(msg *msgjson.Message, f msgFunc) error {
+				resp, _ := msgjson.NewResponse(msg.ID, nil, tryAgainErr)
+				f(resp)
+				return nil
+			})
+		}
+		resendPending()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			pending := false
+			tracker.mtx.RLock()
+			for _, match := range tracker.matches {
+				if route == msgjson.InitRoute {
+					pending = atomic.LoadUint32(&match.sendingInitAsync) != 0
+				} else {
+					pending = atomic.LoadUint32(&match.sendingRedeemAsync) != 0
+				}
+				if pending {
+					break
+				}
+			}
+			tracker.mtx.RUnlock()
+			if !pending {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s resend did not finish after exhausting retries", route)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	// MAKER MATCH
 	matchTime := time.Now()
 	msgMatch := &msgjson.Match{
@@ -5493,7 +5663,7 @@ func TestTradeTracking(t *testing.T) {
 		name: "resend pending init (invalid ack)",
 		fn: func() error {
 			rig.ws.queueResponse(msgjson.InitRoute, invalidAcker)
-			tCore.resendPendingRequests(tracker)
+			resendPending()
 			return nil
 		},
 		expectError:          false,
@@ -5506,13 +5676,28 @@ func TestTradeTracking(t *testing.T) {
 		t.Fatalf("init sig recorded for second invalid init ack")
 	}
 
+	// Try-again init after in-call retries: no ERROR note.
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending init (failover try-again)",
+		fn: func() error {
+			resendPendingTryAgain(msgjson.InitRoute)
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 0,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.InitSig) != 0 {
+		t.Fatalf("init sig recorded for try-again rejected init")
+	}
+
 	// queue a valid DEX init ack and re-send pending init request
 	// a valid ack should produce a db update otherwise it's an error
 	testSwapRelatedAction(swapRelatedAction{
 		name: "resend pending init (valid ack)",
 		fn: func() error {
 			rig.ws.queueResponse(msgjson.InitRoute, initAcker)
-			tCore.resendPendingRequests(tracker)
+			resendPending()
 			return nil
 		},
 		expectError:          false,
@@ -5807,6 +5992,37 @@ func TestTradeTracking(t *testing.T) {
 	if len(auth.RedeemSig) == 0 {
 		t.Fatalf("redeem ack sig not set for taker")
 	}
+
+	// Lost redeem ack + try-again: no ERROR note; valid ack recovers.
+	auth.RedeemSig = nil
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending redeem (failover try-again)",
+		fn: func() error {
+			resendPendingTryAgain(msgjson.RedeemRoute)
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 0,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.RedeemSig) != 0 {
+		t.Fatalf("redeem sig recorded for try-again rejected redeem")
+	}
+	testSwapRelatedAction(swapRelatedAction{
+		name: "resend pending redeem (valid ack)",
+		fn: func() error {
+			rig.ws.queueResponse(msgjson.RedeemRoute, redeemAcker)
+			resendPending()
+			return nil
+		},
+		expectError:          false,
+		expectMatchDBUpdates: 1,
+		expectSwapErrorNote:  false,
+	})
+	if len(auth.RedeemSig) == 0 {
+		t.Fatalf("redeem sig not recorded for valid redeem ack")
+	}
+
 	rig.db.updateMatchChan = nil
 	tBtcWallet.redeemErrChan = nil
 

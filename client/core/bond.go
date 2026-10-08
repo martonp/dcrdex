@@ -855,6 +855,11 @@ func (c *Core) postAndConfirmBond(dc *dexConnection, bond *asset.Bond) {
 	// the bond (in DB and dc.acct.{bond,pendingBonds}).
 	pbr, err := c.postBond(dc, bond) // can be long while server searches
 	if err != nil {
+		var msgErr *msgjson.Error
+		if errors.As(err, &msgErr) && msgErr.Code == msgjson.BondAlreadyConfirmingError {
+			c.log.Debugf("postbond for %s already confirming server-side", coinIDStr)
+			return
+		}
 		subject, details := c.formatDetails(TopicBondPostError, err, err)
 		c.notify(newBondPostNote(TopicBondPostError, subject, details, db.ErrorLevel, dc.acct.host))
 		return
