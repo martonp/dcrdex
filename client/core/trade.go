@@ -334,6 +334,7 @@ type trackedTrade struct {
 	change           asset.Coin
 	changeLocked     bool
 	cancel           *trackedCancel
+	cancelInFlight   bool // A cancel submission is awaiting its result.
 	matches          map[order.MatchID]*matchTracker
 	redemptionLocked uint64 // remaining locked of redemptionReserves
 	refundLocked     uint64 // remaining locked of refundReserves
@@ -1345,11 +1346,38 @@ func (t *trackedTrade) deleteStaleCancelOrder() {
 	t.notify(newOrderNote(TopicFailedCancel, subject, details, db.WarningLevel, t.coreOrderInternal()))
 }
 
-// isActive will be true if the trade is booked or epoch, or if any of the
-// matches are still negotiating.
+// beginCancelSend checks that the trade is cancellable and marks a cancel
+// submission in flight. The caller must clear cancelInFlight after the send.
+func (t *trackedTrade) beginCancelSend() error {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	oid := t.ID()
+	if status := t.metaData.Status; status != order.OrderStatusEpoch && status != order.OrderStatusBooked {
+		return fmt.Errorf("order %v not cancellable in status %v", oid, status)
+	}
+	if t.cancelInFlight {
+		return fmt.Errorf("order %s - a cancel submission is already in flight", oid)
+	}
+	t.deleteStaleCancelOrder()
+	if t.cancel != nil {
+		return fmt.Errorf("order %s - only one cancel order can be submitted per order per epoch. "+
+			"still waiting on cancel order %s to match", oid, t.cancel.ID())
+	}
+	t.cancelInFlight = true
+	return nil
+}
+
+// isActive reports whether the order is booked or in an epoch, a cancel
+// submission is pending, or any matches are still active.
 func (t *trackedTrade) isActive() bool {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
+
+	// Keep the trade tracked until cancel submission finishes so an
+	// accepted cancel can still answer preimage requests.
+	if t.cancelInFlight {
+		return true
+	}
 
 	// Status of the order itself.
 	if t.metaData.Status == order.OrderStatusBooked ||

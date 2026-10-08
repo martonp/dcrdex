@@ -740,22 +740,22 @@ func (c *Core) sendCancelOrder(dc *dexConnection, oid order.OrderID, base, quote
 	// Create and send the order message. Check the response before using it.
 	route, msgOrder, _ := messageOrder(co, nil)
 	var result = new(msgjson.OrderResult)
-	err = dc.signAndRequest(msgOrder, route, result, DefaultResponseTimeout)
-	if err != nil {
-		// At this point there is a possibility that the server got the request
-		// and created the cancel order, but we lost the connection before
-		// receiving the response with the cancel's order ID. Any preimage
-		// request will be unrecognized. This order is ABANDONED.
+
+	abandon := func() {
 		c.sentCommitsMtx.Lock()
 		delete(c.sentCommits, co.Commit)
 		c.sentCommitsMtx.Unlock()
+		close(commitSig)
+	}
+
+	err = dc.signAndRequest(msgOrder, route, result, DefaultResponseTimeout)
+	if err != nil {
+		abandon()
 		return preImg, nil, nil, nil, fmt.Errorf("failed to submit cancel order targeting trade %v: %w", oid, err)
 	}
 	err = validateOrderResponse(dc, result, co, msgOrder)
 	if err != nil {
-		c.sentCommitsMtx.Lock()
-		delete(c.sentCommits, co.Commit)
-		c.sentCommitsMtx.Unlock()
+		abandon()
 		return preImg, nil, nil, nil, fmt.Errorf("Abandoning order. preimage: %x, server time: %d: %w",
 			preImg[:], result.ServerTime, err)
 	}
@@ -785,29 +785,22 @@ func (c *Core) tryCancelTrade(dc *dexConnection, tracker *trackedTrade) error {
 		return newError(marketErr, "unknown market %q", tracker.mktID)
 	}
 
+	if err := tracker.beginCancelSend(); err != nil {
+		return err
+	}
+
+	// Release the trade lock while waiting for the server so settlement
+	// and order queries can continue.
+	preImg, co, sig, commitSig, err := c.sendCancelOrder(dc, oid, tracker.Base(), tracker.Quote())
+
 	tracker.mtx.Lock()
 	defer tracker.mtx.Unlock()
-
-	if status := tracker.metaData.Status; status != order.OrderStatusEpoch && status != order.OrderStatusBooked {
-		return fmt.Errorf("order %v not cancellable in status %v", oid, status)
-	}
-
-	if tracker.cancel != nil {
-		// Existing cancel might be stale. Deleting it now allows this
-		// cancel attempt to proceed.
-		tracker.deleteStaleCancelOrder()
-
-		if tracker.cancel != nil {
-			return fmt.Errorf("order %s - only one cancel order can be submitted per order per epoch. "+
-				"still waiting on cancel order %s to match", oid, tracker.cancel.ID())
-		}
-	}
-
-	// Construct and send the order.
-	preImg, co, sig, commitSig, err := c.sendCancelOrder(dc, oid, tracker.Base(), tracker.Quote())
+	tracker.cancelInFlight = false
 	if err != nil {
 		return err
 	}
+	// The order may have finished while submission was pending, but an
+	// accepted cancel still needs to be tracked to answer preimage requests.
 	defer close(commitSig)
 
 	// Store the cancel order with the tracker.

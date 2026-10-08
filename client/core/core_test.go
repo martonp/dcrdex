@@ -2213,6 +2213,20 @@ func TestGetFee(t *testing.T) {
 }
 */
 
+func TestIsActiveCancelInFlight(t *testing.T) {
+	// Keep an otherwise inactive trade tracked while cancel submission is pending.
+	tracker := &trackedTrade{
+		metaData: &db.OrderMetaData{Status: order.OrderStatusRevoked},
+	}
+	if tracker.isActive() {
+		t.Fatal("revoked trade with no in-flight cancel reported active")
+	}
+	tracker.cancelInFlight = true
+	if !tracker.isActive() {
+		t.Fatal("revoked trade with an in-flight cancel reported inactive")
+	}
+}
+
 func TestHandleReconnect(t *testing.T) {
 	rig := newTestRig()
 	defer rig.shutdown()
@@ -4449,12 +4463,31 @@ func TestCancel(t *testing.T) {
 	dc.trades[oid] = tracker
 
 	rig.queueCancel(nil)
+	cancelResponse := rig.ws.handlers[msgjson.CancelRoute][0]
+	rig.ws.handlers[msgjson.CancelRoute][0] = func(msg *msgjson.Message, f msgFunc) error {
+		if !tracker.mtx.TryLock() {
+			t.Error("trade lock held while submitting cancellation")
+			return tErr
+		}
+		inFlight := tracker.cancelInFlight
+		tracker.mtx.Unlock()
+		if !inFlight {
+			t.Error("cancel submission not marked in flight")
+		}
+		if err := tracker.beginCancelSend(); err == nil {
+			t.Error("another cancel submission allowed while one is in flight")
+		}
+		return cancelResponse(msg, f)
+	}
 	err := rig.core.Cancel(oid[:])
 	if err != nil {
 		t.Fatalf("cancel error: %v", err)
 	}
 	if tracker.cancel == nil {
 		t.Fatalf("cancel order not found")
+	}
+	if tracker.cancelInFlight {
+		t.Fatal("cancel submission still in flight after success")
 	}
 
 	ensureErr := func(tag string) {
@@ -4494,6 +4527,9 @@ func TestCancel(t *testing.T) {
 	rig.ws.reqErr = tErr
 	ensureErr("Request error")
 	ensureNilCancel("Request error")
+	if tracker.cancelInFlight {
+		t.Fatal("cancel submission still in flight after request error")
+	}
 	rig.ws.reqErr = nil
 }
 
