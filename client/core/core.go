@@ -888,10 +888,19 @@ type serverMatches struct {
 // parseMatches sorts the list of matches and associates them with a trade. This
 // may be called from handleMatchRoute on receipt of a new 'match' request, or
 // by authDEX with the list of active matches returned by the 'connect' request.
-func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []msgjson.Acknowledgement, error) {
+// The returned failed set identifies matches the server reported but the client
+// could not process, so reconnect reconciliation does not treat them as missing.
+func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs bool) (map[order.OrderID]*serverMatches, []msgjson.Acknowledgement, map[order.MatchID]struct{}, error) {
 	var acks []msgjson.Acknowledgement
 	matches := make(map[order.OrderID]*serverMatches)
 	var errs []string
+	failed := make(map[order.MatchID]struct{})
+	fail := func(msgMatch *msgjson.Match, reason string) {
+		var mid order.MatchID
+		copy(mid[:], msgMatch.MatchID)
+		failed[mid] = struct{}{}
+		errs = append(errs, reason)
+	}
 
 	// Phase 1: Find all orders and verify/sign signatures. This is fast
 	// and must complete before phase 2's slow wallet RPCs, which could
@@ -927,7 +936,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			swapRate = msgMatch.FeeRateBase
 		}
 		if !isCancel && swapRate > tracker.metaData.MaxFeeRate {
-			errs = append(errs, fmt.Sprintf("rejecting match %s for order %s because assigned rate (%d) is > MaxFeeRate (%d)",
+			fail(msgMatch, fmt.Sprintf("rejecting match %s for order %s because assigned rate (%d) is > MaxFeeRate (%d)",
 				msgMatch.MatchID, msgMatch.OrderID, swapRate, tracker.metaData.MaxFeeRate))
 			continue
 		}
@@ -938,12 +947,12 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 			if err != nil {
 				// If the caller (e.g. handleMatchRoute) requests signature
 				// verification, this is fatal.
-				return nil, nil, fmt.Errorf("parseMatches: match signature verification failed: %w", err)
+				return nil, nil, nil, fmt.Errorf("parseMatches: match signature verification failed: %w", err)
 			}
 		}
 		sig, err := dc.acct.sign(sigMsg)
 		if err != nil {
-			errs = append(errs, err.Error())
+			fail(msgMatch, err.Error())
 			continue
 		}
 
@@ -992,7 +1001,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	for range parsed {
 		res := <-addrCh
 		if res.err != "" {
-			errs = append(errs, res.err)
+			fail(parsed[res.idx].msgMatch, res.err)
 			addrFailed[res.idx] = true
 			continue
 		}
@@ -1044,7 +1053,7 @@ func (dc *dexConnection) parseMatches(msgMatches []*msgjson.Match, checkSigs boo
 	}
 	// A non-nil error only means that at least one match failed to parse, so we
 	// must return the successful matches and acks for further processing.
-	return matches, acks, err
+	return matches, acks, failed, err
 }
 
 // matchDiscreps specifies a trackedTrades's missing and extra matches compared
@@ -1068,8 +1077,9 @@ type matchStatusConflict struct {
 // for each serverMatch.
 // Reported matches with missing trackers are already checked by parseMatches,
 // but we also must check for incomplete matches that the server is not
-// reporting.
-func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serverMatches) (
+// reporting. Matches in failed were reported but could not be processed; they
+// must not be treated as missing.
+func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serverMatches, failed map[order.MatchID]struct{}) (
 	exceptions map[order.OrderID]*matchDiscreps, statusConflicts map[order.OrderID]*matchStatusConflict) {
 
 	exceptions = make(map[order.OrderID]*matchDiscreps)
@@ -1180,6 +1190,9 @@ func (dc *dexConnection) compareServerMatches(srvMatches map[order.OrderID]*serv
 			// redeemed or are revoked. Only client cares about redeem confs.
 			if m.Status >= order.MatchComplete || m.MetaData.Proof.IsRevoked() {
 				continue
+			}
+			if _, ok := failed[m.MatchID]; ok {
+				continue // failed parse, not missing
 			}
 			activeMatches = append(activeMatches, m)
 		}
@@ -7754,12 +7767,12 @@ func (c *Core) authDEX(dc *dexConnection) error {
 	}
 
 	// Associate the matches with known trades.
-	matches, _, err := dc.parseMatches(result.ActiveMatches, false)
+	matches, _, failed, err := dc.parseMatches(result.ActiveMatches, false)
 	if err != nil {
 		c.log.Error(err)
 	}
 
-	exceptions, matchConflicts := dc.compareServerMatches(matches)
+	exceptions, matchConflicts := dc.compareServerMatches(matches, failed)
 	for oid, matchAnomalies := range exceptions {
 		trade := matchAnomalies.trade
 		missing, extras := matchAnomalies.missing, matchAnomalies.extra
@@ -10388,7 +10401,7 @@ func handleMatchRoute(c *Core, dc *dexConnection, msg *msgjson.Message) error {
 	// request handling.
 
 	// Acknowledgements MUST be in the same orders as the msgjson.Matches.
-	matches, acks, err := dc.parseMatches(msgMatches, true)
+	matches, acks, _, err := dc.parseMatches(msgMatches, true)
 	if err != nil {
 		// Even one failed match fails them all since the server requires acks
 		// for them all, and in the same order. TODO: consider lifting this

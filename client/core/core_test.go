@@ -7001,7 +7001,7 @@ func TestCompareServerMatches(t *testing.T) {
 		oidMissing: trackerMissing,
 	}
 
-	exceptions, _ := dc.compareServerMatches(srvMatches)
+	exceptions, _ := dc.compareServerMatches(srvMatches, nil)
 	if len(exceptions) != 2 {
 		t.Fatalf("exceptions did not include both trades, just %d", len(exceptions))
 	}
@@ -13333,7 +13333,7 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, acks, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
@@ -13360,7 +13360,7 @@ func TestParseMatchesPerMatchAddr(t *testing.T) {
 
 	// Test RedemptionAddress error.
 	tBtcWallet.addrErr = tErr
-	_, _, err = dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	_, _, _, err = dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	// parseMatches returns errors as a joined string, not as an error return.
 	// But the match should be skipped and not appear in the acks.
 	// Actually, parseMatches returns the error string. Let me check the
@@ -13417,7 +13417,7 @@ func TestTradePerMatchAddr(t *testing.T) {
 	}
 	sign(tDexPriv, msgMatch)
 
-	matches, acks, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
+	matches, acks, _, err := dc.parseMatches([]*msgjson.Match{msgMatch}, true)
 	if err != nil {
 		t.Fatalf("parseMatches error: %v", err)
 	}
@@ -13480,4 +13480,46 @@ func TestTradePerMatchAddr(t *testing.T) {
 	}
 
 	_ = tBtcWallet
+}
+
+// TestConnectParseFailureNotMissing checks that a match that fails parsing
+// on the connect path is not treated as missing (and revoked).
+func TestConnectParseFailureNotMissing(t *testing.T) {
+	rig := newTestRig()
+	defer rig.shutdown()
+	dc, tCore := rig.dc, rig.core
+
+	lo, dbOrder, preImg, _ := makeLimitOrder(dc, true, dcrBtcLotSize, dcrBtcRateStep*10)
+
+	tracker := newTrackedTrade(dbOrder, preImg, dc, tCore.lockTimeTaker, tCore.lockTimeMaker,
+		rig.db, rig.queue, nil, nil, tCore.notify, tCore.formatDetails, &tCore.wg)
+	dc.trades[lo.ID()] = tracker
+
+	// A known match with no stored address fails parsing rather than
+	// minting a replacement.
+	mid := ordertest.RandomMatchID()
+	tracker.matches[mid] = &matchTracker{MetaMatch: db.MetaMatch{
+		MetaData:  &db.MatchMetaData{},
+		UserMatch: &order.UserMatch{MatchID: mid},
+	}}
+
+	msgMatch := &msgjson.Match{
+		OrderID: lo.ID().Bytes(), MatchID: mid[:],
+		Quantity: dcrBtcLotSize, Rate: dcrBtcRateStep * 10,
+		Address: "counterparty", Side: uint8(order.Maker),
+		ServerTime: uint64(time.Now().UnixMilli()),
+	}
+
+	srvMatches, _, failed, err := dc.parseMatches([]*msgjson.Match{msgMatch}, false)
+	if err == nil {
+		t.Fatal("parseMatches succeeded for known match with no swap address")
+	}
+	if _, ok := failed[mid]; !ok {
+		t.Fatalf("failed set = %v, want %v in it", failed, mid)
+	}
+
+	exceptions, _ := dc.compareServerMatches(srvMatches, failed)
+	if disc := exceptions[lo.ID()]; disc != nil {
+		t.Fatalf("failed match treated as discrepancy: %+v", disc)
+	}
 }
