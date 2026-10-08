@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,8 +87,7 @@ var ErrInvalidCert = fmt.Errorf("invalid certificate")
 // cert was provided.
 var ErrCertRequired = fmt.Errorf("certificate required")
 
-// WsConn is an interface for a websocket client.
-type WsConn interface {
+type wsConnCommon interface {
 	NextID() uint64
 	IsDown() bool
 	Send(msg *msgjson.Message) error
@@ -97,7 +97,31 @@ type WsConn interface {
 	RequestWithTimeout(msg *msgjson.Message, respHandler func(*msgjson.Message), expireTime time.Duration, expire func()) error
 	Connect(ctx context.Context) (*sync.WaitGroup, error)
 	MessageSource() <-chan *msgjson.Message
+}
+
+// WsConn is a single-endpoint websocket client. The endpoint-specific fields in
+// WsCfg are used to create the connection, and UpdateURL can replace that
+// single endpoint while preserving the endpoint's certificate and dialer.
+type WsConn interface {
+	wsConnCommon
 	UpdateURL(string)
+}
+
+// FailoverWsConn is a websocket client that can rotate among configured
+// endpoints on reconnect. Use NewFailoverWsConn with endpoint-specific settings
+// in the []*WsEndpoint argument, and SetFailoverEndpoints to update that list.
+type FailoverWsConn interface {
+	wsConnCommon
+	SetFailoverEndpoints([]*WsEndpoint) error
+	ActiveEndpoint() string
+}
+
+// WsEndpoint is a websocket endpoint and its endpoint-specific connection
+// settings.
+type WsEndpoint struct {
+	URL            string
+	Cert           []byte
+	NetDialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 // When the DEX sends a request to the client, a responseHandler is created
@@ -108,7 +132,10 @@ type responseHandler struct {
 	abort      func() // only to be run at most once, and not if f ran
 }
 
-// WsCfg is the configuration struct for initializing a WsConn.
+// WsCfg configures websocket behavior common to both WsConn and FailoverWsConn.
+// NewWsConn also uses URL, Cert, and NetDialContext as its single endpoint's
+// settings. NewFailoverWsConn takes endpoints separately, so those
+// endpoint-specific fields must be left unset for failover connections.
 type WsCfg struct {
 	// URL is the websocket endpoint URL.
 	URL string
@@ -159,9 +186,12 @@ type wsConn struct {
 	wg     sync.WaitGroup
 	log    dex.Logger
 	cfg    *WsCfg
-	tlsCfg *tls.Config
 	readCh chan *msgjson.Message
-	urlV   atomic.Value // string
+
+	endpoints *endpointSet
+	// connectedURL is the live websocket URL reported by ActiveEndpoint, not
+	// the endpoint-set rotation cursor.
+	connectedURL atomic.Value // string
 
 	wsMtx    sync.Mutex
 	writeMtx sync.Mutex
@@ -176,39 +206,52 @@ type wsConn struct {
 }
 
 var _ WsConn = (*wsConn)(nil)
+var _ FailoverWsConn = (*wsConn)(nil)
 
-// NewWsConn creates a client websocket connection.
+// NewWsConn creates a single-endpoint client websocket connection.
 func NewWsConn(cfg *WsCfg) (WsConn, error) {
+	endpoint := &WsEndpoint{
+		URL:            cfg.URL,
+		Cert:           cfg.Cert,
+		NetDialContext: cfg.NetDialContext,
+	}
+	return newWsConn(cfg, []*WsEndpoint{endpoint})
+}
+
+// NewFailoverWsConn creates a websocket connection that can rotate among
+// multiple endpoints on reconnect. The endpoints list must be non-empty, valid,
+// and contain no duplicate URLs. Endpoint-specific WsCfg fields, URL, Cert, and
+// NetDialContext, must be zero because failover endpoint settings are supplied
+// by the endpoints argument.
+func NewFailoverWsConn(cfg *WsCfg, endpoints []*WsEndpoint) (FailoverWsConn, error) {
+	if cfg.URL != "" {
+		return nil, fmt.Errorf("URL must be provided by failover endpoints, not WsCfg")
+	}
+	if len(cfg.Cert) > 0 {
+		return nil, fmt.Errorf("Cert must be provided by failover endpoints, not WsCfg")
+	}
+	if cfg.NetDialContext != nil {
+		return nil, fmt.Errorf("NetDialContext must be provided by failover endpoints, not WsCfg")
+	}
+
+	commonCfg := *cfg
+	return newWsConn(&commonCfg, endpoints)
+}
+
+func newWsConn(cfg *WsCfg, endpointCfgs []*WsEndpoint) (*wsConn, error) {
 	if cfg.PingWait < 0 {
 		return nil, fmt.Errorf("ping wait cannot be negative")
 	}
 
-	uri, err := url.Parse(cfg.URL)
+	endpoints, err := prepareEndpoints(endpointCfgs)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing URL: %w", err)
-	}
-
-	rootCAs, _ := x509.SystemCertPool()
-	if rootCAs == nil {
-		rootCAs = x509.NewCertPool()
-	}
-
-	if len(cfg.Cert) > 0 {
-		if ok := rootCAs.AppendCertsFromPEM(cfg.Cert); !ok {
-			return nil, ErrInvalidCert
-		}
-	}
-
-	tlsConfig := &tls.Config{
-		RootCAs:    rootCAs,
-		MinVersion: tls.VersionTLS12,
-		ServerName: uri.Hostname(),
+		return nil, err
 	}
 
 	conn := &wsConn{
 		cfg:          cfg,
 		log:          cfg.Logger,
-		tlsCfg:       tlsConfig,
+		endpoints:    &endpointSet{endpoints: endpoints},
 		readCh:       make(chan *msgjson.Message, readBuffSize),
 		respHandlers: make(map[uint64]*responseHandler),
 		reconnectCh:  make(chan struct{}, 1),
@@ -216,17 +259,43 @@ func NewWsConn(cfg *WsCfg) (WsConn, error) {
 	if conn.log == nil {
 		conn.log = dex.Disabled
 	}
-	conn.urlV.Store(cfg.URL)
 
 	return conn, nil
 }
 
+// UpdateURL replaces the connection's endpoint set with a single endpoint
+// using the selected endpoint's certificate and dialer. It is intended for
+// single-endpoint connections whose websocket URL changes.
 func (conn *wsConn) UpdateURL(uri string) {
-	conn.urlV.Store(uri)
+	cfg := conn.endpoints.selectedUpdateCfg(uri)
+
+	endpoint, err := newWsEndpoint(cfg)
+	if err != nil {
+		conn.log.Warnf("Ignoring invalid websocket URL update %q: %v", uri, err)
+		return
+	}
+
+	conn.endpoints.replaceWithSingle(endpoint)
 }
 
-func (conn *wsConn) url() string {
-	return conn.urlV.Load().(string)
+// SetFailoverEndpoints atomically replaces the failover endpoint list. The list
+// must be non-empty, valid, and contain no duplicate URLs. If the selected
+// endpoint URL is present in the new list, the next connection attempt uses its
+// successor; otherwise the next attempt starts with the first endpoint.
+// The current websocket is not reconnected immediately.
+func (conn *wsConn) SetFailoverEndpoints(cfgs []*WsEndpoint) error {
+	return conn.endpoints.replace(cfgs)
+}
+
+// ActiveEndpoint returns the live websocket URL, or empty when down. The URL
+// may be absent from the configured list if SetFailoverEndpoints replaced it
+// while connected.
+func (conn *wsConn) ActiveEndpoint() string {
+	if conn.IsDown() {
+		return ""
+	}
+	url, _ := conn.connectedURL.Load().(string)
+	return url
 }
 
 // IsDown indicates if the connection is known to be down.
@@ -246,24 +315,22 @@ func (conn *wsConn) setConnectionStatus(status ConnectionStatus) {
 
 // connect attempts to establish a websocket connection.
 func (conn *wsConn) connect(ctx context.Context) error {
+	endpoint := conn.endpoints.nextEndpoint()
+	conn.log.Infof("Connecting to websocket endpoint %s...", endpoint.url)
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: DefaultResponseTimeout,
-		TLSClientConfig:  conn.tlsCfg,
+		TLSClientConfig:  endpoint.tlsCfg,
 	}
-	if conn.cfg.NetDialContext != nil {
-		dialer.NetDialContext = conn.cfg.NetDialContext
+	if endpoint.netDialContext != nil {
+		dialer.NetDialContext = endpoint.netDialContext
 	} else {
 		dialer.Proxy = http.ProxyFromEnvironment
 	}
 
-	ws, _, err := dialer.DialContext(ctx, conn.url(), conn.cfg.ConnectHeaders)
+	ws, _, err := dialer.DialContext(ctx, endpoint.url, conn.cfg.ConnectHeaders)
 	if err != nil {
 		if isErrorInvalidCert(err) {
-			conn.setConnectionStatus(InvalidCert)
-			if len(conn.cfg.Cert) == 0 {
-				return dex.NewError(ErrCertRequired, err.Error())
-			}
-			return dex.NewError(ErrInvalidCert, err.Error())
+			return conn.certConnectError(endpoint, err)
 		}
 		conn.setConnectionStatus(Disconnected)
 		return err
@@ -313,6 +380,8 @@ func (conn *wsConn) connect(ctx context.Context) error {
 	conn.ws = ws
 	conn.wsMtx.Unlock()
 
+	// Before status change so connect handlers see the new endpoint.
+	conn.connectedURL.Store(endpoint.url)
 	conn.setConnectionStatus(Connected)
 	conn.wg.Add(1)
 	go func() {
@@ -485,11 +554,9 @@ func (conn *wsConn) keepAlive(ctx context.Context) {
 				return
 			}
 
-			conn.log.Infof("Attempting to reconnect to %s...", conn.url())
 			err := conn.connect(ctx)
 			if err != nil {
-				conn.log.Errorf("Reconnect failed. Scheduling reconnect to %s in %.1f seconds.",
-					conn.url(), rcInt.Seconds())
+				conn.log.Errorf("Reconnect failed: %v. Retrying in %.1f seconds.", err, rcInt.Seconds())
 				time.AfterFunc(rcInt, conn.scheduleReconnect)
 				// Increment the wait up to PingWait.
 				if rcInt < maxReconnectInterval {
@@ -551,9 +618,10 @@ func (conn *wsConn) Connect(ctx context.Context) (*sync.WaitGroup, error) {
 
 	err := conn.connect(ctxInternal)
 	if err != nil {
-		// If the certificate is invalid or missing, do not start the reconnect
-		// loop, and return an error with no WaitGroup.
-		if conn.cfg.DisableAutoReconnect || errors.Is(err, ErrInvalidCert) || errors.Is(err, ErrCertRequired) {
+		// If the certificate is invalid or missing for the only endpoint, do
+		// not start the reconnect loop, and return an error with no WaitGroup.
+		if conn.cfg.DisableAutoReconnect || (errors.Is(err, ErrInvalidCert) || errors.Is(err, ErrCertRequired)) &&
+			conn.endpoints.count() <= 1 {
 			conn.cancel()
 			conn.wg.Wait() // probably a no-op
 			close(conn.readCh)
@@ -772,4 +840,161 @@ func (conn *wsConn) respHandler(id uint64) *responseHandler {
 // shutdown, the channel will be closed.
 func (conn *wsConn) MessageSource() <-chan *msgjson.Message {
 	return conn.readCh
+}
+
+type wsEndpoint struct {
+	url            string
+	cert           []byte
+	tlsCfg         *tls.Config
+	netDialContext func(context.Context, string, string) (net.Conn, error)
+}
+
+// endpointSet holds a nonempty list of prepared endpoints. selected is the
+// position retained when replacing the list, not necessarily the live endpoint.
+// It starts at the first endpoint and changes on each connection attempt.
+type endpointSet struct {
+	mtx       sync.RWMutex
+	endpoints []*wsEndpoint
+	selected  int
+	next      int
+}
+
+func newWsEndpoint(cfg *WsEndpoint) (*wsEndpoint, error) {
+	uri, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing URL: %w", err)
+	}
+	switch strings.ToLower(uri.Scheme) {
+	case "ws", "wss":
+	default:
+		return nil, fmt.Errorf("unsupported websocket scheme %q", uri.Scheme)
+	}
+	if uri.Host == "" {
+		return nil, fmt.Errorf("websocket URL host is empty")
+	}
+
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+
+	cert := append([]byte(nil), cfg.Cert...)
+	if len(cert) > 0 {
+		if ok := rootCAs.AppendCertsFromPEM(cert); !ok {
+			return nil, ErrInvalidCert
+		}
+	}
+
+	return &wsEndpoint{
+		url:            cfg.URL,
+		cert:           cert,
+		netDialContext: cfg.NetDialContext,
+		tlsCfg: &tls.Config{
+			RootCAs:    rootCAs,
+			MinVersion: tls.VersionTLS12,
+			ServerName: uri.Hostname(),
+		},
+	}, nil
+}
+
+func prepareEndpoints(cfgs []*WsEndpoint) ([]*wsEndpoint, error) {
+	if len(cfgs) == 0 {
+		return nil, fmt.Errorf("empty websocket endpoint list")
+	}
+
+	endpoints := make([]*wsEndpoint, 0, len(cfgs))
+	seen := make(map[string]struct{}, len(cfgs))
+	for _, cfg := range cfgs {
+		if cfg == nil {
+			return nil, fmt.Errorf("nil websocket endpoint")
+		}
+		endpoint, err := newWsEndpoint(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("invalid websocket endpoint %q: %w", cfg.URL, err)
+		}
+		if _, found := seen[endpoint.url]; found {
+			return nil, fmt.Errorf("duplicate websocket endpoint URL %q", endpoint.url)
+		}
+		seen[endpoint.url] = struct{}{}
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints, nil
+}
+
+func (conn *wsConn) certConnectError(endpoint *wsEndpoint, err error) error {
+	var connErr error
+	if len(endpoint.cert) == 0 {
+		connErr = dex.NewError(ErrCertRequired, err.Error())
+	} else {
+		connErr = dex.NewError(ErrInvalidCert, err.Error())
+	}
+	if conn.endpoints.count() == 1 {
+		conn.setConnectionStatus(InvalidCert)
+	} else {
+		conn.log.Errorf("Certificate error connecting to websocket endpoint %s: %v", endpoint.url, err)
+		conn.setConnectionStatus(Disconnected)
+	}
+	return connErr
+}
+
+func (set *endpointSet) count() int {
+	set.mtx.RLock()
+	defer set.mtx.RUnlock()
+	return len(set.endpoints)
+}
+
+func (set *endpointSet) nextEndpoint() *wsEndpoint {
+	set.mtx.Lock()
+	defer set.mtx.Unlock()
+	idx := set.next % len(set.endpoints)
+	set.selected = idx
+	set.next = (idx + 1) % len(set.endpoints)
+	return set.endpoints[idx]
+}
+
+func (set *endpointSet) selectedURL() string {
+	set.mtx.RLock()
+	defer set.mtx.RUnlock()
+	return set.endpoints[set.selected].url
+}
+
+func (set *endpointSet) selectedUpdateCfg(uri string) *WsEndpoint {
+	set.mtx.RLock()
+	defer set.mtx.RUnlock()
+	selected := set.endpoints[set.selected]
+	return &WsEndpoint{
+		URL:            uri,
+		Cert:           selected.cert,
+		NetDialContext: selected.netDialContext,
+	}
+}
+
+func (set *endpointSet) replaceWithSingle(endpoint *wsEndpoint) {
+	set.mtx.Lock()
+	set.endpoints = []*wsEndpoint{endpoint}
+	set.selected = 0
+	set.next = 0
+	set.mtx.Unlock()
+}
+
+func (set *endpointSet) replace(cfgs []*WsEndpoint) error {
+	endpoints, err := prepareEndpoints(cfgs)
+	if err != nil {
+		return err
+	}
+
+	set.mtx.Lock()
+	defer set.mtx.Unlock()
+	previousURL := set.endpoints[set.selected].url
+	set.endpoints = endpoints
+	set.selected = 0
+	set.next = 0
+	for i, endpoint := range endpoints {
+		if endpoint.url == previousURL {
+			set.selected = i
+			set.next = (i + 1) % len(endpoints)
+			break
+		}
+	}
+	return nil
 }
