@@ -993,6 +993,10 @@ func (c *Core) RedeemPrepaidBond(appPW []byte, code []byte, host string, certI a
 				dc.connMaster.Disconnect()
 			}
 		}()
+
+		if err := c.checkDupeDEXPubKey(dc, host); err != nil {
+			return 0, err
+		}
 	}
 
 	if !acctExists { // new dex connection or pre-existing view-only connection
@@ -1468,6 +1472,10 @@ func (c *Core) PostBond(form *PostBondForm) (*PostBondResult, error) {
 				dc.connMaster.Disconnect()
 			}
 		}()
+
+		if err := c.checkDupeDEXPubKey(dc, host); err != nil {
+			return nil, err
+		}
 	}
 
 	if !acctExists { // new dex connection or pre-existing view-only connection

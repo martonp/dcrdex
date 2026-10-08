@@ -2394,6 +2394,50 @@ func TestPersistMeshEndpointsOnAccountCreate(t *testing.T) {
 	}
 }
 
+func TestDuplicateDEXRegistration(t *testing.T) {
+	const alternateHost = "mesh2.example.com:7232"
+	tests := []struct {
+		name     string
+		register func(*testRig) error
+	}{
+		{
+			name: "post bond",
+			register: func(rig *testRig) error {
+				wallet, tWallet := newTWallet(tUTXOAssetA.ID)
+				rig.core.wallets[tUTXOAssetA.ID] = wallet
+				tWallet.bal = &asset.Balance{Available: 4e9}
+				_, err := rig.core.PostBond(&PostBondForm{
+					Addr:    alternateHost,
+					AppPass: tPW,
+					Asset:   &tUTXOAssetA.ID,
+					Bond:    dcrBondAsset.Amt,
+					Cert:    []byte{0x1},
+				})
+				return err
+			},
+		},
+		{
+			name: "redeem prepaid bond",
+			register: func(rig *testRig) error {
+				_, err := rig.core.RedeemPrepaidBond(tPW, []byte{0x1}, alternateHost, []byte{0x1})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rig := newTestRig()
+			defer rig.shutdown()
+
+			// The alternate host advertises the existing DEX's public key.
+			rig.queueConfig()
+			if err := test.register(rig); !errorHasCode(err, dupeDEXErr) {
+				t.Fatalf("expected duplicate DEX error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestPostBond(t *testing.T) {
 	// This test takes a little longer because the key is decrypted every time
 	// Register is called.

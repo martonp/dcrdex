@@ -4281,12 +4281,8 @@ func (c *Core) AddDEX(appPW []byte, dexAddr string, certI any) error {
 		}
 	}()
 
-	// Don't allow adding another dex with the same pubKey. There can only be
-	// one dex connection per pubKey. UpdateDEXHost must be called to connect to
-	// the same dex using a different host name.
-	exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey)
-	if exists {
-		return newError(dupeDEXErr, "already connected to DEX at %s but with different host name %s", dexAddr, host)
+	if err := c.checkDupeDEXPubKey(dc, dexAddr); err != nil {
+		return err
 	}
 
 	err = c.db.CreateAccount(&db.AccountInfo{
@@ -4450,6 +4446,18 @@ func (c *Core) dexWithPubKeyExists(pubKey *secp256k1.PublicKey) (bool, string) {
 	return false, ""
 }
 
+// checkDupeDEXPubKey rejects a new DEX connection whose public key matches
+// an existing DEX account.
+func (c *Core) checkDupeDEXPubKey(dc *dexConnection, addr string) error {
+	if dc.acct.dexPubKey == nil {
+		return nil // older server, nothing to compare
+	}
+	if exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey); exists {
+		return newError(dupeDEXErr, "the dex at %s is the same dex as %s (another endpoint of the same server); use Update Host to switch host names", addr, host)
+	}
+	return nil
+}
+
 // upgradeConnection promotes a temporary dex connection and starts listening
 // to the messages it receives.
 func (c *Core) upgradeConnection(dc *dexConnection) {
@@ -4526,14 +4534,9 @@ func (c *Core) DiscoverAccount(dexAddr string, appPW []byte, certI any) (*Exchan
 		return c.exchangeInfo(dc), false, nil
 	}
 
-	// Don't allow registering for another dex with the same pubKey. There can only
-	// be one dex connection per pubKey. UpdateDEXHost must be called to connect to
-	// the same dex using a different host name.
 	if !existingConn {
-		exists, host := c.dexWithPubKeyExists(dc.acct.dexPubKey)
-		if exists {
-			return nil, false,
-				fmt.Errorf("the dex at %v is the same dex as %v. Use Update Host to switch host names", host, dexAddr)
+		if err := c.checkDupeDEXPubKey(dc, dexAddr); err != nil {
+			return nil, false, err
 		}
 	}
 
